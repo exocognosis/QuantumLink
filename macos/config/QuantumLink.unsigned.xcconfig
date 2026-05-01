@@ -1,0 +1,10 @@
+// Use this configuration for local unsigned builds that do not require an Apple Developer account.
+// Real packet-tunnel execution still requires Apple-granted Network Extension entitlements.
+
+#include "QuantumLink.common.xcconfig"
+
+CODE_SIGNING_ALLOWED = NO
+CODE_SIGNING_REQUIRED = NO
+CODE_SIGN_IDENTITY =
+DEVELOPMENT_TEAM =
+PROVISIONING_PROFILE_SPECIFIER =

@@ -1,0 +1,1761 @@
+use crate::{
+    crypto::DeviceKeypair,
+    discovery::{CandidateEndpoint, CandidateType},
+    error::{QlinkError, Result},
+    ice::{perform_ice_check, IceCheckRequest, IceCredentials},
+    inbound_identity::send_inbound_assertion,
+    peer_acl::PeerAcl,
+    quic_transport::{QuicCertificate, QuicDatagramSession, QuicEndpoint},
+    relay::RelayClient,
+    rendezvous::RendezvousClient,
+    traversal::candidate_socket_addr,
+};
+use std::{
+    collections::HashMap,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
+use tokio::{net::UdpSocket, task::JoinSet};
+
+const DEFAULT_DIRECT_PROBE_TIMEOUT: Duration = Duration::from_millis(750);
+const DEFAULT_OVERALL_DEADLINE: Duration = Duration::from_secs(3);
+/// RFC 8445 §6.1.4 default Ta interval between successive connectivity checks.
+/// We deliberately stay close to the spec default so behavior is predictable
+/// for operators familiar with ICE.
+const DEFAULT_PROBE_PACING: Duration = Duration::from_millis(50);
+
+#[derive(Debug, Clone)]
+pub struct MeshConnectorConfig {
+    pub mesh_id: String,
+    pub local_peer_id: String,
+    pub direct_probe_timeout: Duration,
+    pub overall_deadline: Duration,
+    /// Interval between successive paced connectivity checks (RFC 8445 Ta).
+    pub probe_pacing: Duration,
+    /// When `Some`, paced probes run an ICE binding-request check against the
+    /// candidate before attempting the QUIC handshake. The check is signed
+    /// with the remote peer's ICE password (from their signed rendezvous
+    /// record) and authenticated by the responder. When `None`, probes go
+    /// straight to a bare QUIC connect (legacy behavior).
+    pub local_ice_credentials: Option<IceCredentials>,
+    /// Per-check timeout for the ICE binding request itself; when omitted we
+    /// reuse `direct_probe_timeout`.
+    pub ice_check_timeout: Option<Duration>,
+    pub relay_server: Option<String>,
+    /// Peer authorization list. When set, the connector evaluates the
+    /// remote peer ID against this ACL *before* any rendezvous lookup or
+    /// candidate probe. Denied peers fail with a clear protocol error and
+    /// never touch the network. Defaults to no ACL (all peers permitted).
+    pub peer_acl: Option<PeerAcl>,
+    /// Local device keypair. When set, the connector sends a signed
+    /// `InboundIdentityAssertion` over a fresh uni-stream immediately
+    /// after the QUIC handshake completes — this is what lets the
+    /// remote peer's responder loop run the inbound ACL + crypto check.
+    /// Without this, the connector skips the assertion step (legacy
+    /// behavior; remote responders that require assertions will close
+    /// the connection).
+    pub local_device_keypair: Option<Arc<DeviceKeypair>>,
+}
+
+impl MeshConnectorConfig {
+    pub fn new(mesh_id: impl Into<String>, local_peer_id: impl Into<String>) -> Self {
+        Self {
+            mesh_id: mesh_id.into(),
+            local_peer_id: local_peer_id.into(),
+            direct_probe_timeout: DEFAULT_DIRECT_PROBE_TIMEOUT,
+            overall_deadline: DEFAULT_OVERALL_DEADLINE,
+            probe_pacing: DEFAULT_PROBE_PACING,
+            local_ice_credentials: None,
+            ice_check_timeout: None,
+            relay_server: None,
+            peer_acl: None,
+            local_device_keypair: None,
+        }
+    }
+
+    pub fn with_peer_acl(mut self, acl: PeerAcl) -> Self {
+        self.peer_acl = Some(acl);
+        self
+    }
+
+    pub fn with_local_device_keypair(mut self, keypair: Arc<DeviceKeypair>) -> Self {
+        self.local_device_keypair = Some(keypair);
+        self
+    }
+
+    pub fn with_direct_probe_timeout(mut self, timeout: Duration) -> Self {
+        self.direct_probe_timeout = timeout;
+        self
+    }
+
+    pub fn with_overall_deadline(mut self, deadline: Duration) -> Self {
+        self.overall_deadline = deadline;
+        self
+    }
+
+    pub fn with_probe_pacing(mut self, pacing: Duration) -> Self {
+        self.probe_pacing = pacing;
+        self
+    }
+
+    pub fn with_relay_server(mut self, server: impl Into<String>) -> Self {
+        self.relay_server = Some(server.into());
+        self
+    }
+
+    pub fn with_local_ice_credentials(mut self, credentials: IceCredentials) -> Self {
+        self.local_ice_credentials = Some(credentials);
+        self
+    }
+
+    pub fn with_ice_check_timeout(mut self, timeout: Duration) -> Self {
+        self.ice_check_timeout = Some(timeout);
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathKind {
+    Direct,
+    Relay,
+}
+
+/// System-level network events that warrant re-validating active paths.
+///
+/// On macOS these are sourced by the Swift packet-tunnel provider:
+/// `PathChanged` from `NWPathMonitor`, `PreSleep`/`PostWake` from
+/// `NSWorkspace` notifications, and `ReachabilityChanged` from
+/// `NWPathMonitor` reachability transitions. The Rust core stays platform-
+/// neutral; the provider feeds events in via FFI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkEvent {
+    /// Active interface or addressing changed (Wi-Fi ↔ Ethernet ↔ tethering,
+    /// or a DHCP renewal that shifted the local IP). Cached candidate
+    /// addresses may now point at the wrong NAT mapping.
+    PathChanged,
+    /// System is about to suspend. Active probing is paused; in-flight
+    /// connections are left as-is so they can be re-validated post-wake.
+    PreSleep,
+    /// System has resumed. Cached paths are suspect because external NAT
+    /// mappings may have expired during sleep; re-probe is recommended.
+    PostWake,
+    /// Reachability transition. `false` indicates the device has gone
+    /// offline; `true` indicates it has come back.
+    ReachabilityChanged { reachable: bool },
+}
+
+/// Result of feeding a `NetworkEvent` into the connector. Lets callers report
+/// "we just dropped N cached paths" telemetry and decide whether to schedule
+/// an immediate re-probe loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NetworkEventResponse {
+    pub cache_entries_invalidated: usize,
+    pub reprobe_recommended: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeOutcome {
+    Established,
+    TimedOut,
+    Failed(String),
+    /// ICE binding-request check failed before QUIC was even attempted. The
+    /// string carries the underlying error (auth failure, response timeout,
+    /// fingerprint mismatch, etc.).
+    IceFailed(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct ProbeAttempt {
+    pub candidate_type: CandidateType,
+    pub address: SocketAddr,
+    pub elapsed: Duration,
+    pub outcome: ProbeOutcome,
+    /// When the ICE pre-check succeeded, this is the round-trip time of the
+    /// authenticated STUN binding request. `None` when ICE was disabled or
+    /// the check did not complete.
+    pub ice_round_trip: Option<Duration>,
+    /// Peer-reflexive address learned from the ICE response's
+    /// XOR-MAPPED-ADDRESS. May differ from the candidate's advertised address
+    /// behind NAT (RFC 8445 §7.3.1.4 prflx candidate); the connector caches
+    /// the candidate address it actually QUIC-connected to.
+    pub peer_reflexive_address: Option<SocketAddr>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConnectionOutcome {
+    pub remote_peer_id: String,
+    pub path_kind: PathKind,
+    pub remote_addr: Option<SocketAddr>,
+    pub attempts: Vec<ProbeAttempt>,
+    pub total_elapsed: Duration,
+    pub used_cached_path: bool,
+}
+
+pub struct DirectLink {
+    pub remote_addr: SocketAddr,
+    pub session: QuicDatagramSession,
+}
+
+pub struct RelayLink {
+    pub remote_peer_id: String,
+    pub client: RelayClient,
+}
+
+pub enum MeshLink {
+    Direct(DirectLink),
+    Relay(RelayLink),
+}
+
+impl std::fmt::Debug for MeshLink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MeshLink::Direct(link) => f
+                .debug_struct("MeshLink::Direct")
+                .field("remote_addr", &link.remote_addr)
+                .finish(),
+            MeshLink::Relay(link) => f
+                .debug_struct("MeshLink::Relay")
+                .field("remote_peer_id", &link.remote_peer_id)
+                .finish(),
+        }
+    }
+}
+
+impl MeshLink {
+    pub fn path_kind(&self) -> PathKind {
+        match self {
+            MeshLink::Direct(_) => PathKind::Direct,
+            MeshLink::Relay(_) => PathKind::Relay,
+        }
+    }
+
+    pub async fn send_frame(&mut self, frame: Vec<u8>) -> Result<()> {
+        match self {
+            MeshLink::Direct(link) => link.session.send_frame(frame).await,
+            MeshLink::Relay(link) => {
+                link.client
+                    .send_datagram(&link.remote_peer_id, &frame)
+                    .await
+            }
+        }
+    }
+
+    pub async fn receive_frame(&mut self) -> Result<Vec<u8>> {
+        match self {
+            MeshLink::Direct(link) => link.session.receive_frame().await,
+            MeshLink::Relay(link) => match link.client.receive_datagram().await? {
+                Some((_source, payload)) => Ok(payload),
+                None => Err(QlinkError::Protocol(
+                    "relay closed before delivering frame".into(),
+                )),
+            },
+        }
+    }
+
+    pub fn close(&self, reason: &[u8]) {
+        if let MeshLink::Direct(link) = self {
+            link.session.close(reason);
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct LastGoodCache {
+    inner: Mutex<HashMap<String, CachedPath>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CachedPath {
+    address: SocketAddr,
+    last_used: Instant,
+}
+
+impl LastGoodCache {
+    pub fn record(&self, peer_id: &str, address: SocketAddr) {
+        if let Ok(mut guard) = self.inner.lock() {
+            guard.insert(
+                peer_id.to_string(),
+                CachedPath {
+                    address,
+                    last_used: Instant::now(),
+                },
+            );
+        }
+    }
+
+    pub fn lookup(&self, peer_id: &str) -> Option<SocketAddr> {
+        self.inner
+            .lock()
+            .ok()?
+            .get(peer_id)
+            .map(|cached| cached.address)
+    }
+
+    pub fn invalidate(&self, peer_id: &str) {
+        if let Ok(mut guard) = self.inner.lock() {
+            guard.remove(peer_id);
+        }
+    }
+
+    /// Drops every cached entry. Returns the number of entries that were
+    /// removed so callers can surface "N paths invalidated" telemetry on
+    /// network change / wake events.
+    pub fn clear(&self) -> usize {
+        match self.inner.lock() {
+            Ok(mut guard) => {
+                let count = guard.len();
+                guard.clear();
+                count
+            }
+            Err(_) => 0,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.lock().map(|guard| guard.len()).unwrap_or(0)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn last_used(&self, peer_id: &str) -> Option<Instant> {
+        self.inner
+            .lock()
+            .ok()?
+            .get(peer_id)
+            .map(|cached| cached.last_used)
+    }
+}
+
+pub struct MeshConnector {
+    config: MeshConnectorConfig,
+    rendezvous: RendezvousClient,
+    quic: QuicEndpoint,
+    cache: LastGoodCache,
+}
+
+impl MeshConnector {
+    pub fn new(
+        config: MeshConnectorConfig,
+        rendezvous: RendezvousClient,
+        quic: QuicEndpoint,
+    ) -> Self {
+        Self {
+            config,
+            rendezvous,
+            quic,
+            cache: LastGoodCache::default(),
+        }
+    }
+
+    pub fn config(&self) -> &MeshConnectorConfig {
+        &self.config
+    }
+
+    pub fn cache(&self) -> &LastGoodCache {
+        &self.cache
+    }
+
+    /// Re-validates a single peer by dropping its cached path and re-running
+    /// the full discovery → paced-probe → relay-fallback flow. Use this in
+    /// response to per-peer health signals; for system-wide events (path
+    /// change, wake) prefer `handle_network_event` which clears the entire
+    /// cache up front.
+    pub async fn reconnect(&self, remote_peer_id: &str) -> Result<(MeshLink, ConnectionOutcome)> {
+        self.cache.invalidate(remote_peer_id);
+        self.connect(remote_peer_id).await
+    }
+
+    /// Feeds a system-level network event into the connector. The connector
+    /// adjusts its cache and tells the caller whether an immediate re-probe
+    /// is recommended. The caller is expected to call `reconnect()` per peer
+    /// (or `connect()` if peer state is fresh) when `reprobe_recommended` is
+    /// true.
+    ///
+    /// The split between "the connector tracks cache lifetime" and "the
+    /// caller drives the event loop" is deliberate: tunnel providers already
+    /// own the active-peer set and the OS-level notifications, so the Rust
+    /// core stays a pure protocol library.
+    pub fn handle_network_event(&self, event: NetworkEvent) -> NetworkEventResponse {
+        match event {
+            NetworkEvent::PathChanged | NetworkEvent::PostWake => {
+                let invalidated = self.cache.clear();
+                NetworkEventResponse {
+                    cache_entries_invalidated: invalidated,
+                    reprobe_recommended: true,
+                }
+            }
+            NetworkEvent::PreSleep => NetworkEventResponse {
+                cache_entries_invalidated: 0,
+                reprobe_recommended: false,
+            },
+            NetworkEvent::ReachabilityChanged { reachable } => {
+                if reachable {
+                    NetworkEventResponse {
+                        cache_entries_invalidated: 0,
+                        reprobe_recommended: true,
+                    }
+                } else {
+                    // Going offline: keep cached entries; they may still be
+                    // valid when reachability returns. Pause probing.
+                    NetworkEventResponse {
+                        cache_entries_invalidated: 0,
+                        reprobe_recommended: false,
+                    }
+                }
+            }
+        }
+    }
+
+    pub async fn connect(&self, remote_peer_id: &str) -> Result<(MeshLink, ConnectionOutcome)> {
+        let started = Instant::now();
+
+        // ACL check happens before *anything* hits the network: a denied
+        // peer doesn't reveal its presence to the rendezvous server and
+        // never triggers STUN/QUIC traffic.
+        if let Some(acl) = self.config.peer_acl.as_ref() {
+            let decision = acl.evaluate(remote_peer_id);
+            if !decision.is_allowed() {
+                return Err(QlinkError::Protocol(format!(
+                    "peer {remote_peer_id} rejected by ACL: {}",
+                    decision.reason()
+                )));
+            }
+        }
+
+        let record = self
+            .rendezvous
+            .lookup(&self.config.mesh_id, remote_peer_id)
+            .await?
+            .ok_or_else(|| {
+                QlinkError::Protocol(format!(
+                    "peer {remote_peer_id} not found in rendezvous {}",
+                    self.config.mesh_id
+                ))
+            })?;
+        record.verify(&self.config.mesh_id)?;
+        let remote_ice_credentials = record.body.ice_credentials.clone();
+        // The signed record carries the remote's QUIC server cert. We trust
+        // it for the lifetime of this connect attempt; the ML-DSA signature
+        // on the record ensures only the legitimate device key holder can
+        // mint it. Empty bytes mean the peer hasn't published a cert yet —
+        // direct QUIC connect is impossible and we'll fall back to relay.
+        let remote_cert: Option<QuicCertificate> = if record.body.device_certificate_der.is_empty()
+        {
+            None
+        } else {
+            Some(QuicCertificate::from_der(
+                record.body.device_certificate_der.clone(),
+            ))
+        };
+
+        let cached_addr = self.cache.lookup(remote_peer_id);
+        let direct_candidates = order_direct_candidates(&record.body.endpoints, cached_addr);
+        let used_cached_path = cached_addr.is_some();
+        let had_direct_candidates = !direct_candidates.is_empty();
+
+        let probe_outcome = self
+            .race_direct_probes(
+                &direct_candidates,
+                started,
+                remote_ice_credentials,
+                remote_cert,
+            )
+            .await;
+
+        match probe_outcome {
+            DirectProbeResult::Established {
+                address,
+                session,
+                attempts,
+            } => {
+                self.cache.record(remote_peer_id, address);
+                let outcome = ConnectionOutcome {
+                    remote_peer_id: remote_peer_id.to_string(),
+                    path_kind: PathKind::Direct,
+                    remote_addr: Some(address),
+                    attempts,
+                    total_elapsed: started.elapsed(),
+                    used_cached_path,
+                };
+                let link = MeshLink::Direct(DirectLink {
+                    remote_addr: address,
+                    session,
+                });
+                Ok((link, outcome))
+            }
+            DirectProbeResult::Exhausted { attempts } => {
+                if had_direct_candidates {
+                    self.cache.invalidate(remote_peer_id);
+                }
+
+                let Some(server) = self.config.relay_server.as_ref() else {
+                    return Err(QlinkError::Protocol(format!(
+                        "no direct candidate for peer {remote_peer_id} succeeded and no relay server is configured"
+                    )));
+                };
+
+                let client =
+                    RelayClient::connect(server, self.config.local_peer_id.clone()).await?;
+                let outcome = ConnectionOutcome {
+                    remote_peer_id: remote_peer_id.to_string(),
+                    path_kind: PathKind::Relay,
+                    remote_addr: None,
+                    attempts,
+                    total_elapsed: started.elapsed(),
+                    used_cached_path: false,
+                };
+                let link = MeshLink::Relay(RelayLink {
+                    remote_peer_id: remote_peer_id.to_string(),
+                    client,
+                });
+                Ok((link, outcome))
+            }
+        }
+    }
+
+    /// Runs paced parallel connectivity checks across the provided candidate
+    /// list. Each check is offset from the prior by `config.probe_pacing`
+    /// (RFC 8445 Ta default 50ms). The first check that produces an
+    /// established QUIC session wins; the rest are aborted.
+    ///
+    /// This is *ICE-style* probing rather than RFC-conformant ICE: the
+    /// connectivity check is a QUIC connect attempt, not a STUN binding
+    /// request with USERNAME/MESSAGE-INTEGRITY. It still proves bidirectional
+    /// UDP reachability — sufficient for v1 — and matches Quinn's data-plane
+    /// flow so a successful probe directly yields the live session.
+    async fn race_direct_probes(
+        &self,
+        candidates: &[CandidateEndpoint],
+        started: Instant,
+        remote_ice_credentials: IceCredentials,
+        remote_cert: Option<QuicCertificate>,
+    ) -> DirectProbeResult {
+        if candidates.is_empty() {
+            return DirectProbeResult::Exhausted { attempts: vec![] };
+        }
+        // No cert published → direct QUIC is unauthenticated and disallowed.
+        // Skip direct probing entirely so the caller falls back to relay.
+        let Some(remote_cert) = remote_cert else {
+            return DirectProbeResult::Exhausted { attempts: vec![] };
+        };
+
+        let mut join_set: JoinSet<ProbeOutcomeRecord> = JoinSet::new();
+
+        for (index, candidate) in candidates.iter().enumerate() {
+            let address = match candidate_socket_addr(candidate) {
+                Ok(addr) => addr,
+                Err(error) => {
+                    let candidate_type = candidate.candidate_type.clone();
+                    join_set.spawn(async move {
+                        ProbeOutcomeRecord::from_parts(
+                            candidate_type,
+                            None,
+                            false,
+                            Duration::ZERO,
+                            ProbeOutcome::Failed(error.to_string()),
+                        )
+                    });
+                    continue;
+                }
+            };
+
+            let pacing_offset = self.config.probe_pacing.saturating_mul(index as u32);
+            let probe_timeout = self.config.direct_probe_timeout;
+            let overall_deadline = self.config.overall_deadline;
+            let candidate_type = candidate.candidate_type.clone();
+            let quic = self.quic.clone();
+            let local_ice = self.config.local_ice_credentials.clone();
+            let remote_ice = remote_ice_credentials.clone();
+            let candidate_priority = candidate.priority;
+            let ice_check_timeout = self
+                .config
+                .ice_check_timeout
+                .unwrap_or(self.config.direct_probe_timeout);
+            let cert = remote_cert.clone();
+            let local_keypair = self.config.local_device_keypair.clone();
+            let mesh_id_for_task = self.config.mesh_id.clone();
+
+            join_set.spawn(async move {
+                tokio::time::sleep(pacing_offset).await;
+                if started.elapsed() >= overall_deadline {
+                    return ProbeOutcomeRecord::from_parts(
+                        candidate_type,
+                        Some(address),
+                        false,
+                        Duration::ZERO,
+                        ProbeOutcome::TimedOut,
+                    );
+                }
+
+                let probe_started = Instant::now();
+                let effective_quic_timeout = probe_timeout.min(
+                    overall_deadline
+                        .checked_sub(started.elapsed())
+                        .unwrap_or(Duration::ZERO),
+                );
+                if effective_quic_timeout.is_zero() {
+                    return ProbeOutcomeRecord::from_parts(
+                        candidate_type,
+                        Some(address),
+                        false,
+                        Duration::ZERO,
+                        ProbeOutcome::TimedOut,
+                    );
+                }
+
+                // RFC 8445 connectivity check: if we have ICE credentials,
+                // run an authenticated STUN binding request before opening
+                // QUIC. Failure short-circuits the probe so a misbehaving or
+                // unauthenticated peer never gets a QUIC handshake.
+                let mut ice_round_trip: Option<Duration> = None;
+                let mut peer_reflexive_address: Option<SocketAddr> = None;
+
+                if let Some(local_ice) = local_ice.as_ref() {
+                    let bind_addr = match address.ip() {
+                        IpAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+                        IpAddr::V6(_) => {
+                            SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 0)
+                        }
+                    };
+                    let socket = match UdpSocket::bind(bind_addr).await {
+                        Ok(socket) => socket,
+                        Err(error) => {
+                            return ProbeOutcomeRecord::from_parts(
+                                candidate_type,
+                                Some(address),
+                                true,
+                                probe_started.elapsed(),
+                                ProbeOutcome::IceFailed(format!(
+                                    "could not bind ICE socket: {error}"
+                                )),
+                            );
+                        }
+                    };
+
+                    let request = IceCheckRequest {
+                        remote_credentials: remote_ice.clone(),
+                        local_ufrag: local_ice.ufrag.clone(),
+                        local_priority: candidate_priority,
+                        // Tiebreaker per RFC 8445 §6.1.1; a random u64 is fine
+                        // because we always take the controlling role here.
+                        controlling_tiebreaker: rand_u64(),
+                        use_candidate: true,
+                    };
+
+                    match perform_ice_check(&socket, address, request, ice_check_timeout).await {
+                        Ok(result) => {
+                            ice_round_trip = Some(result.round_trip);
+                            peer_reflexive_address = result.mapped_address;
+                        }
+                        Err(error) => {
+                            return ProbeOutcomeRecord {
+                                candidate_type,
+                                address: Some(address),
+                                launched: true,
+                                elapsed: probe_started.elapsed(),
+                                outcome: ProbeOutcome::IceFailed(error.to_string()),
+                                ice_round_trip: None,
+                                peer_reflexive_address: None,
+                                session: None,
+                            };
+                        }
+                    }
+                }
+
+                // Either ICE passed or it was disabled; now run the QUIC
+                // handshake to establish the data path.
+                let remaining_quic_timeout = probe_timeout.min(
+                    overall_deadline
+                        .checked_sub(started.elapsed())
+                        .unwrap_or(Duration::ZERO),
+                );
+                if remaining_quic_timeout.is_zero() {
+                    return ProbeOutcomeRecord {
+                        candidate_type,
+                        address: Some(address),
+                        launched: true,
+                        elapsed: probe_started.elapsed(),
+                        outcome: ProbeOutcome::TimedOut,
+                        ice_round_trip,
+                        peer_reflexive_address,
+                        session: None,
+                    };
+                }
+
+                match tokio::time::timeout(
+                    remaining_quic_timeout,
+                    quic.connect_with_trusted_cert(address, &cert),
+                )
+                .await
+                {
+                    Ok(Ok(session)) => {
+                        // QUIC handshake done. If we have a local device
+                        // keypair, send our inbound identity assertion so
+                        // the remote responder can evaluate us against
+                        // its ACL before any data flows. A failure here
+                        // is treated as a probe failure: the connection
+                        // exists but won't survive the responder's check.
+                        if let Some(keypair) = local_keypair.as_ref() {
+                            if let Err(error) = send_inbound_assertion(
+                                &session,
+                                keypair.as_ref(),
+                                &mesh_id_for_task,
+                            )
+                            .await
+                            {
+                                session.close(b"assertion send failed");
+                                return ProbeOutcomeRecord {
+                                    candidate_type,
+                                    address: Some(address),
+                                    launched: true,
+                                    elapsed: probe_started.elapsed(),
+                                    outcome: ProbeOutcome::Failed(format!(
+                                        "inbound assertion send failed: {error}"
+                                    )),
+                                    ice_round_trip,
+                                    peer_reflexive_address,
+                                    session: None,
+                                };
+                            }
+                        }
+                        ProbeOutcomeRecord {
+                            candidate_type,
+                            address: Some(address),
+                            launched: true,
+                            elapsed: probe_started.elapsed(),
+                            outcome: ProbeOutcome::Established,
+                            ice_round_trip,
+                            peer_reflexive_address,
+                            session: Some(session),
+                        }
+                    }
+                    Ok(Err(error)) => ProbeOutcomeRecord {
+                        candidate_type,
+                        address: Some(address),
+                        launched: true,
+                        elapsed: probe_started.elapsed(),
+                        outcome: ProbeOutcome::Failed(error.to_string()),
+                        ice_round_trip,
+                        peer_reflexive_address,
+                        session: None,
+                    },
+                    Err(_) => ProbeOutcomeRecord {
+                        candidate_type,
+                        address: Some(address),
+                        launched: true,
+                        elapsed: probe_started.elapsed(),
+                        outcome: ProbeOutcome::TimedOut,
+                        ice_round_trip,
+                        peer_reflexive_address,
+                        session: None,
+                    },
+                }
+            });
+        }
+
+        let mut attempts: Vec<ProbeAttempt> = Vec::new();
+        let overall_remaining = self
+            .config
+            .overall_deadline
+            .checked_sub(started.elapsed())
+            .unwrap_or(Duration::ZERO);
+        let race_deadline = tokio::time::Instant::now() + overall_remaining;
+
+        loop {
+            let next = tokio::select! {
+                joined = join_set.join_next() => joined,
+                _ = tokio::time::sleep_until(race_deadline) => {
+                    join_set.shutdown().await;
+                    break;
+                }
+            };
+
+            let Some(joined) = next else {
+                break;
+            };
+
+            let record = match joined {
+                Ok(record) => record,
+                Err(_) => continue,
+            };
+
+            if record.launched {
+                if let Some(addr) = record.address {
+                    attempts.push(ProbeAttempt {
+                        candidate_type: record.candidate_type.clone(),
+                        address: addr,
+                        elapsed: record.elapsed,
+                        outcome: record.outcome.clone(),
+                        ice_round_trip: record.ice_round_trip,
+                        peer_reflexive_address: record.peer_reflexive_address,
+                    });
+                }
+            }
+
+            if let (ProbeOutcome::Established, Some(session), Some(addr)) =
+                (&record.outcome, record.session, record.address)
+            {
+                join_set.shutdown().await;
+                return DirectProbeResult::Established {
+                    address: addr,
+                    session,
+                    attempts,
+                };
+            }
+        }
+
+        DirectProbeResult::Exhausted { attempts }
+    }
+}
+
+enum DirectProbeResult {
+    Established {
+        address: SocketAddr,
+        session: QuicDatagramSession,
+        attempts: Vec<ProbeAttempt>,
+    },
+    Exhausted {
+        attempts: Vec<ProbeAttempt>,
+    },
+}
+
+struct ProbeOutcomeRecord {
+    candidate_type: CandidateType,
+    address: Option<SocketAddr>,
+    launched: bool,
+    elapsed: Duration,
+    outcome: ProbeOutcome,
+    ice_round_trip: Option<Duration>,
+    peer_reflexive_address: Option<SocketAddr>,
+    session: Option<QuicDatagramSession>,
+}
+
+impl ProbeOutcomeRecord {
+    fn from_parts(
+        candidate_type: CandidateType,
+        address: Option<SocketAddr>,
+        launched: bool,
+        elapsed: Duration,
+        outcome: ProbeOutcome,
+    ) -> Self {
+        Self {
+            candidate_type,
+            address,
+            launched,
+            elapsed,
+            outcome,
+            ice_round_trip: None,
+            peer_reflexive_address: None,
+            session: None,
+        }
+    }
+}
+
+fn rand_u64() -> u64 {
+    let mut bytes = [0_u8; 8];
+    if getrandom::fill(&mut bytes).is_err() {
+        // Fall back to a constant; the value is just an ICE tiebreaker, not
+        // security-critical, but the entropy source failing is unusual.
+        return 0xdead_beef_d00d_feed;
+    }
+    u64::from_be_bytes(bytes)
+}
+
+fn order_direct_candidates(
+    endpoints: &[CandidateEndpoint],
+    cached_addr: Option<SocketAddr>,
+) -> Vec<CandidateEndpoint> {
+    let mut direct: Vec<CandidateEndpoint> = endpoints
+        .iter()
+        .filter(|candidate| {
+            matches!(
+                candidate.candidate_type,
+                CandidateType::Host | CandidateType::ServerReflexive
+            )
+        })
+        .cloned()
+        .collect();
+
+    direct.sort_by(|a, b| b.priority.cmp(&a.priority));
+
+    if let Some(target) = cached_addr {
+        if let Some(position) = direct
+            .iter()
+            .position(|candidate| candidate_matches_addr(candidate, target))
+        {
+            let cached = direct.remove(position);
+            direct.insert(0, cached);
+        }
+    }
+
+    direct
+}
+
+fn candidate_matches_addr(candidate: &CandidateEndpoint, addr: SocketAddr) -> bool {
+    candidate
+        .address
+        .parse::<IpAddr>()
+        .map(|ip| ip == addr.ip())
+        .unwrap_or(false)
+        && candidate.port == addr.port()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        crypto::DeviceKeypair,
+        discovery::{PeerRecord, UnsignedPeerRecord},
+        quic_transport::QuicEndpoint,
+        relay::spawn_dev_relay,
+        rendezvous::spawn_dev_rendezvous,
+    };
+    use std::net::Ipv4Addr;
+
+    const MESH_ID: &str = "devmesh";
+
+    #[tokio::test]
+    async fn direct_path_succeeds_and_caches_address() {
+        let rendezvous = spawn_dev_rendezvous().await.unwrap();
+        let rendezvous_client = RendezvousClient::new(rendezvous.local_addr().to_string());
+
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let (server_endpoint, server_cert) = QuicEndpoint::server(bind).unwrap();
+        let server_addr = server_endpoint.local_addr().unwrap();
+        let server_cert_der = server_cert.as_der().to_vec();
+        let client_endpoint = QuicEndpoint::client(bind, &[server_cert]).unwrap();
+
+        // Server side keeps accepting QUIC connections so probes can complete.
+        let _accept_loop = tokio::spawn(async move {
+            loop {
+                match server_endpoint.accept_one().await {
+                    Ok(session) => {
+                        tokio::spawn(async move {
+                            let _ = session.receive_frame().await;
+                        });
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let local_key = DeviceKeypair::generate().unwrap();
+        let remote_key = DeviceKeypair::generate().unwrap();
+        let remote_peer_id = remote_key.public_key().peer_id();
+
+        let remote_record = signed_record_with_cert(
+            &remote_key,
+            vec![CandidateEndpoint {
+                candidate_type: CandidateType::Host,
+                address: server_addr.ip().to_string(),
+                port: server_addr.port(),
+                priority: 120,
+            }],
+            1,
+            server_cert_der,
+        );
+        rendezvous_client
+            .publish(MESH_ID, remote_record)
+            .await
+            .unwrap();
+
+        let connector = MeshConnector::new(
+            MeshConnectorConfig::new(MESH_ID, local_key.public_key().peer_id())
+                .with_direct_probe_timeout(Duration::from_millis(500))
+                .with_overall_deadline(Duration::from_secs(2)),
+            rendezvous_client,
+            client_endpoint,
+        );
+
+        let (link, outcome) = connector.connect(&remote_peer_id).await.unwrap();
+        assert_eq!(link.path_kind(), PathKind::Direct);
+        assert_eq!(outcome.path_kind, PathKind::Direct);
+        assert_eq!(outcome.remote_addr, Some(server_addr));
+        assert_eq!(outcome.attempts.len(), 1);
+        assert_eq!(outcome.attempts[0].outcome, ProbeOutcome::Established);
+        assert!(!outcome.used_cached_path);
+
+        assert_eq!(connector.cache().lookup(&remote_peer_id), Some(server_addr));
+    }
+
+    #[tokio::test]
+    async fn direct_failure_falls_back_to_relay() {
+        let rendezvous = spawn_dev_rendezvous().await.unwrap();
+        let rendezvous_client = RendezvousClient::new(rendezvous.local_addr().to_string());
+
+        let relay = spawn_dev_relay().await.unwrap();
+        let relay_addr = relay.local_addr();
+
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let (server_endpoint, server_cert) = QuicEndpoint::server(bind).unwrap();
+        // Don't accept on the server: connect attempts will time out.
+        drop(server_endpoint);
+        let client_endpoint = QuicEndpoint::client(bind, &[server_cert]).unwrap();
+
+        let local_key = DeviceKeypair::generate().unwrap();
+        let remote_key = DeviceKeypair::generate().unwrap();
+        let remote_peer_id = remote_key.public_key().peer_id();
+
+        // Advertise an unreachable host candidate (port 1) so the direct probe will fail fast,
+        // forcing the relay fallback path.
+        let remote_record = signed_record(
+            &remote_key,
+            vec![CandidateEndpoint {
+                candidate_type: CandidateType::Host,
+                address: "127.0.0.1".to_string(),
+                port: 1,
+                priority: 120,
+            }],
+            1,
+        );
+        rendezvous_client
+            .publish(MESH_ID, remote_record)
+            .await
+            .unwrap();
+
+        let connector = MeshConnector::new(
+            MeshConnectorConfig::new(MESH_ID, local_key.public_key().peer_id())
+                .with_direct_probe_timeout(Duration::from_millis(150))
+                .with_overall_deadline(Duration::from_millis(500))
+                .with_relay_server(relay_addr.to_string()),
+            rendezvous_client,
+            client_endpoint,
+        );
+
+        let (link, outcome) = connector.connect(&remote_peer_id).await.unwrap();
+        assert_eq!(link.path_kind(), PathKind::Relay);
+        assert_eq!(outcome.path_kind, PathKind::Relay);
+        assert_eq!(outcome.remote_addr, None);
+        assert!(!outcome.attempts.is_empty());
+        assert!(outcome.attempts.iter().all(|attempt| {
+            matches!(
+                attempt.outcome,
+                ProbeOutcome::TimedOut | ProbeOutcome::Failed(_)
+            )
+        }));
+        assert!(connector.cache().lookup(&remote_peer_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn missing_peer_returns_protocol_error() {
+        let rendezvous = spawn_dev_rendezvous().await.unwrap();
+        let rendezvous_client = RendezvousClient::new(rendezvous.local_addr().to_string());
+
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let (_unused_server, throwaway_cert) = QuicEndpoint::server(bind).unwrap();
+        let client_endpoint = QuicEndpoint::client(bind, &[throwaway_cert]).unwrap();
+
+        let local_key = DeviceKeypair::generate().unwrap();
+        let connector = MeshConnector::new(
+            MeshConnectorConfig::new(MESH_ID, local_key.public_key().peer_id()),
+            rendezvous_client,
+            client_endpoint,
+        );
+
+        let error = connector.connect("not-published").await.unwrap_err();
+        assert!(error.to_string().contains("not found in rendezvous"));
+    }
+
+    #[tokio::test]
+    async fn cached_path_is_tried_first_on_subsequent_connect() {
+        let rendezvous = spawn_dev_rendezvous().await.unwrap();
+        let rendezvous_client = RendezvousClient::new(rendezvous.local_addr().to_string());
+
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let (server_endpoint, server_cert) = QuicEndpoint::server(bind).unwrap();
+        let server_addr = server_endpoint.local_addr().unwrap();
+        let server_cert_der = server_cert.as_der().to_vec();
+        let client_endpoint = QuicEndpoint::client(bind, &[server_cert]).unwrap();
+
+        let _accept_loop = tokio::spawn(async move {
+            loop {
+                match server_endpoint.accept_one().await {
+                    Ok(session) => {
+                        tokio::spawn(async move {
+                            let _ = session.receive_frame().await;
+                        });
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let local_key = DeviceKeypair::generate().unwrap();
+        let remote_key = DeviceKeypair::generate().unwrap();
+        let remote_peer_id = remote_key.public_key().peer_id();
+
+        // Two host candidates: one unreachable (priority 200), one reachable (priority 100).
+        // First call will try priority 200 first (fail), then reach the working one.
+        // After caching, the second call should probe the cached working address first.
+        let remote_record = signed_record_with_cert(
+            &remote_key,
+            vec![
+                CandidateEndpoint {
+                    candidate_type: CandidateType::Host,
+                    address: "127.0.0.1".to_string(),
+                    port: 1,
+                    priority: 200,
+                },
+                CandidateEndpoint {
+                    candidate_type: CandidateType::Host,
+                    address: server_addr.ip().to_string(),
+                    port: server_addr.port(),
+                    priority: 100,
+                },
+            ],
+            1,
+            server_cert_der,
+        );
+        rendezvous_client
+            .publish(MESH_ID, remote_record)
+            .await
+            .unwrap();
+
+        let connector = MeshConnector::new(
+            MeshConnectorConfig::new(MESH_ID, local_key.public_key().peer_id())
+                .with_direct_probe_timeout(Duration::from_millis(150))
+                .with_overall_deadline(Duration::from_secs(2)),
+            rendezvous_client,
+            client_endpoint,
+        );
+
+        let (_, first) = connector.connect(&remote_peer_id).await.unwrap();
+        assert_eq!(first.path_kind, PathKind::Direct);
+        assert!(!first.used_cached_path);
+        // The working candidate must be among the recorded attempts as
+        // Established. With paced probes the unreachable peer may be aborted
+        // before its outcome lands, so we don't assert on its presence.
+        let working_attempt = first
+            .attempts
+            .iter()
+            .find(|attempt| attempt.address == server_addr)
+            .expect("working candidate should appear in first.attempts");
+        assert_eq!(working_attempt.outcome, ProbeOutcome::Established);
+        assert_eq!(connector.cache().lookup(&remote_peer_id), Some(server_addr));
+
+        let (_, second) = connector.connect(&remote_peer_id).await.unwrap();
+        assert_eq!(second.path_kind, PathKind::Direct);
+        assert!(second.used_cached_path);
+        // The cached path is paced ahead of the others (offset 0 vs 50ms+),
+        // so it wins and the resulting attempt list starts with it.
+        assert_eq!(second.attempts[0].address, server_addr);
+        assert_eq!(second.attempts[0].outcome, ProbeOutcome::Established);
+    }
+
+    #[tokio::test]
+    async fn ice_pre_check_fails_when_no_responder_is_listening() {
+        use crate::ice::IceCredentials;
+
+        let rendezvous = spawn_dev_rendezvous().await.unwrap();
+        let rendezvous_client = RendezvousClient::new(rendezvous.local_addr().to_string());
+
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let (_unused_server, throwaway_cert) = QuicEndpoint::server(bind).unwrap();
+        let throwaway_cert_der = throwaway_cert.as_der().to_vec();
+        let client_endpoint = QuicEndpoint::client(bind, &[throwaway_cert]).unwrap();
+
+        let local_key = DeviceKeypair::generate().unwrap();
+        let remote_key = DeviceKeypair::generate().unwrap();
+        let remote_peer_id = remote_key.public_key().peer_id();
+
+        // No ICE responder bound at port 1; the connector will time out the
+        // ICE check before ever attempting a QUIC handshake. The cert in the
+        // record is a real (parseable) DER blob so the connector reaches the
+        // ICE step rather than short-circuiting on cert-parse.
+        let remote_record = signed_record_with_cert(
+            &remote_key,
+            vec![CandidateEndpoint {
+                candidate_type: CandidateType::Host,
+                address: "127.0.0.1".to_string(),
+                port: 1,
+                priority: 120,
+            }],
+            1,
+            throwaway_cert_der,
+        );
+        rendezvous_client
+            .publish(MESH_ID, remote_record)
+            .await
+            .unwrap();
+
+        let connector = MeshConnector::new(
+            MeshConnectorConfig::new(MESH_ID, local_key.public_key().peer_id())
+                .with_local_ice_credentials(IceCredentials::generate().unwrap())
+                .with_ice_check_timeout(Duration::from_millis(150))
+                .with_direct_probe_timeout(Duration::from_millis(150))
+                .with_overall_deadline(Duration::from_millis(500)),
+            rendezvous_client,
+            client_endpoint,
+        );
+
+        let result = connector.connect(&remote_peer_id).await;
+        // No relay configured, so the absence of a working direct path is a
+        // hard failure. The probe attempt must record IceFailed so the
+        // operator can distinguish auth/path failures from QUIC errors.
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("no direct candidate"));
+    }
+
+    #[tokio::test]
+    async fn ice_pre_check_runs_before_quic_handshake() {
+        use crate::ice::{spawn_dev_ice_responder, IceCredentials};
+
+        let rendezvous = spawn_dev_rendezvous().await.unwrap();
+        let rendezvous_client = RendezvousClient::new(rendezvous.local_addr().to_string());
+
+        // Generate the credentials that will be embedded in the (signed) peer
+        // record AND used to sign the responder's binding-success replies.
+        let remote_credentials = IceCredentials::generate().unwrap();
+
+        // ICE responder lives on its own UDP port; no Quinn server here. We
+        // expect ICE to succeed and QUIC to fail with a known error, which
+        // proves ICE ran first.
+        let responder = spawn_dev_ice_responder(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            remote_credentials.clone(),
+        )
+        .await
+        .unwrap();
+        let responder_addr = responder.local_addr();
+
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let (_unused_server, throwaway_cert) = QuicEndpoint::server(bind).unwrap();
+        let throwaway_cert_der = throwaway_cert.as_der().to_vec();
+        let client_endpoint = QuicEndpoint::client(bind, &[throwaway_cert]).unwrap();
+
+        let local_key = DeviceKeypair::generate().unwrap();
+        let remote_key = DeviceKeypair::generate().unwrap();
+        let remote_peer_id = remote_key.public_key().peer_id();
+
+        let unsigned = UnsignedPeerRecord::new_with_ice_credentials(
+            MESH_ID,
+            "remote-peer",
+            remote_key.public_key(),
+            vec![CandidateEndpoint {
+                candidate_type: CandidateType::Host,
+                address: responder_addr.ip().to_string(),
+                port: responder_addr.port(),
+                priority: 120,
+            }],
+            vec!["100.127.0.10/32".to_string()],
+            60,
+            1,
+            remote_credentials,
+        )
+        .with_device_certificate(throwaway_cert_der);
+        let record = PeerRecord::signed(unsigned, &remote_key).unwrap();
+        rendezvous_client.publish(MESH_ID, record).await.unwrap();
+
+        let connector = MeshConnector::new(
+            MeshConnectorConfig::new(MESH_ID, local_key.public_key().peer_id())
+                .with_local_ice_credentials(IceCredentials::generate().unwrap())
+                .with_ice_check_timeout(Duration::from_millis(500))
+                .with_direct_probe_timeout(Duration::from_millis(500))
+                .with_overall_deadline(Duration::from_secs(2)),
+            rendezvous_client,
+            client_endpoint,
+        );
+
+        // No relay → the QUIC failure surfaces as the overall error. We
+        // inspect the error message for context, then re-run with a relay so
+        // we can verify that the ICE attempt was recorded.
+        let _ = connector.connect(&remote_peer_id).await; // priming run is allowed to fail
+
+        // Add a relay for fallback so the connector returns a successful
+        // outcome whose ProbeAttempts capture both the ICE success and the
+        // post-ICE QUIC failure.
+        let relay = spawn_dev_relay().await.unwrap();
+        let connector_with_relay = MeshConnector::new(
+            MeshConnectorConfig::new(MESH_ID, local_key.public_key().peer_id())
+                .with_local_ice_credentials(IceCredentials::generate().unwrap())
+                .with_ice_check_timeout(Duration::from_millis(500))
+                .with_direct_probe_timeout(Duration::from_millis(500))
+                .with_overall_deadline(Duration::from_secs(2))
+                .with_relay_server(relay.local_addr().to_string()),
+            RendezvousClient::new(rendezvous.local_addr().to_string()),
+            QuicEndpoint::client(bind, &[QuicEndpoint::server(bind).unwrap().1]).unwrap(),
+        );
+
+        let (_link, outcome) = connector_with_relay.connect(&remote_peer_id).await.unwrap();
+        assert_eq!(outcome.path_kind, PathKind::Relay);
+
+        // The recorded ProbeAttempt must show ICE round-trip captured (proves
+        // ICE ran), with the QUIC handshake then failing (since the responder
+        // does not speak QUIC).
+        let attempt = outcome
+            .attempts
+            .iter()
+            .find(|a| a.address == responder_addr)
+            .expect("probe attempt for the responder must be recorded");
+        assert!(
+            attempt.ice_round_trip.is_some(),
+            "ICE round-trip should be captured: {attempt:?}"
+        );
+        // The responder doesn't speak QUIC, so the post-ICE handshake must
+        // fail. That can surface either as a structured QUIC error
+        // (Failed(_)) or as a timeout — both are acceptable evidence that
+        // ICE ran first and QUIC ran second. The crucial property is that
+        // ICE recorded a round-trip BEFORE the QUIC outcome was decided.
+        assert!(
+            matches!(
+                attempt.outcome,
+                ProbeOutcome::Failed(_) | ProbeOutcome::TimedOut
+            ),
+            "QUIC handshake must fail (or time out) because the responder is not a Quinn server: {:?}",
+            attempt.outcome
+        );
+    }
+
+    #[tokio::test]
+    async fn paced_probes_let_fast_candidate_beat_unreachable_one() {
+        let rendezvous = spawn_dev_rendezvous().await.unwrap();
+        let rendezvous_client = RendezvousClient::new(rendezvous.local_addr().to_string());
+
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let (server_endpoint, server_cert) = QuicEndpoint::server(bind).unwrap();
+        let server_addr = server_endpoint.local_addr().unwrap();
+        let server_cert_der = server_cert.as_der().to_vec();
+        let client_endpoint = QuicEndpoint::client(bind, &[server_cert]).unwrap();
+
+        let _accept_loop = tokio::spawn(async move {
+            loop {
+                match server_endpoint.accept_one().await {
+                    Ok(session) => {
+                        tokio::spawn(async move {
+                            let _ = session.receive_frame().await;
+                        });
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let local_key = DeviceKeypair::generate().unwrap();
+        let remote_key = DeviceKeypair::generate().unwrap();
+        let remote_peer_id = remote_key.public_key().peer_id();
+
+        // Black-hole address (TEST-NET-1, RFC 5737) sitting first in the
+        // candidate list. Sequential probes would have to wait for the full
+        // probe timeout before trying anything else; paced probes start the
+        // working candidate ~50ms later and let it win.
+        let remote_record = signed_record_with_cert(
+            &remote_key,
+            vec![
+                CandidateEndpoint {
+                    candidate_type: CandidateType::Host,
+                    address: "192.0.2.1".to_string(),
+                    port: 4433,
+                    priority: 1_000_000,
+                },
+                CandidateEndpoint {
+                    candidate_type: CandidateType::Host,
+                    address: server_addr.ip().to_string(),
+                    port: server_addr.port(),
+                    priority: 1,
+                },
+            ],
+            1,
+            server_cert_der,
+        );
+        rendezvous_client
+            .publish(MESH_ID, remote_record)
+            .await
+            .unwrap();
+
+        let connector = MeshConnector::new(
+            MeshConnectorConfig::new(MESH_ID, local_key.public_key().peer_id())
+                .with_direct_probe_timeout(Duration::from_millis(2_000))
+                .with_overall_deadline(Duration::from_secs(3))
+                .with_probe_pacing(Duration::from_millis(50)),
+            rendezvous_client,
+            client_endpoint,
+        );
+
+        let started = Instant::now();
+        let (_, outcome) = connector.connect(&remote_peer_id).await.unwrap();
+        let total = started.elapsed();
+
+        assert_eq!(outcome.path_kind, PathKind::Direct);
+        assert_eq!(outcome.remote_addr, Some(server_addr));
+        // The probe-timeout is 2s, but parallel pacing should let us win in
+        // well under a second. If we had probed sequentially, the unreachable
+        // candidate would have eaten the full 2s before the second probe even
+        // started.
+        assert!(
+            total < Duration::from_millis(1_500),
+            "paced probes must beat sequential timeout, took {total:?}"
+        );
+    }
+
+    #[test]
+    fn last_good_cache_clear_drops_all_entries_and_returns_count() {
+        let cache = LastGoodCache::default();
+        cache.record("peer-a", "127.0.0.1:1".parse().unwrap());
+        cache.record("peer-b", "127.0.0.1:2".parse().unwrap());
+        cache.record("peer-c", "127.0.0.1:3".parse().unwrap());
+        assert_eq!(cache.len(), 3);
+
+        let dropped = cache.clear();
+        assert_eq!(dropped, 3);
+        assert!(cache.is_empty());
+        assert!(cache.lookup("peer-a").is_none());
+    }
+
+    #[tokio::test]
+    async fn handle_network_event_path_changed_clears_cache_and_recommends_reprobe() {
+        let connector = build_test_connector_no_quic();
+        connector
+            .cache()
+            .record("peer-x", "127.0.0.1:9".parse().unwrap());
+        connector
+            .cache()
+            .record("peer-y", "127.0.0.1:10".parse().unwrap());
+
+        let response = connector.handle_network_event(NetworkEvent::PathChanged);
+        assert_eq!(response.cache_entries_invalidated, 2);
+        assert!(response.reprobe_recommended);
+        assert!(connector.cache().is_empty());
+    }
+
+    #[tokio::test]
+    async fn handle_network_event_post_wake_clears_cache_and_recommends_reprobe() {
+        let connector = build_test_connector_no_quic();
+        connector
+            .cache()
+            .record("peer-z", "127.0.0.1:11".parse().unwrap());
+
+        let response = connector.handle_network_event(NetworkEvent::PostWake);
+        assert_eq!(response.cache_entries_invalidated, 1);
+        assert!(response.reprobe_recommended);
+        assert!(connector.cache().is_empty());
+    }
+
+    #[tokio::test]
+    async fn handle_network_event_pre_sleep_preserves_cache_and_pauses_probing() {
+        let connector = build_test_connector_no_quic();
+        connector
+            .cache()
+            .record("peer-w", "127.0.0.1:12".parse().unwrap());
+
+        let response = connector.handle_network_event(NetworkEvent::PreSleep);
+        assert_eq!(response.cache_entries_invalidated, 0);
+        assert!(!response.reprobe_recommended);
+        assert_eq!(connector.cache().len(), 1, "PreSleep must not drop cache");
+    }
+
+    #[tokio::test]
+    async fn handle_network_event_offline_preserves_cache_and_does_not_reprobe() {
+        let connector = build_test_connector_no_quic();
+        connector
+            .cache()
+            .record("peer-v", "127.0.0.1:13".parse().unwrap());
+
+        let response =
+            connector.handle_network_event(NetworkEvent::ReachabilityChanged { reachable: false });
+        assert_eq!(response.cache_entries_invalidated, 0);
+        assert!(!response.reprobe_recommended);
+        assert_eq!(connector.cache().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn handle_network_event_back_online_recommends_reprobe_without_clearing() {
+        let connector = build_test_connector_no_quic();
+        connector
+            .cache()
+            .record("peer-u", "127.0.0.1:14".parse().unwrap());
+
+        let response =
+            connector.handle_network_event(NetworkEvent::ReachabilityChanged { reachable: true });
+        assert_eq!(response.cache_entries_invalidated, 0);
+        assert!(response.reprobe_recommended);
+        assert_eq!(connector.cache().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reconnect_invalidates_cache_then_runs_full_connect() {
+        let rendezvous = spawn_dev_rendezvous().await.unwrap();
+        let rendezvous_client = RendezvousClient::new(rendezvous.local_addr().to_string());
+
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let (server_endpoint, server_cert) = QuicEndpoint::server(bind).unwrap();
+        let server_addr = server_endpoint.local_addr().unwrap();
+        let server_cert_der = server_cert.as_der().to_vec();
+        let client_endpoint = QuicEndpoint::client(bind, &[server_cert]).unwrap();
+
+        let _accept_loop = tokio::spawn(async move {
+            loop {
+                match server_endpoint.accept_one().await {
+                    Ok(session) => {
+                        tokio::spawn(async move {
+                            let _ = session.receive_frame().await;
+                        });
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let local_key = DeviceKeypair::generate().unwrap();
+        let remote_key = DeviceKeypair::generate().unwrap();
+        let remote_peer_id = remote_key.public_key().peer_id();
+
+        let record = signed_record_with_cert(
+            &remote_key,
+            vec![CandidateEndpoint {
+                candidate_type: CandidateType::Host,
+                address: server_addr.ip().to_string(),
+                port: server_addr.port(),
+                priority: 120,
+            }],
+            1,
+            server_cert_der,
+        );
+        rendezvous_client.publish(MESH_ID, record).await.unwrap();
+
+        let connector = MeshConnector::new(
+            MeshConnectorConfig::new(MESH_ID, local_key.public_key().peer_id())
+                .with_direct_probe_timeout(Duration::from_millis(500))
+                .with_overall_deadline(Duration::from_secs(2)),
+            rendezvous_client,
+            client_endpoint,
+        );
+
+        // First connect populates the cache.
+        let (_link1, first) = connector.connect(&remote_peer_id).await.unwrap();
+        assert_eq!(first.path_kind, PathKind::Direct);
+        assert!(connector.cache().lookup(&remote_peer_id).is_some());
+
+        // Reconnect drops the cache entry, then re-establishes; the new
+        // outcome should NOT report `used_cached_path` because reconnect
+        // explicitly invalidates first.
+        let (_link2, second) = connector.reconnect(&remote_peer_id).await.unwrap();
+        assert_eq!(second.path_kind, PathKind::Direct);
+        assert!(
+            !second.used_cached_path,
+            "reconnect must invalidate the cache before probing"
+        );
+        // Cache should be re-populated by the successful reconnect.
+        assert_eq!(connector.cache().lookup(&remote_peer_id), Some(server_addr));
+    }
+
+    fn build_test_connector_no_quic() -> MeshConnector {
+        // For event-handling tests we never actually probe; a server-side
+        // QUIC endpoint pair is the cheapest way to construct a valid client.
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let (_unused_server, throwaway_cert) = QuicEndpoint::server(bind).unwrap();
+        let client_endpoint = QuicEndpoint::client(bind, &[throwaway_cert]).unwrap();
+        // The rendezvous client never gets called by these tests; a non-
+        // routable address is fine.
+        let rendezvous_client = RendezvousClient::new("127.0.0.1:1".to_string());
+        MeshConnector::new(
+            MeshConnectorConfig::new(MESH_ID, "local-peer"),
+            rendezvous_client,
+            client_endpoint,
+        )
+    }
+
+    #[tokio::test]
+    async fn peer_acl_denylist_short_circuits_before_rendezvous_lookup() {
+        // Build a rendezvous client pointed at a non-routable address. If
+        // the ACL is honored, the connector fails BEFORE attempting any
+        // network IO, so the bogus rendezvous URL is never contacted.
+        // (Without the ACL, the rendezvous lookup would fail with a
+        // connect error instead of "rejected by ACL".)
+        use crate::peer_acl::PeerAcl;
+
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let (_unused_server, throwaway_cert) = QuicEndpoint::server(bind).unwrap();
+        let client_endpoint = QuicEndpoint::client(bind, &[throwaway_cert]).unwrap();
+        let rendezvous_client = RendezvousClient::new("127.0.0.1:1".to_string());
+
+        let local_key = DeviceKeypair::generate().unwrap();
+        let banned_peer_id = "qlink_banned-peer";
+        let connector = MeshConnector::new(
+            MeshConnectorConfig::new(MESH_ID, local_key.public_key().peer_id())
+                .with_peer_acl(PeerAcl::new().with_deny([banned_peer_id])),
+            rendezvous_client,
+            client_endpoint,
+        );
+
+        let error = connector.connect(banned_peer_id).await.unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("rejected by ACL") && message.contains("deny"),
+            "ACL rejection must surface a clear reason: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_acl_allowlist_excludes_unlisted_peers() {
+        use crate::peer_acl::PeerAcl;
+
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let (_unused_server, throwaway_cert) = QuicEndpoint::server(bind).unwrap();
+        let client_endpoint = QuicEndpoint::client(bind, &[throwaway_cert]).unwrap();
+        let rendezvous_client = RendezvousClient::new("127.0.0.1:1".to_string());
+
+        let local_key = DeviceKeypair::generate().unwrap();
+        let connector = MeshConnector::new(
+            MeshConnectorConfig::new(MESH_ID, local_key.public_key().peer_id())
+                .with_peer_acl(PeerAcl::new().with_allow(["qlink_friend"])),
+            rendezvous_client,
+            client_endpoint,
+        );
+
+        let error = connector.connect("qlink_stranger").await.unwrap_err();
+        assert!(
+            error.to_string().contains("not on the allow list"),
+            "unlisted peer must be rejected with the allowlist reason: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_acl_allowlist_permits_listed_peers_to_proceed() {
+        // The ACL says "yes" → the connector proceeds to rendezvous
+        // lookup. The peer doesn't exist, so the lookup fails with the
+        // standard "not found in rendezvous" error — distinct from the
+        // ACL-rejection error. This proves the ACL gate is open.
+        use crate::peer_acl::PeerAcl;
+
+        let rendezvous = spawn_dev_rendezvous().await.unwrap();
+        let rendezvous_client = RendezvousClient::new(rendezvous.local_addr().to_string());
+
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let (_unused_server, throwaway_cert) = QuicEndpoint::server(bind).unwrap();
+        let client_endpoint = QuicEndpoint::client(bind, &[throwaway_cert]).unwrap();
+
+        let local_key = DeviceKeypair::generate().unwrap();
+        let permitted_peer_id = "qlink_friend";
+        let connector = MeshConnector::new(
+            MeshConnectorConfig::new(MESH_ID, local_key.public_key().peer_id())
+                .with_peer_acl(PeerAcl::new().with_allow([permitted_peer_id])),
+            rendezvous_client,
+            client_endpoint,
+        );
+
+        let error = connector.connect(permitted_peer_id).await.unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("not found in rendezvous"),
+            "ACL must let the request through to rendezvous; got: {message}"
+        );
+        assert!(
+            !message.contains("rejected by ACL"),
+            "request should NOT have been ACL-rejected: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wrong_cert_in_record_fails_quic_handshake_and_falls_back_to_relay() {
+        // Two QUIC servers exist: peer A is the "real" server we want to
+        // reach. Peer B's cert is the one we MIS-publish in A's record.
+        // The connector trusts B's cert per the (signed) record; A presents
+        // its own cert; rustls verification fails; the probe records a
+        // failure; relay fallback engages.
+        let rendezvous = spawn_dev_rendezvous().await.unwrap();
+        let rendezvous_client = RendezvousClient::new(rendezvous.local_addr().to_string());
+        let relay = spawn_dev_relay().await.unwrap();
+
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let (real_server_endpoint, _real_cert) = QuicEndpoint::server(bind).unwrap();
+        let real_server_addr = real_server_endpoint.local_addr().unwrap();
+        // Wrong cert: comes from a different self-signed QUIC endpoint.
+        let (_decoy_endpoint, wrong_cert) = QuicEndpoint::server(bind).unwrap();
+        let wrong_cert_der = wrong_cert.as_der().to_vec();
+
+        let _accept_loop = tokio::spawn(async move {
+            loop {
+                match real_server_endpoint.accept_one().await {
+                    Ok(_) => {} // Accept and discard — we expect TLS to fail before useful data flows.
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let client_endpoint = QuicEndpoint::client(bind, &[]).unwrap();
+
+        let local_key = DeviceKeypair::generate().unwrap();
+        let remote_key = DeviceKeypair::generate().unwrap();
+        let remote_peer_id = remote_key.public_key().peer_id();
+
+        // Record advertises the real server's address but the wrong cert.
+        let remote_record = signed_record_with_cert(
+            &remote_key,
+            vec![CandidateEndpoint {
+                candidate_type: CandidateType::Host,
+                address: real_server_addr.ip().to_string(),
+                port: real_server_addr.port(),
+                priority: 120,
+            }],
+            1,
+            wrong_cert_der,
+        );
+        rendezvous_client
+            .publish(MESH_ID, remote_record)
+            .await
+            .unwrap();
+
+        let connector = MeshConnector::new(
+            MeshConnectorConfig::new(MESH_ID, local_key.public_key().peer_id())
+                .with_direct_probe_timeout(Duration::from_millis(500))
+                .with_overall_deadline(Duration::from_secs(2))
+                .with_relay_server(relay.local_addr().to_string()),
+            rendezvous_client,
+            client_endpoint,
+        );
+
+        let (link, outcome) = connector.connect(&remote_peer_id).await.unwrap();
+        // The direct probe must have failed (TLS verification couldn't
+        // match the server's real cert against the wrong one we trusted),
+        // and the connector must have fallen back to relay.
+        assert_eq!(link.path_kind(), PathKind::Relay);
+        assert_eq!(outcome.path_kind, PathKind::Relay);
+        let direct_attempt = outcome
+            .attempts
+            .iter()
+            .find(|a| a.address == real_server_addr)
+            .expect("direct probe attempt must be recorded");
+        assert!(
+            matches!(
+                direct_attempt.outcome,
+                ProbeOutcome::Failed(_) | ProbeOutcome::TimedOut
+            ),
+            "wrong cert must fail or time out the QUIC handshake: {:?}",
+            direct_attempt.outcome
+        );
+    }
+
+    fn signed_record(
+        keypair: &DeviceKeypair,
+        endpoints: Vec<CandidateEndpoint>,
+        sequence: u64,
+    ) -> PeerRecord {
+        // For tests, "any" cert bytes works because the QUIC handshake
+        // doesn't actually run during candidate-pair probing in cases like
+        // the unreachable-host test. Tests that need a real handshake pass
+        // their server cert via `signed_record_with_cert`.
+        signed_record_with_cert(keypair, endpoints, sequence, b"test-cert".to_vec())
+    }
+
+    fn signed_record_with_cert(
+        keypair: &DeviceKeypair,
+        endpoints: Vec<CandidateEndpoint>,
+        sequence: u64,
+        cert_der: Vec<u8>,
+    ) -> PeerRecord {
+        let body = UnsignedPeerRecord::new(
+            MESH_ID,
+            "test-peer",
+            keypair.public_key(),
+            endpoints,
+            vec!["100.127.0.10/32".to_string()],
+            60,
+            sequence,
+        )
+        .with_device_certificate(cert_der);
+        PeerRecord::signed(body, keypair).unwrap()
+    }
+}

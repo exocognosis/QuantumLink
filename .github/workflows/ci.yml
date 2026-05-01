@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  test:
+    name: Swift and Rust tests
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show toolchain
+        run: |
+          swift --version
+          rustc --version
+          cargo --version
+          xcodebuild -version
+      - name: Rust tests
+        run: cargo test --workspace
+      - name: Rust formatting
+        run: cargo fmt --all -- --check
+      - name: Rust QUIC smoke
+        run: cargo run -p qlink-core --bin qlinkctl -- quic-loopback
+      - name: Rust mesh and relay smokes
+        run: |
+          cargo run -p qlink-core --bin qlinkctl -- mesh-loopback
+          cargo run -p qlink-core --bin qlinkctl -- relay-loopback
+      - name: Swift tests
+        run: swift test
+      - name: Swift transport smoke
+        run: |
+          cargo build --workspace --release
+          swift run QuantumLinkSmoke validate-config --config config/mesh.example.json
+          swift run QuantumLinkSmoke preflight \
+            --config config/mesh.example.json \
+            --transport \
+            --mode dev-quic-loopback \
+            --dylib "$PWD/target/release/libqlink_core.dylib"
+      - name: Rust XCFramework
+        run: ./scripts/build-rust-xcframework.sh
+      - name: Development artifact package
+        run: ./scripts/package-dev-artifacts.sh
+
+  xcodegen-smoke:
+    name: Unsigned Xcode project smoke
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Generate unsigned project
+        run: ./scripts/generate-xcode-project.sh
+      - name: Build unsigned app target
+        run: |
+          xcodebuild \
+            -project QuantumLink.xcodeproj \
+            -scheme QuantumLink \
+            -configuration Debug \
+            -destination 'platform=macOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            build

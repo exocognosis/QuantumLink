@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>PayloadContent</key>
+    <array>
+        <dict>
+            <key>PayloadType</key>
+            <string>com.apple.system-extension-policy</string>
+            <key>PayloadVersion</key>
+            <integer>1</integer>
+            <key>PayloadIdentifier</key>
+            <string>com.quantumlink.macos.mdm.system-extension-policy</string>
+            <key>PayloadUUID</key>
+            <string>REPLACE-WITH-UUID</string>
+            <key>PayloadDisplayName</key>
+            <string>QuantumLink Extension Approval</string>
+            <key>AllowedTeamIdentifiers</key>
+            <array>
+                <string>TEAMID</string>
+            </array>
+            <key>AllowedSystemExtensions</key>
+            <dict>
+                <key>TEAMID</key>
+                <array>
+                    <string>com.quantumlink.macos.PacketTunnel</string>
+                </array>
+            </dict>
+        </dict>
+    </array>
+    <key>PayloadType</key>
+    <string>Configuration</string>
+    <key>PayloadVersion</key>
+    <integer>1</integer>
+    <key>PayloadIdentifier</key>
+    <string>com.quantumlink.macos.mdm.extension-preapproval</string>
+    <key>PayloadUUID</key>
+    <string>REPLACE-WITH-PROFILE-UUID</string>
+    <key>PayloadDisplayName</key>
+    <string>QuantumLink Extension Preapproval</string>
+    <key>PayloadOrganization</key>
+    <string>QuantumLink</string>
+</dict>
+</plist>

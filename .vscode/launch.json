@@ -1,0 +1,44 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:QuantumLink}",
+            "name": "Debug QuantumLinkApp",
+            "target": "QuantumLinkApp",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug QuantumLinkApp"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:QuantumLink}",
+            "name": "Release QuantumLinkApp",
+            "target": "QuantumLinkApp",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release QuantumLinkApp"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:QuantumLink}",
+            "name": "Debug QuantumLinkSmoke",
+            "target": "QuantumLinkSmoke",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug QuantumLinkSmoke"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:QuantumLink}",
+            "name": "Release QuantumLinkSmoke",
+            "target": "QuantumLinkSmoke",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release QuantumLinkSmoke"
+        }
+    ]
+}

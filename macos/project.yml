@@ -1,0 +1,105 @@
+name: QuantumLink
+options:
+  bundleIdPrefix: com.quantumlink
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+packages:
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle
+    from: 2.6.0
+settings:
+  base:
+    PRODUCT_NAME: QuantumLink
+    MARKETING_VERSION: 0.1.0
+    CURRENT_PROJECT_VERSION: 1
+    SWIFT_VERSION: 6.0
+configs:
+  Debug: debug
+  Release: release
+targets:
+  QuantumLinkKit:
+    type: framework
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - path: ../Sources/QuantumLinkKit
+    configFiles:
+      Debug: config/QuantumLink.unsigned.xcconfig
+      Release: config/QuantumLink.unsigned.xcconfig
+    settings:
+      base:
+        PRODUCT_NAME: QuantumLinkKit
+        PRODUCT_MODULE_NAME: QuantumLinkKit
+        PRODUCT_BUNDLE_IDENTIFIER: com.quantumlink.macos.Kit
+        GENERATE_INFOPLIST_FILE: YES
+        APPLICATION_EXTENSION_API_ONLY: YES
+  QuantumLink:
+    type: application
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - path: ../Sources/QuantumLinkApp
+    configFiles:
+      Debug: config/QuantumLink.unsigned.xcconfig
+      Release: config/QuantumLink.unsigned.xcconfig
+    settings:
+      base:
+        PRODUCT_NAME: QuantumLink
+        PRODUCT_MODULE_NAME: QuantumLink
+        PRODUCT_BUNDLE_IDENTIFIER: $(QLINK_APP_BUNDLE_ID)
+        INFOPLIST_FILE: macos/Info/QuantumLink.Info.plist
+        CODE_SIGN_ENTITLEMENTS: macos/entitlements/QuantumLink.entitlements
+    dependencies:
+      - target: QuantumLinkKit
+        embed: true
+      - target: QuantumLinkTunnel
+        embed: true
+      - framework: build/qlink-core.xcframework
+        embed: true
+        codeSign: false
+      - package: Sparkle
+  QuantumLinkTunnel:
+    type: app-extension
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - path: ../Sources/QuantumLinkTunnel
+    configFiles:
+      Debug: config/QuantumLink.unsigned.xcconfig
+      Release: config/QuantumLink.unsigned.xcconfig
+    settings:
+      base:
+        PRODUCT_NAME: QuantumLinkTunnel
+        PRODUCT_MODULE_NAME: QuantumLinkTunnel
+        PRODUCT_BUNDLE_IDENTIFIER: $(QLINK_TUNNEL_BUNDLE_ID)
+        INFOPLIST_FILE: macos/Info/QuantumLinkTunnel.Info.plist
+        CODE_SIGN_ENTITLEMENTS: macos/entitlements/QuantumLinkTunnel.entitlements
+        APPLICATION_EXTENSION_API_ONLY: YES
+    dependencies:
+      - target: QuantumLinkKit
+        embed: true
+      - framework: build/qlink-core.xcframework
+        embed: true
+        codeSign: false
+  QuantumLinkSmoke:
+    type: tool
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - path: ../Sources/QuantumLinkSmoke
+    configFiles:
+      Debug: config/QuantumLink.unsigned.xcconfig
+      Release: config/QuantumLink.unsigned.xcconfig
+    settings:
+      base:
+        PRODUCT_NAME: QuantumLinkSmoke
+        PRODUCT_MODULE_NAME: QuantumLinkSmoke
+        PRODUCT_BUNDLE_IDENTIFIER: com.quantumlink.macos.Smoke
+        INFOPLIST_FILE: macos/Info/QuantumLink.Info.plist
+    dependencies:
+      - target: QuantumLinkKit
+        embed: false
+      - framework: build/qlink-core.xcframework
+        embed: false
+        codeSign: false

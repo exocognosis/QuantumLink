@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>PayloadContent</key>
+    <array>
+        <dict>
+            <key>PayloadType</key>
+            <string>com.apple.vpn.managed</string>
+            <key>PayloadVersion</key>
+            <integer>1</integer>
+            <key>PayloadIdentifier</key>
+            <string>com.quantumlink.macos.mdm.vpn</string>
+            <key>PayloadUUID</key>
+            <string>REPLACE-WITH-VPN-PAYLOAD-UUID</string>
+            <key>PayloadDisplayName</key>
+            <string>QuantumLink VPN</string>
+            <key>UserDefinedName</key>
+            <string>QuantumLink</string>
+            <key>VPNType</key>
+            <string>VPN</string>
+            <key>VPNSubType</key>
+            <string>com.quantumlink.macos.PacketTunnel</string>
+            <key>ProviderBundleIdentifier</key>
+            <string>com.quantumlink.macos.PacketTunnel</string>
+            <key>ProviderType</key>
+            <string>packet-tunnel</string>
+            <key>VendorConfig</key>
+            <dict>
+                <key>meshID</key>
+                <string>devmesh</string>
+                <key>configurationProfile</key>
+                <string>managed</string>
+            </dict>
+            <key>OnDemandEnabled</key>
+            <integer>1</integer>
+            <key>OnDemandRules</key>
+            <array>
+                <dict>
+                    <key>Action</key>
+                    <string>Connect</string>
+                </dict>
+            </array>
+        </dict>
+        <dict>
+            <key>PayloadType</key>
+            <string>com.apple.vpn.managed.applayer</string>
+            <key>PayloadVersion</key>
+            <integer>1</integer>
+            <key>PayloadIdentifier</key>
+            <string>com.quantumlink.macos.mdm.per-app-vpn</string>
+            <key>PayloadUUID</key>
+            <string>REPLACE-WITH-PER-APP-PAYLOAD-UUID</string>
+            <key>PayloadDisplayName</key>
+            <string>QuantumLink Per-App VPN Mapping</string>
+            <key>VPNUUID</key>
+            <string>REPLACE-WITH-VPN-PAYLOAD-UUID</string>
+            <key>AppLayerVPNMapping</key>
+            <array>
+                <dict>
+                    <key>Identifier</key>
+                    <string>com.example.ManagedApp</string>
+                    <key>SigningIdentifier</key>
+                    <string>com.example.ManagedApp</string>
+                    <key>DesignatedRequirement</key>
+                    <string>REPLACE-WITH-CODE-SIGNING-REQUIREMENT</string>
+                </dict>
+            </array>
+        </dict>
+    </array>
+    <key>PayloadType</key>
+    <string>Configuration</string>
+    <key>PayloadVersion</key>
+    <integer>1</integer>
+    <key>PayloadIdentifier</key>
+    <string>com.quantumlink.macos.mdm.per-app-vpn-profile</string>
+    <key>PayloadUUID</key>
+    <string>REPLACE-WITH-PROFILE-UUID</string>
+    <key>PayloadDisplayName</key>
+    <string>QuantumLink Managed VPN</string>
+    <key>PayloadOrganization</key>
+    <string>QuantumLink</string>
+</dict>
+</plist>

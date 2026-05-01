@@ -1,0 +1,11 @@
+// Copy this file to QuantumLink.developer-id.local.xcconfig and fill in team/profile values.
+// Do not commit the local file if it includes private team or profile names.
+
+#include "QuantumLink.common.xcconfig"
+
+CODE_SIGNING_ALLOWED = YES
+CODE_SIGNING_REQUIRED = YES
+CODE_SIGN_STYLE = Manual
+DEVELOPMENT_TEAM = YOURTEAMID
+CODE_SIGN_IDENTITY = Developer ID Application
+PROVISIONING_PROFILE_SPECIFIER = QuantumLink Developer ID Profile

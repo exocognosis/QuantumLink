@@ -1,0 +1,149 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build and (optionally) sign QuantumLink.app
+    runs-on: macos-15
+    env:
+      QLINK_APP_BUNDLE_ID: com.quantumlink.macos
+      QLINK_TUNNEL_BUNDLE_ID: com.quantumlink.macos.PacketTunnel
+      QLINK_SPARKLE_FEED_URL: ${{ vars.QLINK_SPARKLE_FEED_URL }}
+      QLINK_SPARKLE_PUBLIC_ED_KEY: ${{ vars.QLINK_SPARKLE_PUBLIC_ED_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          swift --version
+          rustc --version
+          xcodebuild -version
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Decide if signing is available
+        id: signing
+        run: |
+          if [[ -n "${{ secrets.APPLE_DEVELOPER_ID_CERT_P12_BASE64 }}" \
+             && -n "${{ secrets.APPLE_DEVELOPER_ID_CERT_PASSWORD }}" \
+             && -n "${{ secrets.APPLE_NOTARY_API_KEY_BASE64 }}" \
+             && -n "${{ secrets.APPLE_NOTARY_API_KEY_ID }}" \
+             && -n "${{ secrets.APPLE_NOTARY_API_KEY_ISSUER_ID }}" ]]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Import Developer ID certificate
+        if: steps.signing.outputs.available == 'true'
+        env:
+          CERT_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_CERT_P12_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN_PATH="$RUNNER_TEMP/quantumlink-release.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 7200 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
+
+          CERT_PATH="$RUNNER_TEMP/developer-id.p12"
+          echo -n "$CERT_BASE64" | base64 -d -o "$CERT_PATH"
+          security import "$CERT_PATH" -P "$CERT_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          rm -f "$CERT_PATH"
+
+          identity_line="$(security find-identity -p codesigning -v "$KEYCHAIN_PATH" | grep 'Developer ID Application' | head -n 1)"
+          identity_name="$(echo "$identity_line" | sed -E 's/.*"([^"]+)"$/\1/')"
+          if [[ -z "$identity_name" ]]; then
+            echo "No Developer ID Application identity found in imported keychain" >&2
+            exit 1
+          fi
+          echo "APPLE_DEVELOPER_ID_APPLICATION=$identity_name" >> "$GITHUB_ENV"
+
+      - name: Configure notary credentials
+        if: steps.signing.outputs.available == 'true'
+        env:
+          NOTARY_KEY_BASE64: ${{ secrets.APPLE_NOTARY_API_KEY_BASE64 }}
+          NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_API_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_API_KEY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          KEY_PATH="$RUNNER_TEMP/notary-key.p8"
+          echo -n "$NOTARY_KEY_BASE64" | base64 -d -o "$KEY_PATH"
+          xcrun notarytool store-credentials "QLINK_RELEASE_NOTARY" \
+              --key "$KEY_PATH" \
+              --key-id "$NOTARY_KEY_ID" \
+              --issuer "$NOTARY_ISSUER_ID"
+          rm -f "$KEY_PATH"
+          echo "APPLE_NOTARY_PROFILE=QLINK_RELEASE_NOTARY" >> "$GITHUB_ENV"
+
+      - name: Build and (sign + notarize) macOS app
+        run: |
+          if [[ "${{ steps.signing.outputs.available }}" == "true" ]]; then
+            ./scripts/package-macos.sh
+          else
+            ./scripts/package-macos.sh --skip-sign
+          fi
+
+      - name: Generate appcast (signing required)
+        if: steps.signing.outputs.available == 'true' && env.QLINK_SPARKLE_FEED_URL != ''
+        run: |
+          # Sparkle's sign_update tool needs the EdDSA private key in the
+          # keychain. CI imports it from secrets just like the Developer ID cert.
+          if [[ -n "${{ secrets.SPARKLE_EDDSA_PRIVATE_KEY }}" ]]; then
+            echo "${{ secrets.SPARKLE_EDDSA_PRIVATE_KEY }}" | base64 -d > "$RUNNER_TEMP/sparkle.priv"
+            # Sparkle's generate_keys --account flag inserts an entry under that name.
+            # We import the secret key directly via security import for the same account.
+            security import "$RUNNER_TEMP/sparkle.priv" -k "$RUNNER_TEMP/quantumlink-release.keychain-db"
+            rm -f "$RUNNER_TEMP/sparkle.priv"
+
+            ref="${GITHUB_REF_NAME:-dev}"
+            ./scripts/sparkle-build-appcast.sh \
+              --artifact build/release/QuantumLink.dmg \
+              --version "${ref#v}" \
+              --build "${{ github.run_number }}" \
+              --feed-url "${{ vars.QLINK_SPARKLE_FEED_URL }}/QuantumLink-${ref#v}.dmg"
+          else
+            echo "SPARKLE_EDDSA_PRIVATE_KEY secret not set; skipping appcast generation"
+          fi
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: QuantumLink-macos-${{ github.ref_name }}
+          path: |
+            build/release/*.app
+            build/release/*.dmg
+            build/release/*.pkg
+            build/sparkle/appcast.xml
+          if-no-files-found: warn
+
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            build/release/*.dmg
+            build/release/*.pkg
+            build/sparkle/appcast.xml
+          fail_on_unmatched_files: false

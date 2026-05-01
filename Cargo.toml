@@ -1,0 +1,4 @@
+[workspace]
+members = ["rust/qlink-core"]
+resolver = "2"
+

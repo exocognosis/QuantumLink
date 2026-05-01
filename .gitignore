@@ -1,0 +1,42 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Swift Package Manager
+.build/
+.swiftpm/
+
+# Rust / Cargo build output
+target/
+
+# Xcode local state
+DerivedData/
+*.xcuserstate
+*.xcuserdata/
+xcuserdata/
+
+# Generated build and distribution artifacts
+build/
+dist/
+*.app
+*.ipa
+*.pkg
+*.dmg
+*.dSYM
+*.dSYM.zip
+
+# Local signing and release credentials
+macos/config/QuantumLink.developer-id.local.xcconfig
+*.p12
+*.p8
+*.mobileprovision
+
+# Local environment and agent settings
+.env
+.env.*
+.claude/
+.codex/
+
+# Tooling scratch files
+*.moved-aside

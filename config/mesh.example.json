@@ -1,0 +1,21 @@
+{
+  "meshID": "mesh-example7e3a91",
+  "deviceAlias": "device-example42c0de",
+  "overlayIPv4Address": "100.64.10.2",
+  "tunnelRemoteAddress": "100.64.0.1",
+  "protectedRoutes": ["100.64.0.0/10", "10.42.0.0/16"],
+  "excludedRoutes": [],
+  "dnsServers": ["100.64.0.1"],
+  "dnsSearchDomains": [],
+  "routeMode": "splitTunnel",
+  "dnsMode": "tunnelProvided",
+  "discoveryModes": ["rendezvous"],
+  "rendezvousServers": ["127.0.0.1:9471"],
+  "relayServers": ["127.0.0.1:9472"],
+  "mtu": 1280,
+  "crypto": {
+    "suite": "QLINK-FIPS203-MLKEM768-HKDFSHA256-v1",
+    "rekeyAfterSeconds": 3600,
+    "rekeyAfterBytes": 1073741824
+  }
+}

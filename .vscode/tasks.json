@@ -1,0 +1,15 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Run QuantumLink App",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"./script/build_and_run.sh"
+			],
+			"isBackground": true,
+			"group": "build"
+		}
+	]
+}
