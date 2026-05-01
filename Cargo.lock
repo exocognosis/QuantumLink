@@ -1320,7 +1320,7 @@ dependencies = [
  "sha2 0.10.9",
  "slh-dsa",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "x25519-dalek",
