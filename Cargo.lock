@@ -1306,7 +1306,7 @@ dependencies = [
  "flume",
  "getrandom 0.3.4",
  "hkdf",
- "hmac 0.12.1",
+ "hmac 0.13.0",
  "mdns-sd",
  "ml-dsa",
  "ml-kem",
