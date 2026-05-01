@@ -19,7 +19,7 @@ jobs:
       # one machine-parseable line per scenario.
       RUSTFLAGS: "-C debuginfo=0"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Show toolchain
         run: |
@@ -92,7 +92,7 @@ jobs:
     runs-on: macos-15
     needs: rust-benchmarks
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Build dylib
         run: cargo build -p qlink-core --release
       - name: Run Swift perf tests

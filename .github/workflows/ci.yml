@@ -10,7 +10,7 @@ jobs:
     name: Swift and Rust tests
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Show toolchain
         run: |
           swift --version
@@ -47,7 +47,7 @@ jobs:
     name: Unsigned Xcode project smoke
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install XcodeGen
         run: brew install xcodegen
       - name: Generate unsigned project

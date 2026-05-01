@@ -19,7 +19,7 @@ jobs:
       QLINK_SPARKLE_FEED_URL: ${{ vars.QLINK_SPARKLE_FEED_URL }}
       QLINK_SPARKLE_PUBLIC_ED_KEY: ${{ vars.QLINK_SPARKLE_PUBLIC_ED_KEY }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Show toolchain
         run: |
