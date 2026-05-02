@@ -28,8 +28,12 @@
 //! `mdns_sd::ServiceDaemon`. Drop unregisters and shuts the daemon down so
 //! resources don't leak across test boundaries.
 
-use crate::error::{QlinkError, Result};
+use crate::{
+    crypto::DevicePublicKey,
+    error::{QlinkError, Result},
+};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     net::{IpAddr, SocketAddr},
@@ -38,6 +42,24 @@ use tokio::sync::mpsc;
 
 /// DNS-SD service type. The `.local.` suffix is required by mDNS.
 pub const QLINK_MDNS_SERVICE_TYPE: &str = "_qlink._udp.local.";
+
+/// Computes the truncated-SHA-256 fingerprint that goes in the `fp` field
+/// of an [`MdnsPeerAnnouncement`]. 16 hex chars (64 bits) — enough for a
+/// sanity check that a discovered peer's announcement matches the public
+/// key we know about from the signed rendezvous record. Full ML-DSA
+/// signature verification still happens against the rendezvous record;
+/// this is a lightweight cross-check, not the cryptographic anchor.
+///
+/// Producing AND consuming sides MUST use this function so the bytes
+/// match. Any drift between publisher and consumer turns into silent
+/// "fingerprint mismatch" rejections that are hard to diagnose.
+pub fn compute_public_key_fingerprint(public_key: &DevicePublicKey) -> String {
+    let digest = Sha256::digest(&public_key.bytes);
+    digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
 
 /// Payload published in the mDNS TXT record. Compact by design — keep this
 /// under ~200 bytes after encoding so it fits in a single mDNS response

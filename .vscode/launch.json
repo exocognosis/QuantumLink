@@ -4,7 +4,7 @@
             "type": "swift",
             "request": "launch",
             "args": [],
-            "cwd": "${workspaceFolder:QuantumLink}",
+            "cwd": "${workspaceFolder:QuantumLinkOS}",
             "name": "Debug QuantumLinkApp",
             "target": "QuantumLinkApp",
             "configuration": "debug",
@@ -14,7 +14,7 @@
             "type": "swift",
             "request": "launch",
             "args": [],
-            "cwd": "${workspaceFolder:QuantumLink}",
+            "cwd": "${workspaceFolder:QuantumLinkOS}",
             "name": "Release QuantumLinkApp",
             "target": "QuantumLinkApp",
             "configuration": "release",
@@ -24,7 +24,7 @@
             "type": "swift",
             "request": "launch",
             "args": [],
-            "cwd": "${workspaceFolder:QuantumLink}",
+            "cwd": "${workspaceFolder:QuantumLinkOS}",
             "name": "Debug QuantumLinkSmoke",
             "target": "QuantumLinkSmoke",
             "configuration": "debug",
@@ -34,11 +34,31 @@
             "type": "swift",
             "request": "launch",
             "args": [],
-            "cwd": "${workspaceFolder:QuantumLink}",
+            "cwd": "${workspaceFolder:QuantumLinkOS}",
             "name": "Release QuantumLinkSmoke",
             "target": "QuantumLinkSmoke",
             "configuration": "release",
             "preLaunchTask": "swift: Build Release QuantumLinkSmoke"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:QuantumLinkOS}",
+            "name": "Debug QuantumLinkMDM",
+            "target": "QuantumLinkMDM",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug QuantumLinkMDM"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:QuantumLinkOS}",
+            "name": "Release QuantumLinkMDM",
+            "target": "QuantumLinkMDM",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release QuantumLinkMDM"
         }
     ]
 }

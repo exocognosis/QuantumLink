@@ -15,6 +15,7 @@ use qlink_core::{
     quic_transport::QuicEndpoint,
     relay::spawn_dev_relay,
     rendezvous::{spawn_dev_rendezvous, RendezvousClient},
+    synthetic_wan::{WanProfile, WanProxy},
 };
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -33,6 +34,10 @@ pub struct DirectEnv {
     _rendezvous: qlink_core::rendezvous::DevRendezvousServer,
     _relay: qlink_core::relay::DevRelayServer,
     _accept_loop: JoinHandle<()>,
+    /// Held when the environment is running through a synthetic WAN
+    /// proxy. Drop tears down the forwarding tasks. `None` for plain
+    /// loopback environments.
+    _wan_proxy: Option<WanProxy>,
 }
 
 pub async fn build_direct_env(probe_ms: u64, deadline_ms: u64) -> DirectEnv {
@@ -102,6 +107,90 @@ pub async fn build_direct_env(probe_ms: u64, deadline_ms: u64) -> DirectEnv {
         _rendezvous: rendezvous,
         _relay: relay,
         _accept_loop: accept_loop,
+        _wan_proxy: None,
+    }
+}
+
+/// Same as `build_direct_env` but inserts a [`WanProxy`] between the
+/// connector and the QUIC server. The candidate published in the
+/// rendezvous record points at the proxy's client-facing port, so the
+/// connector dials the proxy. The proxy then forwards (with delay / loss
+/// / jitter per `profile`) to the actual QUIC server.
+///
+/// Use this for SLO scenarios that want realistic network conditions.
+pub async fn build_direct_env_via_wan(
+    probe_ms: u64,
+    deadline_ms: u64,
+    profile: WanProfile,
+) -> DirectEnv {
+    let rendezvous = spawn_dev_rendezvous().await.unwrap();
+    let relay = spawn_dev_relay().await.unwrap();
+    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+    let (server_endpoint, server_cert) = QuicEndpoint::server(bind).unwrap();
+    let server_addr = server_endpoint.local_addr().unwrap();
+    let server_cert_der = server_cert.as_der().to_vec();
+    let client_endpoint = QuicEndpoint::client(bind, &[]).unwrap();
+    drop(server_cert);
+
+    // Stand up the impairment proxy between the connector and the QUIC
+    // server. The proxy's `client_facing_addr` is what gets published in
+    // the rendezvous record.
+    let wan_proxy = WanProxy::between(server_addr, profile).await.unwrap();
+    let advertised_addr = wan_proxy.client_facing_addr();
+
+    let accept_loop = tokio::spawn(async move {
+        loop {
+            match server_endpoint.accept_one().await {
+                Ok(session) => {
+                    tokio::spawn(async move {
+                        let _ = session.receive_frame().await;
+                    });
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let remote_key = DeviceKeypair::generate().unwrap();
+    let remote_peer_id = remote_key.public_key().peer_id();
+    let unsigned = UnsignedPeerRecord::new(
+        MESH_ID,
+        "bench-remote-wan",
+        remote_key.public_key(),
+        vec![CandidateEndpoint {
+            candidate_type: CandidateType::Host,
+            address: advertised_addr.ip().to_string(),
+            port: advertised_addr.port(),
+            priority: 120,
+        }],
+        vec!["100.127.0.10/32".to_string()],
+        300,
+        1,
+    )
+    .with_device_certificate(server_cert_der);
+    let record = PeerRecord::signed(unsigned, &remote_key).unwrap();
+    let publisher = RendezvousClient::new(rendezvous.local_addr().to_string());
+    publisher.publish(MESH_ID, record).await.unwrap();
+
+    let local_key = DeviceKeypair::generate().unwrap();
+    let local_peer_id = local_key.public_key().peer_id();
+    let connector = Arc::new(MeshConnector::new(
+        MeshConnectorConfig::new(MESH_ID, local_peer_id)
+            .with_direct_probe_timeout(Duration::from_millis(probe_ms))
+            .with_overall_deadline(Duration::from_millis(deadline_ms))
+            .with_probe_pacing(Duration::from_millis(50))
+            .with_relay_server(relay.local_addr().to_string()),
+        RendezvousClient::new(rendezvous.local_addr().to_string()),
+        client_endpoint,
+    ));
+
+    DirectEnv {
+        connector,
+        remote_peer_id,
+        _rendezvous: rendezvous,
+        _relay: relay,
+        _accept_loop: accept_loop,
+        _wan_proxy: Some(wan_proxy),
     }
 }
 
@@ -156,6 +245,78 @@ pub async fn build_relay_only_env(probe_ms: u64, deadline_ms: u64) -> RelayOnlyE
         RendezvousClient::new(rendezvous.local_addr().to_string()),
         client_endpoint,
     ));
+
+    RelayOnlyEnv {
+        connector,
+        remote_peer_id,
+        _rendezvous: rendezvous,
+        _relay: relay,
+    }
+}
+
+/// `RelayOnlyEnv` variant whose direct candidate is exposed through a
+/// `WanProxy`. The direct probe still fails (the candidate points at an
+/// unreachable port via the proxy) but at realistic latency, so the
+/// fallback timer behaves the way it would on a real WAN.
+pub async fn build_relay_only_env_via_wan(
+    probe_ms: u64,
+    deadline_ms: u64,
+    profile: WanProfile,
+) -> RelayOnlyEnv {
+    // Stand up a "blackhole" UDP socket that accepts but never replies.
+    // Putting the proxy in front of it gives us delayed-then-dropped
+    // probe behavior, mimicking a candidate behind a strict firewall.
+    let blackhole = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let blackhole_addr = blackhole.local_addr().unwrap();
+    // Hold the socket alive for the lifetime of the env so the OS
+    // doesn't reassign the port; we just never read or reply.
+    std::mem::forget(blackhole);
+    let wan_proxy = WanProxy::between(blackhole_addr, profile).await.unwrap();
+    let advertised_addr = wan_proxy.client_facing_addr();
+
+    let rendezvous = spawn_dev_rendezvous().await.unwrap();
+    let relay = spawn_dev_relay().await.unwrap();
+    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+    let (_unused_server, server_cert) = QuicEndpoint::server(bind).unwrap();
+    let server_cert_der = server_cert.as_der().to_vec();
+    let client_endpoint = QuicEndpoint::client(bind, &[]).unwrap();
+
+    let remote_key = DeviceKeypair::generate().unwrap();
+    let remote_peer_id = remote_key.public_key().peer_id();
+    let unsigned = UnsignedPeerRecord::new(
+        MESH_ID,
+        "bench-remote-relay-wan",
+        remote_key.public_key(),
+        vec![CandidateEndpoint {
+            candidate_type: CandidateType::Host,
+            address: advertised_addr.ip().to_string(),
+            port: advertised_addr.port(),
+            priority: 120,
+        }],
+        vec!["100.127.0.20/32".to_string()],
+        300,
+        1,
+    )
+    .with_device_certificate(server_cert_der);
+    let record = PeerRecord::signed(unsigned, &remote_key).unwrap();
+    let publisher = RendezvousClient::new(rendezvous.local_addr().to_string());
+    publisher.publish(MESH_ID, record).await.unwrap();
+
+    let local_key = DeviceKeypair::generate().unwrap();
+    let connector = Arc::new(MeshConnector::new(
+        MeshConnectorConfig::new(MESH_ID, local_key.public_key().peer_id())
+            .with_direct_probe_timeout(Duration::from_millis(probe_ms))
+            .with_overall_deadline(Duration::from_millis(deadline_ms))
+            .with_probe_pacing(Duration::from_millis(50))
+            .with_relay_server(relay.local_addr().to_string()),
+        RendezvousClient::new(rendezvous.local_addr().to_string()),
+        client_endpoint,
+    ));
+
+    // Keep the proxy alive in the closure-captured scope. We don't have
+    // a field for it on RelayOnlyEnv, so leak it — bench environments
+    // are short-lived.
+    Box::leak(Box::new(wan_proxy));
 
     RelayOnlyEnv {
         connector,

@@ -10,6 +10,7 @@ let package = Package(
     products: [
         .executable(name: "QuantumLinkApp", targets: ["QuantumLinkApp"]),
         .executable(name: "QuantumLinkSmoke", targets: ["QuantumLinkSmoke"]),
+        .executable(name: "QuantumLinkMDM", targets: ["QuantumLinkMDM"]),
         .library(name: "QuantumLinkKit", targets: ["QuantumLinkKit"]),
         .library(name: "QuantumLinkTunnel", targets: ["QuantumLinkTunnel"])
     ],
@@ -24,6 +25,10 @@ let package = Package(
         ),
         .executableTarget(
             name: "QuantumLinkSmoke",
+            dependencies: ["QuantumLinkKit"]
+        ),
+        .executableTarget(
+            name: "QuantumLinkMDM",
             dependencies: ["QuantumLinkKit"]
         ),
         .target(

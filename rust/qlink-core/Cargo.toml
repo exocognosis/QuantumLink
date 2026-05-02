@@ -57,3 +57,7 @@ harness = false
 [[bench]]
 name = "slos"
 harness = false
+
+[[bench]]
+name = "slos_wan"
+harness = false

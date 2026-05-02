@@ -17,6 +17,7 @@ pub mod rendezvous;
 pub mod replay;
 pub mod routing;
 pub mod stun;
+pub mod synthetic_wan;
 pub mod traversal;
 
 pub use error::{QlinkError, Result};

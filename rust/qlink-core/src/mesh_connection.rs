@@ -4,11 +4,12 @@ use crate::{
     error::{QlinkError, Result},
     ice::{perform_ice_check, IceCheckRequest, IceCredentials},
     inbound_identity::send_inbound_assertion,
+    mdns_discovery::{compute_public_key_fingerprint, MdnsPeerObservation},
     peer_acl::PeerAcl,
     quic_transport::{QuicCertificate, QuicDatagramSession, QuicEndpoint},
     relay::RelayClient,
     rendezvous::RendezvousClient,
-    traversal::candidate_socket_addr,
+    traversal::{candidate_socket_addr, HOST_PRIORITY},
 };
 use std::{
     collections::HashMap,
@@ -329,11 +330,115 @@ impl LastGoodCache {
     }
 }
 
+/// In-memory cache of [`MdnsPeerObservation`]s, keyed by remote peer ID.
+///
+/// Callers (typically a background task draining an `MdnsBrowser`) feed
+/// observations via [`Self::record`]. The connector consults the cache
+/// during `connect()` to fold in LAN-discovered host candidates that
+/// rendezvous-published records may not reflect — e.g., the rendezvous
+/// only knows the peer's public srflx address, but mDNS knows the
+/// `192.168.x.x` an LAN peer can reach you on directly.
+///
+/// Entries past `ttl` are stale and silently excluded from lookups. There
+/// is no background sweep — the cache is bounded by the natural turnover
+/// of mDNS announcements, plus per-call filtering at lookup time.
+#[derive(Debug)]
+pub struct MdnsObservationCache {
+    inner: Mutex<HashMap<String, Vec<TimestampedObservation>>>,
+    ttl: Duration,
+}
+
+#[derive(Debug, Clone)]
+struct TimestampedObservation {
+    observation: MdnsPeerObservation,
+    recorded_at: Instant,
+}
+
+/// Default freshness window: observations older than 5 minutes are
+/// considered stale. Matches typical mDNS announcement re-issue cadence
+/// while bounding the window during which a peer that's gone offline
+/// keeps "appearing" in connect attempts.
+pub const DEFAULT_MDNS_OBSERVATION_TTL: Duration = Duration::from_secs(300);
+
+impl Default for MdnsObservationCache {
+    fn default() -> Self {
+        Self::with_ttl(DEFAULT_MDNS_OBSERVATION_TTL)
+    }
+}
+
+impl MdnsObservationCache {
+    pub fn with_ttl(ttl: Duration) -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+            ttl,
+        }
+    }
+
+    pub fn ttl(&self) -> Duration {
+        self.ttl
+    }
+
+    /// Records a fresh observation. Multiple observations for the same
+    /// peer ID are kept (peers can announce on multiple interfaces); the
+    /// connector deduplicates by address when folding into candidates.
+    pub fn record(&self, observation: MdnsPeerObservation) {
+        if let Ok(mut guard) = self.inner.lock() {
+            let entries = guard
+                .entry(observation.announcement.peer_id.clone())
+                .or_default();
+            // Drop any existing observation that announces the same set of
+            // addresses; replace with the fresh one. This keeps the cache
+            // from accumulating duplicates as the same peer re-announces.
+            entries.retain(|existing| existing.observation.addresses != observation.addresses);
+            entries.push(TimestampedObservation {
+                observation,
+                recorded_at: Instant::now(),
+            });
+        }
+    }
+
+    /// Returns observations for `peer_id` that are still within the TTL
+    /// window. Stale entries are pruned in-place during the call so they
+    /// don't accumulate.
+    pub fn observations_for(&self, peer_id: &str) -> Vec<MdnsPeerObservation> {
+        let mut guard = match self.inner.lock() {
+            Ok(guard) => guard,
+            Err(_) => return Vec::new(),
+        };
+        let cutoff = Instant::now()
+            .checked_sub(self.ttl)
+            .unwrap_or_else(Instant::now);
+        let Some(entries) = guard.get_mut(peer_id) else {
+            return Vec::new();
+        };
+        entries.retain(|entry| entry.recorded_at >= cutoff);
+        if entries.is_empty() {
+            guard.remove(peer_id);
+            return Vec::new();
+        }
+        entries
+            .iter()
+            .map(|entry| entry.observation.clone())
+            .collect()
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.lock().map(|g| g.len()).unwrap_or(0)
+    }
+
+    pub fn clear(&self) {
+        if let Ok(mut guard) = self.inner.lock() {
+            guard.clear();
+        }
+    }
+}
+
 pub struct MeshConnector {
     config: MeshConnectorConfig,
     rendezvous: RendezvousClient,
     quic: QuicEndpoint,
     cache: LastGoodCache,
+    mdns_cache: MdnsObservationCache,
 }
 
 impl MeshConnector {
@@ -347,6 +452,7 @@ impl MeshConnector {
             rendezvous,
             quic,
             cache: LastGoodCache::default(),
+            mdns_cache: MdnsObservationCache::default(),
         }
     }
 
@@ -356,6 +462,23 @@ impl MeshConnector {
 
     pub fn cache(&self) -> &LastGoodCache {
         &self.cache
+    }
+
+    pub fn mdns_cache(&self) -> &MdnsObservationCache {
+        &self.mdns_cache
+    }
+
+    /// Feeds an mDNS observation into the connector's local cache. The
+    /// observation will be considered during the next call to `connect()`
+    /// for the matching peer ID, provided it cross-checks the public-key
+    /// fingerprint published in the rendezvous record.
+    ///
+    /// Caller is typically a background task draining an `MdnsBrowser`.
+    /// Connector owns no mDNS state itself — it just consumes observations
+    /// the caller hands in. This keeps the mDNS daemon lifecycle
+    /// (entirely platform-dependent) outside the protocol library.
+    pub fn record_mdns_observation(&self, observation: MdnsPeerObservation) {
+        self.mdns_cache.record(observation);
     }
 
     /// Re-validates a single peer by dropping its cached path and re-running
@@ -451,8 +574,43 @@ impl MeshConnector {
             ))
         };
 
+        // Fold in any LAN-side candidates we've observed via mDNS, but only
+        // when the announcement's truncated fingerprint matches the
+        // public key from the (signed) rendezvous record. The cross-check
+        // protects against an attacker on the LAN announcing themselves
+        // under a legitimate peer ID — they can't forge the fingerprint
+        // without also forging the rendezvous-published public key, which
+        // requires the device private key.
+        let mut all_endpoints: Vec<CandidateEndpoint> = record.body.endpoints.clone();
+        let expected_fingerprint =
+            compute_public_key_fingerprint(&record.body.device_public_key);
+        for observation in self.mdns_cache.observations_for(remote_peer_id) {
+            if observation.announcement.public_key_fingerprint != expected_fingerprint {
+                tracing::debug!(
+                    peer_id = %remote_peer_id,
+                    "discarding mDNS observation: fingerprint mismatch"
+                );
+                continue;
+            }
+            for address in &observation.addresses {
+                let already_listed = all_endpoints.iter().any(|existing| {
+                    existing.port == address.port()
+                        && existing.address == address.ip().to_string()
+                });
+                if already_listed {
+                    continue;
+                }
+                all_endpoints.push(CandidateEndpoint {
+                    candidate_type: CandidateType::Host,
+                    address: address.ip().to_string(),
+                    port: address.port(),
+                    priority: HOST_PRIORITY,
+                });
+            }
+        }
+
         let cached_addr = self.cache.lookup(remote_peer_id);
-        let direct_candidates = order_direct_candidates(&record.body.endpoints, cached_addr);
+        let direct_candidates = order_direct_candidates(&all_endpoints, cached_addr);
         let used_cached_path = cached_addr.is_some();
         let had_direct_candidates = !direct_candidates.is_empty();
 
@@ -1726,6 +1884,220 @@ mod tests {
             "wrong cert must fail or time out the QUIC handshake: {:?}",
             direct_attempt.outcome
         );
+    }
+
+    // === mDNS observation integration tests ===
+
+    #[tokio::test]
+    async fn mdns_observation_with_matching_fingerprint_adds_extra_host_candidate() {
+        use crate::mdns_discovery::{
+            compute_public_key_fingerprint, MdnsPeerAnnouncement, MdnsPeerObservation,
+        };
+
+        let rendezvous = spawn_dev_rendezvous().await.unwrap();
+        let rendezvous_client = RendezvousClient::new(rendezvous.local_addr().to_string());
+
+        // Bring up a real "remote" QUIC server so the LAN-side address we
+        // synthesize via mDNS is reachable. The rendezvous-published
+        // candidate is a deliberately unreachable port; the mDNS
+        // observation provides the working one.
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let (server_endpoint, server_cert) = QuicEndpoint::server(bind).unwrap();
+        let working_addr = server_endpoint.local_addr().unwrap();
+        let server_cert_der = server_cert.as_der().to_vec();
+        let client_endpoint = QuicEndpoint::client(bind, &[server_cert]).unwrap();
+
+        let _accept_loop = tokio::spawn(async move {
+            loop {
+                match server_endpoint.accept_one().await {
+                    Ok(session) => {
+                        tokio::spawn(async move {
+                            let _ = session.receive_frame().await;
+                        });
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let local_key = DeviceKeypair::generate().unwrap();
+        let remote_key = DeviceKeypair::generate().unwrap();
+        let remote_peer_id = remote_key.public_key().peer_id();
+        let expected_fingerprint = compute_public_key_fingerprint(&remote_key.public_key());
+
+        // Rendezvous record advertises only an unreachable candidate.
+        let remote_record = signed_record_with_cert(
+            &remote_key,
+            vec![CandidateEndpoint {
+                candidate_type: CandidateType::Host,
+                address: "127.0.0.1".to_string(),
+                port: 1, // unreachable
+                priority: 120,
+            }],
+            1,
+            server_cert_der,
+        );
+        rendezvous_client
+            .publish(MESH_ID, remote_record)
+            .await
+            .unwrap();
+
+        let connector = MeshConnector::new(
+            MeshConnectorConfig::new(MESH_ID, local_key.public_key().peer_id())
+                .with_direct_probe_timeout(Duration::from_millis(400))
+                .with_overall_deadline(Duration::from_secs(2)),
+            rendezvous_client,
+            client_endpoint,
+        );
+
+        // Feed an mDNS observation that points at the working address.
+        connector.record_mdns_observation(MdnsPeerObservation {
+            announcement: MdnsPeerAnnouncement {
+                peer_id: remote_peer_id.clone(),
+                mesh_id: MESH_ID.to_string(),
+                alias: "peer-mdns".to_string(),
+                sequence: 1,
+                public_key_fingerprint: expected_fingerprint,
+            },
+            addresses: vec![working_addr],
+        });
+
+        let (link, outcome) = connector.connect(&remote_peer_id).await.unwrap();
+        assert_eq!(link.path_kind(), PathKind::Direct);
+        assert_eq!(outcome.path_kind, PathKind::Direct);
+
+        // The successful Established attempt must be the mDNS-supplied
+        // address, not the unreachable rendezvous one.
+        let established = outcome
+            .attempts
+            .iter()
+            .find(|attempt| attempt.outcome == ProbeOutcome::Established)
+            .expect("at least one probe must succeed");
+        assert_eq!(established.address, working_addr);
+    }
+
+    #[tokio::test]
+    async fn mdns_observation_with_wrong_fingerprint_is_silently_discarded() {
+        use crate::mdns_discovery::MdnsPeerAnnouncement;
+
+        let rendezvous = spawn_dev_rendezvous().await.unwrap();
+        let rendezvous_client = RendezvousClient::new(rendezvous.local_addr().to_string());
+
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let (_unused_server, throwaway_cert) = QuicEndpoint::server(bind).unwrap();
+        let throwaway_cert_der = throwaway_cert.as_der().to_vec();
+        let client_endpoint = QuicEndpoint::client(bind, &[throwaway_cert]).unwrap();
+
+        let local_key = DeviceKeypair::generate().unwrap();
+        let remote_key = DeviceKeypair::generate().unwrap();
+        let remote_peer_id = remote_key.public_key().peer_id();
+
+        // Rendezvous record advertises an unreachable candidate; without
+        // mDNS, connect() should fail with no direct candidate working.
+        let remote_record = signed_record_with_cert(
+            &remote_key,
+            vec![CandidateEndpoint {
+                candidate_type: CandidateType::Host,
+                address: "127.0.0.1".to_string(),
+                port: 1,
+                priority: 120,
+            }],
+            1,
+            throwaway_cert_der,
+        );
+        rendezvous_client
+            .publish(MESH_ID, remote_record)
+            .await
+            .unwrap();
+
+        let connector = MeshConnector::new(
+            MeshConnectorConfig::new(MESH_ID, local_key.public_key().peer_id())
+                .with_direct_probe_timeout(Duration::from_millis(150))
+                .with_overall_deadline(Duration::from_millis(500)),
+            rendezvous_client,
+            client_endpoint,
+        );
+
+        // Attacker on the LAN announces under the right peer_id but with
+        // a forged fingerprint and a bogus address.
+        connector.record_mdns_observation(MdnsPeerObservation {
+            announcement: MdnsPeerAnnouncement {
+                peer_id: remote_peer_id.clone(),
+                mesh_id: MESH_ID.to_string(),
+                alias: "peer-attacker".to_string(),
+                sequence: 1,
+                public_key_fingerprint: "0000000000000000".to_string(),
+            },
+            addresses: vec!["127.0.0.1:2".parse().unwrap()],
+        });
+
+        let error = connector.connect(&remote_peer_id).await.unwrap_err();
+        // The forged observation must NOT have surfaced any extra
+        // candidate, so the connector exhausts and reports "no direct
+        // candidate succeeded" rather than something that mentions the
+        // attacker's address.
+        assert!(
+            error.to_string().contains("no direct candidate"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn mdns_cache_purges_stale_observations_past_ttl() {
+        use crate::mdns_discovery::{MdnsPeerAnnouncement, MdnsPeerObservation};
+
+        // 50 ms TTL so the test can advance past it quickly.
+        let cache = MdnsObservationCache::with_ttl(Duration::from_millis(50));
+        cache.record(MdnsPeerObservation {
+            announcement: MdnsPeerAnnouncement {
+                peer_id: "qlink_aged".to_string(),
+                mesh_id: MESH_ID.to_string(),
+                alias: "peer-aged".to_string(),
+                sequence: 1,
+                public_key_fingerprint: "deadbeefdeadbeef".to_string(),
+            },
+            addresses: vec!["127.0.0.1:9".parse().unwrap()],
+        });
+
+        assert_eq!(cache.observations_for("qlink_aged").len(), 1);
+
+        // Sleep past the TTL.
+        std::thread::sleep(Duration::from_millis(80));
+
+        // Lookup must purge the stale entry and return empty.
+        assert!(cache.observations_for("qlink_aged").is_empty());
+        // The peer key is fully removed from the underlying map so the
+        // cache size stays bounded over long runs.
+        assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn mdns_cache_replaces_duplicate_observation_for_same_addresses() {
+        use crate::mdns_discovery::{MdnsPeerAnnouncement, MdnsPeerObservation};
+
+        let cache = MdnsObservationCache::default();
+        let announcement = MdnsPeerAnnouncement {
+            peer_id: "qlink_dup".to_string(),
+            mesh_id: MESH_ID.to_string(),
+            alias: "peer-dup".to_string(),
+            sequence: 1,
+            public_key_fingerprint: "abcdef0123456789".to_string(),
+        };
+        let addresses = vec!["127.0.0.1:1234".parse().unwrap()];
+
+        // Record the same observation twice — the cache should NOT
+        // accumulate duplicates (would cause the connector to probe the
+        // same address multiple times in one connect cycle).
+        cache.record(MdnsPeerObservation {
+            announcement: announcement.clone(),
+            addresses: addresses.clone(),
+        });
+        cache.record(MdnsPeerObservation {
+            announcement,
+            addresses,
+        });
+
+        assert_eq!(cache.observations_for("qlink_dup").len(), 1);
     }
 
     fn signed_record(

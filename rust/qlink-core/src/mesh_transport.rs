@@ -37,6 +37,7 @@ use crate::{
 };
 use serde::Deserialize;
 use std::{
+    collections::HashMap,
     net::SocketAddr,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -81,6 +82,13 @@ pub struct MeshTransportRawMetrics {
     pub reconnect_count: u64,
 }
 
+/// Per-peer session state. One instance per active remote peer.
+///
+/// The fields that matter to operators (state, path_kind, last_error,
+/// frame/byte counters, reconnect_count) are per-peer because each peer
+/// reconnects, fails, and carries traffic independently. Transport-level
+/// counts that span all peers (most notably `network_event_count`) live
+/// on [`AggregateState`].
 #[derive(Debug)]
 struct SharedState {
     state: StdMutex<MeshTransportState>,
@@ -92,7 +100,6 @@ struct SharedState {
     bytes_received: AtomicU64,
     send_failures: AtomicU64,
     receive_failures: AtomicU64,
-    network_event_count: AtomicU64,
     reconnect_count: AtomicU64,
 }
 
@@ -108,7 +115,6 @@ impl SharedState {
             bytes_received: AtomicU64::new(0),
             send_failures: AtomicU64::new(0),
             receive_failures: AtomicU64::new(0),
-            network_event_count: AtomicU64::new(0),
             reconnect_count: AtomicU64::new(0),
         }
     }
@@ -146,16 +152,43 @@ impl SharedState {
         }
     }
 
-    fn snapshot_metrics(&self) -> MeshTransportRawMetrics {
-        MeshTransportRawMetrics {
+    /// Per-peer metrics only. Transport-level fields like
+    /// `network_event_count` are populated by the caller from
+    /// [`AggregateState`].
+    fn snapshot_per_peer_metrics(&self) -> PerPeerMetricsRaw {
+        PerPeerMetricsRaw {
             frames_sent: self.frames_sent.load(Ordering::Relaxed),
             frames_received: self.frames_received.load(Ordering::Relaxed),
             bytes_sent: self.bytes_sent.load(Ordering::Relaxed),
             bytes_received: self.bytes_received.load(Ordering::Relaxed),
             send_failures: self.send_failures.load(Ordering::Relaxed),
             receive_failures: self.receive_failures.load(Ordering::Relaxed),
-            network_event_count: self.network_event_count.load(Ordering::Relaxed),
             reconnect_count: self.reconnect_count.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct PerPeerMetricsRaw {
+    frames_sent: u64,
+    frames_received: u64,
+    bytes_sent: u64,
+    bytes_received: u64,
+    send_failures: u64,
+    receive_failures: u64,
+    reconnect_count: u64,
+}
+
+/// Transport-level counters that aren't tied to a specific peer.
+#[derive(Debug)]
+struct AggregateState {
+    network_event_count: AtomicU64,
+}
+
+impl AggregateState {
+    fn new() -> Self {
+        Self {
+            network_event_count: AtomicU64::new(0),
         }
     }
 }
@@ -212,18 +245,66 @@ fn default_reconnect_max_backoff_ms() -> u64 {
     30_000
 }
 
+/// A frame received from a specific remote peer. Multi-peer transports
+/// preserve the source peer ID so callers can route inbound traffic.
+#[derive(Debug, Clone)]
+pub struct InboundFrame {
+    pub peer_id: String,
+    pub frame: Vec<u8>,
+}
+
+/// Per-peer session state held inside `MeshTransportHandle`. Each entry
+/// drives one independent session manager loop with its own outbound
+/// queue, network-event channel, and shared state.
+struct PerPeerSession {
+    outbound_tx: mpsc::UnboundedSender<Vec<u8>>,
+    event_tx: mpsc::UnboundedSender<NetworkEvent>,
+    shutdown_tx: mpsc::UnboundedSender<()>,
+    shared: Arc<SharedState>,
+    manager_task: Option<JoinHandle<()>>,
+}
+
+impl PerPeerSession {
+    /// Tears down this peer's session. Called both when the operator
+    /// removes the peer and when the whole transport is dropped.
+    fn shutdown(&mut self) {
+        let _ = self.shutdown_tx.send(());
+        if let Some(handle) = self.manager_task.take() {
+            handle.abort();
+        }
+        self.shared.set_state(MeshTransportState::Stopped);
+    }
+}
+
 pub struct MeshTransportHandle {
     /// Wrapped in `Option` so `Drop` can take it out and call
     /// `Runtime::shutdown_background()`. Letting a `Runtime` drop normally
     /// inside an async context panics with "Cannot drop a runtime in a
     /// context where blocking is not allowed".
     runtime: Option<Runtime>,
-    shared: Arc<SharedState>,
-    outbound_tx: mpsc::UnboundedSender<Vec<u8>>,
-    inbound_rx: TokioMutex<mpsc::UnboundedReceiver<Vec<u8>>>,
-    event_tx: mpsc::UnboundedSender<NetworkEvent>,
-    manager_task: StdMutex<Option<JoinHandle<()>>>,
-    shutdown_tx: mpsc::UnboundedSender<()>,
+    /// Shared mesh connector — one rendezvous + QUIC endpoint serves all
+    /// peers. The connector itself is multi-peer-friendly: its caches
+    /// (last-good, mDNS) are keyed by remote peer ID.
+    connector: Arc<MeshConnector>,
+    /// Backoff policy applied uniformly across all peers. (Per-peer
+    /// backoff state lives inside each session manager.)
+    backoff: BackoffConfig,
+    /// Active peers, keyed by remote peer ID. `add_peer` inserts;
+    /// `remove_peer` extracts and shuts down the entry. Wrapped in `Arc`
+    /// so the OpenMetrics provider closure can read it without
+    /// holding the handle.
+    peers: Arc<StdMutex<HashMap<String, PerPeerSession>>>,
+    /// Default peer for the legacy single-peer API. Set from the config's
+    /// `remote_peer_id` at construction so the existing
+    /// `send_frame` / `try_receive_frame` / `state_code` keep working.
+    default_peer_id: StdMutex<Option<String>>,
+    /// Shared inbound channel: every per-peer session manager forwards
+    /// received frames here (wrapped with the source peer ID).
+    inbound_tx: mpsc::UnboundedSender<InboundFrame>,
+    inbound_rx: TokioMutex<mpsc::UnboundedReceiver<InboundFrame>>,
+    /// Transport-level counters that aren't per-peer (today: just the
+    /// network-event count).
+    aggregate: Arc<AggregateState>,
     /// Held only when the operator opted into the OpenMetrics endpoint via
     /// `metrics_endpoint_bind_addr`. Drop aborts the listener task.
     metrics_endpoint: StdMutex<Option<MetricsEndpoint>>,
@@ -245,10 +326,10 @@ impl MeshTransportHandle {
             .parse()
             .map_err(|err| QlinkError::Protocol(format!("invalid bind_addr: {err}")))?;
 
-        // The connector now learns the remote's QUIC server cert from the
-        // signed rendezvous record and uses `connect_with_trusted_cert` for
-        // per-connection trust. The endpoint-level trust list is empty —
-        // any direct `connect()` would fail by design. (See module docs.)
+        // The connector learns each peer's QUIC server cert from the
+        // signed rendezvous record and uses `connect_with_trusted_cert`
+        // for per-connection trust. The endpoint-level trust list is
+        // empty — any direct `connect()` would fail by design.
         let _runtime_guard = runtime.enter();
         let quic_endpoint = QuicEndpoint::client(bind_addr, &[])?;
 
@@ -273,61 +354,60 @@ impl MeshTransportHandle {
             quic_endpoint,
         ));
 
-        let shared = Arc::new(SharedState::new());
-
-        let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let (event_tx, event_rx) = mpsc::unbounded_channel::<NetworkEvent>();
-        let (shutdown_tx, shutdown_rx) = mpsc::unbounded_channel::<()>();
-
-        let remote_peer_id = config.remote_peer_id.clone();
-        let connector_for_task = connector.clone();
-        let shared_for_task = shared.clone();
         let backoff = BackoffConfig {
             initial: Duration::from_millis(config.reconnect_initial_backoff_ms.max(1)),
             max: Duration::from_millis(config.reconnect_max_backoff_ms.max(1)),
         };
-        let manager_task = runtime.spawn(run_session_manager(
-            connector_for_task,
-            remote_peer_id,
-            outbound_rx,
-            inbound_tx,
-            event_rx,
-            shutdown_rx,
-            shared_for_task,
-            backoff,
-        ));
 
-        // Optional OpenMetrics endpoint. Off by default; only spawned when
-        // the operator explicitly sets a bind address. The provider closure
-        // pulls a fresh snapshot from `shared` on every scrape.
+        let aggregate = Arc::new(AggregateState::new());
+        let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<InboundFrame>();
+        let peers: Arc<StdMutex<HashMap<String, PerPeerSession>>> =
+            Arc::new(StdMutex::new(HashMap::new()));
+
+        // Optional OpenMetrics endpoint. Off by default; only spawned
+        // when the operator explicitly sets a bind address. The provider
+        // closure clones the `peers` and `aggregate` Arcs and walks them
+        // on every scrape — newly added peers surface automatically.
         let metrics_endpoint = match config.metrics_endpoint_bind_addr.as_ref() {
             Some(addr_str) => {
                 let bind: SocketAddr = addr_str.parse().map_err(|err| {
                     QlinkError::Protocol(format!("invalid metrics_endpoint_bind_addr: {err}"))
                 })?;
-                let provider_state = shared.clone();
+                let peers_provider = peers.clone();
+                let aggregate_provider = aggregate.clone();
                 let provider: crate::metrics_endpoint::MetricsSnapshotProvider =
-                    Arc::new(move || mesh_transport_snapshot(&provider_state));
+                    Arc::new(move || {
+                        mesh_transport_snapshot(&peers_provider, &aggregate_provider)
+                    });
                 Some(runtime.block_on(spawn_metrics_endpoint(bind, provider))?)
             }
             None => None,
         };
 
-        Ok(Self {
+        let handle = Self {
             runtime: Some(runtime),
-            shared,
-            outbound_tx,
+            connector,
+            backoff,
+            peers,
+            default_peer_id: StdMutex::new(Some(config.remote_peer_id.clone())),
+            inbound_tx,
             inbound_rx: TokioMutex::new(inbound_rx),
-            event_tx,
-            manager_task: StdMutex::new(Some(manager_task)),
-            shutdown_tx,
+            aggregate,
             metrics_endpoint: StdMutex::new(metrics_endpoint),
-        })
+        };
+
+        // Auto-add the configured peer for back-compat with the
+        // single-peer API.
+        handle.add_peer(&config.remote_peer_id)?;
+
+        Ok(handle)
     }
 
-    /// Local address of the OpenMetrics endpoint, when one is bound. Useful
-    /// for tests that need the assigned ephemeral port.
+    // (continued below — public API)
+}
+
+impl MeshTransportHandle {
+    /// Local address of the OpenMetrics endpoint, when one is bound.
     pub fn metrics_endpoint_addr(&self) -> Option<SocketAddr> {
         self.metrics_endpoint
             .lock()
@@ -336,41 +416,191 @@ impl MeshTransportHandle {
             .map(|endpoint| endpoint.local_addr())
     }
 
-    pub fn send_frame(&self, frame: Vec<u8>) -> Result<()> {
+    /// Spawns a session manager for a new remote peer. Idempotent: if
+    /// the peer is already active, this is a no-op.
+    pub fn add_peer(&self, remote_peer_id: &str) -> Result<()> {
+        let mut peers = self.peers.lock().map_err(|_| {
+            QlinkError::Protocol("mesh transport peers mutex poisoned".into())
+        })?;
+        if peers.contains_key(remote_peer_id) {
+            return Ok(());
+        }
+
+        let runtime = self.runtime.as_ref().ok_or_else(|| {
+            QlinkError::Protocol("mesh transport runtime is shut down".into())
+        })?;
+
+        let shared = Arc::new(SharedState::new());
+        let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (event_tx, event_rx) = mpsc::unbounded_channel::<NetworkEvent>();
+        let (shutdown_tx, shutdown_rx) = mpsc::unbounded_channel::<()>();
+
+        let manager_task = runtime.spawn(run_session_manager(
+            self.connector.clone(),
+            remote_peer_id.to_string(),
+            outbound_rx,
+            self.inbound_tx.clone(),
+            event_rx,
+            shutdown_rx,
+            shared.clone(),
+            self.backoff,
+        ));
+
+        peers.insert(
+            remote_peer_id.to_string(),
+            PerPeerSession {
+                outbound_tx,
+                event_tx,
+                shutdown_tx,
+                shared,
+                manager_task: Some(manager_task),
+            },
+        );
+        Ok(())
+    }
+
+    /// Tears down a peer's session. Idempotent: removing a peer that
+    /// isn't active is a no-op.
+    pub fn remove_peer(&self, remote_peer_id: &str) {
+        if let Ok(mut peers) = self.peers.lock() {
+            if let Some(mut session) = peers.remove(remote_peer_id) {
+                session.shutdown();
+            }
+        }
+        // If the removed peer was the default, pick another active peer
+        // (or None) so the legacy single-peer API doesn't dangle.
+        if let Ok(mut default_guard) = self.default_peer_id.lock() {
+            if default_guard.as_deref() == Some(remote_peer_id) {
+                let next = self
+                    .peers
+                    .lock()
+                    .ok()
+                    .and_then(|peers| peers.keys().next().cloned());
+                *default_guard = next;
+            }
+        }
+    }
+
+    /// Lists the peers currently being managed by this transport.
+    pub fn peer_ids(&self) -> Vec<String> {
+        self.peers
+            .lock()
+            .map(|peers| peers.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Sends a frame to a specific peer. Errors if the peer isn't active
+    /// (call `add_peer` first) or if its outbound channel is closed.
+    pub fn send_frame_to(&self, remote_peer_id: &str, frame: Vec<u8>) -> Result<()> {
         let len = frame.len() as u64;
-        match self.outbound_tx.send(frame) {
+        let peers = self.peers.lock().map_err(|_| {
+            QlinkError::Protocol("mesh transport peers mutex poisoned".into())
+        })?;
+        let session = peers.get(remote_peer_id).ok_or_else(|| {
+            QlinkError::Protocol(format!(
+                "mesh transport has no active session for peer {remote_peer_id}"
+            ))
+        })?;
+        match session.outbound_tx.send(frame) {
             Ok(()) => {
-                self.shared.frames_sent.fetch_add(1, Ordering::Relaxed);
-                self.shared.bytes_sent.fetch_add(len, Ordering::Relaxed);
+                session.shared.frames_sent.fetch_add(1, Ordering::Relaxed);
+                session.shared.bytes_sent.fetch_add(len, Ordering::Relaxed);
                 Ok(())
             }
             Err(_) => {
-                self.shared.send_failures.fetch_add(1, Ordering::Relaxed);
-                Err(QlinkError::Protocol(
-                    "mesh transport outbound channel closed".into(),
-                ))
+                session.shared.send_failures.fetch_add(1, Ordering::Relaxed);
+                Err(QlinkError::Protocol(format!(
+                    "outbound channel for peer {remote_peer_id} is closed"
+                )))
             }
         }
     }
 
-    pub fn try_receive_frame(&self) -> Option<Vec<u8>> {
+    /// Pulls the next inbound frame from any active peer, with the
+    /// source peer ID attached. Returns `None` if no frame is queued.
+    pub fn try_receive_frame_from_any(&self) -> Option<InboundFrame> {
         let mut rx = self.inbound_rx.try_lock().ok()?;
-        match rx.try_recv() {
-            Ok(frame) => Some(frame),
-            Err(_) => None,
-        }
+        rx.try_recv().ok()
     }
 
+    /// Per-peer state code: 0=connecting, 1=ready, 2=failed, 3=stopped.
+    /// Returns `None` if the peer isn't active.
+    pub fn peer_state_code(&self, remote_peer_id: &str) -> Option<u32> {
+        self.peers
+            .lock()
+            .ok()?
+            .get(remote_peer_id)
+            .map(|session| session.shared.state_code())
+    }
+
+    pub fn peer_path_kind_code(&self, remote_peer_id: &str) -> Option<u32> {
+        self.peers
+            .lock()
+            .ok()?
+            .get(remote_peer_id)
+            .map(|session| session.shared.path_kind_code())
+    }
+
+    pub fn peer_last_error(&self, remote_peer_id: &str) -> Option<String> {
+        let peers = self.peers.lock().ok()?;
+        let session = peers.get(remote_peer_id)?;
+        let guard = session.shared.last_error.lock().ok()?;
+        guard.clone()
+    }
+
+    pub fn peer_metrics(&self, remote_peer_id: &str) -> Option<MeshTransportRawMetrics> {
+        let peers = self.peers.lock().ok()?;
+        let session = peers.get(remote_peer_id)?;
+        let raw = session.shared.snapshot_per_peer_metrics();
+        Some(MeshTransportRawMetrics {
+            frames_sent: raw.frames_sent,
+            frames_received: raw.frames_received,
+            bytes_sent: raw.bytes_sent,
+            bytes_received: raw.bytes_received,
+            send_failures: raw.send_failures,
+            receive_failures: raw.receive_failures,
+            // The aggregate `network_event_count` is reported even on a
+            // per-peer query because every active peer saw the same
+            // events fan out from `handle_network_event`.
+            network_event_count: self
+                .aggregate
+                .network_event_count
+                .load(Ordering::Relaxed),
+            reconnect_count: raw.reconnect_count,
+        })
+    }
+
+    // === Legacy single-peer API (back-compat) ===
+
+    /// Sends a frame to the configured default peer (the
+    /// `remote_peer_id` from `MeshTransportConfig`). Equivalent to
+    /// `send_frame_to(default_peer_id, frame)` for callers who haven't
+    /// migrated to the multi-peer API yet.
+    pub fn send_frame(&self, frame: Vec<u8>) -> Result<()> {
+        let default = self.default_peer_id_or_err()?;
+        self.send_frame_to(&default, frame)
+    }
+
+    /// Pulls the next inbound frame from any peer; the source peer ID is
+    /// dropped because the legacy API has no field to carry it. New code
+    /// should use `try_receive_frame_from_any()` instead.
+    pub fn try_receive_frame(&self) -> Option<Vec<u8>> {
+        self.try_receive_frame_from_any()
+            .map(|inbound| inbound.frame)
+    }
+
+    /// Fans the event out to every active per-peer session manager.
+    /// Returns the static policy mapping (matches what each session
+    /// would report individually).
     pub fn handle_network_event(&self, event: NetworkEvent) -> NetworkEventResponse {
-        self.shared
+        self.aggregate
             .network_event_count
             .fetch_add(1, Ordering::Relaxed);
-        // Send the event to the manager task; it'll invalidate its cache and
-        // tear down the active session if the policy demands it. The
-        // response we return reflects the static policy mapping rather than
-        // the actual cache state inside the connector — sufficient for
-        // operator telemetry.
-        let _ = self.event_tx.send(event);
+        if let Ok(peers) = self.peers.lock() {
+            for session in peers.values() {
+                let _ = session.event_tx.send(event);
+            }
+        }
         match event {
             NetworkEvent::PathChanged | NetworkEvent::PostWake => NetworkEventResponse {
                 cache_entries_invalidated: 0,
@@ -387,27 +617,67 @@ impl MeshTransportHandle {
         }
     }
 
+    /// Aggregate metrics across every active peer plus transport-level
+    /// counters (network_event_count). Per-peer breakdowns are
+    /// available via `peer_metrics(peer_id)`.
     pub fn metrics(&self) -> MeshTransportRawMetrics {
-        self.shared.snapshot_metrics()
+        let mut totals = PerPeerMetricsRaw::default();
+        if let Ok(peers) = self.peers.lock() {
+            for session in peers.values() {
+                let raw = session.shared.snapshot_per_peer_metrics();
+                totals.frames_sent += raw.frames_sent;
+                totals.frames_received += raw.frames_received;
+                totals.bytes_sent += raw.bytes_sent;
+                totals.bytes_received += raw.bytes_received;
+                totals.send_failures += raw.send_failures;
+                totals.receive_failures += raw.receive_failures;
+                totals.reconnect_count += raw.reconnect_count;
+            }
+        }
+        MeshTransportRawMetrics {
+            frames_sent: totals.frames_sent,
+            frames_received: totals.frames_received,
+            bytes_sent: totals.bytes_sent,
+            bytes_received: totals.bytes_received,
+            send_failures: totals.send_failures,
+            receive_failures: totals.receive_failures,
+            network_event_count: self
+                .aggregate
+                .network_event_count
+                .load(Ordering::Relaxed),
+            reconnect_count: totals.reconnect_count,
+        }
     }
 
+    /// State code of the configured default peer, for back-compat with
+    /// the single-peer FFI. Returns Failed if there's no default peer.
     pub fn state_code(&self) -> u32 {
-        self.shared.state_code()
+        self.default_peer_id
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .and_then(|peer_id| self.peer_state_code(&peer_id))
+            .unwrap_or_else(|| MeshTransportState::Failed.as_code())
     }
 
     pub fn path_kind_code(&self) -> u32 {
-        self.shared.path_kind_code()
+        self.default_peer_id
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .and_then(|peer_id| self.peer_path_kind_code(&peer_id))
+            .unwrap_or(0)
     }
 
     pub fn last_error(&self) -> Option<String> {
-        self.shared.last_error.lock().ok()?.clone()
+        let default = self.default_peer_id.lock().ok().and_then(|g| g.clone())?;
+        self.peer_last_error(&default)
     }
 
     pub fn shutdown(&self) {
-        let _ = self.shutdown_tx.send(());
-        if let Ok(mut guard) = self.manager_task.lock() {
-            if let Some(handle) = guard.take() {
-                handle.abort();
+        if let Ok(mut peers) = self.peers.lock() {
+            for (_, mut session) in peers.drain() {
+                session.shutdown();
             }
         }
         if let Ok(mut guard) = self.metrics_endpoint.lock() {
@@ -415,90 +685,174 @@ impl MeshTransportHandle {
                 endpoint.shutdown();
             }
         }
-        self.shared.set_state(MeshTransportState::Stopped);
+    }
+
+    fn default_peer_id_or_err(&self) -> Result<String> {
+        self.default_peer_id
+            .lock()
+            .map_err(|_| QlinkError::Protocol("default peer id mutex poisoned".into()))?
+            .clone()
+            .ok_or_else(|| {
+                QlinkError::Protocol(
+                    "no default peer configured for legacy single-peer send_frame".into(),
+                )
+            })
     }
 }
 
 impl Drop for MeshTransportHandle {
     fn drop(&mut self) {
-        let _ = self.shutdown_tx.send(());
-        if let Ok(mut guard) = self.manager_task.lock() {
-            if let Some(handle) = guard.take() {
-                handle.abort();
+        if let Ok(mut peers) = self.peers.lock() {
+            for (_, mut session) in peers.drain() {
+                session.shutdown();
             }
         }
         if let Ok(mut guard) = self.metrics_endpoint.lock() {
             // Drop on MetricsEndpoint already aborts the listener task.
             guard.take();
         }
-        // Take the runtime and shutdown asynchronously so this Drop is safe
-        // to call from any context (including from within another tokio
-        // runtime, which is what tests do).
+        // Take the runtime and shutdown asynchronously so this Drop is
+        // safe to call from any context (including from within another
+        // tokio runtime, which is what tests do).
         if let Some(runtime) = self.runtime.take() {
             runtime.shutdown_background();
         }
     }
 }
 
-fn mesh_transport_snapshot(shared: &Arc<SharedState>) -> MetricsSnapshot {
+fn mesh_transport_snapshot(
+    peers: &Arc<StdMutex<HashMap<String, PerPeerSession>>>,
+    aggregate: &Arc<AggregateState>,
+) -> MetricsSnapshot {
     let mut snapshot = MetricsSnapshot::default();
 
-    // State + path kind expressed as gauges so dashboards can plot
-    // transitions over time. Counters are the per-direction frame/byte
-    // tallies the manager updates on every send/receive.
+    // Aggregate counters across every active peer. v2 should add
+    // per-peer labels (`{peer="..."}`) so dashboards can break this down;
+    // for v1 the aggregate matches the existing single-peer scrape
+    // shape exactly.
+    let mut totals = PerPeerMetricsRaw::default();
+    let mut state_code = MeshTransportState::Failed.as_code();
+    let mut path_kind_code: u32 = 0;
+    let mut peer_count: u64 = 0;
+
+    if let Ok(guard) = peers.lock() {
+        peer_count = guard.len() as u64;
+        for session in guard.values() {
+            let raw = session.shared.snapshot_per_peer_metrics();
+            totals.frames_sent += raw.frames_sent;
+            totals.frames_received += raw.frames_received;
+            totals.bytes_sent += raw.bytes_sent;
+            totals.bytes_received += raw.bytes_received;
+            totals.send_failures += raw.send_failures;
+            totals.receive_failures += raw.receive_failures;
+            totals.reconnect_count += raw.reconnect_count;
+
+            // Surface the "best" state across peers so a dashboard's
+            // single gauge says something useful: Ready beats
+            // Connecting beats Failed beats Stopped.
+            let session_state = session.shared.state_code();
+            state_code = better_state(state_code, session_state);
+
+            // Same for path kind: Direct (1) beats Relay (2) beats
+            // None (0). (Numerically inverse, so we pick the smallest
+            // non-zero value.)
+            let session_path = session.shared.path_kind_code();
+            path_kind_code = better_path_kind(path_kind_code, session_path);
+        }
+    }
+
+    snapshot.push_gauge(
+        "qlink_mesh_transport_peers",
+        "Number of active peer sessions managed by this transport",
+        peer_count as f64,
+    );
     snapshot.push_gauge(
         "qlink_mesh_transport_state",
-        "Mesh transport state: 0=connecting, 1=ready, 2=failed, 3=stopped",
-        shared.state_code() as f64,
+        "Best state across active peers: 0=connecting, 1=ready, 2=failed, 3=stopped",
+        state_code as f64,
     );
     snapshot.push_gauge(
         "qlink_mesh_transport_path_kind",
-        "Selected path kind: 0=none, 1=direct, 2=relay",
-        shared.path_kind_code() as f64,
+        "Best path kind across active peers: 0=none, 1=direct, 2=relay",
+        path_kind_code as f64,
     );
 
     snapshot.push_counter(
         "qlink_mesh_transport_frames_sent_total",
-        "Total frames the manager has handed to the live MeshLink.send_frame",
-        shared.frames_sent.load(Ordering::Relaxed) as f64,
+        "Frames sent across all peers",
+        totals.frames_sent as f64,
     );
     snapshot.push_counter(
         "qlink_mesh_transport_frames_received_total",
-        "Total frames the manager has pulled out of the live MeshLink.receive_frame",
-        shared.frames_received.load(Ordering::Relaxed) as f64,
+        "Frames received across all peers",
+        totals.frames_received as f64,
     );
     snapshot.push_counter(
         "qlink_mesh_transport_bytes_sent_total",
-        "Total bytes accepted by the manager outbound queue",
-        shared.bytes_sent.load(Ordering::Relaxed) as f64,
+        "Bytes sent across all peers",
+        totals.bytes_sent as f64,
     );
     snapshot.push_counter(
         "qlink_mesh_transport_bytes_received_total",
-        "Total bytes delivered out of the manager inbound queue",
-        shared.bytes_received.load(Ordering::Relaxed) as f64,
+        "Bytes received across all peers",
+        totals.bytes_received as f64,
     );
     snapshot.push_counter(
         "qlink_mesh_transport_send_failures_total",
-        "Send-frame errors recorded by the manager (dead link, channel closed, etc.)",
-        shared.send_failures.load(Ordering::Relaxed) as f64,
+        "Send-frame errors across all peers",
+        totals.send_failures as f64,
     );
     snapshot.push_counter(
         "qlink_mesh_transport_receive_failures_total",
-        "Receive-frame errors recorded by the manager",
-        shared.receive_failures.load(Ordering::Relaxed) as f64,
+        "Receive-frame errors across all peers",
+        totals.receive_failures as f64,
     );
     snapshot.push_counter(
         "qlink_mesh_transport_network_events_total",
-        "System-level network events fed into the manager (path-changed, sleep, wake, reachability)",
-        shared.network_event_count.load(Ordering::Relaxed) as f64,
+        "Transport-level network events handled (fanned out to all peers)",
+        aggregate.network_event_count.load(Ordering::Relaxed) as f64,
     );
     snapshot.push_counter(
         "qlink_mesh_transport_reconnects_total",
-        "Manager loop iterations after the first connect (i.e. reconnect attempts)",
-        shared.reconnect_count.load(Ordering::Relaxed) as f64,
+        "Reconnect attempts across all peers",
+        totals.reconnect_count as f64,
     );
 
     snapshot
+}
+
+/// "Best of two" ordering for the aggregate state gauge:
+/// Ready (1) beats Connecting (0) beats Failed (2) beats Stopped (3).
+/// Returns whichever input is "more useful" for the dashboard.
+fn better_state(a: u32, b: u32) -> u32 {
+    let rank = |code: u32| match code {
+        1 => 0, // Ready — best
+        0 => 1, // Connecting
+        2 => 2, // Failed
+        3 => 3, // Stopped
+        _ => 4,
+    };
+    if rank(a) <= rank(b) {
+        a
+    } else {
+        b
+    }
+}
+
+/// Direct (1) beats Relay (2) beats None (0). Picks the most-preferred
+/// path-kind across active peers.
+fn better_path_kind(a: u32, b: u32) -> u32 {
+    let rank = |code: u32| match code {
+        1 => 0, // Direct — best
+        2 => 1, // Relay
+        0 => 2, // None
+        _ => 3,
+    };
+    if rank(a) <= rank(b) {
+        a
+    } else {
+        b
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -531,7 +885,7 @@ async fn run_session_manager(
     connector: Arc<MeshConnector>,
     remote_peer_id: String,
     mut outbound_rx: mpsc::UnboundedReceiver<Vec<u8>>,
-    inbound_tx: mpsc::UnboundedSender<Vec<u8>>,
+    inbound_tx: mpsc::UnboundedSender<InboundFrame>,
     mut event_rx: mpsc::UnboundedReceiver<NetworkEvent>,
     mut shutdown_rx: mpsc::UnboundedReceiver<()>,
     shared: Arc<SharedState>,
@@ -606,7 +960,11 @@ async fn run_session_manager(
                             let len = frame.len() as u64;
                             shared.frames_received.fetch_add(1, Ordering::Relaxed);
                             shared.bytes_received.fetch_add(len, Ordering::Relaxed);
-                            if inbound_tx.send(frame).is_err() {
+                            let envelope = InboundFrame {
+                                peer_id: remote_peer_id.clone(),
+                                frame,
+                            };
+                            if inbound_tx.send(envelope).is_err() {
                                 // Swift dropped the receiver — handle is
                                 // dying; let the manager exit on next event.
                                 return;
@@ -1082,6 +1440,409 @@ mod tests {
             "PathChanged must short-circuit backoff (before={}, after={})",
             metrics_before_event.reconnect_count,
             metrics_after_event.reconnect_count
+        );
+    }
+
+    // === Multi-peer integration tests ===
+
+    /// Stands up two distinct "remote peer" QUIC servers on different
+    /// ports, publishes a record for each, and adds both to a single
+    /// `MeshTransportHandle`. Verifies that frames sent to peer A go to
+    /// the right server, and inbound frames are tagged with the source
+    /// peer ID.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mesh_transport_routes_frames_per_peer_with_two_active_peers() {
+        let rendezvous = spawn_dev_rendezvous().await.unwrap();
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+
+        // Peer A's "remote": echoes "A:<frame>"
+        let (server_a, cert_a) = QuicEndpoint::server(bind).unwrap();
+        let server_a_addr = server_a.local_addr().unwrap();
+        let cert_a_der = cert_a.as_der().to_vec();
+        let _accept_a = tokio::spawn(async move {
+            loop {
+                match server_a.accept_one().await {
+                    Ok(session) => {
+                        tokio::spawn(async move {
+                            while let Ok(frame) = session.receive_frame().await {
+                                let mut out = b"A:".to_vec();
+                                out.extend_from_slice(&frame);
+                                let _ = session.send_frame(out).await;
+                            }
+                        });
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        // Peer B's "remote": echoes "B:<frame>"
+        let (server_b, cert_b) = QuicEndpoint::server(bind).unwrap();
+        let server_b_addr = server_b.local_addr().unwrap();
+        let cert_b_der = cert_b.as_der().to_vec();
+        let _accept_b = tokio::spawn(async move {
+            loop {
+                match server_b.accept_one().await {
+                    Ok(session) => {
+                        tokio::spawn(async move {
+                            while let Ok(frame) = session.receive_frame().await {
+                                let mut out = b"B:".to_vec();
+                                out.extend_from_slice(&frame);
+                                let _ = session.send_frame(out).await;
+                            }
+                        });
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        // Publish records for each remote peer.
+        let key_a = DeviceKeypair::generate().unwrap();
+        let peer_a_id = key_a.public_key().peer_id();
+        let record_a = PeerRecord::signed(
+            UnsignedPeerRecord::new(
+                "devmesh",
+                "remote-a",
+                key_a.public_key(),
+                vec![CandidateEndpoint {
+                    candidate_type: CandidateType::Host,
+                    address: server_a_addr.ip().to_string(),
+                    port: server_a_addr.port(),
+                    priority: 120,
+                }],
+                vec!["100.127.0.10/32".to_string()],
+                120,
+                1,
+            )
+            .with_device_certificate(cert_a_der),
+            &key_a,
+        )
+        .unwrap();
+
+        let key_b = DeviceKeypair::generate().unwrap();
+        let peer_b_id = key_b.public_key().peer_id();
+        let record_b = PeerRecord::signed(
+            UnsignedPeerRecord::new(
+                "devmesh",
+                "remote-b",
+                key_b.public_key(),
+                vec![CandidateEndpoint {
+                    candidate_type: CandidateType::Host,
+                    address: server_b_addr.ip().to_string(),
+                    port: server_b_addr.port(),
+                    priority: 120,
+                }],
+                vec!["100.127.0.11/32".to_string()],
+                120,
+                1,
+            )
+            .with_device_certificate(cert_b_der),
+            &key_b,
+        )
+        .unwrap();
+
+        let publisher = RendezvousClient::new(rendezvous.local_addr().to_string());
+        publisher.publish("devmesh", record_a).await.unwrap();
+        publisher.publish("devmesh", record_b).await.unwrap();
+
+        // Build the transport with peer A as the default; then add peer B.
+        let local_key = DeviceKeypair::generate().unwrap();
+        let local_peer_id = local_key.public_key().peer_id();
+        let rendezvous_url = rendezvous.local_addr().to_string();
+        let peer_a_id_for_handle = peer_a_id.clone();
+        let handle = tokio::task::spawn_blocking(move || {
+            MeshTransportHandle::new(MeshTransportConfig {
+                mesh_id: "devmesh".to_string(),
+                local_peer_id,
+                remote_peer_id: peer_a_id_for_handle,
+                rendezvous_url,
+                relay_url: None,
+                bind_addr: "127.0.0.1:0".to_string(),
+                overall_deadline_ms: 2_000,
+                direct_probe_timeout_ms: 500,
+                probe_pacing_ms: 50,
+                enable_ice: false,
+                reconnect_initial_backoff_ms: 250,
+                reconnect_max_backoff_ms: 30_000,
+                metrics_endpoint_bind_addr: None,
+            })
+            .expect("transport new")
+        })
+        .await
+        .unwrap();
+
+        handle.add_peer(&peer_b_id).unwrap();
+        assert!(handle.peer_ids().contains(&peer_a_id));
+        assert!(handle.peer_ids().contains(&peer_b_id));
+
+        // Wait for both sessions to reach Ready.
+        let mut waited = 0_u64;
+        loop {
+            let a_ready =
+                handle.peer_state_code(&peer_a_id) == Some(MeshTransportState::Ready.as_code());
+            let b_ready =
+                handle.peer_state_code(&peer_b_id) == Some(MeshTransportState::Ready.as_code());
+            if a_ready && b_ready {
+                break;
+            }
+            if waited > 5_000 {
+                panic!(
+                    "peers did not reach Ready: a={:?} b={:?}",
+                    handle.peer_state_code(&peer_a_id),
+                    handle.peer_state_code(&peer_b_id)
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            waited += 50;
+        }
+
+        // Send "ping-A" to peer A and "ping-B" to peer B.
+        handle.send_frame_to(&peer_a_id, b"ping-A".to_vec()).unwrap();
+        handle.send_frame_to(&peer_b_id, b"ping-B".to_vec()).unwrap();
+
+        // Collect echoes; expect each one back tagged with its source.
+        let mut got_a = false;
+        let mut got_b = false;
+        for _ in 0..40 {
+            if let Some(inbound) = handle.try_receive_frame_from_any() {
+                if inbound.peer_id == peer_a_id && inbound.frame == b"A:ping-A" {
+                    got_a = true;
+                }
+                if inbound.peer_id == peer_b_id && inbound.frame == b"B:ping-B" {
+                    got_b = true;
+                }
+            }
+            if got_a && got_b {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(got_a, "peer A's echo did not arrive tagged with its peer_id");
+        assert!(got_b, "peer B's echo did not arrive tagged with its peer_id");
+
+        // Aggregate metrics should sum traffic across both peers.
+        let aggregate = handle.metrics();
+        assert!(aggregate.frames_sent >= 2);
+        assert!(aggregate.frames_received >= 2);
+
+        // Per-peer metrics break it down.
+        let per_a = handle.peer_metrics(&peer_a_id).unwrap();
+        let per_b = handle.peer_metrics(&peer_b_id).unwrap();
+        assert!(per_a.frames_sent >= 1);
+        assert!(per_b.frames_sent >= 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remove_peer_shuts_down_session_and_send_to_errors() {
+        let rendezvous = spawn_dev_rendezvous().await.unwrap();
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let (server, cert) = QuicEndpoint::server(bind).unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let cert_der = cert.as_der().to_vec();
+        let _accept = tokio::spawn(async move {
+            loop {
+                match server.accept_one().await {
+                    Ok(session) => {
+                        tokio::spawn(async move {
+                            let _ = session.receive_frame().await;
+                        });
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let remote_key = DeviceKeypair::generate().unwrap();
+        let remote_peer_id = remote_key.public_key().peer_id();
+        let record = PeerRecord::signed(
+            UnsignedPeerRecord::new(
+                "devmesh",
+                "remote",
+                remote_key.public_key(),
+                vec![CandidateEndpoint {
+                    candidate_type: CandidateType::Host,
+                    address: server_addr.ip().to_string(),
+                    port: server_addr.port(),
+                    priority: 120,
+                }],
+                vec!["100.127.0.10/32".to_string()],
+                120,
+                1,
+            )
+            .with_device_certificate(cert_der),
+            &remote_key,
+        )
+        .unwrap();
+        let publisher = RendezvousClient::new(rendezvous.local_addr().to_string());
+        publisher.publish("devmesh", record).await.unwrap();
+
+        let local_key = DeviceKeypair::generate().unwrap();
+        let local_peer_id = local_key.public_key().peer_id();
+        let rendezvous_url = rendezvous.local_addr().to_string();
+        let remote_peer_id_for_handle = remote_peer_id.clone();
+        let handle = tokio::task::spawn_blocking(move || {
+            MeshTransportHandle::new(MeshTransportConfig {
+                mesh_id: "devmesh".to_string(),
+                local_peer_id,
+                remote_peer_id: remote_peer_id_for_handle,
+                rendezvous_url,
+                relay_url: None,
+                bind_addr: "127.0.0.1:0".to_string(),
+                overall_deadline_ms: 2_000,
+                direct_probe_timeout_ms: 500,
+                probe_pacing_ms: 50,
+                enable_ice: false,
+                reconnect_initial_backoff_ms: 250,
+                reconnect_max_backoff_ms: 30_000,
+                metrics_endpoint_bind_addr: None,
+            })
+            .expect("transport new")
+        })
+        .await
+        .unwrap();
+
+        // Wait for Ready then remove the peer.
+        let mut waited = 0;
+        while handle.peer_state_code(&remote_peer_id)
+            != Some(MeshTransportState::Ready.as_code())
+        {
+            if waited > 3_000 {
+                panic!("peer did not reach Ready");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            waited += 50;
+        }
+
+        handle.remove_peer(&remote_peer_id);
+        assert!(handle.peer_ids().is_empty());
+        // Sending to the removed peer must error explicitly — the session
+        // is gone, not just temporarily disconnected.
+        let result = handle.send_frame_to(&remote_peer_id, b"after-remove".to_vec());
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("no active session"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn handle_network_event_fans_out_to_all_active_peers() {
+        // Two peers with bogus rendezvous targets so they sit in
+        // backoff. PathChanged should short-circuit the backoff for
+        // BOTH peers — observed via per-peer reconnect_count both
+        // bumping after the event.
+        let local_key = DeviceKeypair::generate().unwrap();
+        let local_peer_id = local_key.public_key().peer_id();
+        let handle = tokio::task::spawn_blocking(move || {
+            MeshTransportHandle::new(MeshTransportConfig {
+                mesh_id: "devmesh".to_string(),
+                local_peer_id,
+                remote_peer_id: "qlink_does-not-exist-A".to_string(),
+                rendezvous_url: "127.0.0.1:1".to_string(), // unreachable
+                relay_url: None,
+                bind_addr: "127.0.0.1:0".to_string(),
+                overall_deadline_ms: 200,
+                direct_probe_timeout_ms: 100,
+                probe_pacing_ms: 50,
+                enable_ice: false,
+                reconnect_initial_backoff_ms: 5_000, // long enough that natural retry won't fire
+                reconnect_max_backoff_ms: 5_000,
+                metrics_endpoint_bind_addr: None,
+            })
+            .expect("transport new")
+        })
+        .await
+        .unwrap();
+
+        handle.add_peer("qlink_does-not-exist-B").unwrap();
+
+        // Let initial connect attempts fail and the managers park in
+        // backoff.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        let a_before = handle
+            .peer_metrics("qlink_does-not-exist-A")
+            .unwrap()
+            .reconnect_count;
+        let b_before = handle
+            .peer_metrics("qlink_does-not-exist-B")
+            .unwrap()
+            .reconnect_count;
+
+        handle.handle_network_event(NetworkEvent::PathChanged);
+
+        // Both peers should come out of backoff and retry.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let a_after = handle
+            .peer_metrics("qlink_does-not-exist-A")
+            .unwrap()
+            .reconnect_count;
+        let b_after = handle
+            .peer_metrics("qlink_does-not-exist-B")
+            .unwrap()
+            .reconnect_count;
+        assert!(
+            a_after > a_before,
+            "peer A reconnect_count did not advance ({a_before} → {a_after})"
+        );
+        assert!(
+            b_after > b_before,
+            "peer B reconnect_count did not advance ({b_before} → {b_after})"
+        );
+
+        // Aggregate network_event_count bumps once per event, regardless
+        // of how many peers it fans out to.
+        let aggregate = handle.metrics();
+        assert_eq!(aggregate.network_event_count, 1);
+    }
+
+    #[test]
+    fn add_peer_is_idempotent() {
+        // Construct a transport pointing at an unreachable rendezvous so
+        // it doesn't actually do network IO during the test. We just
+        // exercise the peer-map bookkeeping.
+        let runtime = Runtime::new().unwrap();
+        let handle = runtime.block_on(async {
+            tokio::task::spawn_blocking(|| {
+                let local_key = DeviceKeypair::generate().unwrap();
+                MeshTransportHandle::new(MeshTransportConfig {
+                    mesh_id: "devmesh".to_string(),
+                    local_peer_id: local_key.public_key().peer_id(),
+                    remote_peer_id: "qlink_initial-peer".to_string(),
+                    rendezvous_url: "127.0.0.1:1".to_string(),
+                    relay_url: None,
+                    bind_addr: "127.0.0.1:0".to_string(),
+                    overall_deadline_ms: 200,
+                    direct_probe_timeout_ms: 100,
+                    probe_pacing_ms: 50,
+                    enable_ice: false,
+                    reconnect_initial_backoff_ms: 60_000,
+                    reconnect_max_backoff_ms: 60_000,
+                    metrics_endpoint_bind_addr: None,
+                })
+                .unwrap()
+            })
+            .await
+            .unwrap()
+        });
+
+        // The configured peer was auto-added.
+        assert_eq!(handle.peer_ids(), vec!["qlink_initial-peer".to_string()]);
+        // Adding it again is a no-op.
+        handle.add_peer("qlink_initial-peer").unwrap();
+        assert_eq!(handle.peer_ids().len(), 1);
+
+        // Adding a second peer makes it 2.
+        handle.add_peer("qlink_second-peer").unwrap();
+        let mut ids = handle.peer_ids();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec![
+                "qlink_initial-peer".to_string(),
+                "qlink_second-peer".to_string()
+            ]
         );
     }
 }

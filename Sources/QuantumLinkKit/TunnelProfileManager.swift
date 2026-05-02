@@ -111,6 +111,35 @@ public final class TunnelProfileManager {
         return try JSONDecoder().decode(TunnelProviderMessage.self, from: responseData)
     }
 
+    /// Apply a set of On-Demand rules to the tunnel profile. The system
+    /// evaluates these in order on every reachability change and decides
+    /// whether to bring the tunnel up. Pass an empty array to clear the
+    /// rule list (and disable on-demand).
+    ///
+    /// This is the runtime path — useful for unmanaged Macs and dev. For
+    /// managed deployments, ship the rules through MDM by serializing an
+    /// `OnDemandPayloadFragment` into a configuration profile.
+    public func applyOnDemandRules(
+        _ rules: [OnDemandRule],
+        providerBundleIdentifier: String
+    ) async throws {
+        guard let manager = try await manager(for: providerBundleIdentifier) else {
+            throw TunnelProfileManagerError.profileNotFound(providerBundleIdentifier)
+        }
+        try await reload(manager)
+
+        if rules.isEmpty {
+            manager.onDemandRules = nil
+            manager.isOnDemandEnabled = false
+        } else {
+            manager.onDemandRules = rules.map { $0.toNEOnDemandRule() }
+            manager.isOnDemandEnabled = true
+        }
+
+        try await save(manager)
+        try await reload(manager)
+    }
+
     public func remove(providerBundleIdentifier: String) async throws {
         let managers = try await loadManagers()
         for manager in managers {
