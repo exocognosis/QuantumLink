@@ -38,6 +38,9 @@ jobs:
       - name: Pre-build dylib (for Swift step + cache warming)
         run: cargo build -p qlink-core --release
 
+      - name: Prepare build/ directory for tee'd logs
+        run: mkdir -p build
+
       - name: Run SLO scenarios (asserts product.md targets)
         id: slos
         run: |
@@ -53,10 +56,24 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
         shell: bash
 
+      - name: Run synthetic-WAN SLO scenarios
+        id: slos_wan
+        run: |
+          set -o pipefail
+          cargo bench -p qlink-core --bench slos_wan 2>&1 | tee build/perf-slos-wan.log
+          {
+            echo ""
+            echo "## SLO scenarios — synthetic WAN"
+            echo ""
+            echo '```'
+            grep -E '^slo\.' build/perf-slos-wan.log || echo "(no slo.* lines captured)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+        shell: bash
+
       - name: Run connector + ICE micro-benchmarks
         run: |
           set -o pipefail
-          mkdir -p build
           cargo bench -p qlink-core --bench connector 2>&1 | tee build/perf-connector.log
           cargo bench -p qlink-core --bench ice 2>&1 | tee build/perf-ice.log
           {
@@ -71,6 +88,32 @@ jobs:
             grep -E 'time:|^ice/' build/perf-ice.log || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+        shell: bash
+
+      - name: Compare against docs/perf-baseline.json (gates the job)
+        # Runs after every bench step so the gate sees the full data.
+        # Exits 1 if any metric regresses past the baseline's
+        # `regression_threshold_pct` (default 20%) or if a metric the
+        # baseline expects is missing from the bench output.
+        run: |
+          set -o pipefail
+          cargo build -p qlink-core --bin perfgate --release
+          set +e
+          target/release/perfgate \
+            --baseline docs/perf-baseline.json \
+            --slo-log build/perf-slos.log \
+            --slo-log build/perf-slos-wan.log \
+            --criterion-dir target/criterion 2>&1 | tee build/perf-gate.log
+          gate_exit=${PIPESTATUS[0]}
+          set -e
+          {
+            echo ""
+            echo "## Perf gate"
+            echo '```'
+            cat build/perf-gate.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$gate_exit"
         shell: bash
 
       - name: Upload criterion HTML report
@@ -107,17 +150,8 @@ jobs:
           path: build/perf-swift.log
           if-no-files-found: warn
 
-  # FOLLOW-UP: real regression gating.
-  #
-  # The current workflow runs benches and uploads artifacts but does not yet
-  # diff against a stored baseline. The next step is to:
-  #   1. Commit a JSON baseline at docs/perf-baseline.json (one row per
-  #      criterion benchmark + one row per SLO scenario).
-  #   2. Add a `compare-against-baseline` job that parses build/perf-*.log,
-  #      computes per-row deltas, and fails if any p50 regresses by >20%.
-  #   3. Open an automated PR to refresh the baseline when intentional perf
-  #      improvements land (`bench-update` label on a tag push).
-  #
-  # Tracked separately because regression gating on shared CI runners needs
-  # variance characterization first; tightening too early would produce
-  # constant false positives.
+  # Refreshing the baseline when intentional perf changes land:
+  #   1. Run the suites locally (`cargo bench --bench slos|connector|ice`).
+  #   2. Update `docs/perf-baseline.json` with the new numbers.
+  #   3. Update the table in `docs/perf-baseline.md` to match.
+  #   4. Commit both — the gate uses the JSON, humans read the markdown.

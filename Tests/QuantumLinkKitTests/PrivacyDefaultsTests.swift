@@ -136,4 +136,79 @@ final class PrivacyDefaultsTests: XCTestCase {
         XCTAssertTrue(configuration.deviceAlias.hasPrefix("device-"))
         XCTAssertEqual(configuration.dnsSearchDomains, [])
     }
+
+    // MARK: - peer-identifier + log redaction (crash-report safety)
+
+    func testRedactsPeerIdentifierInTheCanonicalFormat() {
+        // The canonical peer_id is `qlink_` + 22 chars of URL-safe
+        // base64-no-pad over the SHA-256-truncated public key.
+        let line = "rejected by ACL: peer qlink_7mAA6HLACEO4_WoR6YwJiw"
+        let redacted = PrivacyDefaults.redactPeerIdentifiers(in: line)
+        XCTAssertEqual(redacted, "rejected by ACL: peer [redacted-peer]")
+    }
+
+    func testRedactsMultiplePeerIdentifiersInOneLine() {
+        let line = "qlink_AAAA1111BBBB2222CCCC33 talking to qlink_DDDD4444EEEE5555FFFF66"
+        let redacted = PrivacyDefaults.redactPeerIdentifiers(in: line)
+        XCTAssertEqual(redacted, "[redacted-peer] talking to [redacted-peer]")
+    }
+
+    func testPeerRedactionLeavesUnrelatedQlinkPrefixesAlone() {
+        // The pattern requires `qlink_` followed by 20+ chars.
+        // Configuration keys, log labels, and short identifiers must
+        // pass through unchanged.
+        let cases = [
+            "qlinkctl",                   // CLI binary name
+            "qlink_short",                // not enough trailing chars
+            "qlink_metrics_endpoint",     // config key
+        ]
+        for value in cases {
+            XCTAssertEqual(
+                PrivacyDefaults.redactPeerIdentifiers(in: value),
+                value,
+                "should not redact: \(value)"
+            )
+        }
+    }
+
+    func testRedactForLogStripsBothNetworkAndPeerIdentifiers() {
+        // The shape of an actual Rust-core protocol error that flows
+        // up through `localizedDescription` into a `.public` log line:
+        // mesh_id, peer_id, and a host:port candidate all in the same
+        // string.
+        let raw = "peer qlink_7mAA6HLACEO4_WoR6YwJiw not found in rendezvous devmesh; last try 192.168.1.50:9471"
+        let redacted = PrivacyDefaults.redactForLog(raw)
+
+        XCTAssertFalse(redacted.contains("qlink_7mAA6HLACEO4_WoR6YwJiw"))
+        XCTAssertFalse(redacted.contains("192.168.1.50"))
+        XCTAssertFalse(redacted.contains("9471"))
+        XCTAssertTrue(redacted.contains("[redacted-peer]"))
+        XCTAssertTrue(redacted.contains("[redacted-ip]"))
+        // Pseudonymous mesh_id is intentionally preserved — it's a
+        // configuration value the operator chose, not an identifier
+        // derived from device material.
+        XCTAssertTrue(redacted.contains("devmesh"))
+    }
+
+    func testRedactForLogErrorOverloadRunsOnLocalizedDescription() {
+        struct TestError: LocalizedError {
+            let errorDescription: String?
+        }
+        let error = TestError(errorDescription: "transport handshake failed against qlink_AAAAAAAAAAAAAAAAAAAA at 10.0.0.5:443")
+        let redacted = PrivacyDefaults.redactForLog(error)
+
+        XCTAssertFalse(redacted.contains("qlink_AAAAAAAAAAAAAAAAAAAA"))
+        XCTAssertFalse(redacted.contains("10.0.0.5"))
+        XCTAssertTrue(redacted.contains("transport handshake failed"))
+    }
+
+    func testRedactNetworkIdentifiersStillKeepsPeerIdentifiersForSupportBundlePath() {
+        // Regression guard for the deliberate split: support bundles
+        // keep peer_id by design (see `SupportBundleRedactionMode`
+        // doc). Don't accidentally widen `redactNetworkIdentifiers`.
+        let line = "peer qlink_7mAA6HLACEO4_WoR6YwJiw at 192.168.1.50"
+        let redacted = PrivacyDefaults.redactNetworkIdentifiers(in: line)
+        XCTAssertTrue(redacted.contains("qlink_7mAA6HLACEO4_WoR6YwJiw"))
+        XCTAssertFalse(redacted.contains("192.168.1.50"))
+    }
 }

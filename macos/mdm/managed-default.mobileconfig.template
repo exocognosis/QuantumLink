@@ -1,0 +1,105 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Tunnel-wide managed VPN profile (no per-app mapping). Push this when
+  every managed app should route through the QuantumLink mesh — i.e.,
+  the device's default network policy is "this VPN, period."
+
+  Differs from `per-app-vpn.mobileconfig.template`: omits the
+  `com.apple.vpn.managed.applayer` payload, adds a `VendorConfig`
+  block with managed defaults the Swift app will read on first launch
+  (mesh ID, rendezvous URL, kill switch), and bumps the on-demand
+  rule set so the tunnel comes up automatically when the device has
+  any reachable network.
+
+  Replace before deploy:
+    REPLACE-WITH-VPN-PAYLOAD-UUID
+    REPLACE-WITH-PROFILE-UUID
+    rendezvous + relay URLs in VendorConfig
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>PayloadContent</key>
+    <array>
+        <dict>
+            <key>PayloadType</key>
+            <string>com.apple.vpn.managed</string>
+            <key>PayloadVersion</key>
+            <integer>1</integer>
+            <key>PayloadIdentifier</key>
+            <string>com.quantumlink.macos.mdm.vpn.managed-default</string>
+            <key>PayloadUUID</key>
+            <string>REPLACE-WITH-VPN-PAYLOAD-UUID</string>
+            <key>PayloadDisplayName</key>
+            <string>QuantumLink VPN (managed default)</string>
+            <key>UserDefinedName</key>
+            <string>QuantumLink</string>
+            <key>VPNType</key>
+            <string>VPN</string>
+            <key>VPNSubType</key>
+            <string>com.quantumlink.macos.PacketTunnel</string>
+            <key>ProviderBundleIdentifier</key>
+            <string>com.quantumlink.macos.PacketTunnel</string>
+            <key>ProviderType</key>
+            <string>packet-tunnel</string>
+            <!--
+              VendorConfig is the Apple-blessed channel for handing
+              implementation-specific settings to the packet tunnel
+              provider. The Swift app reads this dictionary out of
+              `protocolConfiguration.providerConfiguration` and
+              hydrates the `TunnelConfiguration` it passes to the
+              extension. Keys here mirror the JSON config schema in
+              `Sources/QuantumLinkKit/Models.swift`.
+            -->
+            <key>VendorConfig</key>
+            <dict>
+                <key>meshID</key>
+                <string>devmesh</string>
+                <key>rendezvousServers</key>
+                <array>
+                    <string>rendezvous.example.com:9471</string>
+                </array>
+                <key>relayServers</key>
+                <array>
+                    <string>relay.example.com:9472</string>
+                </array>
+                <key>killSwitch</key>
+                <string>failClosed</string>
+                <key>routeMode</key>
+                <string>splitTunnel</string>
+                <key>configurationProfile</key>
+                <string>managed-default</string>
+            </dict>
+            <key>OnDemandEnabled</key>
+            <integer>1</integer>
+            <!--
+              "Connect on any reachable network" — appropriate for
+              managed-default because the policy intent is "always
+              prefer the mesh." Operators wanting a more nuanced
+              policy (Wi-Fi only, exclude cellular, etc.) should
+              start from `on-demand-exemplar.mobileconfig.template`
+              and adapt.
+            -->
+            <key>OnDemandRules</key>
+            <array>
+                <dict>
+                    <key>Action</key>
+                    <string>Connect</string>
+                </dict>
+            </array>
+        </dict>
+    </array>
+    <key>PayloadType</key>
+    <string>Configuration</string>
+    <key>PayloadVersion</key>
+    <integer>1</integer>
+    <key>PayloadIdentifier</key>
+    <string>com.quantumlink.macos.mdm.managed-default-profile</string>
+    <key>PayloadUUID</key>
+    <string>REPLACE-WITH-PROFILE-UUID</string>
+    <key>PayloadDisplayName</key>
+    <string>QuantumLink Managed Default VPN</string>
+    <key>PayloadOrganization</key>
+    <string>QuantumLink</string>
+</dict>
+</plist>

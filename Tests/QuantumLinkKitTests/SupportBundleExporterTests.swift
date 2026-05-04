@@ -83,6 +83,12 @@ final class SupportBundleExporterTests: XCTestCase {
         counters.transportFramesAccepted = 47
         counters.failedInboundFrames = 0
         counters.tunnelPacketsEmitted = 47
+        // Two peers contributing to the accepted-frame total.
+        // Surfaced through `PumpDiagnostics.transportFramesAcceptedPerPeer`.
+        counters.transportFramesAcceptedPerPeer = [
+            "qlink_AAAA1111BBBB2222CCCC33": 30,
+            "qlink_DDDD4444EEEE5555FFFF66": 17
+        ]
         return counters
     }
 
@@ -259,5 +265,31 @@ final class SupportBundleExporterTests: XCTestCase {
 
         XCTAssertTrue(defaultJSON.contains("\"redactionMode\" : \"default\""))
         XCTAssertTrue(rawJSON.contains("\"redactionMode\" : \"raw\""))
+    }
+
+    func testPumpDiagnosticsCarriesPerPeerBreakdown() throws {
+        // The per-peer counter is the load-bearing piece of the
+        // peer-attribution work shipped in earlier sessions; the
+        // bundle exposes it (peer_id is pseudonymous + signed,
+        // safe to ship in operator diagnostics).
+        let exporter = makeExporter()
+        let bundle = exporter.buildBundle(
+            status: tunnelStatusWithLeakyError(),
+            meshMetrics: meshMetricsWithLeakyState(),
+            meshLastError: nil,
+            pumpCounters: leakyPumpCounters(),
+            configuration: leakyConfiguration(),
+            redactionMode: .default
+        )
+
+        let pump = try XCTUnwrap(bundle.pump)
+        XCTAssertEqual(pump.transportFramesAcceptedPerPeer["qlink_AAAA1111BBBB2222CCCC33"], 30)
+        XCTAssertEqual(pump.transportFramesAcceptedPerPeer["qlink_DDDD4444EEEE5555FFFF66"], 17)
+        // Sum of the per-peer breakdown is consistent with the
+        // overall counter.
+        XCTAssertEqual(
+            pump.transportFramesAcceptedPerPeer.values.reduce(0, +),
+            pump.transportFramesAccepted
+        )
     }
 }

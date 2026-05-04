@@ -190,6 +190,53 @@ public enum PrivacyDefaults {
         )
     }
 
+    /// Redacts peer-attributable identifiers that should not appear in
+    /// crash reports or `.public`-tagged log output:
+    ///
+    /// - QuantumLink `peer_id` strings (`qlink_<22-char-base64url>`).
+    ///   The format is fixed by `DevicePublicKey::peer_id` in the Rust
+    ///   core: `"qlink_"` + URL-safe base64 of the first 16 bytes of
+    ///   `SHA-256(public_key_bytes)`, no padding. The pattern is
+    ///   deliberately a shade more permissive than the spec (allowing
+    ///   20-32 trailing chars) so a future format tweak doesn't
+    ///   silently start leaking identifiers.
+    ///
+    /// Why this is separate from `redactNetworkIdentifiers`: support
+    /// bundles deliberately keep `peer_id`s by design (see
+    /// `SupportBundleRedactionMode` doc comment). Crash reports and
+    /// OS-log output are user-shareable artifacts where we want
+    /// stricter redaction — `redactForLog` combines both.
+    public static func redactPeerIdentifiers(in value: String) -> String {
+        let pattern = #"\bqlink_[A-Za-z0-9_-]{20,32}\b"#
+        return value.replacingOccurrences(
+            of: pattern,
+            with: "[redacted-peer]",
+            options: .regularExpression
+        )
+    }
+
+    /// Combined redaction for crash reports and `.public`-tagged
+    /// `Logger` interpolations: drops both network identifiers and
+    /// QuantumLink peer IDs.
+    ///
+    /// Use this for any string that may end up in a user-shareable
+    /// artifact (crash reports, Console.app exports, `log show`
+    /// output). For support-bundle JSON keep using
+    /// `redactNetworkIdentifiers` — that path intentionally retains
+    /// `peer_id`s as pseudonymous identifiers.
+    public static func redactForLog(_ value: String) -> String {
+        redactPeerIdentifiers(in: redactNetworkIdentifiers(in: value))
+    }
+
+    /// Convenience overload that pulls `localizedDescription` off the
+    /// error and runs `redactForLog` on it. The vast majority of leak
+    /// vectors in this codebase are
+    /// `\(error.localizedDescription, privacy: .public)` — call sites
+    /// can swap straight to `\(PrivacyDefaults.redactForLog(error), privacy: .public)`.
+    public static func redactForLog(_ error: Error) -> String {
+        redactForLog(error.localizedDescription)
+    }
+
     /// Redacts network identifiers that operators or users might paste into
     /// a support bundle or share over chat. Covers:
     ///
@@ -204,6 +251,11 @@ public enum PrivacyDefaults {
     /// addresses vs. configuration keys vs. peer aliases. Hostname
     /// redaction is a v2 feature once we have a clearer separation in the
     /// data model.
+    ///
+    /// **Note**: this function does NOT touch `peer_id` strings — by
+    /// design, since support bundles use it and intentionally keep
+    /// `peer_id`s as pseudonymous identifiers. For crash reports and
+    /// log lines, use `redactForLog` instead.
     public static func redactNetworkIdentifiers(in value: String) -> String {
         // Order matters: redact bracketed IPv6 (with optional port) FIRST,
         // because the inner address would otherwise be matched by the

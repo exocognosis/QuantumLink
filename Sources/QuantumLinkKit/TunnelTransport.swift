@@ -26,6 +26,18 @@ public struct MeshTransportConfiguration: Codable, Equatable, Sendable {
     public let directProbeTimeoutMs: UInt64
     public let probePacingMs: UInt64
     public let enableICE: Bool
+    /// Filesystem path of the persistent peer-record cache.
+    /// Mirrors the Rust `peer_store_path`; `nil` keeps the
+    /// connector's in-memory-only store. The parent directory must
+    /// exist before tunnel start.
+    public let peerStorePath: String?
+    /// Optional 32-byte ChaCha20-Poly1305 key, base64-encoded
+    /// (standard alphabet, with padding). Mirrors the Rust
+    /// `peer_store_key_b64`. When set together with `peerStorePath`,
+    /// the on-disk cache file is written in the v2 encrypted
+    /// envelope; without it the file is plaintext JSON. Mint via
+    /// `PeerStoreKey.loadOrGenerateBase64()`.
+    public let peerStoreKeyB64: String?
 
     public init(
         meshID: String,
@@ -37,7 +49,9 @@ public struct MeshTransportConfiguration: Codable, Equatable, Sendable {
         overallDeadlineMs: UInt64 = 3_000,
         directProbeTimeoutMs: UInt64 = 750,
         probePacingMs: UInt64 = 50,
-        enableICE: Bool = false
+        enableICE: Bool = false,
+        peerStorePath: String? = nil,
+        peerStoreKeyB64: String? = nil
     ) {
         self.meshID = meshID
         self.localPeerID = localPeerID
@@ -49,6 +63,8 @@ public struct MeshTransportConfiguration: Codable, Equatable, Sendable {
         self.directProbeTimeoutMs = directProbeTimeoutMs
         self.probePacingMs = probePacingMs
         self.enableICE = enableICE
+        self.peerStorePath = peerStorePath
+        self.peerStoreKeyB64 = peerStoreKeyB64
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -62,6 +78,8 @@ public struct MeshTransportConfiguration: Codable, Equatable, Sendable {
         case directProbeTimeoutMs
         case probePacingMs
         case enableICE = "enableIce"
+        case peerStorePath = "peerStorePath"
+        case peerStoreKeyB64 = "peerStoreKeyB64"
     }
 }
 
@@ -114,11 +132,25 @@ public struct TunnelTransportMetrics: Codable, Equatable, Sendable {
     }
 }
 
+/// Inbound frame surfaced by a `TunnelTransporting`. For mesh transports
+/// `peerID` is the verified peer ID from the inbound responder loop; for
+/// transports with no peer concept (development drop, dev QUIC loopback)
+/// it's `nil`.
+public struct InboundTransportFrame: Equatable, Sendable {
+    public let frame: Data
+    public let peerID: String?
+
+    public init(frame: Data, peerID: String? = nil) {
+        self.frame = frame
+        self.peerID = peerID
+    }
+}
+
 public protocol TunnelTransporting: AnyObject, TransportFrameSink {
     var metrics: TunnelTransportMetrics { get }
     func start() throws
     func stop()
-    func receiveTransportFrame() throws -> Data?
+    func receiveTransportFrame() throws -> InboundTransportFrame?
 }
 
 public final class DevelopmentDropTransportSender: TunnelTransporting {
@@ -156,7 +188,7 @@ public final class DevelopmentDropTransportSender: TunnelTransporting {
         metrics.lastError = reason
     }
 
-    public func receiveTransportFrame() throws -> Data? {
+    public func receiveTransportFrame() throws -> InboundTransportFrame? {
         nil
     }
 }
@@ -224,13 +256,15 @@ public final class RustDevQuicLoopbackTransport: TunnelTransporting {
         }
     }
 
-    public func receiveTransportFrame() throws -> Data? {
+    public func receiveTransportFrame() throws -> InboundTransportFrame? {
         guard let handle else {
             return nil
         }
         let frame = library.receiveDevQuicFrame(handle: handle)
         refreshMetrics()
-        return frame
+        // Dev loopback has a single hard-coded session pair; there's no
+        // verified peer identity to report.
+        return frame.map { InboundTransportFrame(frame: $0, peerID: nil) }
     }
 
     private func refreshMetrics() {
@@ -265,6 +299,11 @@ public final class RustDevQuicLoopbackTransport: TunnelTransporting {
 public final class RustMeshTransport: TunnelTransporting {
     private let library: RustCoreLibrary
     private let configuration: MeshTransportConfiguration
+    /// Local device keypair for the responder + cert publishing flow.
+    /// When `nil`, the connector skips signing inbound assertions and
+    /// `publishSelf` is unavailable. Production deployments MUST set
+    /// this to enable real multi-peer connectivity.
+    private let keypair: RustDeviceKeypair?
     private var handle: UnsafeMutableRawPointer?
     public private(set) var metrics = TunnelTransportMetrics(
         kind: .meshQuic,
@@ -272,9 +311,20 @@ public final class RustMeshTransport: TunnelTransporting {
         pathType: .unavailable
     )
 
-    public init(library: RustCoreLibrary, configuration: MeshTransportConfiguration) {
+    public init(
+        library: RustCoreLibrary,
+        configuration: MeshTransportConfiguration,
+        keypair: RustDeviceKeypair? = nil
+    ) {
         self.library = library
         self.configuration = configuration
+        self.keypair = keypair
+    }
+
+    /// Public peer ID this transport will publish under. `nil` when
+    /// no keypair was supplied at construction.
+    public var localPeerID: String? {
+        keypair?.peerID
     }
 
     deinit {
@@ -292,7 +342,17 @@ public final class RustMeshTransport: TunnelTransporting {
         }
         do {
             let configJSON = try JSONEncoder().encode(configuration)
-            handle = try library.createMeshTransport(configJSON: configJSON)
+            // Pick the constructor variant based on whether the
+            // caller supplied a keypair. Without a keypair the
+            // connector won't sign outbound assertions, so any peer
+            // running the inbound responder will silently close us
+            // out — but legacy single-peer deployments without a
+            // responder still work.
+            if let keypair {
+                handle = try library.createMeshTransport(configJSON: configJSON, keypair: keypair.handle)
+            } else {
+                handle = try library.createMeshTransport(configJSON: configJSON)
+            }
             metrics.state = .ready
             metrics.pathType = .probing
             metrics.lastError = nil
@@ -300,6 +360,96 @@ public final class RustMeshTransport: TunnelTransporting {
         } catch {
             metrics.state = .failed
             metrics.pathType = .unavailable
+            metrics.lastError = error.localizedDescription
+            throw error
+        }
+    }
+
+    /// DER-encoded QUIC server certificate the responder presents.
+    /// `nil` when the responder is disabled or the transport hasn't
+    /// started. Required for callers that mint signed peer records.
+    public var serverCertificateDER: Data? {
+        guard let handle else { return nil }
+        return library.meshTransportServerCertificateDER(handle: handle)
+    }
+
+    /// Bound address of the inbound responder, formatted as
+    /// `host:port`. `nil` when the responder is disabled or the
+    /// transport hasn't started.
+    public var responderLocalAddress: String? {
+        guard let handle else { return nil }
+        return library.meshTransportResponderLocalAddress(handle: handle)
+    }
+
+    /// Mints + signs a peer record for the local node and publishes
+    /// it to the rendezvous server. Synchronous on the calling
+    /// thread (FFI uses the Rust runtime internally). Throws when:
+    /// - no keypair was supplied at construction
+    /// - the transport hasn't been started
+    /// - the responder is disabled in the configuration
+    /// - the keypair's peer_id doesn't match `configuration.localPeerID`
+    /// - the rendezvous publish call fails
+    public func publishSelf(
+        rendezvousURL: String,
+        ttlSeconds: UInt64 = 120,
+        sequence: UInt64
+    ) throws {
+        guard let handle else {
+            throw RustCoreBridgeError.operationFailed("Mesh transport is not started")
+        }
+        guard let keypair else {
+            throw RustCoreBridgeError.operationFailed("publishSelf requires a keypair-equipped transport")
+        }
+        try library.meshTransportPublishSelf(
+            handle: handle,
+            keypair: keypair.handle,
+            rendezvousURL: rendezvousURL,
+            ttlSeconds: ttlSeconds,
+            sequence: sequence
+        )
+    }
+
+    /// Adds a peer to the multi-peer transport. Idempotent. The
+    /// transport's session manager will start dialing this peer via
+    /// rendezvous + ICE in the background.
+    public func addPeer(_ peerID: String) throws {
+        guard let handle else {
+            throw RustCoreBridgeError.operationFailed("Mesh transport is not started")
+        }
+        try library.meshTransportAddPeer(handle: handle, peerID: peerID)
+    }
+
+    /// Removes a peer from the multi-peer transport. Idempotent.
+    public func removePeer(_ peerID: String) {
+        guard let handle else { return }
+        library.meshTransportRemovePeer(handle: handle, peerID: peerID)
+    }
+
+    /// Per-peer state code (`RustMeshTransportState`). `nil` when
+    /// the peer isn't active.
+    public func peerStateCode(_ peerID: String) -> RustMeshTransportState? {
+        guard let handle else { return nil }
+        guard let raw = library.meshTransportPeerStateCode(handle: handle, peerID: peerID) else {
+            return nil
+        }
+        return RustMeshTransportState(rawValue: raw)
+    }
+
+    /// Sends a frame to a specific peer. Use this when `addPeer` /
+    /// `removePeer` has populated multiple peers and the caller
+    /// knows which one to target. For single-peer back-compat, use
+    /// `sendTransportFrame` (which targets the configured default).
+    public func sendFrameTo(_ peerID: String, frame: Data) throws {
+        guard let handle else {
+            metrics.sendFailures += 1
+            metrics.lastError = "Mesh transport is not started"
+            throw RustCoreBridgeError.operationFailed("Mesh transport is not started")
+        }
+        do {
+            try library.meshTransportSendFrameTo(handle: handle, peerID: peerID, frame: frame)
+            refreshMetrics()
+        } catch {
+            metrics.sendFailures += 1
             metrics.lastError = error.localizedDescription
             throw error
         }
@@ -330,11 +480,14 @@ public final class RustMeshTransport: TunnelTransporting {
         }
     }
 
-    public func receiveTransportFrame() throws -> Data? {
+    public func receiveTransportFrame() throws -> InboundTransportFrame? {
         guard let handle else { return nil }
-        let frame = library.receiveMeshTransportFrame(handle: handle)
+        guard let inbound = library.receiveMeshTransportFrame(handle: handle) else {
+            refreshMetrics()
+            return nil
+        }
         refreshMetrics()
-        return frame
+        return InboundTransportFrame(frame: inbound.frame, peerID: inbound.peerID)
     }
 
     /// Forwards a system-level network event to the Rust connector. The
@@ -380,6 +533,38 @@ public final class RustMeshTransport: TunnelTransporting {
     }
 }
 
+/// Encapsulates everything `RustMeshTransport.makeProduction(...)`
+/// returns: the transport itself plus the auxiliary state the
+/// caller needs to drive publishSelf + diagnostics.
+public struct ProductionMeshTransportBundle {
+    public let transport: RustMeshTransport
+    public let keypair: RustDeviceKeypair
+    public let library: RustCoreLibrary
+    /// First rendezvous URL configured on the tunnel; used by the
+    /// caller to invoke `publishSelf`. `nil` when the configuration
+    /// has no rendezvous servers — caller should not start the
+    /// publish loop in that case.
+    public let rendezvousURL: String?
+    /// Whether peer-store on-disk encryption is wired. Diagnostics
+    /// surface this so operators can confirm the encrypted path is
+    /// active.
+    public let peerStoreEncryptionEnabled: Bool
+}
+
+public enum TunnelTransportFactoryError: Error, LocalizedError {
+    case libraryUnavailable(Error)
+    case deviceKeypairLoadFailed(Error)
+
+    public var errorDescription: String? {
+        switch self {
+        case .libraryUnavailable(let underlying):
+            "Rust core library unavailable: \(underlying.localizedDescription)"
+        case .deviceKeypairLoadFailed(let underlying):
+            "Could not load or generate device keypair: \(underlying.localizedDescription)"
+        }
+    }
+}
+
 public enum TunnelTransportFactory {
     public static func makeDefault(
         configuration: TunnelConfiguration,
@@ -397,6 +582,91 @@ public enum TunnelTransportFactory {
                 reason: "Set QLINK_TRANSPORT_MODE=mesh-quic for the production data plane, or QLINK_TRANSPORT_MODE=dev-quic-loopback for local QUIC smoke testing"
             )
         }
+    }
+
+    /// Production wiring path: loads the device keypair from the
+    /// Keychain (or generates + persists on first launch), optionally
+    /// loads the peer-store encryption key, stitches a
+    /// `MeshTransportConfiguration` from the tunnel configuration,
+    /// and constructs a keypair-equipped `RustMeshTransport`.
+    ///
+    /// Throws when the Rust dylib is unreachable or the Keychain
+    /// can't surface a device keypair (entitlement missing,
+    /// disk full on first generation, etc). Callers running outside
+    /// a signed app bundle (SPM smoke tests, qlinkctl) should fall
+    /// back to `makeDefault` on this throw.
+    public static func makeProductionMeshTransport(
+        configuration: TunnelConfiguration,
+        bindAddress: String = "0.0.0.0:0",
+        peerStoreDirectory: URL? = nil,
+        keychainStore: KeychainSecretStore? = nil
+    ) throws -> ProductionMeshTransportBundle {
+        let library: RustCoreLibrary
+        do {
+            library = try RustCoreLibrary.openBundledOrConfigured()
+        } catch {
+            throw TunnelTransportFactoryError.libraryUnavailable(error)
+        }
+
+        let keychain = keychainStore ?? KeychainSecretStore(service: "com.quantumlink.macos.secrets")
+
+        let keypair: RustDeviceKeypair
+        do {
+            keypair = try DeviceKeypairStore(keychain: keychain).loadOrGenerate(library: library)
+        } catch {
+            throw TunnelTransportFactoryError.deviceKeypairLoadFailed(error)
+        }
+
+        // Peer-store path: only wire the cache if a directory was
+        // given. The caller decides where (NEPacketTunnelProvider
+        // uses the app-group container; tests pass a tempdir).
+        var peerStorePath: String?
+        var peerStoreKeyB64: String?
+        var peerStoreEncryptionEnabled = false
+        if let dir = peerStoreDirectory {
+            // The Rust core does not auto-create the parent
+            // directory, so ensure it exists before pointing at it.
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            peerStorePath = dir.appendingPathComponent("peers.json").path
+            // Encryption is best-effort: if the Keychain isn't
+            // available (SPM smoke), silently ship with plaintext
+            // on disk rather than failing the whole launch. The
+            // file is still mode 0o600 in either case.
+            if let keyB64 = try? PeerStoreKey(keychain: keychain).loadOrGenerateBase64() {
+                peerStoreKeyB64 = keyB64
+                peerStoreEncryptionEnabled = true
+            }
+        }
+
+        let rendezvousURL = configuration.rendezvousServers.first
+        let relayURL = configuration.relayServers.first
+
+        let meshConfig = MeshTransportConfiguration(
+            meshID: configuration.meshID,
+            localPeerID: keypair.peerID,
+            // Default peer for the legacy single-peer fallback
+            // surface; production callers should `addPeer(_:)`
+            // explicit peers post-start.
+            remotePeerID: "qlink_unconfigured",
+            rendezvousURL: rendezvousURL ?? "127.0.0.1:9471",
+            relayURL: relayURL,
+            bindAddress: bindAddress,
+            peerStorePath: peerStorePath,
+            peerStoreKeyB64: peerStoreKeyB64
+        )
+
+        let transport = RustMeshTransport(
+            library: library,
+            configuration: meshConfig,
+            keypair: keypair
+        )
+        return ProductionMeshTransportBundle(
+            transport: transport,
+            keypair: keypair,
+            library: library,
+            rendezvousURL: rendezvousURL,
+            peerStoreEncryptionEnabled: peerStoreEncryptionEnabled
+        )
     }
 
     private static func makeDevQuicLoopbackTransport() -> TunnelTransporting {

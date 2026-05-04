@@ -6,6 +6,7 @@ use crate::{
     inbound_identity::send_inbound_assertion,
     mdns_discovery::{compute_public_key_fingerprint, MdnsPeerObservation},
     peer_acl::PeerAcl,
+    peer_store::{InMemoryPeerStore, PeerStore},
     quic_transport::{QuicCertificate, QuicDatagramSession, QuicEndpoint},
     relay::RelayClient,
     rendezvous::RendezvousClient,
@@ -439,6 +440,12 @@ pub struct MeshConnector {
     quic: QuicEndpoint,
     cache: LastGoodCache,
     mdns_cache: MdnsObservationCache,
+    /// Persistent + in-memory cache of signed peer records. Defaults to
+    /// in-memory; set via `with_peer_store` to use a file-backed store
+    /// that survives process restarts. The connector consults the
+    /// store as a fallback when rendezvous is unreachable, and writes
+    /// through to it on every successful rendezvous lookup.
+    peer_store: Arc<dyn PeerStore>,
 }
 
 impl MeshConnector {
@@ -453,7 +460,20 @@ impl MeshConnector {
             quic,
             cache: LastGoodCache::default(),
             mdns_cache: MdnsObservationCache::default(),
+            peer_store: Arc::new(InMemoryPeerStore::new()),
         }
+    }
+
+    /// Replaces the connector's peer record store. Use this to swap in
+    /// a `FilePeerStore` (or any other `PeerStore` impl) for cross-
+    /// restart persistence.
+    pub fn with_peer_store(mut self, peer_store: Arc<dyn PeerStore>) -> Self {
+        self.peer_store = peer_store;
+        self
+    }
+
+    pub fn peer_store(&self) -> &Arc<dyn PeerStore> {
+        &self.peer_store
     }
 
     pub fn config(&self) -> &MeshConnectorConfig {
@@ -548,16 +568,72 @@ impl MeshConnector {
             }
         }
 
-        let record = self
+        // Rendezvous is the source of truth for freshness, so try it
+        // first. If it succeeds, we write through to the local store
+        // on the way out so a future rendezvous outage can fall back
+        // to the cached record.
+        //
+        // If rendezvous fails (timeout, server down, transient
+        // network) and we have a cached record for this peer, we use
+        // it. The signature is re-verified below — a cache hit isn't
+        // a trust shortcut, just a freshness fallback. Records that
+        // verify successfully but are past their `expires_at_unix`
+        // are still usable; the connector treats expiry as advisory
+        // (the protocol's actual security boundary is the signature),
+        // and "stale record beats no record at all" matches the spec
+        // intent of degraded-mode operation.
+        let record = match self
             .rendezvous
             .lookup(&self.config.mesh_id, remote_peer_id)
-            .await?
-            .ok_or_else(|| {
-                QlinkError::Protocol(format!(
-                    "peer {remote_peer_id} not found in rendezvous {}",
-                    self.config.mesh_id
-                ))
-            })?;
+            .await
+        {
+            Ok(Some(fresh)) => {
+                // Pre-verify before writing through so we never cache
+                // a record we wouldn't trust. Verification runs again
+                // below for the use-time check; the cost is negligible
+                // and the duplication is intentional (cache invariant
+                // vs. use invariant).
+                if fresh.verify(&self.config.mesh_id).is_ok() {
+                    self.peer_store.store(&self.config.mesh_id, &fresh);
+                }
+                fresh
+            }
+            Ok(None) => {
+                // Rendezvous is healthy but doesn't know this peer.
+                // The cache might still have a record from a previous
+                // session — accept it as a fallback.
+                match self.peer_store.load(&self.config.mesh_id, remote_peer_id) {
+                    Some(cached) => {
+                        tracing::debug!(
+                            peer_id = %remote_peer_id,
+                            "peer not found in rendezvous; using cached record"
+                        );
+                        cached
+                    }
+                    None => {
+                        return Err(QlinkError::Protocol(format!(
+                            "peer {remote_peer_id} not found in rendezvous {}",
+                            self.config.mesh_id
+                        )));
+                    }
+                }
+            }
+            Err(rendezvous_error) => {
+                // Network / server failure. The cache is exactly the
+                // safety net the spec wants here.
+                match self.peer_store.load(&self.config.mesh_id, remote_peer_id) {
+                    Some(cached) => {
+                        tracing::warn!(
+                            peer_id = %remote_peer_id,
+                            error = %rendezvous_error,
+                            "rendezvous lookup failed; falling back to cached record"
+                        );
+                        cached
+                    }
+                    None => return Err(rendezvous_error),
+                }
+            }
+        };
         record.verify(&self.config.mesh_id)?;
         let remote_ice_credentials = record.body.ice_credentials.clone();
         // The signed record carries the remote's QUIC server cert. We trust
@@ -2098,6 +2174,213 @@ mod tests {
         });
 
         assert_eq!(cache.observations_for("qlink_dup").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn connect_writes_through_to_peer_store_on_rendezvous_hit() {
+        // After a successful rendezvous lookup, the record must end up
+        // in the connector's peer_store — that's what populates the
+        // cache for future rendezvous-outage fallback.
+        use crate::peer_store::{InMemoryPeerStore, PeerStore};
+
+        let rendezvous = spawn_dev_rendezvous().await.unwrap();
+        let rendezvous_client = RendezvousClient::new(rendezvous.local_addr().to_string());
+
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let (server_endpoint, server_cert) = QuicEndpoint::server(bind).unwrap();
+        let server_addr = server_endpoint.local_addr().unwrap();
+        let server_cert_der = server_cert.as_der().to_vec();
+        let client_endpoint = QuicEndpoint::client(bind, &[server_cert]).unwrap();
+
+        let _accept_loop = tokio::spawn(async move {
+            loop {
+                match server_endpoint.accept_one().await {
+                    Ok(session) => {
+                        tokio::spawn(async move {
+                            let _ = session.receive_frame().await;
+                        });
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let local_key = DeviceKeypair::generate().unwrap();
+        let remote_key = DeviceKeypair::generate().unwrap();
+        let remote_peer_id = remote_key.public_key().peer_id();
+
+        rendezvous_client
+            .publish(
+                MESH_ID,
+                signed_record_with_cert(
+                    &remote_key,
+                    vec![CandidateEndpoint {
+                        candidate_type: CandidateType::Host,
+                        address: server_addr.ip().to_string(),
+                        port: server_addr.port(),
+                        priority: 120,
+                    }],
+                    1,
+                    server_cert_der,
+                ),
+            )
+            .await
+            .unwrap();
+
+        let peer_store: Arc<dyn PeerStore> = Arc::new(InMemoryPeerStore::new());
+        assert!(peer_store.is_empty(), "store starts empty");
+
+        let connector = MeshConnector::new(
+            MeshConnectorConfig::new(MESH_ID, local_key.public_key().peer_id())
+                .with_direct_probe_timeout(Duration::from_millis(500))
+                .with_overall_deadline(Duration::from_secs(2)),
+            rendezvous_client,
+            client_endpoint,
+        )
+        .with_peer_store(peer_store.clone());
+
+        let (_link, _outcome) = connector.connect(&remote_peer_id).await.unwrap();
+
+        let cached = peer_store
+            .load(MESH_ID, &remote_peer_id)
+            .expect("write-through must populate the store");
+        assert_eq!(cached.body.peer_id, remote_peer_id);
+        assert_eq!(cached.body.sequence, 1);
+        assert_eq!(peer_store.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn connect_falls_back_to_peer_store_when_rendezvous_unreachable() {
+        // The reason we built persistence: a connector that can't
+        // reach rendezvous must still be able to dial peers it has
+        // previously authenticated. Pre-populate the store with a
+        // valid signed record, point the connector at a dead
+        // rendezvous address, and confirm the dial still completes.
+        use crate::peer_store::{InMemoryPeerStore, PeerStore};
+
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let (server_endpoint, server_cert) = QuicEndpoint::server(bind).unwrap();
+        let server_addr = server_endpoint.local_addr().unwrap();
+        let server_cert_der = server_cert.as_der().to_vec();
+        let client_endpoint = QuicEndpoint::client(bind, &[server_cert]).unwrap();
+
+        let _accept_loop = tokio::spawn(async move {
+            loop {
+                match server_endpoint.accept_one().await {
+                    Ok(session) => {
+                        tokio::spawn(async move {
+                            let _ = session.receive_frame().await;
+                        });
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let local_key = DeviceKeypair::generate().unwrap();
+        let remote_key = DeviceKeypair::generate().unwrap();
+        let remote_peer_id = remote_key.public_key().peer_id();
+        let cached_record = signed_record_with_cert(
+            &remote_key,
+            vec![CandidateEndpoint {
+                candidate_type: CandidateType::Host,
+                address: server_addr.ip().to_string(),
+                port: server_addr.port(),
+                priority: 120,
+            }],
+            1,
+            server_cert_der,
+        );
+
+        let peer_store: Arc<dyn PeerStore> = Arc::new(InMemoryPeerStore::new());
+        peer_store.store(MESH_ID, &cached_record);
+
+        // Port 1 on loopback is reliably dead — no rendezvous server
+        // listens there, so the connector's lookup will fail and it
+        // must consult the peer_store fallback.
+        let dead_rendezvous = RendezvousClient::new("127.0.0.1:1".to_string());
+        let connector = MeshConnector::new(
+            MeshConnectorConfig::new(MESH_ID, local_key.public_key().peer_id())
+                .with_direct_probe_timeout(Duration::from_millis(500))
+                .with_overall_deadline(Duration::from_secs(2)),
+            dead_rendezvous,
+            client_endpoint,
+        )
+        .with_peer_store(peer_store);
+
+        let (link, outcome) = connector
+            .connect(&remote_peer_id)
+            .await
+            .expect("cached record must let the dial succeed");
+        assert_eq!(link.path_kind(), PathKind::Direct);
+        assert_eq!(outcome.path_kind, PathKind::Direct);
+        assert_eq!(outcome.remote_addr, Some(server_addr));
+    }
+
+    #[tokio::test]
+    async fn connect_falls_back_to_peer_store_when_rendezvous_returns_no_record() {
+        // Distinct from the unreachable-rendezvous case: the server is
+        // healthy but doesn't know this peer. The cached record is
+        // still our best information and the connector should use it
+        // rather than failing.
+        use crate::peer_store::{InMemoryPeerStore, PeerStore};
+
+        let rendezvous = spawn_dev_rendezvous().await.unwrap();
+        let rendezvous_client = RendezvousClient::new(rendezvous.local_addr().to_string());
+
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let (server_endpoint, server_cert) = QuicEndpoint::server(bind).unwrap();
+        let server_addr = server_endpoint.local_addr().unwrap();
+        let server_cert_der = server_cert.as_der().to_vec();
+        let client_endpoint = QuicEndpoint::client(bind, &[server_cert]).unwrap();
+
+        let _accept_loop = tokio::spawn(async move {
+            loop {
+                match server_endpoint.accept_one().await {
+                    Ok(session) => {
+                        tokio::spawn(async move {
+                            let _ = session.receive_frame().await;
+                        });
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let local_key = DeviceKeypair::generate().unwrap();
+        let remote_key = DeviceKeypair::generate().unwrap();
+        let remote_peer_id = remote_key.public_key().peer_id();
+        let cached_record = signed_record_with_cert(
+            &remote_key,
+            vec![CandidateEndpoint {
+                candidate_type: CandidateType::Host,
+                address: server_addr.ip().to_string(),
+                port: server_addr.port(),
+                priority: 120,
+            }],
+            1,
+            server_cert_der,
+        );
+
+        let peer_store: Arc<dyn PeerStore> = Arc::new(InMemoryPeerStore::new());
+        peer_store.store(MESH_ID, &cached_record);
+
+        // Note: nothing was published to the rendezvous server for
+        // this peer_id; the lookup will return Ok(None).
+        let connector = MeshConnector::new(
+            MeshConnectorConfig::new(MESH_ID, local_key.public_key().peer_id())
+                .with_direct_probe_timeout(Duration::from_millis(500))
+                .with_overall_deadline(Duration::from_secs(2)),
+            rendezvous_client,
+            client_endpoint,
+        )
+        .with_peer_store(peer_store);
+
+        let (link, _outcome) = connector
+            .connect(&remote_peer_id)
+            .await
+            .expect("rendezvous-not-found must fall back to cache");
+        assert_eq!(link.path_kind(), PathKind::Direct);
     }
 
     fn signed_record(

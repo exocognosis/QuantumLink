@@ -78,6 +78,71 @@ public enum RustMeshNetworkEvent: UInt32, Equatable, Sendable {
     case reachabilityGained = 4
 }
 
+/// RAII wrapper around a Rust-owned `DeviceKeypair`. The Rust core
+/// holds the actual ML-DSA signing material; Swift sees only the
+/// opaque pointer plus the `peerID` derived from the public key.
+///
+/// **Persistence contract**: callers MUST save `seed` somewhere
+/// secure (Keychain on macOS) before this object is deallocated, and
+/// reload via `RustDeviceKeypair.load(library:seed:)` next launch.
+/// Without that round-trip the published `peer_id` changes per
+/// process restart and cached peer records become unauthenticatable.
+public final class RustDeviceKeypair {
+    // Module-internal so other QuantumLinkKit types (notably
+    // `RustMeshTransport`) can pass the raw handle through to the
+    // FFI layer. External callers should treat the keypair as
+    // opaque and only touch `seed` (for persistence) and `peerID`.
+    internal let library: RustCoreLibrary
+    internal let handle: UnsafeMutableRawPointer
+    public let seed: Data
+    public let peerID: String
+
+    fileprivate init(library: RustCoreLibrary, handle: UnsafeMutableRawPointer, seed: Data) throws {
+        self.library = library
+        self.handle = handle
+        self.seed = seed
+        guard let peerID = library.deviceKeypairPeerID(handle: handle) else {
+            library.destroyDeviceKeypair(handle)
+            throw RustCoreBridgeError.operationFailed("Rust device keypair peer_id read failed")
+        }
+        self.peerID = peerID
+    }
+
+    deinit {
+        library.destroyDeviceKeypair(handle)
+    }
+
+    /// Generates a fresh ML-DSA-65 device keypair. The 32-byte
+    /// `seed` returned via `seed` MUST be persisted before the
+    /// keypair object goes out of scope.
+    public static func generate(library: RustCoreLibrary) throws -> RustDeviceKeypair {
+        let (handle, seed) = try library.generateDeviceKeypair()
+        return try RustDeviceKeypair(library: library, handle: handle, seed: seed)
+    }
+
+    /// Reconstructs a keypair previously generated and persisted as
+    /// `seed`. Throws if the seed is the wrong length or the bytes
+    /// don't decode as a valid ML-DSA-65 seed.
+    public static func load(library: RustCoreLibrary, seed: Data) throws -> RustDeviceKeypair {
+        let handle = try library.loadDeviceKeypair(seed: seed)
+        return try RustDeviceKeypair(library: library, handle: handle, seed: seed)
+    }
+}
+
+/// Inbound mesh frame paired with the verified peer ID. The Rust
+/// responder loop authenticates the peer's `InboundIdentityAssertion`
+/// before tagging frames with `peerID`; the FFI surfaces both halves
+/// here so Swift consumers can route per-peer.
+public struct RustMeshInboundFrame: Equatable, Sendable {
+    public let peerID: String
+    public let frame: Data
+
+    public init(peerID: String, frame: Data) {
+        self.peerID = peerID
+        self.frame = frame
+    }
+}
+
 public struct RustMeshTransportMetrics: Equatable, Sendable {
     public let stateCode: UInt32
     public let pathKindCode: UInt32
@@ -334,15 +399,19 @@ public final class RustCoreLibrary {
         }
     }
 
-    func receiveMeshTransportFrame(handle: UnsafeMutableRawPointer) -> Data? {
-        var buffer = QlinkOwnedBuffer()
-        let hasFrame = withUnsafeMutablePointer(to: &buffer) { pointer in
+    func receiveMeshTransportFrame(handle: UnsafeMutableRawPointer) -> RustMeshInboundFrame? {
+        var inbound = QlinkInboundFrame()
+        let hasFrame = withUnsafeMutablePointer(to: &inbound) { pointer in
             symbols.meshTransportReceiveFrame(handle, UnsafeMutableRawPointer(pointer))
         }
         guard hasFrame else {
             return nil
         }
-        return consume(buffer: buffer)
+        // Both buffers are caller-owned. `consume` frees each one.
+        let frameBytes = consume(buffer: inbound.frame)
+        let peerIDBytes = consume(buffer: inbound.peerId)
+        let peerID = String(data: peerIDBytes, encoding: .utf8) ?? ""
+        return RustMeshInboundFrame(peerID: peerID, frame: frameBytes)
     }
 
     func meshTransportMetrics(handle: UnsafeMutableRawPointer) throws -> RustMeshTransportMetrics {
@@ -389,6 +458,211 @@ public final class RustCoreLibrary {
         }
         let bytes = consume(buffer: buffer)
         return String(data: bytes, encoding: .utf8)
+    }
+
+    // MARK: - Device keypair (cert publishing + persistence)
+
+    /// Generates a fresh ML-DSA-65 device keypair. Returns the opaque
+    /// handle plus the 32-byte seed callers must persist (Keychain on
+    /// macOS) to reload via `loadDeviceKeypair(seed:)` next launch.
+    /// Failing to persist the seed means the published `peer_id`
+    /// changes per process restart — defeats the cert-publishing
+    /// pipeline.
+    func generateDeviceKeypair() throws -> (handle: UnsafeMutableRawPointer, seed: Data) {
+        var seed = [UInt8](repeating: 0, count: 32)
+        let handle = seed.withUnsafeMutableBufferPointer { buffer in
+            symbols.deviceKeypairGenerate(buffer.baseAddress)
+        }
+        guard let handle else {
+            throw RustCoreBridgeError.operationFailed("Rust device keypair generation failed")
+        }
+        return (handle, Data(seed))
+    }
+
+    /// Reconstructs a device keypair from a 32-byte seed previously
+    /// returned by `generateDeviceKeypair()`. Returns nil if the
+    /// seed is the wrong length or the bytes don't decode.
+    func loadDeviceKeypair(seed: Data) throws -> UnsafeMutableRawPointer {
+        guard seed.count == 32 else {
+            throw RustCoreBridgeError.operationFailed("Device keypair seed must be exactly 32 bytes; got \(seed.count)")
+        }
+        let handle = seed.withUnsafeBytes { rawBuffer -> UnsafeMutableRawPointer? in
+            symbols.deviceKeypairFromSeed(rawBuffer.bindMemory(to: UInt8.self).baseAddress)
+        }
+        guard let handle else {
+            throw RustCoreBridgeError.operationFailed("Rust device keypair seed decode failed")
+        }
+        return handle
+    }
+
+    func destroyDeviceKeypair(_ handle: UnsafeMutableRawPointer) {
+        symbols.deviceKeypairDestroy(handle)
+    }
+
+    func deviceKeypairPeerID(handle: UnsafeMutableRawPointer) -> String? {
+        var buffer = QlinkOwnedBuffer()
+        let ok = withUnsafeMutablePointer(to: &buffer) { pointer in
+            symbols.deviceKeypairPeerId(handle, UnsafeMutableRawPointer(pointer))
+        }
+        guard ok else { return nil }
+        let bytes = consume(buffer: buffer)
+        return String(data: bytes, encoding: .utf8)
+    }
+
+    // MARK: - Mesh transport (keypair + multi-peer + cert-publishing)
+
+    func createMeshTransport(
+        configJSON: Data,
+        keypair: UnsafeMutableRawPointer
+    ) throws -> UnsafeMutableRawPointer {
+        let handle = configJSON.withUnsafeBytes { rawBuffer -> UnsafeMutableRawPointer? in
+            symbols.meshTransportCreateWithKeypair(
+                rawBuffer.bindMemory(to: UInt8.self).baseAddress,
+                rawBuffer.count,
+                keypair
+            )
+        }
+        guard let handle else {
+            throw RustCoreBridgeError.initializationFailed
+        }
+        return handle
+    }
+
+    func meshTransportServerCertificateDER(handle: UnsafeMutableRawPointer) -> Data? {
+        var buffer = QlinkOwnedBuffer()
+        let ok = withUnsafeMutablePointer(to: &buffer) { pointer in
+            symbols.meshTransportServerCertificateDer(handle, UnsafeMutableRawPointer(pointer))
+        }
+        guard ok else { return nil }
+        return consume(buffer: buffer)
+    }
+
+    func meshTransportResponderLocalAddress(handle: UnsafeMutableRawPointer) -> String? {
+        var buffer = QlinkOwnedBuffer()
+        let ok = withUnsafeMutablePointer(to: &buffer) { pointer in
+            symbols.meshTransportResponderLocalAddr(handle, UnsafeMutableRawPointer(pointer))
+        }
+        guard ok else { return nil }
+        let bytes = consume(buffer: buffer)
+        return String(data: bytes, encoding: .utf8)
+    }
+
+    func meshTransportPublishSelf(
+        handle: UnsafeMutableRawPointer,
+        keypair: UnsafeMutableRawPointer,
+        rendezvousURL: String,
+        ttlSeconds: UInt64,
+        sequence: UInt64
+    ) throws {
+        let urlBytes = Array(rendezvousURL.utf8)
+        let result = urlBytes.withUnsafeBufferPointer { buffer in
+            symbols.meshTransportPublishSelf(
+                handle,
+                keypair,
+                buffer.baseAddress,
+                buffer.count,
+                ttlSeconds,
+                sequence
+            )
+        }
+        guard result == 0 else {
+            throw RustCoreBridgeError.operationFailed("Rust mesh transport publish_self failed (code \(result))")
+        }
+    }
+
+    func meshTransportAddPeer(
+        handle: UnsafeMutableRawPointer,
+        peerID: String
+    ) throws {
+        let bytes = Array(peerID.utf8)
+        let result = bytes.withUnsafeBufferPointer { buffer in
+            symbols.meshTransportAddPeer(handle, buffer.baseAddress, buffer.count)
+        }
+        guard result == 0 else {
+            throw RustCoreBridgeError.operationFailed("Rust mesh transport add_peer failed (code \(result))")
+        }
+    }
+
+    func meshTransportRemovePeer(
+        handle: UnsafeMutableRawPointer,
+        peerID: String
+    ) {
+        let bytes = Array(peerID.utf8)
+        bytes.withUnsafeBufferPointer { buffer in
+            symbols.meshTransportRemovePeer(handle, buffer.baseAddress, buffer.count)
+        }
+    }
+
+    func meshTransportPeerStateCode(
+        handle: UnsafeMutableRawPointer,
+        peerID: String
+    ) -> UInt32? {
+        let bytes = Array(peerID.utf8)
+        var stateCode: UInt32 = 0
+        let ok = bytes.withUnsafeBufferPointer { buffer -> Bool in
+            withUnsafeMutablePointer(to: &stateCode) { statePtr in
+                symbols.meshTransportPeerStateCode(handle, buffer.baseAddress, buffer.count, statePtr)
+            }
+        }
+        return ok ? stateCode : nil
+    }
+
+    func meshTransportSendFrameTo(
+        handle: UnsafeMutableRawPointer,
+        peerID: String,
+        frame: Data
+    ) throws {
+        let peerBytes = Array(peerID.utf8)
+        let result = peerBytes.withUnsafeBufferPointer { peerBuffer -> Int32 in
+            frame.withUnsafeBytes { frameRaw in
+                symbols.meshTransportSendFrameTo(
+                    handle,
+                    peerBuffer.baseAddress,
+                    peerBuffer.count,
+                    frameRaw.bindMemory(to: UInt8.self).baseAddress,
+                    frameRaw.count
+                )
+            }
+        }
+        guard result == 0 else {
+            throw RustCoreBridgeError.operationFailed("Rust mesh transport send_frame_to failed (code \(result))")
+        }
+    }
+
+    // MARK: - Tracing bridge (Rust warnings/errors → host logger)
+
+    /// Installs the in-process tracing subscriber. Idempotent.
+    /// Returns `true` on success; `false` when some other code has
+    /// already set a global tracing subscriber for this process (in
+    /// which case the bridge is unavailable and Rust diagnostics
+    /// stay silent — the Swift caller should treat this as a soft
+    /// failure, not an error).
+    @discardableResult
+    func installTracingBridge() -> Bool {
+        symbols.tracingInstall() == 0
+    }
+
+    /// Pops the next captured Rust tracing event as a JSON string.
+    /// Returns `nil` when the buffer is empty or the bridge isn't
+    /// installed. Caller is responsible for redacting the event's
+    /// `message` field before forwarding to a user-visible logger
+    /// (the message routinely contains peer_ids, addresses, and
+    /// rendezvous URLs from Rust-side error context).
+    func popTracingEvent() -> String? {
+        var buffer = QlinkOwnedBuffer()
+        let hasEvent = withUnsafeMutablePointer(to: &buffer) { pointer in
+            symbols.tracingPopEvent(UnsafeMutableRawPointer(pointer))
+        }
+        guard hasEvent else { return nil }
+        let bytes = consume(buffer: buffer)
+        return String(data: bytes, encoding: .utf8)
+    }
+
+    /// Cumulative count of Rust tracing events dropped due to ring
+    /// buffer pressure. Non-zero means at least one event was lost
+    /// since process start.
+    func tracingDroppedCount() -> UInt64 {
+        symbols.tracingDroppedCount()
     }
 
     private func consume(buffer: QlinkOwnedBuffer) -> Data {
@@ -463,6 +737,18 @@ private struct QlinkOwnedPacket {
     }
 }
 
+/// Mirror of the Rust `QlinkInboundFrame` struct (see `ffi.rs`). Field
+/// order and layout must stay identical for the FFI cast to be safe.
+private struct QlinkInboundFrame {
+    var frame: QlinkOwnedBuffer
+    var peerId: QlinkOwnedBuffer
+
+    init(frame: QlinkOwnedBuffer = QlinkOwnedBuffer(), peerId: QlinkOwnedBuffer = QlinkOwnedBuffer()) {
+        self.frame = frame
+        self.peerId = peerId
+    }
+}
+
 private struct QlinkTunnelMetrics {
     var packetsFromTunnel: UInt64 = 0
     var packetsToTunnel: UInt64 = 0
@@ -517,6 +803,25 @@ private struct Symbols {
     typealias MeshHandleEventFn = @convention(c) (UnsafeMutableRawPointer?, UInt32) -> Int32
     typealias MeshStateCodeFn = @convention(c) (UnsafeMutableRawPointer?) -> UInt32
     typealias MeshLastErrorFn = @convention(c) (UnsafeMutableRawPointer?, UnsafeMutableRawPointer?) -> Bool
+    // Device keypair handle management (used for cert publishing).
+    typealias DeviceKeypairGenerateFn = @convention(c) (UnsafeMutablePointer<UInt8>?) -> UnsafeMutableRawPointer?
+    typealias DeviceKeypairFromSeedFn = @convention(c) (UnsafePointer<UInt8>?) -> UnsafeMutableRawPointer?
+    typealias DeviceKeypairDestroyFn = @convention(c) (UnsafeMutableRawPointer?) -> Void
+    typealias DeviceKeypairPeerIdFn = @convention(c) (UnsafeMutableRawPointer?, UnsafeMutableRawPointer?) -> Bool
+    // Mesh transport — keypair-aware constructor + cert-publishing surface.
+    typealias MeshCreateWithKeypairFn = @convention(c) (UnsafePointer<UInt8>?, Int, UnsafeMutableRawPointer?) -> UnsafeMutableRawPointer?
+    typealias MeshServerCertFn = @convention(c) (UnsafeMutableRawPointer?, UnsafeMutableRawPointer?) -> Bool
+    typealias MeshResponderAddrFn = @convention(c) (UnsafeMutableRawPointer?, UnsafeMutableRawPointer?) -> Bool
+    typealias MeshPublishSelfFn = @convention(c) (UnsafeMutableRawPointer?, UnsafeMutableRawPointer?, UnsafePointer<UInt8>?, Int, UInt64, UInt64) -> Int32
+    // Multi-peer control surface.
+    typealias MeshAddPeerFn = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<UInt8>?, Int) -> Int32
+    typealias MeshRemovePeerFn = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<UInt8>?, Int) -> Void
+    typealias MeshPeerStateCodeFn = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<UInt8>?, Int, UnsafeMutablePointer<UInt32>?) -> Bool
+    typealias MeshSendFrameToFn = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<UInt8>?, Int, UnsafePointer<UInt8>?, Int) -> Int32
+    // Tracing bridge — surfaces Rust-side warnings/errors to the host logger.
+    typealias TracingInstallFn = @convention(c) () -> Int32
+    typealias TracingPopEventFn = @convention(c) (UnsafeMutableRawPointer?) -> Bool
+    typealias TracingDroppedCountFn = @convention(c) () -> UInt64
 
     let version: VersionFn
     let defaultSuite: VersionFn
@@ -541,6 +846,21 @@ private struct Symbols {
     let meshTransportHandleNetworkEvent: MeshHandleEventFn
     let meshTransportStateCode: MeshStateCodeFn
     let meshTransportLastError: MeshLastErrorFn
+    let deviceKeypairGenerate: DeviceKeypairGenerateFn
+    let deviceKeypairFromSeed: DeviceKeypairFromSeedFn
+    let deviceKeypairDestroy: DeviceKeypairDestroyFn
+    let deviceKeypairPeerId: DeviceKeypairPeerIdFn
+    let meshTransportCreateWithKeypair: MeshCreateWithKeypairFn
+    let meshTransportServerCertificateDer: MeshServerCertFn
+    let meshTransportResponderLocalAddr: MeshResponderAddrFn
+    let meshTransportPublishSelf: MeshPublishSelfFn
+    let meshTransportAddPeer: MeshAddPeerFn
+    let meshTransportRemovePeer: MeshRemovePeerFn
+    let meshTransportPeerStateCode: MeshPeerStateCodeFn
+    let meshTransportSendFrameTo: MeshSendFrameToFn
+    let tracingInstall: TracingInstallFn
+    let tracingPopEvent: TracingPopEventFn
+    let tracingDroppedCount: TracingDroppedCountFn
 
     init(handle: UnsafeMutableRawPointer) throws {
         self.version = try load("qlink_core_version", from: handle)
@@ -568,6 +888,31 @@ private struct Symbols {
         )
         self.meshTransportStateCode = try load("qlink_mesh_transport_state_code", from: handle)
         self.meshTransportLastError = try load("qlink_mesh_transport_last_error", from: handle)
+        self.deviceKeypairGenerate = try load("qlink_device_keypair_generate", from: handle)
+        self.deviceKeypairFromSeed = try load("qlink_device_keypair_from_seed", from: handle)
+        self.deviceKeypairDestroy = try load("qlink_device_keypair_destroy", from: handle)
+        self.deviceKeypairPeerId = try load("qlink_device_keypair_peer_id", from: handle)
+        self.meshTransportCreateWithKeypair = try load(
+            "qlink_mesh_transport_create_with_keypair", from: handle
+        )
+        self.meshTransportServerCertificateDer = try load(
+            "qlink_mesh_transport_server_certificate_der", from: handle
+        )
+        self.meshTransportResponderLocalAddr = try load(
+            "qlink_mesh_transport_responder_local_addr", from: handle
+        )
+        self.meshTransportPublishSelf = try load("qlink_mesh_transport_publish_self", from: handle)
+        self.meshTransportAddPeer = try load("qlink_mesh_transport_add_peer", from: handle)
+        self.meshTransportRemovePeer = try load("qlink_mesh_transport_remove_peer", from: handle)
+        self.meshTransportPeerStateCode = try load(
+            "qlink_mesh_transport_peer_state_code", from: handle
+        )
+        self.meshTransportSendFrameTo = try load(
+            "qlink_mesh_transport_send_frame_to", from: handle
+        )
+        self.tracingInstall = try load("qlink_tracing_install", from: handle)
+        self.tracingPopEvent = try load("qlink_tracing_pop_event", from: handle)
+        self.tracingDroppedCount = try load("qlink_tracing_dropped_count", from: handle)
     }
 }
 

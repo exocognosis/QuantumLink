@@ -1,14 +1,17 @@
 use crate::{
+    crypto::DeviceKeypair,
     mesh_connection::NetworkEvent,
-    mesh_transport::{MeshTransportHandle, MeshTransportState},
+    mesh_transport::{MeshTransportConfig, MeshTransportHandle, MeshTransportState},
     packet_core::{PacketDisposition, PacketTunnelCore},
     quic_transport::{QuicDatagramSession, QuicEndpoint},
+    tracing_bridge,
 };
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     os::raw::c_char,
     ptr, slice,
-    sync::Mutex,
+    str,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 use tokio::runtime::Runtime;
@@ -40,6 +43,16 @@ pub struct QlinkOwnedBuffer {
 pub struct QlinkOwnedPacket {
     pub protocol_family: u32,
     pub buffer: QlinkOwnedBuffer,
+}
+
+/// Two owned buffers: the inbound mesh frame and the verified peer ID
+/// (UTF-8, no NUL terminator) the inbound responder authenticated.
+/// Both buffers are caller-owned — free each with
+/// `qlink_owned_buffer_free` (or `qlink_owned_buffer_free_ptr`).
+#[repr(C)]
+pub struct QlinkInboundFrame {
+    pub frame: QlinkOwnedBuffer,
+    pub peer_id: QlinkOwnedBuffer,
 }
 
 #[repr(C)]
@@ -461,7 +474,7 @@ pub unsafe extern "C" fn qlink_mesh_transport_send_frame(
 #[no_mangle]
 pub unsafe extern "C" fn qlink_mesh_transport_receive_frame(
     handle: *mut MeshTransportHandle,
-    out: *mut QlinkOwnedBuffer,
+    out: *mut QlinkInboundFrame,
 ) -> bool {
     let Some(handle) = handle.as_ref() else {
         return false;
@@ -469,9 +482,13 @@ pub unsafe extern "C" fn qlink_mesh_transport_receive_frame(
     let Some(out) = out.as_mut() else {
         return false;
     };
-    match handle.try_receive_frame() {
-        Some(frame) => {
-            *out = owned_buffer_from_vec(frame);
+    // Multi-peer surface: the responder loop tags every accepted frame
+    // with the verified peer_id (see `inbound_identity::evaluate_inbound`).
+    // Stripping it here used to leave Swift unable to route per-peer.
+    match handle.try_receive_frame_from_any() {
+        Some(inbound) => {
+            out.frame = owned_buffer_from_vec(inbound.frame);
+            out.peer_id = owned_buffer_from_vec(inbound.peer_id.into_bytes());
             true
         }
         None => false,
@@ -554,6 +571,406 @@ pub unsafe extern "C" fn qlink_mesh_transport_last_error(
             true
         }
         None => false,
+    }
+}
+
+// ===================================================================
+// Device keypair FFI — needed for cert publishing + persistence.
+// ===================================================================
+
+/// Generates a fresh ML-DSA-65 device keypair and writes its 32-byte
+/// persistence seed to `out_seed`. The caller MUST save the seed
+/// (Keychain on macOS, encrypted key file otherwise) and reload via
+/// `qlink_device_keypair_from_seed` on next launch — without that
+/// round-trip the published peer_id changes per process restart.
+///
+/// Returns an owned handle that the caller frees with
+/// `qlink_device_keypair_destroy`. Returns null on failure.
+#[no_mangle]
+pub unsafe extern "C" fn qlink_device_keypair_generate(
+    out_seed: *mut u8,
+) -> *mut DeviceKeypair {
+    if out_seed.is_null() {
+        return ptr::null_mut();
+    }
+    let keypair = match DeviceKeypair::generate() {
+        Ok(kp) => kp,
+        Err(error) => {
+            tracing::warn!(?error, "qlink_device_keypair_generate failed");
+            return ptr::null_mut();
+        }
+    };
+    let Some(seed) = keypair.seed() else {
+        tracing::warn!("device keypair generated without a persistable seed");
+        return ptr::null_mut();
+    };
+    ptr::copy_nonoverlapping(seed.as_ptr(), out_seed, 32);
+    Box::into_raw(Box::new(keypair))
+}
+
+/// Reconstructs an ML-DSA-65 device keypair from a 32-byte seed
+/// previously emitted by `qlink_device_keypair_generate`. Returns
+/// null if the seed pointer is invalid or the bytes don't decode.
+#[no_mangle]
+pub unsafe extern "C" fn qlink_device_keypair_from_seed(
+    seed: *const u8,
+) -> *mut DeviceKeypair {
+    let Some(seed_slice) = borrowed_slice(seed, 32) else {
+        return ptr::null_mut();
+    };
+    let mut seed_array = [0_u8; 32];
+    seed_array.copy_from_slice(seed_slice);
+    match DeviceKeypair::from_seed(seed_array) {
+        Ok(kp) => Box::into_raw(Box::new(kp)),
+        Err(error) => {
+            tracing::warn!(?error, "qlink_device_keypair_from_seed failed");
+            ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn qlink_device_keypair_destroy(handle: *mut DeviceKeypair) {
+    if !handle.is_null() {
+        drop(Box::from_raw(handle));
+    }
+}
+
+/// Writes the keypair's `peer_id` (UTF-8, no NUL terminator) into
+/// the supplied owned buffer. Caller frees via
+/// `qlink_owned_buffer_free`. Returns false on bad arguments.
+#[no_mangle]
+pub unsafe extern "C" fn qlink_device_keypair_peer_id(
+    handle: *mut DeviceKeypair,
+    out: *mut QlinkOwnedBuffer,
+) -> bool {
+    let Some(handle) = handle.as_ref() else {
+        return false;
+    };
+    let Some(out) = out.as_mut() else {
+        return false;
+    };
+    *out = owned_buffer_from_vec(handle.public_key().peer_id().into_bytes());
+    true
+}
+
+// ===================================================================
+// Mesh transport — keypair-aware constructor + multi-peer control.
+// ===================================================================
+
+/// Variant of `qlink_mesh_transport_create` that also installs a
+/// local device keypair on the connector. Without this, the Rust
+/// connector skips the inbound `InboundIdentityAssertion` and the
+/// remote peer's responder closes the connection silently. Use this
+/// constructor for any production deployment where the responder is
+/// enabled on either side.
+///
+/// The keypair handle is **borrowed** for the duration of this call.
+/// Internally the FFI re-derives an owned keypair from the borrowed
+/// keypair's seed (`DeviceKeypair::seed`) so the Swift side keeps
+/// ownership and can free the keypair handle independently. This
+/// requires the keypair to have been generated via the seedable
+/// ML-DSA path (any keypair from `qlink_device_keypair_generate` or
+/// `qlink_device_keypair_from_seed`); SLH-DSA keypairs return null.
+#[no_mangle]
+pub unsafe extern "C" fn qlink_mesh_transport_create_with_keypair(
+    config_json: *const u8,
+    config_json_len: usize,
+    keypair: *mut DeviceKeypair,
+) -> *mut MeshTransportHandle {
+    let Some(config_bytes) = borrowed_slice(config_json, config_json_len) else {
+        return ptr::null_mut();
+    };
+    let config: MeshTransportConfig = match serde_json::from_slice(config_bytes) {
+        Ok(cfg) => cfg,
+        Err(error) => {
+            tracing::warn!(?error, "qlink_mesh_transport_create_with_keypair config decode failed");
+            return ptr::null_mut();
+        }
+    };
+    let Some(keypair_ref) = keypair.as_ref() else {
+        return ptr::null_mut();
+    };
+    // Re-derive an owned keypair from the borrowed seed so the FFI
+    // owns the Arc that gets passed into the connector. The Swift
+    // side keeps the original handle and can free it whenever.
+    let Some(seed) = keypair_ref.seed() else {
+        tracing::warn!("qlink_mesh_transport_create_with_keypair received non-seedable keypair");
+        return ptr::null_mut();
+    };
+    let owned_keypair = match DeviceKeypair::from_seed(seed) {
+        Ok(kp) => Arc::new(kp),
+        Err(error) => {
+            tracing::warn!(?error, "qlink_mesh_transport_create_with_keypair seed decode failed");
+            return ptr::null_mut();
+        }
+    };
+    match MeshTransportHandle::new_with_keypair(config, Some(owned_keypair)) {
+        Ok(handle) => Box::into_raw(Box::new(handle)),
+        Err(error) => {
+            tracing::warn!(?error, "qlink_mesh_transport_create_with_keypair failed");
+            ptr::null_mut()
+        }
+    }
+}
+
+/// DER-encoded QUIC server certificate the responder presents.
+/// Required for callers that mint signed peer records (the
+/// `device_certificate_der` field on `UnsignedPeerRecord`). Returns
+/// false when the responder is disabled.
+#[no_mangle]
+pub unsafe extern "C" fn qlink_mesh_transport_server_certificate_der(
+    handle: *mut MeshTransportHandle,
+    out: *mut QlinkOwnedBuffer,
+) -> bool {
+    let Some(handle) = handle.as_ref() else {
+        return false;
+    };
+    let Some(out) = out.as_mut() else {
+        return false;
+    };
+    match handle.server_certificate_der() {
+        Some(der) => {
+            *out = owned_buffer_from_vec(der.to_vec());
+            true
+        }
+        None => false,
+    }
+}
+
+/// Bound address of the inbound responder, formatted as a UTF-8
+/// `host:port` string ("127.0.0.1:54321"). Returns false when the
+/// responder is disabled.
+#[no_mangle]
+pub unsafe extern "C" fn qlink_mesh_transport_responder_local_addr(
+    handle: *mut MeshTransportHandle,
+    out: *mut QlinkOwnedBuffer,
+) -> bool {
+    let Some(handle) = handle.as_ref() else {
+        return false;
+    };
+    let Some(out) = out.as_mut() else {
+        return false;
+    };
+    match handle.responder_local_addr() {
+        Some(addr) => {
+            *out = owned_buffer_from_vec(addr.to_string().into_bytes());
+            true
+        }
+        None => false,
+    }
+}
+
+/// Mints + signs a peer record for the local node and publishes it
+/// to the rendezvous server. Wraps the async `publish_self` via the
+/// handle's internal runtime, so the FFI is synchronous from the
+/// caller's perspective. Returns 0 on success, -1 on failure (the
+/// reason is available via `qlink_mesh_transport_last_error`-style
+/// surfaces or by re-publishing with logging enabled on the Rust
+/// side).
+///
+/// Pre-conditions:
+/// - the responder is enabled (`disable_inbound_responder = false`)
+/// - the keypair's `peer_id` matches the handle's `local_peer_id`
+/// - the rendezvous server is reachable
+#[no_mangle]
+pub unsafe extern "C" fn qlink_mesh_transport_publish_self(
+    handle: *mut MeshTransportHandle,
+    keypair: *mut DeviceKeypair,
+    rendezvous_url: *const u8,
+    rendezvous_url_len: usize,
+    ttl_seconds: u64,
+    sequence: u64,
+) -> i32 {
+    let Some(handle) = handle.as_ref() else {
+        return -1;
+    };
+    let Some(keypair) = keypair.as_ref() else {
+        return -1;
+    };
+    let Some(url_bytes) = borrowed_slice(rendezvous_url, rendezvous_url_len) else {
+        return -1;
+    };
+    let Ok(url) = str::from_utf8(url_bytes) else {
+        return -1;
+    };
+    match handle.publish_self_blocking(keypair, url, ttl_seconds, sequence, Vec::new()) {
+        Ok(_record) => 0,
+        Err(error) => {
+            tracing::warn!(?error, "qlink_mesh_transport_publish_self failed");
+            -1
+        }
+    }
+}
+
+/// Adds a peer to the multi-peer transport. Idempotent — adding a
+/// peer that's already active is a no-op. The session manager that
+/// drives `connector.connect(peer_id)` is spawned on the handle's
+/// runtime and runs until the peer is removed or the handle is
+/// dropped.
+///
+/// Returns 0 on success, -1 on bad arguments / poisoned mutex / no
+/// runtime.
+#[no_mangle]
+pub unsafe extern "C" fn qlink_mesh_transport_add_peer(
+    handle: *mut MeshTransportHandle,
+    peer_id: *const u8,
+    peer_id_len: usize,
+) -> i32 {
+    let Some(handle) = handle.as_ref() else {
+        return -1;
+    };
+    let Some(peer_id_bytes) = borrowed_slice(peer_id, peer_id_len) else {
+        return -1;
+    };
+    let Ok(peer_id_str) = str::from_utf8(peer_id_bytes) else {
+        return -1;
+    };
+    match handle.add_peer(peer_id_str) {
+        Ok(()) => 0,
+        Err(error) => {
+            tracing::warn!(?error, "qlink_mesh_transport_add_peer failed");
+            -1
+        }
+    }
+}
+
+/// Removes a peer from the multi-peer transport. Idempotent.
+#[no_mangle]
+pub unsafe extern "C" fn qlink_mesh_transport_remove_peer(
+    handle: *mut MeshTransportHandle,
+    peer_id: *const u8,
+    peer_id_len: usize,
+) {
+    let Some(handle) = handle.as_ref() else {
+        return;
+    };
+    let Some(peer_id_bytes) = borrowed_slice(peer_id, peer_id_len) else {
+        return;
+    };
+    let Ok(peer_id_str) = str::from_utf8(peer_id_bytes) else {
+        return;
+    };
+    handle.remove_peer(peer_id_str);
+}
+
+/// Per-peer state code (matches `qlink_mesh_transport_state_code`'s
+/// integer mapping: 0=connecting, 1=ready, 2=failed, 3=stopped).
+/// Returns false when the peer isn't active.
+#[no_mangle]
+pub unsafe extern "C" fn qlink_mesh_transport_peer_state_code(
+    handle: *mut MeshTransportHandle,
+    peer_id: *const u8,
+    peer_id_len: usize,
+    out_state_code: *mut u32,
+) -> bool {
+    let Some(handle) = handle.as_ref() else {
+        return false;
+    };
+    let Some(peer_id_bytes) = borrowed_slice(peer_id, peer_id_len) else {
+        return false;
+    };
+    let Ok(peer_id_str) = str::from_utf8(peer_id_bytes) else {
+        return false;
+    };
+    let Some(out) = out_state_code.as_mut() else {
+        return false;
+    };
+    match handle.peer_state_code(peer_id_str) {
+        Some(code) => {
+            *out = code;
+            true
+        }
+        None => false,
+    }
+}
+
+// ===================================================================
+// Tracing bridge — surface Rust-side `tracing::warn!`/`error!` events
+// into the Swift host's logger. See `tracing_bridge.rs` for design.
+// ===================================================================
+
+/// Installs the in-process tracing subscriber that captures
+/// WARN-and-above events. Idempotent — second call is a no-op.
+/// Returns 0 on success, -1 if some other code already set a global
+/// tracing subscriber (in which case the bridge is unavailable for
+/// this process; the Swift side should fall back to "no Rust
+/// diagnostics" rather than failing hard).
+///
+/// Call this once at app/dylib initialization, before any code that
+/// might emit tracing events. After installation, drain via
+/// `qlink_tracing_pop_event` on a polling cadence.
+#[no_mangle]
+pub unsafe extern "C" fn qlink_tracing_install() -> i32 {
+    match tracing_bridge::install() {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
+/// Pops the next captured event as a JSON string into the supplied
+/// owned buffer. Returns true if an event was popped, false when
+/// the buffer is empty (or the bridge isn't installed).
+///
+/// JSON shape:
+/// `{"level":"warn","target":"qlink_core::mesh_connection","message":"..."}`
+///
+/// The Swift caller MUST redact the message field before forwarding
+/// to `os_log` — Rust events routinely embed peer_ids, addresses,
+/// and rendezvous URLs verbatim.
+#[no_mangle]
+pub unsafe extern "C" fn qlink_tracing_pop_event(out: *mut QlinkOwnedBuffer) -> bool {
+    let Some(out) = out.as_mut() else {
+        return false;
+    };
+    let Some(buffer) = tracing_bridge::global() else {
+        return false;
+    };
+    match buffer.pop() {
+        Some(event) => {
+            *out = owned_buffer_from_vec(event.to_json().into_bytes());
+            true
+        }
+        None => false,
+    }
+}
+
+/// Cumulative count of events evicted from the bridge buffer due to
+/// capacity pressure. Operators can watch this for oversaturation:
+/// a non-zero value means at least one tracing event was dropped
+/// since process start. Returns 0 if the bridge isn't installed.
+#[no_mangle]
+pub unsafe extern "C" fn qlink_tracing_dropped_count() -> u64 {
+    tracing_bridge::global()
+        .map(|b| b.dropped_count())
+        .unwrap_or(0)
+}
+
+/// Sends a frame to a specific peer. Returns 0 on success, -1 on
+/// bad arguments or when the peer isn't active.
+#[no_mangle]
+pub unsafe extern "C" fn qlink_mesh_transport_send_frame_to(
+    handle: *mut MeshTransportHandle,
+    peer_id: *const u8,
+    peer_id_len: usize,
+    frame: *const u8,
+    frame_len: usize,
+) -> i32 {
+    let Some(handle) = handle.as_ref() else {
+        return -1;
+    };
+    let Some(peer_id_bytes) = borrowed_slice(peer_id, peer_id_len) else {
+        return -1;
+    };
+    let Ok(peer_id_str) = str::from_utf8(peer_id_bytes) else {
+        return -1;
+    };
+    let Some(frame_bytes) = borrowed_slice(frame, frame_len) else {
+        return -1;
+    };
+    match handle.send_frame_to(peer_id_str, frame_bytes.to_vec()) {
+        Ok(()) => 0,
+        Err(_) => -1,
     }
 }
 

@@ -1,0 +1,150 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Exhaustive on-demand-rules exemplar. Demonstrates every match
+  predicate the Swift `OnDemandRule` generators support: SSID match,
+  DNS-server match, DNS-search-domain match, interface-type match,
+  and URL-string probe. Each rule is annotated with the operator
+  intent it expresses.
+
+  The intent of this template is *reference*, not direct deployment —
+  the rule set as written contradicts itself in places (e.g.
+  ConnectIfNeeded for cable + Disconnect for cellular). Operators
+  should copy individual rules and remix them for their actual
+  policy.
+
+  Replace before deploy:
+    REPLACE-WITH-VPN-PAYLOAD-UUID
+    REPLACE-WITH-PROFILE-UUID
+    Org-specific SSIDs, DNS suffixes, probe URLs
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>PayloadContent</key>
+    <array>
+        <dict>
+            <key>PayloadType</key>
+            <string>com.apple.vpn.managed</string>
+            <key>PayloadVersion</key>
+            <integer>1</integer>
+            <key>PayloadIdentifier</key>
+            <string>com.quantumlink.macos.mdm.vpn.on-demand-exemplar</string>
+            <key>PayloadUUID</key>
+            <string>REPLACE-WITH-VPN-PAYLOAD-UUID</string>
+            <key>PayloadDisplayName</key>
+            <string>QuantumLink VPN (on-demand exemplar)</string>
+            <key>UserDefinedName</key>
+            <string>QuantumLink</string>
+            <key>VPNType</key>
+            <string>VPN</string>
+            <key>VPNSubType</key>
+            <string>com.quantumlink.macos.PacketTunnel</string>
+            <key>ProviderBundleIdentifier</key>
+            <string>com.quantumlink.macos.PacketTunnel</string>
+            <key>ProviderType</key>
+            <string>packet-tunnel</string>
+            <key>VendorConfig</key>
+            <dict>
+                <key>meshID</key>
+                <string>devmesh</string>
+                <key>configurationProfile</key>
+                <string>on-demand-exemplar</string>
+            </dict>
+            <key>OnDemandEnabled</key>
+            <integer>1</integer>
+            <key>OnDemandRules</key>
+            <array>
+                <!-- Rule 1: corporate Wi-Fi → always connect.
+                     Demonstrates SSIDMatch. Apple matches any SSID
+                     in the array, so this list is effectively a
+                     "trusted networks" allowlist. -->
+                <dict>
+                    <key>Action</key>
+                    <string>Connect</string>
+                    <key>SSIDMatch</key>
+                    <array>
+                        <string>CorpNet-Internal</string>
+                        <string>CorpNet-Guest</string>
+                    </array>
+                </dict>
+
+                <!-- Rule 2: home networks (DNS suffix) →
+                     ConnectIfNeeded. The tunnel comes up only when
+                     a managed app actually wants to reach a
+                     protected destination. Reduces battery /
+                     bandwidth on residential broadband where the
+                     tunnel isn't always strictly required. -->
+                <dict>
+                    <key>Action</key>
+                    <string>ConnectIfNeeded</string>
+                    <key>DNSDomainMatch</key>
+                    <array>
+                        <string>*.home.example.com</string>
+                    </array>
+                </dict>
+
+                <!-- Rule 3: device is on the corporate VPN's split
+                     DNS (recognized by the resolver IP) → tunnel
+                     stays up. Useful for kiosk / lab setups where
+                     the DNS topology is known-stable. -->
+                <dict>
+                    <key>Action</key>
+                    <string>Connect</string>
+                    <key>DNSServerAddressMatch</key>
+                    <array>
+                        <string>10.0.0.53</string>
+                    </array>
+                </dict>
+
+                <!-- Rule 4: cellular → disconnect by default.
+                     Operators with strict mobile-data budgets often
+                     want this; remove it if your policy is "always
+                     mesh." -->
+                <dict>
+                    <key>Action</key>
+                    <string>Disconnect</string>
+                    <key>InterfaceTypeMatch</key>
+                    <string>Cellular</string>
+                </dict>
+
+                <!-- Rule 5: captive-portal probe. URLStringProbe
+                     fetches the URL and treats success as evidence
+                     the network is healthy. Common pattern: probe
+                     an internal-only URL — if it responds, we're
+                     on the corp network and the tunnel can come
+                     up; otherwise we're outside and the rule fails
+                     through to the next match. -->
+                <dict>
+                    <key>Action</key>
+                    <string>EvaluateConnection</string>
+                    <key>URLStringProbe</key>
+                    <string>http://intranet.example.com/probe</string>
+                </dict>
+
+                <!-- Rule 6: catch-all. Apple evaluates rules
+                     top-to-bottom and uses the first match. A
+                     trailing "Connect" rule with no predicates
+                     means "if nothing above matched, default to
+                     connect." Swap to "Ignore" for a more
+                     conservative posture. -->
+                <dict>
+                    <key>Action</key>
+                    <string>Connect</string>
+                </dict>
+            </array>
+        </dict>
+    </array>
+    <key>PayloadType</key>
+    <string>Configuration</string>
+    <key>PayloadVersion</key>
+    <integer>1</integer>
+    <key>PayloadIdentifier</key>
+    <string>com.quantumlink.macos.mdm.on-demand-exemplar-profile</string>
+    <key>PayloadUUID</key>
+    <string>REPLACE-WITH-PROFILE-UUID</string>
+    <key>PayloadDisplayName</key>
+    <string>QuantumLink On-Demand Rules Exemplar</string>
+    <key>PayloadOrganization</key>
+    <string>QuantumLink</string>
+</dict>
+</plist>

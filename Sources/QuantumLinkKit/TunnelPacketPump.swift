@@ -39,6 +39,11 @@ public struct PacketPumpCounters: Equatable, Sendable {
     public var transportFramesAccepted: UInt64 = 0
     public var failedInboundFrames: UInt64 = 0
     public var tunnelPacketsEmitted: UInt64 = 0
+    /// Inbound frames accepted from each verified mesh peer. Frames
+    /// without an attributed peer (development drop, dev QUIC loopback)
+    /// are not counted here. Useful for diagnostics + future per-peer
+    /// rate limits or routing decisions.
+    public var transportFramesAcceptedPerPeer: [String: UInt64] = [:]
 }
 
 public protocol TransportFrameSink {
@@ -64,6 +69,29 @@ public struct ClosureTransportFrameSink: TransportFrameSink {
     }
 }
 
+/// Outbound + inbound packet pump that drives the Rust core's encode /
+/// decode loop. The pump is the **second** line of fail-closed defense
+/// against protected-prefix traffic escaping the tunnel:
+///
+/// 1. The OS routes only packets whose destination matches
+///    `NEIPv4Settings.includedRoutes` (set from
+///    `TunnelConfiguration.protectedRoutes` in `PacketTunnelProvider`)
+///    into the tunnel interface in the first place.
+/// 2. Every packet observed by `handlePackets` is therefore presumed
+///    to belong to a protected prefix; the pump's only job is to
+///    refuse to forward it when the data plane is unhealthy
+///    (`coreAdapter == nil` or `transportSink.isReady == false`),
+///    rather than letting it silently fall through to the default
+///    interface.
+/// 3. The Rust core (`packet_core::submit_tunnel_packet`) re-validates
+///    the destination against its own `protected_routes` policy. A
+///    misconfigured `NEIPv4Settings` that lets an unprotected packet
+///    through still gets dropped here.
+/// 4. Encrypted transport frames produced by the core are sent on a
+///    pop-then-send pattern: if `sendTransportFrame` fails, the frame
+///    is lost (counted as `failedSubmissions`). The bytes never fall
+///    back to plaintext routing — the worst case is a dropped packet,
+///    not a leaked one.
 public final class TunnelPacketPump {
     public private(set) var counters = PacketPumpCounters()
     private let coreAdapter: TunnelCoreAdapting?
@@ -153,7 +181,7 @@ public final class TunnelPacketPump {
         try coreAdapter?.metrics()
     }
 
-    public func acceptTransportFrame(_ frame: Data) throws {
+    public func acceptTransportFrame(_ frame: Data, peerID: String? = nil) throws {
         guard let coreAdapter else {
             counters.failedInboundFrames += 1
             throw RustCoreBridgeError.operationFailed("Rust core is unavailable for inbound transport frame")
@@ -162,6 +190,9 @@ public final class TunnelPacketPump {
         do {
             try coreAdapter.acceptTransportFrame(frame)
             counters.transportFramesAccepted += 1
+            if let peerID, !peerID.isEmpty {
+                counters.transportFramesAcceptedPerPeer[peerID, default: 0] += 1
+            }
         } catch {
             counters.failedInboundFrames += 1
             throw error

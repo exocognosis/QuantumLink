@@ -75,7 +75,9 @@ final class TunnelTransportTests: XCTestCase {
         try transport.sendTransportFrame(Data([0xaa, 0xbb]))
 
         let received = try XCTUnwrap(transport.receiveTransportFrame())
-        XCTAssertEqual(received, Data([0xaa, 0xbb]))
+        XCTAssertEqual(received.frame, Data([0xaa, 0xbb]))
+        // Dev QUIC loopback has no peer identity to attribute.
+        XCTAssertNil(received.peerID)
         XCTAssertEqual(transport.metrics.kind, .devQuicLoopback)
         XCTAssertEqual(transport.metrics.pathType, .direct)
         XCTAssertEqual(transport.metrics.framesSent, 1)

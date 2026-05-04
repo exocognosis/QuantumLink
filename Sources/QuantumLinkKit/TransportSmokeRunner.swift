@@ -46,8 +46,8 @@ public enum TransportSmokeRunner {
         )
 
         var restored: TunnelCorePacket?
-        while let frame = try transport.receiveTransportFrame() {
-            try pump.acceptTransportFrame(frame)
+        while let inbound = try transport.receiveTransportFrame() {
+            try pump.acceptTransportFrame(inbound.frame, peerID: inbound.peerID)
             if let packet = try pump.popTunnelPacket() {
                 restored = packet
                 break
