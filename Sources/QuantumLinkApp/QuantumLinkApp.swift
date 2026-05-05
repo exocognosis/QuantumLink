@@ -39,6 +39,40 @@ struct QuantumLinkMacApp: App {
                 }
                 .keyboardShortcut("r", modifiers: [.command])
             }
+
+            // Replace the default Help menu (which throws "Help isn't
+            // available" because no .help bundle is wired) with one
+            // that opens our SwiftUI-based help window. We keep the
+            // ⌘? shortcut macOS users expect on the QuantumLink Help
+            // item, and add a direct Submit-a-Ticket entry as a
+            // shortcut for the "I just need to email someone" path.
+            CommandGroup(replacing: .help) {
+                HelpMenuItems()
+            }
+        }
+
+        // Secondary scene for the in-app Help window. Registered
+        // here so SwiftUI's openWindow(id:) environment can find it.
+        HelpWindowScene()
+    }
+}
+
+/// Help-menu buttons. Pulled into its own view so the
+/// `@Environment(\.openWindow)` lookup can run inside a SwiftUI view —
+/// `App.commands` blocks aren't a view context.
+private struct HelpMenuItems: View {
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        Button("QuantumLink Help") {
+            openWindow(id: HelpWindowScene.windowID)
+        }
+        .keyboardShortcut("?", modifiers: [.command])
+
+        Divider()
+
+        Button("Submit a Support Ticket…") {
+            openWindow(id: HelpWindowScene.windowID)
         }
     }
 }

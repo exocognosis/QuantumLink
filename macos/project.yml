@@ -55,8 +55,14 @@ targets:
         embed: true
       - target: QuantumLinkTunnel
         embed: true
+      # qlink-core.xcframework wraps a static archive (libqlink_core.a),
+      # not a dylib. Static archives are linked into the binary and
+      # must NOT be embedded — codesign rejects any bundle whose
+      # Frameworks/ contains a .a file with "code object is not signed
+      # at all". `embed: false` keeps the linker reference but skips
+      # the embed-and-sign build phase.
       - framework: build/qlink-core.xcframework
-        embed: true
+        embed: false
         codeSign: false
       - package: Sparkle
   QuantumLinkTunnel:
@@ -80,7 +86,7 @@ targets:
       - target: QuantumLinkKit
         embed: true
       - framework: build/qlink-core.xcframework
-        embed: true
+        embed: false
         codeSign: false
   QuantumLinkSmoke:
     type: tool
