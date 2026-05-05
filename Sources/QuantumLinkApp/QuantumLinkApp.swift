@@ -49,11 +49,32 @@ struct QuantumLinkMacApp: App {
             CommandGroup(replacing: .help) {
                 HelpMenuItems()
             }
+
+            // Privacy & anonymity controls live in their own
+            // window so they can be tweaked without dismissing
+            // the main dashboard. The Window menu is the
+            // conventional macOS spot for this kind of secondary
+            // window.
+            CommandGroup(after: .windowList) {
+                PrivacyMenuItems()
+            }
         }
 
-        // Secondary scene for the in-app Help window. Registered
-        // here so SwiftUI's openWindow(id:) environment can find it.
+        // Secondary scenes — registered so SwiftUI's
+        // openWindow(id:) environment can find them.
         HelpWindowScene()
+        PrivacyWindowScene()
+    }
+}
+
+private struct PrivacyMenuItems: View {
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        Button("Privacy & Anonymity…") {
+            openWindow(id: PrivacyWindowScene.windowID)
+        }
+        .keyboardShortcut(",", modifiers: [.command, .shift])
     }
 }
 
