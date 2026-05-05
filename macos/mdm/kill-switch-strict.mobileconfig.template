@@ -1,0 +1,107 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  "Strict" deployment posture. Use this on managed Macs where a
+  half-up tunnel is worse than no tunnel — e.g. devices that handle
+  regulated data and must never silently leak. Pairs with the Swift
+  side's `KillSwitchPolicy.strict` runtime watchdog: if the transport
+  stays unhealthy past the deadline, the tunnel is torn down rather
+  than continuing to drop packets.
+
+  Replace before deploy:
+    REPLACE-WITH-VPN-PAYLOAD-UUID
+    REPLACE-WITH-PROFILE-UUID
+    Production rendezvous + relay URLs
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>PayloadContent</key>
+    <array>
+        <dict>
+            <key>PayloadType</key>
+            <string>com.apple.vpn.managed</string>
+            <key>PayloadVersion</key>
+            <integer>1</integer>
+            <key>PayloadIdentifier</key>
+            <string>com.quantumlink.macos.mdm.vpn.kill-switch-strict</string>
+            <key>PayloadUUID</key>
+            <string>REPLACE-WITH-VPN-PAYLOAD-UUID</string>
+            <key>PayloadDisplayName</key>
+            <string>QuantumLink VPN (strict kill switch)</string>
+            <key>UserDefinedName</key>
+            <string>QuantumLink (strict)</string>
+            <key>VPNType</key>
+            <string>VPN</string>
+            <key>VPNSubType</key>
+            <string>com.quantumlink.macos.PacketTunnel</string>
+            <key>ProviderBundleIdentifier</key>
+            <string>com.quantumlink.macos.PacketTunnel</string>
+            <key>ProviderType</key>
+            <string>packet-tunnel</string>
+            <key>VendorConfig</key>
+            <dict>
+                <key>meshID</key>
+                <string>prodmesh</string>
+                <key>rendezvousServers</key>
+                <array>
+                    <string>rendezvous.example.com:9471</string>
+                </array>
+                <key>relayServers</key>
+                <array>
+                    <string>relay.example.com:9472</string>
+                </array>
+                <!-- The strict kill switch has two layers of teeth:
+                       1. Per-batch fail-closed (drop protected
+                          packets when the transport is unready).
+                       2. Runtime watchdog that tears the tunnel
+                          down after sustained unreadiness (default
+                          30s, see KillSwitchWatchdog).
+                     The Swift side bridges this string to the
+                     KillSwitchPolicy enum on TunnelConfiguration. -->
+                <key>killSwitch</key>
+                <string>strict</string>
+                <key>routeMode</key>
+                <string>splitTunnel</string>
+                <key>configurationProfile</key>
+                <string>kill-switch-strict</string>
+            </dict>
+            <key>OnDemandEnabled</key>
+            <integer>1</integer>
+            <!-- DisconnectOnIdle/0 keeps the tunnel up even when
+                 no app is actively sending. Strict mode wants the
+                 transport in lock-step with reachability so the
+                 watchdog has a stable signal to evaluate. -->
+            <key>DisconnectOnIdle</key>
+            <integer>0</integer>
+            <key>OnDemandRules</key>
+            <array>
+                <dict>
+                    <key>Action</key>
+                    <string>Connect</string>
+                </dict>
+            </array>
+        </dict>
+    </array>
+    <key>PayloadType</key>
+    <string>Configuration</string>
+    <key>PayloadVersion</key>
+    <integer>1</integer>
+    <key>PayloadIdentifier</key>
+    <string>com.quantumlink.macos.mdm.kill-switch-strict-profile</string>
+    <key>PayloadUUID</key>
+    <string>REPLACE-WITH-PROFILE-UUID</string>
+    <key>PayloadDisplayName</key>
+    <string>QuantumLink Strict Kill-Switch Profile</string>
+    <key>PayloadOrganization</key>
+    <string>QuantumLink</string>
+    <!--
+      RemovalDisallowed prevents end users on managed Macs from
+      pulling the profile out themselves. Combined with strict
+      kill-switch + always-on on-demand, this is the maximum-
+      enforcement posture; verify it matches your support model
+      before shipping (it's hostile to user-initiated debugging).
+    -->
+    <key>PayloadRemovalDisallowed</key>
+    <true/>
+</dict>
+</plist>

@@ -248,6 +248,13 @@ pub fn answer_handshake(initiator: &InitiatorHello) -> Result<ResponderState> {
 
 pub struct DeviceKeypair {
     signing_key: DeviceSigningKey,
+    /// Seed used to derive the ML-DSA signing key. Stored so the
+    /// keypair can be persisted as a 32-byte secret (Keychain on
+    /// macOS, key file for `qlinkctl`) and reloaded across process
+    /// restarts. `None` for SLH-DSA keypairs, which use a generation
+    /// path that doesn't expose a stable seed; SLH-DSA persistence is
+    /// out of scope for v1 since the production default is ML-DSA-65.
+    seed: Option<[u8; 32]>,
 }
 
 // Debug elides the private key material so accidental log lines never
@@ -297,6 +304,10 @@ impl DeviceKeypair {
                     signing_key: DeviceSigningKey::SlhDsa(SlhSigningKey::<Sha2_128s>::new(
                         &mut rng,
                     )),
+                    // SLH-DSA's KeyGen API doesn't surface a stable
+                    // seed we can persist; v1 doesn't ship SLH-DSA
+                    // device keys to disk.
+                    seed: None,
                 })
             }
         }
@@ -309,11 +320,24 @@ impl DeviceKeypair {
     }
 
     pub fn from_seed(seed: [u8; 32]) -> Result<Self> {
-        let seed = ml_dsa::B32::try_from(seed.as_slice())
+        let parsed = ml_dsa::B32::try_from(seed.as_slice())
             .map_err(|_| QlinkError::InvalidKey("invalid ML-DSA seed".into()))?;
         Ok(Self {
-            signing_key: DeviceSigningKey::MlDsa(MlDsa65::from_seed(&seed)),
+            signing_key: DeviceSigningKey::MlDsa(MlDsa65::from_seed(&parsed)),
+            seed: Some(seed),
         })
+    }
+
+    /// Returns the ML-DSA seed bytes that can be passed back to
+    /// `from_seed` to reconstruct this keypair. `None` when the
+    /// keypair was generated via a non-seedable algorithm (SLH-DSA),
+    /// in which case persistence requires re-generating a fresh
+    /// keypair on next launch.
+    ///
+    /// This is the canonical persistent form: 32 bytes is small
+    /// enough for Keychain storage and the inverse is exact.
+    pub fn seed(&self) -> Option<[u8; 32]> {
+        self.seed
     }
 
     pub fn public_key(&self) -> DevicePublicKey {
@@ -580,5 +604,35 @@ mod tests {
         public.verify(message, &signature).unwrap();
         assert!(public.verify(b"tampered", &signature).is_err());
         assert!(public.peer_id().starts_with("qlink_"));
+    }
+
+    #[test]
+    fn ml_dsa_keypair_round_trips_through_seed_for_persistence() {
+        let original = DeviceKeypair::generate().unwrap();
+        let seed = original
+            .seed()
+            .expect("ML-DSA keypair must expose a seed for persistence");
+        let restored = DeviceKeypair::from_seed(seed).unwrap();
+
+        // Restored keypair must produce the same peer_id (derived
+        // deterministically from the public key) and verify the same
+        // signatures — that's the persistence contract.
+        assert_eq!(original.public_key().bytes, restored.public_key().bytes);
+        assert_eq!(original.public_key().peer_id(), restored.public_key().peer_id());
+
+        // Cross-verify: a signature from the restored key validates
+        // against the original public key.
+        let message = b"persistence-round-trip";
+        let signature = restored.sign(message);
+        original.public_key().verify(message, &signature).unwrap();
+    }
+
+    #[test]
+    fn slh_dsa_keypair_does_not_expose_a_seed() {
+        // SLH-DSA's KeyGen API doesn't surface a stable seed, so
+        // `seed()` returns None — callers persist these by
+        // re-generating, not by serializing.
+        let keypair = DeviceKeypair::generate_for_suite(SUITE_FIPS205).unwrap();
+        assert!(keypair.seed().is_none());
     }
 }

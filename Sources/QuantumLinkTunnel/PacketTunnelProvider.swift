@@ -17,6 +17,26 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var lastNetworkEvent: NetworkLifecycleEvent?
     private var networkEventCount: UInt64 = 0
     private var lastReprobeAt: Date?
+    /// Strict-mode watchdog. Periodically checks whether the transport
+    /// has stayed unhealthy past `KillSwitchWatchdog.defaultDeadlineSeconds`
+    /// and tears down the tunnel if so — the runtime teeth that turn
+    /// `KillSwitchPolicy.strict` into something stronger than
+    /// `failClosed` (which is purely a per-batch drop policy).
+    private var killSwitchWatchdog: KillSwitchWatchdog?
+    private var killSwitchWatchdogTask: Task<Void, Never>?
+    /// Refreshes the local node's signed peer record with the
+    /// rendezvous server on a TTL/2 cadence so dialing peers always
+    /// see a fresh entry. Cancelled on stopTunnel. `nil` until
+    /// startTunnel constructs a keypair-equipped mesh transport.
+    private var publishSelfTask: Task<Void, Never>?
+    /// Forwards Rust-side `tracing::warn!`/`error!` events into the
+    /// Swift logger, redacted at the seam. Started on startTunnel,
+    /// stopped on stopTunnel.
+    private var tracingForwarder: RustTracingForwarder?
+    /// Production transport bundle held for diagnostics + the
+    /// publish loop. `nil` when running through the legacy / dev
+    /// transport paths.
+    private var productionMeshBundle: ProductionMeshTransportBundle?
 
     public override func startTunnel(
         options: [String: NSObject]? = nil,
@@ -31,7 +51,7 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
             setTunnelNetworkSettings(settings) { [weak self] error in
                 guard let self else { return }
                 if let error {
-                    self.logger.error("Failed to apply tunnel network settings: \(error.localizedDescription, privacy: .public)")
+                    self.logger.error("Failed to apply tunnel network settings: \(PrivacyDefaults.redactForLog(error), privacy: .public)")
                     completion(error)
                     return
                 }
@@ -46,23 +66,26 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
                     try self.transport.start()
                 } catch {
                     if configuration.killSwitch == .strict {
-                        self.logger.error("Strict kill switch: refusing to start tunnel because transport failed: \(error.localizedDescription, privacy: .public)")
+                        self.logger.error("Strict kill switch: refusing to start tunnel because transport failed: \(PrivacyDefaults.redactForLog(error), privacy: .public)")
                         self.isRunning = false
                         self.transport = DevelopmentDropTransportSender(reason: error.localizedDescription)
                         completion(error)
                         return
                     }
-                    self.logger.error("Transport start failed; using development drop sender: \(error.localizedDescription, privacy: .public)")
+                    self.logger.error("Transport start failed; using development drop sender: \(PrivacyDefaults.redactForLog(error), privacy: .public)")
                     self.transport = DevelopmentDropTransportSender(reason: error.localizedDescription)
                     try? self.transport.start()
                 }
                 self.logger.info("QuantumLink packet tunnel started for mesh \(configuration.meshID, privacy: .public)")
                 self.startNetworkObserver()
+                self.startKillSwitchWatchdog(policy: configuration.killSwitch)
+                self.startPublishSelfLoop()
+                self.startTracingForwarder()
                 self.schedulePacketRead()
                 completion(nil)
             }
         } catch {
-            logger.error("Invalid tunnel configuration: \(error.localizedDescription, privacy: .public)")
+            logger.error("Invalid tunnel configuration: \(PrivacyDefaults.redactForLog(error), privacy: .public)")
             completionHandler(error)
         }
     }
@@ -73,6 +96,10 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
     ) {
         isRunning = false
         stopNetworkObserver()
+        stopKillSwitchWatchdog()
+        stopPublishSelfLoop()
+        stopTracingForwarder()
+        productionMeshBundle = nil
         packetPump = TunnelPacketPump(coreAdapter: nil)
         transport.stop()
         transport = DevelopmentDropTransportSender(reason: "Tunnel transport is stopped")
@@ -178,20 +205,20 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
         var protocols: [NSNumber] = []
 
         while true {
-            let frame: Data?
+            let inbound: InboundTransportFrame?
             do {
-                frame = try transport.receiveTransportFrame()
+                inbound = try transport.receiveTransportFrame()
             } catch {
-                logger.error("Failed to receive transport frame: \(error.localizedDescription, privacy: .public)")
+                logger.error("Failed to receive transport frame: \(PrivacyDefaults.redactForLog(error), privacy: .public)")
                 break
             }
 
-            guard let frame else {
+            guard let inbound else {
                 break
             }
 
             do {
-                try packetPump.acceptTransportFrame(frame)
+                try packetPump.acceptTransportFrame(inbound.frame, peerID: inbound.peerID)
                 while true {
                     guard let packet = try packetPump.popTunnelPacket() else {
                         break
@@ -200,7 +227,7 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
                     protocols.append(NSNumber(value: packet.protocolFamily))
                 }
             } catch {
-                logger.error("Failed to drain inbound transport frame: \(error.localizedDescription, privacy: .public)")
+                logger.error("Failed to drain inbound transport frame: \(PrivacyDefaults.redactForLog(error), privacy: .public)")
             }
         }
 
@@ -216,13 +243,132 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
             logger.info("Loaded QuantumLink Rust core \(library.version, privacy: .public)")
             return adapter
         } catch {
-            logger.error("Rust core unavailable; tunnel remains fail-closed: \(error.localizedDescription, privacy: .public)")
+            logger.error("Rust core unavailable; tunnel remains fail-closed: \(PrivacyDefaults.redactForLog(error), privacy: .public)")
             return nil
         }
     }
 
     private func makeTransport(configuration: TunnelConfiguration) -> TunnelTransporting {
-        TunnelTransportFactory.makeDefault(configuration: configuration)
+        // If `QLINK_TRANSPORT_MODE` is set we honor it as an explicit
+        // smoke / dev override and skip the production wiring.
+        // Otherwise (the production default), build a keypair-equipped
+        // mesh transport from Keychain-persisted material.
+        let environment = ProcessInfo.processInfo.environment
+        if environment["QLINK_TRANSPORT_MODE"] != nil {
+            return TunnelTransportFactory.makeDefault(
+                configuration: configuration,
+                environment: environment
+            )
+        }
+        do {
+            let bundle = try TunnelTransportFactory.makeProductionMeshTransport(
+                configuration: configuration,
+                peerStoreDirectory: peerStoreDirectory()
+            )
+            productionMeshBundle = bundle
+            logger.info(
+                "production mesh transport built (peer_id=\(bundle.keypair.peerID, privacy: .public), peer_store_encryption=\(bundle.peerStoreEncryptionEnabled ? "enabled" : "disabled", privacy: .public))"
+            )
+            return bundle.transport
+        } catch {
+            logger.error(
+                "Production mesh transport unavailable; falling back to default factory: \(PrivacyDefaults.redactForLog(error), privacy: .public)"
+            )
+            return TunnelTransportFactory.makeDefault(
+                configuration: configuration,
+                environment: environment
+            )
+        }
+    }
+
+    /// Resolves the directory the FilePeerStore should live in.
+    /// Inside the NEPacketTunnelProvider sandbox, Application
+    /// Support is the canonical writable location. If the lookup
+    /// fails (which it shouldn't on macOS), return nil so the
+    /// factory falls back to in-memory-only storage.
+    private func peerStoreDirectory() -> URL? {
+        guard
+            let base = try? FileManager.default.url(
+                for: .applicationSupportDirectory,
+                in: .userDomainMask,
+                appropriateFor: nil,
+                create: true
+            )
+        else {
+            return nil
+        }
+        return base.appendingPathComponent("QuantumLink", isDirectory: true)
+    }
+
+    /// Cadence for refreshing the local peer record. TTL/2 keeps a
+    /// fresh entry visible to dialing peers before the previous one
+    /// expires; the Rust side defaults TTL to 120s, so we publish
+    /// every 60s.
+    private static let publishSelfTTLSeconds: UInt64 = 120
+    private static let publishSelfRefreshInterval: Duration = .seconds(60)
+
+    private func startPublishSelfLoop() {
+        guard publishSelfTask == nil else { return }
+        guard let bundle = productionMeshBundle else {
+            // No keypair on this transport — publishSelf would just
+            // throw. Skip silently; the dev / drop path doesn't need
+            // a published record.
+            return
+        }
+        guard let rendezvousURL = bundle.rendezvousURL else {
+            logger.notice("publishSelf loop skipped: no rendezvous URL configured")
+            return
+        }
+        let transport = bundle.transport
+        let logger = self.logger
+        let refreshInterval = Self.publishSelfRefreshInterval
+        let ttlSeconds = Self.publishSelfTTLSeconds
+        publishSelfTask = Task.detached {
+            var sequence: UInt64 = 1
+            while !Task.isCancelled {
+                do {
+                    try transport.publishSelf(
+                        rendezvousURL: rendezvousURL,
+                        ttlSeconds: ttlSeconds,
+                        sequence: sequence
+                    )
+                    logger.info("publishSelf ok (sequence=\(sequence, privacy: .public))")
+                } catch {
+                    logger.error(
+                        "publishSelf failed: \(PrivacyDefaults.redactForLog(error), privacy: .public)"
+                    )
+                }
+                // u64 wrap takes ~600 billion years at this cadence;
+                // saturate at .max so the build doesn't trap if
+                // someone changes the cadence and we hit the
+                // theoretical edge.
+                sequence = sequence == .max ? sequence : sequence + 1
+                try? await Task.sleep(for: refreshInterval)
+            }
+        }
+    }
+
+    private func stopPublishSelfLoop() {
+        publishSelfTask?.cancel()
+        publishSelfTask = nil
+    }
+
+    private func startTracingForwarder() {
+        guard tracingForwarder == nil else { return }
+        guard let bundle = productionMeshBundle else {
+            // Tracing forwarder needs a library handle. The
+            // dev / drop transport paths don't construct one;
+            // their diagnostics flow through `Logger` directly.
+            return
+        }
+        let forwarder = RustTracingForwarder(library: bundle.library)
+        forwarder.start()
+        tracingForwarder = forwarder
+    }
+
+    private func stopTracingForwarder() {
+        tracingForwarder?.stop()
+        tracingForwarder = nil
     }
 
     private func startNetworkObserver() {
@@ -242,6 +388,50 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
         Task { @MainActor in
             observer?.stop()
         }
+    }
+
+    /// Cadence at which the strict-mode watchdog re-checks the
+    /// transport's health. Smaller values catch sustained-failure
+    /// faster; larger values reduce wakeups on long-idle tunnels.
+    /// 5 s gives ~6 evaluations within the 30 s default deadline.
+    private static let killSwitchWatchdogTickInterval: UInt64 = 5_000_000_000
+
+    private func startKillSwitchWatchdog(policy: KillSwitchPolicy) {
+        // failClosed needs no runtime teeth — the per-batch pump gate
+        // already covers it. Skip the periodic Task entirely so we
+        // don't burn wakeups on a no-op.
+        guard policy == .strict else { return }
+        let watchdog = KillSwitchWatchdog(
+            policy: policy,
+            readyCheck: { [weak self] in
+                guard let self else { return false }
+                return self.transport.isReady
+            },
+            deadlineHandler: { [weak self] in
+                guard let self else { return }
+                self.logger.error(
+                    "Strict kill switch deadline expired: tearing down tunnel after \(KillSwitchWatchdog.defaultDeadlineSeconds, privacy: .public)s of unhealthy transport"
+                )
+                self.cancelTunnelWithError(NSError(
+                    domain: "com.quantumlink.macos",
+                    code: -1,
+                    userInfo: [NSLocalizedDescriptionKey: "Strict kill switch tripped: transport unavailable past deadline"]
+                ))
+            }
+        )
+        killSwitchWatchdog = watchdog
+        killSwitchWatchdogTask = Task { [weak self] in
+            while let self, !Task.isCancelled, self.isRunning {
+                self.killSwitchWatchdog?.evaluate()
+                try? await Task.sleep(nanoseconds: Self.killSwitchWatchdogTickInterval)
+            }
+        }
+    }
+
+    private func stopKillSwitchWatchdog() {
+        killSwitchWatchdogTask?.cancel()
+        killSwitchWatchdogTask = nil
+        killSwitchWatchdog = nil
     }
 
     private func handleNetworkEvent(_ event: NetworkLifecycleEvent) {
@@ -320,8 +510,22 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
             "pump_dropped_unprotected=\(packetPump.counters.droppedUnprotected)",
             "pump_failed_submissions=\(packetPump.counters.failedSubmissions)",
             "pump_frames_accepted=\(packetPump.counters.transportFramesAccepted)",
-            "pump_tunnel_packets_emitted=\(packetPump.counters.tunnelPacketsEmitted)"
+            "pump_tunnel_packets_emitted=\(packetPump.counters.tunnelPacketsEmitted)",
+            "pump_distinct_peers_seen=\(packetPump.counters.transportFramesAcceptedPerPeer.count)"
         ]
+        // Per-peer breakdown surfaced as a single comma-separated
+        // field. peer_id is pseudonymous + signed, so safe in the
+        // diagnostic export. Truncate at 12 entries to keep the
+        // summary readable; operators wanting the full breakdown
+        // pull the support bundle.
+        if !packetPump.counters.transportFramesAcceptedPerPeer.isEmpty {
+            let breakdown = packetPump.counters.transportFramesAcceptedPerPeer
+                .sorted { lhs, rhs in lhs.value > rhs.value }
+                .prefix(12)
+                .map { "\($0.key)=\($0.value)" }
+                .joined(separator: ",")
+            fields.append("pump_per_peer_frames=\(breakdown)")
+        }
         if let lastError = transportMetrics.lastError {
             fields.append("transport_last_error=\(PrivacyDefaults.redactNetworkIdentifiers(in: lastError))")
         }

@@ -165,6 +165,14 @@ public struct PumpDiagnostics: Codable, Equatable, Sendable {
     public let transportFramesAccepted: UInt64
     public let failedInboundFrames: UInt64
     public let tunnelPacketsEmitted: UInt64
+    /// Per-peer breakdown of `transportFramesAccepted`. Surfaced for
+    /// operator diagnostics: lets the support bundle show which
+    /// authenticated peers actually delivered traffic since launch.
+    /// Default-mode redaction does not touch peer_ids (they're
+    /// pseudonymous identifiers by design); raw mode emits the
+    /// unredacted map verbatim. Operators with a stricter policy
+    /// can post-process the bundle.
+    public let transportFramesAcceptedPerPeer: [String: UInt64]
 
     public init(from counters: PacketPumpCounters) {
         self.packetsObserved = counters.packetsObserved
@@ -177,6 +185,7 @@ public struct PumpDiagnostics: Codable, Equatable, Sendable {
         self.transportFramesAccepted = counters.transportFramesAccepted
         self.failedInboundFrames = counters.failedInboundFrames
         self.tunnelPacketsEmitted = counters.tunnelPacketsEmitted
+        self.transportFramesAcceptedPerPeer = counters.transportFramesAcceptedPerPeer
     }
 }
 

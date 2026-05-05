@@ -539,43 +539,23 @@ private struct OnboardingPanel: View {
     let configuration: TunnelConfiguration
     let status: TunnelStatus
 
-    private let columns = [
-        GridItem(.adaptive(minimum: 320), spacing: 16)
-    ]
-
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                VStack(alignment: .leading, spacing: 16) {
-                    HStack(alignment: .top, spacing: 16) {
-                        Image(systemName: "sparkles.rectangle.stack")
-                            .font(.system(size: 34, weight: .semibold))
-                            .foregroundStyle(Color.accentColor)
-                            .frame(width: 52, height: 52)
+        PanelChrome {
+            PanelHeader(
+                tab: .onboarding,
+                subtitle: "Choose your deployment defaults, verify tunnel identity, and confirm you are ready to send your first post-quantum protected session."
+            )
 
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text("Welcome to QuantumLink")
-                                .font(.title2.weight(.semibold))
-                            Text("Use this first-run workspace to choose your deployment defaults, verify tunnel identity, and confirm you are ready to send your first post-quantum protected session.")
-                                .foregroundStyle(.secondary)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-
-                        Spacer(minLength: 16)
-                    }
-
-                    HStack(spacing: 10) {
-                        OnboardingBadge(title: deploymentMode.title, systemImage: deploymentMode.systemImage)
-                        OnboardingBadge(title: globalPQCAlgorithm.shortTitle, systemImage: "lock.shield")
-                        OnboardingBadge(title: status.phase.label, systemImage: status.phase == .connected ? "checkmark.circle" : "shield")
-                    }
+            ConfigurationCard(title: "Welcome to QuantumLink", systemImage: "sparkles.rectangle.stack") {
+                HStack(spacing: 10) {
+                    OnboardingBadge(title: deploymentMode.title, systemImage: deploymentMode.systemImage)
+                    OnboardingBadge(title: globalPQCAlgorithm.shortTitle, systemImage: "lock.shield")
+                    OnboardingBadge(title: status.phase.label, systemImage: status.phase == .connected ? "checkmark.circle" : "shield")
                 }
-                .padding(18)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+            }
 
-                LazyVGrid(columns: columns, alignment: .leading, spacing: 16) {
-                    ConfigurationCard(title: "Choose Deployment", systemImage: "network") {
+            PanelGrid {
+                ConfigurationCard(title: "Choose Deployment", systemImage: "network") {
                         Picker("Deployment", selection: $deploymentMode) {
                             ForEach(QuantumLinkDeploymentMode.allCases) { mode in
                                 Label(mode.title, systemImage: mode.systemImage)
@@ -651,18 +631,15 @@ private struct OnboardingPanel: View {
                     }
                 }
 
-                ConfigurationCard(title: "Completion", systemImage: "sidebar.left") {
-                    Toggle("Remove Onboarding Tab", isOn: removeOnboardingBinding)
-                        .toggleStyle(.checkbox)
+            ConfigurationCard(title: "Completion", systemImage: "sidebar.left") {
+                Toggle("Remove Onboarding Tab", isOn: removeOnboardingBinding)
+                    .toggleStyle(.checkbox)
 
-                    Text("Hide this tab after your initial setup is complete. You can restore it at any time from Configuration.")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
+                Text("Hide this tab after your initial setup is complete. You can restore it at any time from Configuration.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
-            .frame(maxWidth: .infinity, alignment: .topLeading)
-            .padding(.bottom, 8)
         }
     }
 
@@ -728,47 +705,51 @@ private struct HomePanel: View {
     let onStartConnection: (ConnectionProfile) -> Void
     let onToggleFavoriteConnection: (ConnectionProfile) -> Void
 
-    private let lowerColumns = [
-        GridItem(.adaptive(minimum: 320), spacing: 16)
-    ]
-
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 20) {
-                HomeHeader(
-                    status: status,
-                    deploymentMode: deploymentMode,
-                    onConnect: onConnect,
-                    onDisconnect: onDisconnect,
-                    onRefresh: onRefresh
-                )
-
-                ConnectionLauncherPanel(
-                    draft: $draftConnectionProfile,
-                    deploymentMode: deploymentModeBinding,
-                    globalPQCAlgorithm: globalPQCAlgorithm,
-                    recentProfiles: recentConnectionProfiles,
-                    favoriteProfiles: favoriteConnectionProfiles,
-                    overlayAddress: status.overlayIPv4Address,
-                    onStart: onStartConnection,
-                    onToggleFavorite: onToggleFavoriteConnection
-                )
-
-                KPIGrid(status: status)
-
-                LazyVGrid(columns: lowerColumns, alignment: .leading, spacing: 16) {
-                    RecentSessionsPanel(
-                        sessions: recentSessions
-                    )
-                    TechnicalInfoPanel(
-                        status: status,
-                        configuration: configuration,
-                        deploymentMode: deploymentMode
-                    )
+        PanelChrome {
+            PanelHeader(
+                tab: .home,
+                subtitle: "\(status.phase.label) · \(deploymentMode.title) · \(status.routeMode.label) · DNS \(status.dnsMode.label)"
+            ) {
+                HStack(spacing: 8) {
+                    Button(action: onRefresh) {
+                        Label("Refresh", systemImage: "arrow.clockwise")
+                    }
+                    Button(action: status.phase == .connected ? onDisconnect : onConnect) {
+                        Label(
+                            status.phase == .connected ? "Disconnect" : "Connect",
+                            systemImage: status.phase == .connected ? "power" : "bolt.horizontal.circle"
+                        )
+                    }
+                    .buttonStyle(.borderedProminent)
                 }
             }
-            .frame(maxWidth: .infinity, alignment: .topLeading)
-            .padding(.bottom, 8)
+
+            ConnectionLauncherPanel(
+                draft: $draftConnectionProfile,
+                deploymentMode: deploymentModeBinding,
+                globalPQCAlgorithm: globalPQCAlgorithm,
+                recentProfiles: recentConnectionProfiles,
+                favoriteProfiles: favoriteConnectionProfiles,
+                overlayAddress: status.overlayIPv4Address,
+                onStart: onStartConnection,
+                onToggleFavorite: onToggleFavoriteConnection
+            )
+
+            ConfigurationCard(title: "Status", systemImage: "shield.lefthalf.filled") {
+                StatusHeader(status: status)
+                Divider()
+                KPIGrid(status: status)
+            }
+
+            PanelGrid {
+                RecentSessionsPanel(sessions: recentSessions)
+                TechnicalInfoPanel(
+                    status: status,
+                    configuration: configuration,
+                    deploymentMode: deploymentMode
+                )
+            }
         }
     }
 }
@@ -784,28 +765,22 @@ private struct ConnectionsPanel: View {
     let onToggleFavoriteConnection: (ConnectionProfile) -> Void
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Connections")
-                        .font(.title2.weight(.semibold))
-                    Text("Create, favorite, and relaunch connection profiles.")
-                        .foregroundStyle(.secondary)
-                }
+        PanelChrome {
+            PanelHeader(
+                tab: .connections,
+                subtitle: "Create, favorite, and relaunch connection profiles."
+            )
 
-                ConnectionLauncherPanel(
-                    draft: $draftConnectionProfile,
-                    deploymentMode: $deploymentMode,
-                    globalPQCAlgorithm: $globalPQCAlgorithm,
-                    recentProfiles: recentConnectionProfiles,
-                    favoriteProfiles: favoriteConnectionProfiles,
-                    overlayAddress: overlayAddress,
-                    onStart: onStartConnection,
-                    onToggleFavorite: onToggleFavoriteConnection
-                )
-            }
-            .frame(maxWidth: .infinity, alignment: .topLeading)
-            .padding(.bottom, 8)
+            ConnectionLauncherPanel(
+                draft: $draftConnectionProfile,
+                deploymentMode: $deploymentMode,
+                globalPQCAlgorithm: $globalPQCAlgorithm,
+                recentProfiles: recentConnectionProfiles,
+                favoriteProfiles: favoriteConnectionProfiles,
+                overlayAddress: overlayAddress,
+                onStart: onStartConnection,
+                onToggleFavorite: onToggleFavoriteConnection
+            )
         }
     }
 }
@@ -818,38 +793,30 @@ private struct ActivityPanel: View {
     let onStartConnection: (ConnectionProfile) -> Void
     let onToggleFavoriteConnection: (ConnectionProfile) -> Void
 
-    private let columns = [
-        GridItem(.adaptive(minimum: 320), spacing: 16)
-    ]
-
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Activity")
-                        .font(.title2.weight(.semibold))
-                    Text("\(status.metrics.bytesIn.byteCount) in · \(status.metrics.bytesOut.byteCount) out · \(status.metrics.replayDrops) replay drops")
-                        .foregroundStyle(.secondary)
-                }
+        PanelChrome {
+            PanelHeader(
+                tab: .activity,
+                subtitle: "\(status.metrics.bytesIn.byteCount) in · \(status.metrics.bytesOut.byteCount) out · \(status.metrics.replayDrops) replay drops"
+            )
 
+            ConfigurationCard(title: "Live Metrics", systemImage: "speedometer") {
                 KPIGrid(status: status)
-
-                LazyVGrid(columns: columns, alignment: .leading, spacing: 16) {
-                    RecentSessionsPanel(sessions: recentSessions)
-
-                    ConnectionProfileList(
-                        title: "Recent Connections",
-                        systemImage: "clock.arrow.circlepath",
-                        emptyTitle: "No recent connections",
-                        profiles: recentConnectionProfiles,
-                        favoriteProfiles: favoriteConnectionProfiles,
-                        onStart: onStartConnection,
-                        onToggleFavorite: onToggleFavoriteConnection
-                    )
-                }
             }
-            .frame(maxWidth: .infinity, alignment: .topLeading)
-            .padding(.bottom, 8)
+
+            PanelGrid {
+                RecentSessionsPanel(sessions: recentSessions)
+
+                ConnectionProfileList(
+                    title: "Recent Connections",
+                    systemImage: "clock.arrow.circlepath",
+                    emptyTitle: "No recent connections",
+                    profiles: recentConnectionProfiles,
+                    favoriteProfiles: favoriteConnectionProfiles,
+                    onStart: onStartConnection,
+                    onToggleFavorite: onToggleFavoriteConnection
+                )
+            }
         }
     }
 }
@@ -1411,22 +1378,15 @@ private struct ConfigurationPanel: View {
     let configuration: TunnelConfiguration
     let status: TunnelStatus
 
-    private let columns = [
-        GridItem(.adaptive(minimum: 330), spacing: 16)
-    ]
-
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Configuration")
-                        .font(.title2.weight(.semibold))
-                    Text("\(configuration.deviceAlias) · \(configuration.meshID) · \(status.phase.label)")
-                        .foregroundStyle(.secondary)
-                }
+        PanelChrome {
+            PanelHeader(
+                tab: .configuration,
+                subtitle: "\(configuration.deviceAlias) · \(configuration.meshID) · \(status.phase.label)"
+            )
 
-                LazyVGrid(columns: columns, alignment: .leading, spacing: 16) {
-                    ConfigurationCard(title: "Deployment", systemImage: "network") {
+            PanelGrid {
+                ConfigurationCard(title: "Deployment", systemImage: "network") {
                         Picker("Deployment", selection: $deploymentMode) {
                             ForEach(QuantumLinkDeploymentMode.allCases) { mode in
                                 Label(mode.title, systemImage: mode.systemImage)
@@ -1500,19 +1460,16 @@ private struct ConfigurationPanel: View {
                         InfoRow(label: "Current Path", value: status.pathType.label)
                     }
 
-                    ConfigurationCard(title: "Workflow", systemImage: "sidebar.left") {
-                        Toggle("Show onboarding tab in sidebar", isOn: $onboardingTabVisible)
-                            .toggleStyle(.checkbox)
+                ConfigurationCard(title: "Workflow", systemImage: "sidebar.left") {
+                    Toggle("Show onboarding tab in sidebar", isOn: $onboardingTabVisible)
+                        .toggleStyle(.checkbox)
 
-                        Text("Re-enable the onboarding workspace if you want to revisit first-run guidance or walkthrough settings later.")
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
+                    Text("Re-enable the onboarding workspace if you want to revisit first-run guidance or walkthrough settings later.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
-            .frame(maxWidth: .infinity, alignment: .topLeading)
-            .padding(.bottom, 8)
         }
     }
 }
@@ -1536,8 +1493,100 @@ private struct ConfigurationCard<Content: View>: View {
             content
         }
         .padding(16)
-        .frame(maxWidth: .infinity, alignment: .topLeading)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+/// Unified panel-title row used at the top of every detail panel.
+/// Pulls the icon + display name straight off the `SidebarTab` so the
+/// panel header always matches whatever's selected in the sidebar.
+/// Optional `subtitle` carries the panel's one-line context (mesh ID,
+/// device alias, current state) in the same `secondary` style the
+/// rest of the app uses. Optional `trailing` slot lets a panel hang
+/// action buttons (Refresh, Connect, Disconnect) on the right edge
+/// without breaking the title alignment.
+private struct PanelHeader<Trailing: View>: View {
+    let tab: SidebarTab
+    let subtitle: String?
+    let trailing: Trailing
+
+    init(
+        tab: SidebarTab,
+        subtitle: String? = nil,
+        @ViewBuilder trailing: () -> Trailing = { EmptyView() }
+    ) {
+        self.tab = tab
+        self.subtitle = subtitle
+        self.trailing = trailing()
+    }
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 12) {
+            Image(systemName: tab.systemImage)
+                .font(.title2)
+                .foregroundStyle(.tint)
+                .frame(width: 28, height: 28, alignment: .center)
+                .accessibilityHidden(true)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(tab.title)
+                    .font(.title2.weight(.semibold))
+                if let subtitle, !subtitle.isEmpty {
+                    Text(subtitle)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+            }
+
+            Spacer()
+
+            trailing
+        }
+    }
+}
+
+/// Wraps every detail panel in the same scroll + spacing chrome so
+/// padding, gutters, and panel-title alignment are identical across
+/// Network, Peers, Routes, Security, Diagnostics, Configuration.
+private struct PanelChrome<Content: View>: View {
+    let content: Content
+
+    init(@ViewBuilder content: () -> Content) {
+        self.content = content()
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                content
+            }
+            .frame(maxWidth: .infinity, alignment: .topLeading)
+            .padding(.bottom, 8)
+        }
+    }
+}
+
+/// Shared card grid used by every panel that lays out cards. Adaptive
+/// columns at 320pt-min keep the layout consistent at every window
+/// size; explicit `alignment: .leading` matches the panel header's
+/// alignment so card edges line up with the title above.
+private struct PanelGrid<Content: View>: View {
+    let content: Content
+
+    private let columns = [
+        GridItem(.adaptive(minimum: 320), spacing: 16, alignment: .top)
+    ]
+
+    init(@ViewBuilder content: () -> Content) {
+        self.content = content()
+    }
+
+    var body: some View {
+        LazyVGrid(columns: columns, alignment: .leading, spacing: 16) {
+            content
+        }
     }
 }
 
@@ -1592,50 +1641,49 @@ private struct NetworkOverview: View {
     let configuration: TunnelConfiguration
     let deploymentMode: QuantumLinkDeploymentMode
 
-    private let columns = [
-        GridItem(.adaptive(minimum: 320), spacing: 16)
-    ]
-
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
+        PanelChrome {
+            PanelHeader(
+                tab: .network,
+                subtitle: "\(configuration.meshID) · \(status.phase.label) · \(status.pathType.label)"
+            )
+
+            ConfigurationCard(title: "Status", systemImage: "shield.lefthalf.filled") {
                 StatusHeader(status: status)
-
+                Divider()
                 KPIGrid(status: status)
+            }
 
-                LazyVGrid(columns: columns, alignment: .leading, spacing: 16) {
-                    ConfigurationCard(title: "Deployment", systemImage: deploymentMode.systemImage) {
-                        DeploymentModeSummary(mode: deploymentMode)
-                        InfoRow(label: "Phase", value: status.phase.label)
-                        InfoRow(label: "Path", value: status.pathType.label)
-                        InfoRow(label: "Route Mode", value: status.routeMode.label)
-                        InfoRow(label: "DNS", value: status.dnsMode.label)
-                    }
+            PanelGrid {
+                ConfigurationCard(title: "Deployment", systemImage: deploymentMode.systemImage) {
+                    DeploymentModeSummary(mode: deploymentMode)
+                    InfoRow(label: "Phase", value: status.phase.label)
+                    InfoRow(label: "Path", value: status.pathType.label)
+                    InfoRow(label: "Route Mode", value: status.routeMode.label)
+                    InfoRow(label: "DNS", value: status.dnsMode.label)
+                }
 
-                    ConfigurationCard(title: "Addressing", systemImage: "number") {
-                        InfoRow(label: "Overlay", value: PrivacyDefaults.redactNetworkIdentifiers(in: status.overlayIPv4Address))
-                        InfoRow(label: "Remote", value: PrivacyDefaults.redactNetworkIdentifiers(in: configuration.tunnelRemoteAddress))
-                        InfoRow(label: "MTU", value: "\(configuration.mtu)")
-                        InfoRow(label: "Protected", value: PrivacyDefaults.redactNetworkIdentifiers(in: status.protectedRoutes.joined(separator: ", ")))
-                    }
+                ConfigurationCard(title: "Addressing", systemImage: "number") {
+                    InfoRow(label: "Overlay", value: PrivacyDefaults.redactNetworkIdentifiers(in: status.overlayIPv4Address))
+                    InfoRow(label: "Remote", value: PrivacyDefaults.redactNetworkIdentifiers(in: configuration.tunnelRemoteAddress))
+                    InfoRow(label: "MTU", value: "\(configuration.mtu)")
+                    InfoRow(label: "Protected", value: PrivacyDefaults.redactNetworkIdentifiers(in: status.protectedRoutes.joined(separator: ", ")))
+                }
 
-                    ConfigurationCard(title: "Discovery", systemImage: "antenna.radiowaves.left.and.right") {
-                        InfoRow(label: "Modes", value: configuration.discoveryModes.map(\.label).joined(separator: ", "))
-                        InfoRow(label: "Rendezvous", value: configuration.rendezvousServers.isEmpty ? "Disabled" : PrivacyDefaults.redactNetworkIdentifiers(in: configuration.rendezvousServers.joined(separator: ", ")))
-                        InfoRow(label: "Relay", value: configuration.relayServers.isEmpty ? "Disabled" : PrivacyDefaults.redactNetworkIdentifiers(in: configuration.relayServers.joined(separator: ", ")))
-                        InfoRow(label: "Last Probe", value: status.metrics.lastPathProbe?.formatted(date: .abbreviated, time: .shortened) ?? "Never")
-                    }
+                ConfigurationCard(title: "Discovery", systemImage: "antenna.radiowaves.left.and.right") {
+                    InfoRow(label: "Modes", value: configuration.discoveryModes.map(\.label).joined(separator: ", "))
+                    InfoRow(label: "Rendezvous", value: configuration.rendezvousServers.isEmpty ? "Disabled" : PrivacyDefaults.redactNetworkIdentifiers(in: configuration.rendezvousServers.joined(separator: ", ")))
+                    InfoRow(label: "Relay", value: configuration.relayServers.isEmpty ? "Disabled" : PrivacyDefaults.redactNetworkIdentifiers(in: configuration.relayServers.joined(separator: ", ")))
+                    InfoRow(label: "Last Probe", value: status.metrics.lastPathProbe?.formatted(date: .abbreviated, time: .shortened) ?? "Never")
+                }
 
-                    ConfigurationCard(title: "Peer Mix", systemImage: "desktopcomputer.and.arrow.down") {
-                        InfoRow(label: "Total", value: "\(status.metrics.peerCount)")
-                        InfoRow(label: "Direct", value: "\(status.metrics.directPeerCount)")
-                        InfoRow(label: "Relay", value: "\(status.metrics.relayPeerCount)")
-                        InfoRow(label: "Replay Drops", value: "\(status.metrics.replayDrops)")
-                    }
+                ConfigurationCard(title: "Peer Mix", systemImage: "desktopcomputer.and.arrow.down") {
+                    InfoRow(label: "Total", value: "\(status.metrics.peerCount)")
+                    InfoRow(label: "Direct", value: "\(status.metrics.directPeerCount)")
+                    InfoRow(label: "Relay", value: "\(status.metrics.relayPeerCount)")
+                    InfoRow(label: "Replay Drops", value: "\(status.metrics.replayDrops)")
                 }
             }
-            .frame(maxWidth: .infinity, alignment: .topLeading)
-            .padding(.bottom, 8)
         }
     }
 }
@@ -1644,14 +1692,35 @@ private struct RoutesDetail: View {
     let status: TunnelStatus
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            RouteList(routes: status.protectedRoutes)
-            Divider()
-            Grid(alignment: .leading, horizontalSpacing: 36, verticalSpacing: 10) {
-                GridRow {
-                    MetricCell(label: "Route Mode", value: status.routeMode.label)
-                    MetricCell(label: "DNS Mode", value: status.dnsMode.label)
-                    MetricCell(label: "Overlay", value: PrivacyDefaults.redactNetworkIdentifiers(in: status.overlayIPv4Address))
+        PanelChrome {
+            PanelHeader(
+                tab: .routes,
+                subtitle: "\(status.protectedRoutes.count) protected · \(status.routeMode.label)"
+            )
+
+            PanelGrid {
+                ConfigurationCard(title: "Protected Routes", systemImage: "lock") {
+                    if status.protectedRoutes.isEmpty {
+                        Text("No protected routes configured.")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        FlowLayout(spacing: 8) {
+                            ForEach(status.protectedRoutes, id: \.self) { route in
+                                Label(route, systemImage: "lock")
+                                    .font(.callout.monospaced())
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 6))
+                            }
+                        }
+                    }
+                }
+
+                ConfigurationCard(title: "Route Policy", systemImage: "arrow.triangle.branch") {
+                    InfoRow(label: "Route Mode", value: status.routeMode.label)
+                    InfoRow(label: "DNS Mode", value: status.dnsMode.label)
+                    InfoRow(label: "Overlay", value: PrivacyDefaults.redactNetworkIdentifiers(in: status.overlayIPv4Address))
                 }
             }
         }
@@ -1662,23 +1731,15 @@ private struct SecurityDetail: View {
     let status: TunnelStatus
     let configuration: TunnelConfiguration
 
-    private let columns = [
-        GridItem(.adaptive(minimum: 320), spacing: 16)
-    ]
-
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Security")
-                        .font(.title2.weight(.semibold))
-                    Text("\(configuration.crypto.pqcAlgorithm.title) · \(status.metrics.replayDrops) replay drops")
-                        .foregroundStyle(.secondary)
-                        .lineLimit(2)
-                }
+        PanelChrome {
+            PanelHeader(
+                tab: .security,
+                subtitle: "\(configuration.crypto.pqcAlgorithm.title) · \(status.metrics.replayDrops) replay drops"
+            )
 
-                LazyVGrid(columns: columns, alignment: .leading, spacing: 16) {
-                    ConfigurationCard(title: "Crypto Policy", systemImage: "key.horizontal") {
+            PanelGrid {
+                ConfigurationCard(title: "Crypto Policy", systemImage: "key.horizontal") {
                         InfoRow(label: "PQC", value: configuration.crypto.pqcAlgorithm.title)
                         InfoRow(label: "Suite", value: configuration.crypto.suite)
                         InfoRow(label: "Rekey Time", value: "\(Int(configuration.crypto.rekeyAfterSeconds)) sec")
@@ -1693,38 +1754,35 @@ private struct SecurityDetail: View {
                         InfoRow(label: "Excluded", value: configuration.excludedRoutes.isEmpty ? "None" : PrivacyDefaults.redactNetworkIdentifiers(in: configuration.excludedRoutes.joined(separator: ", ")))
                     }
 
-                    ConfigurationCard(title: "Peer Keys", systemImage: "person.badge.key") {
-                        if status.peers.isEmpty {
-                            ContentUnavailableView("No peer keys available", systemImage: "person.badge.key")
-                                .frame(maxWidth: .infinity, minHeight: 120)
-                        } else {
-                            VStack(spacing: 0) {
-                                ForEach(status.peers) { peer in
-                                    VStack(alignment: .leading, spacing: 4) {
-                                        Text(peer.identity.alias)
-                                            .font(.callout.weight(.semibold))
-                                        Text(peer.identity.publicKeyFingerprint)
-                                            .font(.caption.monospaced())
-                                            .foregroundStyle(.secondary)
-                                            .textSelection(.enabled)
-                                        Text("Last rekey: \(peer.lastRekey?.formatted(date: .abbreviated, time: .shortened) ?? "Unknown")")
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
-                                    }
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .padding(.vertical, 8)
+                ConfigurationCard(title: "Peer Keys", systemImage: "person.badge.key") {
+                    if status.peers.isEmpty {
+                        ContentUnavailableView("No peer keys available", systemImage: "person.badge.key")
+                            .frame(maxWidth: .infinity, minHeight: 120)
+                    } else {
+                        VStack(spacing: 0) {
+                            ForEach(status.peers) { peer in
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(peer.identity.alias)
+                                        .font(.callout.weight(.semibold))
+                                    Text(peer.identity.publicKeyFingerprint)
+                                        .font(.caption.monospaced())
+                                        .foregroundStyle(.secondary)
+                                        .textSelection(.enabled)
+                                    Text("Last rekey: \(peer.lastRekey?.formatted(date: .abbreviated, time: .shortened) ?? "Unknown")")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.vertical, 8)
 
-                                    if peer.id != status.peers.last?.id {
-                                        Divider()
-                                    }
+                                if peer.id != status.peers.last?.id {
+                                    Divider()
                                 }
                             }
                         }
                     }
                 }
             }
-            .frame(maxWidth: .infinity, alignment: .topLeading)
-            .padding(.bottom, 8)
         }
     }
 }
@@ -1733,31 +1791,41 @@ private struct DiagnosticsDetail: View {
     let status: TunnelStatus
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            StatusHeader(status: status)
-            Divider()
-            MetricsStrip(status: status)
-            Divider()
-            Grid(alignment: .leading, horizontalSpacing: 36, verticalSpacing: 10) {
-                GridRow {
-                    MetricCell(label: "Phase", value: status.phase.label)
-                    MetricCell(label: "Last Probe", value: lastPathProbe)
-                    MetricCell(label: "Replay Drops", value: "\(status.metrics.replayDrops)")
+        PanelChrome {
+            PanelHeader(
+                tab: .diagnostics,
+                subtitle: "\(status.phase.label) · \(status.pathType.label) · \(status.metrics.peerCount) peers"
+            )
+
+            ConfigurationCard(title: "Status", systemImage: "shield.lefthalf.filled") {
+                StatusHeader(status: status)
+                Divider()
+                MetricsStrip(status: status)
+            }
+
+            PanelGrid {
+                ConfigurationCard(title: "Session", systemImage: "clock.arrow.circlepath") {
+                    InfoRow(label: "Phase", value: status.phase.label)
+                    InfoRow(label: "Last Probe", value: lastPathProbe)
+                    InfoRow(label: "Replay Drops", value: "\(status.metrics.replayDrops)")
+                    InfoRow(label: "Last Error", value: status.lastError.map { PrivacyDefaults.redactNetworkIdentifiers(in: $0) } ?? "None")
                 }
-                GridRow {
-                    MetricCell(label: "Last Error", value: status.lastError.map { PrivacyDefaults.redactNetworkIdentifiers(in: $0) } ?? "None")
-                    MetricCell(label: "Bytes In", value: status.metrics.bytesIn.byteCount)
-                    MetricCell(label: "Bytes Out", value: status.metrics.bytesOut.byteCount)
+
+                ConfigurationCard(title: "Traffic", systemImage: "arrow.up.arrow.down") {
+                    InfoRow(label: "Bytes In", value: status.metrics.bytesIn.byteCount)
+                    InfoRow(label: "Bytes Out", value: status.metrics.bytesOut.byteCount)
                 }
-                GridRow {
-                    MetricCell(label: "Transport", value: transportKind)
-                    MetricCell(label: "Transport State", value: transportState)
-                    MetricCell(label: "Transport Path", value: transportPath)
+
+                ConfigurationCard(title: "Transport", systemImage: "antenna.radiowaves.left.and.right") {
+                    InfoRow(label: "Kind", value: transportKind)
+                    InfoRow(label: "State", value: transportState)
+                    InfoRow(label: "Path", value: transportPath)
                 }
-                GridRow {
-                    MetricCell(label: "Frames Sent", value: transportFramesSent)
-                    MetricCell(label: "Frames Received", value: transportFramesReceived)
-                    MetricCell(label: "Frames Dropped", value: transportFramesDropped)
+
+                ConfigurationCard(title: "Frames", systemImage: "rectangle.stack") {
+                    InfoRow(label: "Sent", value: transportFramesSent)
+                    InfoRow(label: "Received", value: transportFramesReceived)
+                    InfoRow(label: "Dropped", value: transportFramesDropped)
                 }
             }
         }
@@ -1879,39 +1947,51 @@ private struct PeerList: View {
     let peers: [PeerStatus]
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Peers")
-                .font(.headline)
-            if peers.isEmpty {
-                ContentUnavailableView("No connected peers", systemImage: "network.slash")
-                    .frame(maxWidth: .infinity, minHeight: 160)
-            } else {
-                Table(peers) {
-                    TableColumn("Alias") { peer in
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(peer.identity.alias)
-                            Text(peer.identity.peerID)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+        PanelChrome {
+            PanelHeader(tab: .peers, subtitle: subtitleText)
+
+            ConfigurationCard(title: "Connected Peers", systemImage: "desktopcomputer.and.arrow.down") {
+                if peers.isEmpty {
+                    ContentUnavailableView("No connected peers", systemImage: "network.slash")
+                        .frame(maxWidth: .infinity, minHeight: 160)
+                } else {
+                    Table(peers) {
+                        TableColumn("Alias") { peer in
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(peer.identity.alias)
+                                    .font(.callout)
+                                Text(peer.identity.peerID)
+                                    .font(.caption.monospaced())
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        TableColumn("Overlay") { peer in
+                            Text(PrivacyDefaults.redactNetworkIdentifiers(in: peer.overlayAddress))
+                                .font(.callout.monospaced())
+                        }
+                        TableColumn("Path") { peer in
+                            Label(peer.pathType.label, systemImage: peer.pathType.systemImage)
+                                .font(.callout)
+                        }
+                        TableColumn("RTT") { peer in
+                            Text(peer.rttMilliseconds.map { "\($0) ms" } ?? "unknown")
+                                .font(.callout.monospacedDigit())
+                        }
+                        TableColumn("Traffic") { peer in
+                            Text("\(peer.bytesIn.byteCount) / \(peer.bytesOut.byteCount)")
+                                .font(.callout.monospacedDigit())
                         }
                     }
-                    TableColumn("Overlay") { peer in
-                        Text(PrivacyDefaults.redactNetworkIdentifiers(in: peer.overlayAddress))
-                            .font(.body.monospaced())
-                    }
-                    TableColumn("Path") { peer in
-                        Label(peer.pathType.label, systemImage: peer.pathType.systemImage)
-                    }
-                    TableColumn("RTT") { peer in
-                        Text(peer.rttMilliseconds.map { "\($0) ms" } ?? "unknown")
-                    }
-                    TableColumn("Traffic") { peer in
-                        Text("\(peer.bytesIn.byteCount) / \(peer.bytesOut.byteCount)")
-                    }
+                    .frame(minHeight: 220)
                 }
-                .frame(minHeight: 220)
             }
         }
+    }
+
+    private var subtitleText: String {
+        peers.isEmpty
+            ? "No peers connected"
+            : "\(peers.count) connected · \(peers.filter { $0.pathType == .direct }.count) direct"
     }
 }
 

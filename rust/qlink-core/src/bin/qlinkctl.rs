@@ -5,6 +5,7 @@ use qlink_core::{
     ice::{perform_ice_check, spawn_dev_ice_responder, IceCheckRequest, IceCredentials},
     local_loopback::{run_local_mesh_loopback, run_relay_loopback},
     mesh_connection::{MeshConnector, MeshConnectorConfig, PathKind},
+    mesh_transport::{MeshTransportConfig, MeshTransportHandle},
     packet_core::{FfiRouteMode, PacketTunnelCore, PacketTunnelCoreConfig},
     quic_transport::QuicEndpoint,
     relay::{run_relay, spawn_dev_relay, RelayClient},
@@ -14,6 +15,7 @@ use qlink_core::{
 };
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::net::UdpSocket;
@@ -62,6 +64,43 @@ enum Command {
     MeshConnect {
         #[arg(long, default_value = "direct")]
         scenario: String,
+    },
+    /// Stand up a `MeshTransportHandle` (responder enabled), publish the
+    /// local node's signed peer record to a rendezvous server, and stay
+    /// resident — refreshing the record on a TTL/2 cadence — until the
+    /// process is interrupted. Pairs with `mesh-connect` on a second
+    /// peer to exercise the full responder + cert-publishing pipeline
+    /// without lab-test scaffolding.
+    ///
+    /// Pass `--keyfile` to persist the device keypair across runs;
+    /// without it the process generates a fresh ephemeral keypair each
+    /// launch (peer_id changes, cached records become unauthenticatable).
+    PublishSelf {
+        #[arg(long, default_value = "127.0.0.1:9471")]
+        rendezvous: String,
+        #[arg(long, default_value = "devmesh")]
+        mesh_id: String,
+        /// Local UDP bind address for the responder + outbound client.
+        #[arg(long, default_value = "127.0.0.1:0")]
+        bind_addr: String,
+        /// Record TTL in seconds. Republish cadence is TTL/2.
+        #[arg(long, default_value = "120")]
+        ttl_seconds: u64,
+        /// Publish once and exit instead of staying resident.
+        #[arg(long)]
+        once: bool,
+        /// Path to a 32-byte ML-DSA seed file. If the file exists,
+        /// the keypair is loaded from it; otherwise a fresh keypair
+        /// is generated and the seed is written to the file (mode
+        /// 0o600). Without this flag, a fresh keypair is generated
+        /// in memory and discarded on exit.
+        #[arg(long)]
+        keyfile: Option<String>,
+        /// Optional path to a `peers.json` cache (FilePeerStore).
+        /// When set, the connector falls back to cached records on
+        /// rendezvous failure. The parent directory must exist.
+        #[arg(long)]
+        peer_store: Option<String>,
     },
 }
 
@@ -243,9 +282,163 @@ async fn main() -> qlink_core::Result<()> {
         Command::MeshConnect { scenario } => {
             run_mesh_connect_demo(&scenario).await?;
         }
+        Command::PublishSelf {
+            rendezvous,
+            mesh_id,
+            bind_addr,
+            ttl_seconds,
+            once,
+            keyfile,
+            peer_store,
+        } => {
+            run_publish_self(
+                &rendezvous,
+                &mesh_id,
+                &bind_addr,
+                ttl_seconds,
+                once,
+                keyfile.as_deref(),
+                peer_store.as_deref(),
+            )
+            .await?;
+        }
     }
 
     Ok(())
+}
+
+async fn run_publish_self(
+    rendezvous_url: &str,
+    mesh_id: &str,
+    bind_addr: &str,
+    ttl_seconds: u64,
+    once: bool,
+    keyfile: Option<&str>,
+    peer_store_path: Option<&str>,
+) -> qlink_core::Result<()> {
+    let keypair = Arc::new(load_or_generate_keypair(keyfile)?);
+    let local_peer_id = keypair.public_key().peer_id();
+
+    // Construction needs to live outside the async runtime context
+    // (it spins up its own internal tokio runtime); spawn_blocking
+    // gives us a thread that isn't already inside one.
+    let mesh_id_owned = mesh_id.to_string();
+    let bind_addr_owned = bind_addr.to_string();
+    let rendezvous_owned = rendezvous_url.to_string();
+    let peer_store_for_handle = peer_store_path.map(|p| p.to_string());
+    let local_peer_id_for_handle = local_peer_id.clone();
+    let keypair_for_handle = keypair.clone();
+    let handle = tokio::task::spawn_blocking(move || {
+        MeshTransportHandle::new_with_keypair(
+            MeshTransportConfig {
+                mesh_id: mesh_id_owned,
+                local_peer_id: local_peer_id_for_handle,
+                // No specific remote yet — operators add peers via a
+                // future control surface. The default-peer field is
+                // legacy single-peer scaffolding that the back-compat
+                // API still requires.
+                remote_peer_id: "qlink_unconfigured".to_string(),
+                rendezvous_url: rendezvous_owned,
+                relay_url: None,
+                bind_addr: bind_addr_owned,
+                overall_deadline_ms: 3_000,
+                direct_probe_timeout_ms: 750,
+                probe_pacing_ms: 50,
+                enable_ice: false,
+                reconnect_initial_backoff_ms: 250,
+                reconnect_max_backoff_ms: 30_000,
+                metrics_endpoint_bind_addr: None,
+                inbound_acl: None,
+                disable_inbound_responder: false,
+                peer_store_path: peer_store_for_handle,
+                peer_store_key_b64: None,
+            },
+            Some(keypair_for_handle),
+        )
+    })
+    .await
+    .map_err(|err| qlink_core::QlinkError::Protocol(format!("handle spawn failed: {err}")))??;
+
+    let responder_addr = handle
+        .responder_local_addr()
+        .ok_or_else(|| qlink_core::QlinkError::Protocol("responder_local_addr missing".into()))?;
+    println!("local_peer_id={local_peer_id}");
+    println!("responder_addr={responder_addr}");
+    println!("mesh_id={mesh_id}");
+    println!("rendezvous_url={rendezvous_url}");
+
+    // Sequence increments per publish so peers see "newer" records and
+    // can drop stale duplicates. Starts at 1 to match the canonical
+    // peer-record convention used elsewhere in the crate.
+    let mut sequence: u64 = 1;
+    loop {
+        let record = handle
+            .publish_self(keypair.as_ref(), rendezvous_url, ttl_seconds, sequence, vec![])
+            .await?;
+        println!(
+            "published sequence={sequence} expires_at_unix={}",
+            record.body.expires_at_unix
+        );
+        if once {
+            return Ok(());
+        }
+        sequence = sequence.saturating_add(1);
+        // Republish at TTL/2 so consumers always see a fresh record
+        // before the previous one is allowed to expire. Bottom out at
+        // 1s so absurdly small TTLs don't busy-loop.
+        let sleep_secs = ttl_seconds.saturating_div(2).max(1);
+        tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
+    }
+}
+
+/// Loads a 32-byte ML-DSA seed from `keyfile` if provided + present,
+/// otherwise generates a fresh keypair and (if `keyfile` was given)
+/// writes the seed to disk with mode 0o600. The seed file format is
+/// raw bytes — not encoded, not encrypted. Operators that need
+/// at-rest encryption should store the seed in macOS Keychain via
+/// the Swift app instead.
+fn load_or_generate_keypair(keyfile: Option<&str>) -> qlink_core::Result<DeviceKeypair> {
+    let Some(path) = keyfile else {
+        return DeviceKeypair::generate();
+    };
+    let path_buf = std::path::Path::new(path);
+    if path_buf.exists() {
+        let bytes = std::fs::read(path_buf).map_err(|err| {
+            qlink_core::QlinkError::Protocol(format!("failed to read keyfile {path}: {err}"))
+        })?;
+        if bytes.len() != 32 {
+            return Err(qlink_core::QlinkError::Protocol(format!(
+                "keyfile {path} must be exactly 32 bytes; got {}",
+                bytes.len()
+            )));
+        }
+        let mut seed = [0_u8; 32];
+        seed.copy_from_slice(&bytes);
+        let keypair = DeviceKeypair::from_seed(seed)?;
+        eprintln!("loaded device keypair from {path} (peer_id={})", keypair.public_key().peer_id());
+        return Ok(keypair);
+    }
+    let keypair = DeviceKeypair::generate()?;
+    let seed = keypair
+        .seed()
+        .ok_or_else(|| qlink_core::QlinkError::Protocol("generated keypair has no seed".into()))?;
+    std::fs::write(path_buf, seed).map_err(|err| {
+        qlink_core::QlinkError::Protocol(format!("failed to write keyfile {path}: {err}"))
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(path_buf) {
+            let mut perms = meta.permissions();
+            perms.set_mode(0o600);
+            let _ = std::fs::set_permissions(path_buf, perms);
+        }
+    }
+    eprintln!(
+        "generated new device keypair, wrote seed to {path} (peer_id={})",
+        keypair.public_key().peer_id()
+    );
+    Ok(keypair)
 }
 
 async fn run_mesh_connect_demo(scenario: &str) -> qlink_core::Result<()> {

@@ -26,14 +26,24 @@
 //! handle is dropped.
 
 use crate::{
+    crypto::DeviceKeypair,
+    discovery::{CandidateEndpoint, CandidateType, PeerRecord, UnsignedPeerRecord},
     error::{QlinkError, Result},
     ice::IceCredentials,
+    inbound_identity::{
+        receive_and_evaluate_inbound, InboundDecision, DEFAULT_INBOUND_ASSERTION_MAX_AGE_SECONDS,
+    },
     mesh_connection::{
         MeshConnector, MeshConnectorConfig, NetworkEvent, NetworkEventResponse, PathKind,
     },
     metrics_endpoint::{spawn_metrics_endpoint, MetricsEndpoint, MetricsSnapshot},
+    peer_acl::PeerAcl,
+    peer_store::{
+        open_file_peer_store, open_file_peer_store_with_key, InMemoryPeerStore, PeerStore,
+    },
     quic_transport::QuicEndpoint,
     rendezvous::RendezvousClient,
+    traversal::HOST_PRIORITY,
 };
 use serde::Deserialize;
 use std::{
@@ -227,6 +237,40 @@ pub struct MeshTransportConfig {
     /// explicitly opt in.
     #[serde(default)]
     pub metrics_endpoint_bind_addr: Option<String>,
+    /// Inbound peer authorization list. When set, the responder loop
+    /// rejects any peer whose `InboundIdentityAssertion` falls outside
+    /// the ACL — the QUIC connection is closed without a response so the
+    /// rejection reason isn't leaked over the wire. When `None`, every
+    /// peer that produces a valid assertion (correct mesh_id, fresh
+    /// timestamp, valid ML-DSA signature) is accepted.
+    #[serde(default)]
+    pub inbound_acl: Option<PeerAcl>,
+    /// Kill-switch for the inbound responder loop. When `true`,
+    /// `MeshTransportHandle::new` skips binding a server endpoint and
+    /// the transport behaves like the pre-responder world (outbound
+    /// only). Useful in environments where binding a server port is
+    /// blocked or unwanted (e.g. some CI sandboxes). Default `false`.
+    #[serde(default)]
+    pub disable_inbound_responder: bool,
+    /// Filesystem path for a `FilePeerStore` that persists signed
+    /// peer records across process restarts. When set, the connector
+    /// uses the store as a fallback for rendezvous lookups (graceful
+    /// degradation under rendezvous outage) and writes through to it
+    /// on every successful lookup. The parent directory MUST exist
+    /// when the handle is constructed; the handle does not auto-
+    /// create directory trees. When `None`, the connector keeps an
+    /// in-memory-only store that's lost on restart.
+    #[serde(default)]
+    pub peer_store_path: Option<String>,
+    /// Optional base64 (standard alphabet, with padding) of a
+    /// 32-byte ChaCha20-Poly1305 key. When set together with
+    /// `peer_store_path`, the on-disk file is encrypted in the v2
+    /// envelope; without it the file is plaintext JSON. The host
+    /// (Swift app) is expected to mint + persist this key in the
+    /// macOS Keychain. `qlinkctl` deployments without a Keychain
+    /// can leave this `None` and rely on file mode 0o600.
+    #[serde(default)]
+    pub peer_store_key_b64: Option<String>,
 }
 
 fn default_overall_deadline_ms() -> u64 {
@@ -308,6 +352,19 @@ pub struct MeshTransportHandle {
     /// Held only when the operator opted into the OpenMetrics endpoint via
     /// `metrics_endpoint_bind_addr`. Drop aborts the listener task.
     metrics_endpoint: StdMutex<Option<MetricsEndpoint>>,
+    /// QUIC server certificate for the inbound responder, in DER. Callers
+    /// minting peer records (Swift app, qlinkctl) must publish this DER
+    /// in `device_certificate_der` so dialing peers can pin our cert via
+    /// `connect_with_trusted_cert`. `None` when the responder is disabled.
+    server_certificate_der: Option<Vec<u8>>,
+    /// Address the inbound responder is bound to, captured at endpoint
+    /// creation. Needed by callers that publish peer records (host
+    /// candidate addresses) and by tests that dial the responder. `None`
+    /// when the responder is disabled.
+    responder_local_addr: Option<SocketAddr>,
+    /// Responder accept-loop task. Aborted on `Drop`. `None` when the
+    /// responder is disabled via `disable_inbound_responder`.
+    responder_task: StdMutex<Option<JoinHandle<()>>>,
 }
 
 impl MeshTransportHandle {
@@ -317,6 +374,26 @@ impl MeshTransportHandle {
     }
 
     pub fn new(config: MeshTransportConfig) -> Result<Self> {
+        Self::new_with_keypair(config, None)
+    }
+
+    /// Variant of `new` that also installs a local device keypair on
+    /// the connector. When set, the connector signs and sends an
+    /// `InboundIdentityAssertion` over a fresh uni-stream immediately
+    /// after each successful QUIC handshake — this is what lets the
+    /// remote peer's responder loop verify our peer_id and run its
+    /// inbound ACL. Without it, remote responders that require
+    /// assertions (the production responder this crate now ships) close
+    /// our connection silently.
+    ///
+    /// The keypair's `public_key().peer_id()` MUST match
+    /// `config.local_peer_id` for the same reason `publish_self`
+    /// requires the match: a connector that asserts a different
+    /// identity than its published peer_id is unauthenticatable.
+    pub fn new_with_keypair(
+        config: MeshTransportConfig,
+        local_device_keypair: Option<Arc<DeviceKeypair>>,
+    ) -> Result<Self> {
         let runtime = Runtime::new().map_err(|err| {
             QlinkError::Protocol(format!("failed to create mesh transport runtime: {err}"))
         })?;
@@ -326,12 +403,39 @@ impl MeshTransportHandle {
             .parse()
             .map_err(|err| QlinkError::Protocol(format!("invalid bind_addr: {err}")))?;
 
+        let _runtime_guard = runtime.enter();
+
+        // The inbound responder owns the operator-supplied `bind_addr`
+        // (it's the port peers will dial). The outbound client runs on a
+        // distinct ephemeral socket on the same interface — quinn's
+        // `Endpoint` doesn't multiplex client + server roles cleanly, and
+        // peers shouldn't see our outbound source port advertised via
+        // rendezvous (we publish the responder's address, not the
+        // client's).
+        let (server_endpoint, server_certificate_der, responder_local_addr) =
+            if config.disable_inbound_responder {
+                (None, None, None)
+            } else {
+                let (endpoint, certificate) = QuicEndpoint::server(bind_addr)?;
+                let local_addr = endpoint.local_addr()?;
+                let cert_der = certificate.as_der().to_vec();
+                (Some(endpoint), Some(cert_der), Some(local_addr))
+            };
+
+        let client_bind_addr = if config.disable_inbound_responder {
+            // No server bound — let the client take the operator's
+            // address as before.
+            bind_addr
+        } else {
+            // Same interface, ephemeral port.
+            SocketAddr::new(bind_addr.ip(), 0)
+        };
+
         // The connector learns each peer's QUIC server cert from the
         // signed rendezvous record and uses `connect_with_trusted_cert`
         // for per-connection trust. The endpoint-level trust list is
         // empty — any direct `connect()` would fail by design.
-        let _runtime_guard = runtime.enter();
-        let quic_endpoint = QuicEndpoint::client(bind_addr, &[])?;
+        let quic_endpoint = QuicEndpoint::client(client_bind_addr, &[])?;
 
         let rendezvous_client = RendezvousClient::new(config.rendezvous_url.clone());
         let local_credentials = IceCredentials::generate()?;
@@ -347,12 +451,57 @@ impl MeshTransportHandle {
         if config.enable_ice {
             connector_config = connector_config.with_local_ice_credentials(local_credentials);
         }
+        if let Some(keypair) = local_device_keypair {
+            // Sanity check the keypair matches the configured peer_id
+            // up front — otherwise we'd happily dial out under the
+            // wrong identity, and the remote responder would just close
+            // the connection with no actionable error.
+            let keypair_peer_id = keypair.public_key().peer_id();
+            if keypair_peer_id != config.local_peer_id {
+                return Err(QlinkError::Protocol(format!(
+                    "MeshTransportHandle local_device_keypair peer_id {keypair_peer_id} \
+                     does not match config.local_peer_id {}",
+                    config.local_peer_id
+                )));
+            }
+            connector_config = connector_config.with_local_device_keypair(keypair);
+        }
 
-        let connector = Arc::new(MeshConnector::new(
-            connector_config,
-            rendezvous_client,
-            quic_endpoint,
-        ));
+        // Resolve the configured persistence path, if any, into a
+        // `FilePeerStore`. Construction errors (missing parent dir,
+        // unreadable file) are surfaced up — we'd rather refuse to
+        // start than silently degrade to ephemeral storage when the
+        // operator asked for persistence. When `peer_store_key_b64`
+        // is set, the file is wrapped in the v2 ChaCha20-Poly1305
+        // envelope; the key MUST decode to exactly 32 bytes.
+        let peer_store: Arc<dyn PeerStore> = match config.peer_store_path.as_deref() {
+            None => Arc::new(InMemoryPeerStore::new()),
+            Some(path) => match config.peer_store_key_b64.as_deref() {
+                None => Arc::new(open_file_peer_store(path)?),
+                Some(b64) => {
+                    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+                    let key_bytes = B64.decode(b64).map_err(|err| {
+                        QlinkError::Protocol(format!(
+                            "peer_store_key_b64 is not valid base64: {err}"
+                        ))
+                    })?;
+                    if key_bytes.len() != 32 {
+                        return Err(QlinkError::Protocol(format!(
+                            "peer_store_key_b64 must decode to exactly 32 bytes; got {}",
+                            key_bytes.len()
+                        )));
+                    }
+                    let mut key = [0_u8; 32];
+                    key.copy_from_slice(&key_bytes);
+                    Arc::new(open_file_peer_store_with_key(path, key)?)
+                }
+            },
+        };
+
+        let connector = Arc::new(
+            MeshConnector::new(connector_config, rendezvous_client, quic_endpoint)
+                .with_peer_store(peer_store),
+        );
 
         let backoff = BackoffConfig {
             initial: Duration::from_millis(config.reconnect_initial_backoff_ms.max(1)),
@@ -384,6 +533,27 @@ impl MeshTransportHandle {
             None => None,
         };
 
+        // Spawn the responder loop now that the inbound channel exists.
+        // The loop accepts QUIC connections on the server endpoint, runs
+        // identity + ACL evaluation, and routes accepted frames into
+        // `inbound_tx` tagged with the verified peer_id. Disabled paths
+        // simply skip the spawn.
+        let responder_task = match server_endpoint {
+            Some(endpoint) => {
+                let inbound_acl = config.inbound_acl.clone().map(Arc::new);
+                let mesh_id = config.mesh_id.clone();
+                let inbound_tx_responder = inbound_tx.clone();
+                let task = runtime.spawn(run_responder_loop(
+                    endpoint,
+                    mesh_id,
+                    inbound_acl,
+                    inbound_tx_responder,
+                ));
+                Some(task)
+            }
+            None => None,
+        };
+
         let handle = Self {
             runtime: Some(runtime),
             connector,
@@ -394,6 +564,9 @@ impl MeshTransportHandle {
             inbound_rx: TokioMutex::new(inbound_rx),
             aggregate,
             metrics_endpoint: StdMutex::new(metrics_endpoint),
+            server_certificate_der,
+            responder_local_addr,
+            responder_task: StdMutex::new(responder_task),
         };
 
         // Auto-add the configured peer for back-compat with the
@@ -414,6 +587,137 @@ impl MeshTransportHandle {
             .ok()?
             .as_ref()
             .map(|endpoint| endpoint.local_addr())
+    }
+
+    /// DER-encoded QUIC certificate the inbound responder presents.
+    /// Callers that mint signed peer records must publish this DER as
+    /// `device_certificate_der` so dialing peers can pin our cert.
+    /// Returns `None` when the responder is disabled.
+    pub fn server_certificate_der(&self) -> Option<&[u8]> {
+        self.server_certificate_der.as_deref()
+    }
+
+    /// Local address the inbound responder is bound to. `None` when the
+    /// responder is disabled. Stable for the lifetime of the handle.
+    pub fn responder_local_addr(&self) -> Option<SocketAddr> {
+        self.responder_local_addr
+    }
+
+    /// Synchronous wrapper for `publish_self` that drives the async
+    /// publish on the handle's internal runtime. Intended for FFI
+    /// callers (Swift) that don't have their own async context.
+    ///
+    /// MUST NOT be called from inside a tokio runtime (would deadlock
+    /// on `block_on`). Use the async `publish_self` from Rust async
+    /// code; use this from synchronous FFI entry points.
+    pub fn publish_self_blocking(
+        &self,
+        keypair: &DeviceKeypair,
+        rendezvous_url: &str,
+        ttl_seconds: u64,
+        sequence: u64,
+        overlay_routes: Vec<String>,
+    ) -> Result<PeerRecord> {
+        let runtime = self.runtime.as_ref().ok_or_else(|| {
+            QlinkError::Protocol("mesh transport runtime is shut down".into())
+        })?;
+        runtime.block_on(self.publish_self(
+            keypair,
+            rendezvous_url,
+            ttl_seconds,
+            sequence,
+            overlay_routes,
+        ))
+    }
+
+    /// Mints + signs a `PeerRecord` for the local node and publishes it
+    /// to the rendezvous server, advertising the responder's bound
+    /// address as a Host candidate and the responder's QUIC server
+    /// certificate as the dialer's trust anchor.
+    ///
+    /// `keypair.public_key().peer_id()` MUST equal the `local_peer_id`
+    /// passed to `MeshTransportHandle::new` — otherwise the record will
+    /// publish a peer ID that doesn't match the identity the connector
+    /// asserts on dial-out, and remote peers' inbound responders will
+    /// reject our assertions.
+    ///
+    /// Returns the signed record on success so callers can republish it
+    /// (verbatim or with a fresh sequence) to refresh TTL.
+    ///
+    /// Errors when:
+    /// - the responder is disabled (no cert / addr to publish)
+    /// - the supplied keypair's peer_id doesn't match the handle's
+    ///   `local_peer_id`
+    /// - the rendezvous publish call fails (network, server-side)
+    pub async fn publish_self(
+        &self,
+        keypair: &DeviceKeypair,
+        rendezvous_url: &str,
+        ttl_seconds: u64,
+        sequence: u64,
+        overlay_routes: Vec<String>,
+    ) -> Result<PeerRecord> {
+        let cert_der = self
+            .server_certificate_der
+            .as_ref()
+            .ok_or_else(|| {
+                QlinkError::Protocol(
+                    "publish_self requires the inbound responder; \
+                     `disable_inbound_responder` is set on this handle"
+                        .into(),
+                )
+            })?
+            .clone();
+        let local_addr = self.responder_local_addr.ok_or_else(|| {
+            QlinkError::Protocol(
+                "publish_self requires the inbound responder; bound \
+                 local address is unavailable"
+                    .into(),
+            )
+        })?;
+
+        let connector_config = self.connector.config();
+        let expected_peer_id = &connector_config.local_peer_id;
+        let keypair_peer_id = keypair.public_key().peer_id();
+        if &keypair_peer_id != expected_peer_id {
+            return Err(QlinkError::Protocol(format!(
+                "publish_self keypair peer_id {keypair_peer_id} does not match \
+                 handle local_peer_id {expected_peer_id}; the wrong key would \
+                 publish a record peers can't authenticate"
+            )));
+        }
+        let mesh_id = connector_config.mesh_id.clone();
+
+        let endpoints = vec![CandidateEndpoint {
+            candidate_type: CandidateType::Host,
+            address: local_addr.ip().to_string(),
+            port: local_addr.port(),
+            priority: HOST_PRIORITY,
+        }];
+        let body = UnsignedPeerRecord::new(
+            mesh_id.clone(),
+            // The alias gets replaced inside `UnsignedPeerRecord::new`
+            // with a privacy-preserving derivative of the peer_id +
+            // sequence; passing a placeholder here keeps the call site
+            // self-explanatory.
+            "qlink",
+            keypair.public_key(),
+            endpoints,
+            overlay_routes,
+            ttl_seconds,
+            sequence,
+        )
+        .with_device_certificate(cert_der);
+        let record = PeerRecord::signed(body, keypair)?;
+
+        // The rendezvous publish is a single short-lived TCP request;
+        // it doesn't need the handle's specialized runtime. Awaiting on
+        // the caller's runtime keeps `publish_self` callable from any
+        // async context (tests, `qlinkctl`, future FFI bridges).
+        let client = RendezvousClient::new(rendezvous_url.to_string());
+        client.publish(&mesh_id, record.clone()).await?;
+
+        Ok(record)
     }
 
     /// Spawns a session manager for a new remote peer. Idempotent: if
@@ -707,6 +1011,11 @@ impl Drop for MeshTransportHandle {
                 session.shutdown();
             }
         }
+        if let Ok(mut guard) = self.responder_task.lock() {
+            if let Some(task) = guard.take() {
+                task.abort();
+            }
+        }
         if let Ok(mut guard) = self.metrics_endpoint.lock() {
             // Drop on MetricsEndpoint already aborts the listener task.
             guard.take();
@@ -717,6 +1026,61 @@ impl Drop for MeshTransportHandle {
         if let Some(runtime) = self.runtime.take() {
             runtime.shutdown_background();
         }
+    }
+}
+
+/// Inbound responder: accepts QUIC connections, verifies the assertion +
+/// ACL, and forwards accepted frames into the shared inbound queue
+/// tagged with the verified peer_id. Runs until the server endpoint
+/// stops accepting (Drop on the endpoint, runtime shutdown, etc).
+async fn run_responder_loop(
+    server: QuicEndpoint,
+    expected_mesh_id: String,
+    inbound_acl: Option<Arc<PeerAcl>>,
+    inbound_tx: mpsc::UnboundedSender<InboundFrame>,
+) {
+    loop {
+        let session = match server.accept_one().await {
+            Ok(session) => session,
+            Err(_) => break,
+        };
+        let mesh_id = expected_mesh_id.clone();
+        let acl = inbound_acl.clone();
+        let inbound_tx = inbound_tx.clone();
+        tokio::spawn(async move {
+            let acl_ref = acl.as_deref();
+            let evaluation = receive_and_evaluate_inbound(
+                &session,
+                &mesh_id,
+                DEFAULT_INBOUND_ASSERTION_MAX_AGE_SECONDS,
+                acl_ref,
+            )
+            .await;
+            match evaluation {
+                Ok((InboundDecision::Accepted, assertion)) => {
+                    let peer_id = assertion.peer_id;
+                    while let Ok(frame) = session.receive_frame().await {
+                        let inbound_frame = InboundFrame {
+                            peer_id: peer_id.clone(),
+                            frame,
+                        };
+                        if inbound_tx.send(inbound_frame).is_err() {
+                            // Receiver dropped — the transport handle is
+                            // gone or being torn down; nothing useful to
+                            // do here.
+                            break;
+                        }
+                    }
+                }
+                _ => {
+                    // Closing without a reason is intentional: echoing
+                    // the rejection (`acl: peer is on the deny list`)
+                    // would let an attacker probe the ACL contents. The
+                    // peer just sees a generic close.
+                    session.close(b"");
+                }
+            }
+        });
     }
 }
 
@@ -1014,6 +1378,8 @@ mod tests {
     use crate::{
         crypto::DeviceKeypair,
         discovery::{CandidateEndpoint, CandidateType, PeerRecord, UnsignedPeerRecord},
+        inbound_identity::send_inbound_assertion,
+        quic_transport::QuicCertificate,
         rendezvous::spawn_dev_rendezvous,
     };
     use std::net::{IpAddr, Ipv4Addr};
@@ -1114,6 +1480,10 @@ mod tests {
                 reconnect_initial_backoff_ms: 250,
                 reconnect_max_backoff_ms: 30_000,
                 metrics_endpoint_bind_addr: None,
+                inbound_acl: None,
+                disable_inbound_responder: true,
+                peer_store_path: None,
+                peer_store_key_b64: None,
             })
             .expect("transport construction must succeed")
         })
@@ -1180,6 +1550,10 @@ mod tests {
                 reconnect_initial_backoff_ms: 60_000,
                 reconnect_max_backoff_ms: 60_000,
                 metrics_endpoint_bind_addr: None,
+                inbound_acl: None,
+                disable_inbound_responder: true,
+                peer_store_path: None,
+                peer_store_key_b64: None,
             })
             .unwrap()
         })
@@ -1225,6 +1599,10 @@ mod tests {
                 reconnect_initial_backoff_ms: 50,
                 reconnect_max_backoff_ms: 200,
                 metrics_endpoint_bind_addr: None,
+                inbound_acl: None,
+                disable_inbound_responder: true,
+                peer_store_path: None,
+                peer_store_key_b64: None,
             })
             .unwrap()
         })
@@ -1310,6 +1688,10 @@ mod tests {
                 reconnect_initial_backoff_ms: 250,
                 reconnect_max_backoff_ms: 30_000,
                 metrics_endpoint_bind_addr: Some("127.0.0.1:0".to_string()),
+                inbound_acl: None,
+                disable_inbound_responder: true,
+                peer_store_path: None,
+                peer_store_key_b64: None,
             })
             .expect("transport construction with metrics endpoint must succeed")
         })
@@ -1417,6 +1799,10 @@ mod tests {
                 reconnect_initial_backoff_ms: 5_000,
                 reconnect_max_backoff_ms: 5_000,
                 metrics_endpoint_bind_addr: None,
+                inbound_acl: None,
+                disable_inbound_responder: true,
+                peer_store_path: None,
+                peer_store_key_b64: None,
             })
             .unwrap()
         })
@@ -1566,6 +1952,10 @@ mod tests {
                 reconnect_initial_backoff_ms: 250,
                 reconnect_max_backoff_ms: 30_000,
                 metrics_endpoint_bind_addr: None,
+                inbound_acl: None,
+                disable_inbound_responder: true,
+                peer_store_path: None,
+                peer_store_key_b64: None,
             })
             .expect("transport new")
         })
@@ -1696,6 +2086,10 @@ mod tests {
                 reconnect_initial_backoff_ms: 250,
                 reconnect_max_backoff_ms: 30_000,
                 metrics_endpoint_bind_addr: None,
+                inbound_acl: None,
+                disable_inbound_responder: true,
+                peer_store_path: None,
+                peer_store_key_b64: None,
             })
             .expect("transport new")
         })
@@ -1749,6 +2143,10 @@ mod tests {
                 reconnect_initial_backoff_ms: 5_000, // long enough that natural retry won't fire
                 reconnect_max_backoff_ms: 5_000,
                 metrics_endpoint_bind_addr: None,
+                inbound_acl: None,
+                disable_inbound_responder: true,
+                peer_store_path: None,
+                peer_store_key_b64: None,
             })
             .expect("transport new")
         })
@@ -1820,6 +2218,10 @@ mod tests {
                     reconnect_initial_backoff_ms: 60_000,
                     reconnect_max_backoff_ms: 60_000,
                     metrics_endpoint_bind_addr: None,
+                    inbound_acl: None,
+                    disable_inbound_responder: true,
+                    peer_store_path: None,
+                    peer_store_key_b64: None,
                 })
                 .unwrap()
             })
@@ -1843,6 +2245,322 @@ mod tests {
                 "qlink_initial-peer".to_string(),
                 "qlink_second-peer".to_string()
             ]
+        );
+    }
+
+    /// Helper for the responder tests: build a `MeshTransportHandle`
+    /// with the responder enabled and an arbitrary `inbound_acl`. The
+    /// rendezvous URL is real but unused for the simpler tests — the
+    /// dialer in those connects directly to the responder address, so
+    /// the connector's outbound path stays idle (it'll fail-and-backoff
+    /// in the background, which is harmless for those assertions).
+    /// Pass `Some(keypair)` to install a local device keypair so the
+    /// outbound connector can sign + send `InboundIdentityAssertion`
+    /// messages — required for any test that relies on the production
+    /// responder path accepting frames.
+    async fn build_handle_with_responder(
+        rendezvous_url: String,
+        local_peer_id: String,
+        mesh_id: &str,
+        inbound_acl: Option<PeerAcl>,
+        local_device_keypair: Option<Arc<DeviceKeypair>>,
+    ) -> MeshTransportHandle {
+        let mesh_id = mesh_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            MeshTransportHandle::new_with_keypair(
+                MeshTransportConfig {
+                    mesh_id,
+                    local_peer_id,
+                    remote_peer_id: "qlink_unused-for-this-test".to_string(),
+                    rendezvous_url,
+                    relay_url: None,
+                    bind_addr: "127.0.0.1:0".to_string(),
+                    overall_deadline_ms: 2_000,
+                    direct_probe_timeout_ms: 500,
+                    probe_pacing_ms: 50,
+                    enable_ice: false,
+                    reconnect_initial_backoff_ms: 60_000,
+                    reconnect_max_backoff_ms: 60_000,
+                    metrics_endpoint_bind_addr: None,
+                    inbound_acl,
+                    disable_inbound_responder: false,
+                    peer_store_path: None,
+                    peer_store_key_b64: None,
+                },
+                local_device_keypair,
+            )
+            .expect("transport construction with responder must succeed")
+        })
+        .await
+        .unwrap()
+    }
+
+    /// Helper for the responder tests: build a dialer (client endpoint
+    /// + connected QUIC session) targeting the handle's responder.
+    async fn dial_responder(handle: &MeshTransportHandle) -> crate::quic_transport::QuicDatagramSession {
+        let server_addr = handle
+            .responder_local_addr()
+            .expect("responder must be enabled");
+        let cert_der = handle
+            .server_certificate_der()
+            .expect("responder must be enabled")
+            .to_vec();
+        let trusted = QuicCertificate::from_der(cert_der);
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let client = QuicEndpoint::client(bind, &[]).unwrap();
+        client
+            .connect_with_trusted_cert(server_addr, &trusted)
+            .await
+            .expect("dial against responder must succeed")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn responder_accepts_peer_in_allowlist() {
+        let rendezvous = spawn_dev_rendezvous().await.unwrap();
+
+        let dialer_key = DeviceKeypair::generate().unwrap();
+        let dialer_peer_id = dialer_key.public_key().peer_id();
+        let local_key = DeviceKeypair::generate().unwrap();
+        let local_peer_id = local_key.public_key().peer_id();
+
+        let acl = PeerAcl::new().with_allow([dialer_peer_id.clone()]);
+        let handle = build_handle_with_responder(
+            rendezvous.local_addr().to_string(),
+            local_peer_id,
+            "devmesh",
+            Some(acl),
+            None,
+        )
+        .await;
+
+        let session = dial_responder(&handle).await;
+        send_inbound_assertion(&session, &dialer_key, "devmesh")
+            .await
+            .unwrap();
+        session.send_frame(b"hello mesh".to_vec()).await.unwrap();
+
+        // Poll the inbound queue until the frame surfaces. 2s ceiling
+        // so the test fails loudly rather than hanging.
+        let mut waited = 0_u64;
+        let inbound = loop {
+            if let Some(frame) = handle.try_receive_frame_from_any() {
+                break frame;
+            }
+            if waited > 2_000 {
+                panic!("inbound frame never reached the responder queue");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            waited += 20;
+        };
+        assert_eq!(inbound.peer_id, dialer_peer_id);
+        assert_eq!(inbound.frame, b"hello mesh".to_vec());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn responder_rejects_peer_not_in_allowlist() {
+        let rendezvous = spawn_dev_rendezvous().await.unwrap();
+
+        let allowed_key = DeviceKeypair::generate().unwrap();
+        let allowed_peer_id = allowed_key.public_key().peer_id();
+        let dialer_key = DeviceKeypair::generate().unwrap();
+        let local_key = DeviceKeypair::generate().unwrap();
+        let local_peer_id = local_key.public_key().peer_id();
+
+        let acl = PeerAcl::new().with_allow([allowed_peer_id]);
+        let handle = build_handle_with_responder(
+            rendezvous.local_addr().to_string(),
+            local_peer_id,
+            "devmesh",
+            Some(acl),
+            None,
+        )
+        .await;
+
+        let session = dial_responder(&handle).await;
+        // Assertion send may complete before the responder closes the
+        // connection (QUIC is async), so don't assert on its result —
+        // assert on the receiver instead.
+        let _ = send_inbound_assertion(&session, &dialer_key, "devmesh").await;
+        let _ = session.send_frame(b"forbidden".to_vec()).await;
+
+        // Drain for 500ms — well past any plausible queue latency on
+        // loopback. The responder must NOT have surfaced anything.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            handle.try_receive_frame_from_any().is_none(),
+            "denied peer should never reach the inbound queue"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn publish_self_then_two_peers_round_trip_via_rendezvous() {
+        // Closes the loop on the responder + cert-publishing pipeline:
+        // both peers publish their own peer record (with the responder's
+        // server cert in `device_certificate_der`), then each dials the
+        // other through the real rendezvous lookup. A frame from peer A
+        // surfaces on peer B's inbound queue tagged with A's verified
+        // peer_id — the exact end-to-end path that lab tests previously
+        // could not exercise because no caller ever published the
+        // responder's cert.
+        let rendezvous = spawn_dev_rendezvous().await.unwrap();
+        let rendezvous_url = rendezvous.local_addr().to_string();
+
+        let key_a = Arc::new(DeviceKeypair::generate().unwrap());
+        let key_b = Arc::new(DeviceKeypair::generate().unwrap());
+        let peer_a = key_a.public_key().peer_id();
+        let peer_b = key_b.public_key().peer_id();
+
+        // Each handle's inbound ACL is set to the *other* peer so we
+        // also exercise the ACL path against rendezvous-discovered IDs.
+        let acl_a = PeerAcl::new().with_allow([peer_b.clone()]);
+        let acl_b = PeerAcl::new().with_allow([peer_a.clone()]);
+
+        let handle_a = build_handle_with_responder(
+            rendezvous_url.clone(),
+            peer_a.clone(),
+            "devmesh",
+            Some(acl_a),
+            Some(key_a.clone()),
+        )
+        .await;
+        let handle_b = build_handle_with_responder(
+            rendezvous_url.clone(),
+            peer_b.clone(),
+            "devmesh",
+            Some(acl_b),
+            Some(key_b.clone()),
+        )
+        .await;
+
+        let _record_a = handle_a
+            .publish_self(key_a.as_ref(), &rendezvous_url, 120, 1, vec![])
+            .await
+            .expect("peer A must publish its record");
+        let _record_b = handle_b
+            .publish_self(key_b.as_ref(), &rendezvous_url, 120, 1, vec![])
+            .await
+            .expect("peer B must publish its record");
+
+        // Each side dials the other. add_peer spawns a session manager
+        // that runs `connector.connect(peer_id)` with backoff; success
+        // requires the rendezvous record + cert + responder + assertion
+        // chain to all align.
+        handle_a.add_peer(&peer_b).expect("add_peer B on handle A");
+        handle_b.add_peer(&peer_a).expect("add_peer A on handle B");
+
+        // Wait for both sessions to reach Ready. 5s is generous on
+        // loopback (the existing direct-connect SLO is sub-millisecond)
+        // but tolerant of CI scheduling jitter.
+        let mut waited = 0_u64;
+        loop {
+            let a_ready = handle_a
+                .peer_state_code(&peer_b)
+                .map(|code| code == MeshTransportState::Ready.as_code())
+                .unwrap_or(false);
+            let b_ready = handle_b
+                .peer_state_code(&peer_a)
+                .map(|code| code == MeshTransportState::Ready.as_code())
+                .unwrap_or(false);
+            if a_ready && b_ready {
+                break;
+            }
+            if waited > 5_000 {
+                panic!(
+                    "sessions never both reached Ready: a→b ready={a_ready} \
+                     (last_error={:?}), b→a ready={b_ready} (last_error={:?})",
+                    handle_a.peer_last_error(&peer_b),
+                    handle_b.peer_last_error(&peer_a)
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            waited += 50;
+        }
+
+        // A → B
+        handle_a
+            .send_frame_to(&peer_b, b"hello from A".to_vec())
+            .expect("A must enqueue frame to B");
+
+        // The frame arrives at B's *inbound* queue via B's responder
+        // (because A dialed B and sent on that session). Poll for it
+        // with a 5s ceiling.
+        let inbound = {
+            let mut waited = 0_u64;
+            loop {
+                if let Some(frame) = handle_b.try_receive_frame_from_any() {
+                    break frame;
+                }
+                if waited > 5_000 {
+                    panic!("frame from A never reached B's inbound queue");
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                waited += 50;
+            }
+        };
+        assert_eq!(
+            inbound.peer_id, peer_a,
+            "B's responder must surface frames tagged with A's verified peer_id"
+        );
+        assert_eq!(inbound.frame, b"hello from A".to_vec());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn publish_self_rejects_keypair_that_doesnt_match_handle_local_peer_id() {
+        let rendezvous = spawn_dev_rendezvous().await.unwrap();
+        let local_key = DeviceKeypair::generate().unwrap();
+        let local_peer_id = local_key.public_key().peer_id();
+        let handle = build_handle_with_responder(
+            rendezvous.local_addr().to_string(),
+            local_peer_id,
+            "devmesh",
+            None,
+            None,
+        )
+        .await;
+
+        // Different keypair → different peer_id → publish_self should
+        // refuse rather than mint a record peers can't authenticate.
+        let other_key = DeviceKeypair::generate().unwrap();
+        let err = handle
+            .publish_self(&other_key, &rendezvous.local_addr().to_string(), 120, 1, vec![])
+            .await
+            .expect_err("mismatched keypair must be rejected");
+        assert!(
+            err.to_string().contains("does not match"),
+            "error should explain the mismatch, got: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn responder_rejects_peer_with_forged_mesh_id() {
+        let rendezvous = spawn_dev_rendezvous().await.unwrap();
+
+        let dialer_key = DeviceKeypair::generate().unwrap();
+        let dialer_peer_id = dialer_key.public_key().peer_id();
+        let local_key = DeviceKeypair::generate().unwrap();
+        let local_peer_id = local_key.public_key().peer_id();
+
+        // Dialer is on the allowlist — but signs the assertion for a
+        // mesh they aren't a member of. Crypto verification rejects
+        // before the ACL ever runs.
+        let acl = PeerAcl::new().with_allow([dialer_peer_id]);
+        let handle = build_handle_with_responder(
+            rendezvous.local_addr().to_string(),
+            local_peer_id,
+            "devmesh",
+            Some(acl),
+            None,
+        )
+        .await;
+
+        let session = dial_responder(&handle).await;
+        let _ = send_inbound_assertion(&session, &dialer_key, "wrong-mesh").await;
+        let _ = session.send_frame(b"forbidden".to_vec()).await;
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            handle.try_receive_frame_from_any().is_none(),
+            "peer asserting for the wrong mesh must be rejected by crypto verification"
         );
     }
 }

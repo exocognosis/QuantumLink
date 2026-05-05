@@ -1,8 +1,9 @@
 # Performance Baseline
 
-This file records the first-run baseline for QuantumLink's performance
-harness. Subsequent runs in CI compare against these numbers; a regression
-of more than 20% on any p50 should block release until investigated.
+This file records the human-readable perf baseline for QuantumLink. The
+machine-readable copy at [`perf-baseline.json`](./perf-baseline.json)
+drives CI's regression gate (see "Regression gating" below); keep the
+two in sync when refreshing.
 
 ## Methodology
 
@@ -169,6 +170,40 @@ QLINK_CORE_DYLIB="$PWD/target/release/libqlink_core.dylib" \
   swift test --filter RustMeshTransportPerformanceTests
 ```
 
+## Regression gating
+
+CI runs the same suites on a `macos-15` runner and then runs
+`perfgate` (the binary at `rust/qlink-core/src/bin/perfgate.rs`) to
+diff observed values against `perf-baseline.json`. Any metric that
+regresses past the baseline's `regression_threshold_pct` (currently
+`20.0`) fails the `Performance` workflow.
+
+```sh
+# Locally, after running the bench suites:
+cargo build -p qlink-core --bin perfgate --release
+target/release/perfgate \
+  --baseline docs/perf-baseline.json \
+  --slo-log build/perf-slos.log \
+  --criterion-dir target/criterion
+```
+
+The flags are independent: pass only `--slo-log` if you only ran the
+SLO scenarios; pass only `--criterion-dir` if you only ran the
+micro-benches. Baseline metrics without a corresponding data source are
+silently skipped. Add `--dry-run` to print the report without exiting
+non-zero.
+
+### Refreshing the baseline
+
+When an intentional perf change moves a metric past the threshold:
+
+1. Re-run the affected bench suite locally (or download the artifact
+   from the CI run).
+2. Update the corresponding row in `perf-baseline.json`.
+3. Update the matching numbers in the tables below so humans reading
+   the doc and the machine reading the JSON agree.
+4. Commit both files in the same change.
+
 ## Known limitations
 
 - The WAN harness impairs **UDP only**. Relay (TCP) timing on the WAN
@@ -180,9 +215,20 @@ QLINK_CORE_DYLIB="$PWD/target/release/libqlink_core.dylib" \
 - Swift perf tests do not yet exercise a successful end-to-end mesh
   transport path because building one in XCTest requires hosting a Rust
   rendezvous server inside the Swift test process. Tracked as a follow-up.
-- The 20% regression-gate threshold in `.github/workflows/perf.yml` is
-  documented but not yet enforced. Variance characterization on shared
-  runners has to come first.
+- The 20% regression gate is enforced by `perfgate` against the
+  metrics in `perf-baseline.json`. The WAN-impaired SLO rows
+  (`slo.direct_warm.{lan,cable}`, `slo.post_event_recovery.{lan,cable}`,
+  `slo.relay_fallback.{lan,cable,mobile-3g}`) were captured on the
+  same dev workstation as the loopback rows, so the first
+  `macos-15` CI run may show drift; refresh after that run if the
+  20% threshold proves too tight under runner-vs-workstation drift
+  or the synthetic-WAN proxy's inherent variance.
+- The `mobile-3g` direct-connect + post-event rows are *not*
+  baselined: their p50 is dominated by the configured probe-budget
+  timeout (the protocol falls back to relay almost every iteration),
+  so gating on them would assert "did we time out exactly the same
+  way" rather than meaningful protocol latency. The mobile-3g
+  *relay* row is baselined since the relay path actually completes.
 - The mobile-3g profile fails the direct-connect SLOs by design: 1%
   loss × 250 ms RTT × 3-RTT QUIC handshake exceeds the probe budget.
   This isn't a bug in the protocol layer; it's an honest measurement

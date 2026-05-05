@@ -45,4 +45,52 @@ final class ConfigurationValidationTests: XCTestCase {
 
         XCTAssertEqual(report.warnings, ["protectedRoutes is empty; no traffic will be protected"])
     }
+
+    func testTunnelConfigurationDecoderDefaultsKillSwitchToFailClosed() throws {
+        // Fail-closed is a load-bearing security default: an MDM payload
+        // or operator config that omits the `killSwitch` field MUST NOT
+        // silently fall through to a more permissive policy. The
+        // explicit decoder default at `Models.swift` is the only thing
+        // that guarantees this; pin it with a regression test.
+        let json = """
+        {
+          "meshID": "devmesh",
+          "deviceAlias": "mac",
+          "overlayIPv4Address": "100.127.0.2",
+          "tunnelRemoteAddress": "100.127.0.1",
+          "protectedRoutes": ["100.127.0.0/16"],
+          "dnsServers": ["100.127.0.1"],
+          "rendezvousServers": ["127.0.0.1:9471"]
+        }
+        """
+
+        let configuration = try JSONDecoder().decode(
+            TunnelConfiguration.self,
+            from: Data(json.utf8)
+        )
+
+        XCTAssertEqual(configuration.killSwitch, .failClosed)
+    }
+
+    func testTunnelConfigurationDecoderHonoursExplicitStrictKillSwitch() throws {
+        let json = """
+        {
+          "meshID": "devmesh",
+          "deviceAlias": "mac",
+          "overlayIPv4Address": "100.127.0.2",
+          "tunnelRemoteAddress": "100.127.0.1",
+          "protectedRoutes": ["100.127.0.0/16"],
+          "dnsServers": ["100.127.0.1"],
+          "rendezvousServers": ["127.0.0.1:9471"],
+          "killSwitch": "strict"
+        }
+        """
+
+        let configuration = try JSONDecoder().decode(
+            TunnelConfiguration.self,
+            from: Data(json.utf8)
+        )
+
+        XCTAssertEqual(configuration.killSwitch, .strict)
+    }
 }
