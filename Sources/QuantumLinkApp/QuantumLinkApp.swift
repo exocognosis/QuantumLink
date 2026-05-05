@@ -578,7 +578,7 @@ private struct DashboardDetailView: View {
             case .security:
                 SecurityDetail(status: status, configuration: configuration)
             case .privacy:
-                PrivacyView()
+                PrivacyPanel()
             case .diagnostics:
                 DiagnosticsDetail(status: status)
             case .configuration:
@@ -1560,6 +1560,150 @@ private struct ConfigurationCard<Content: View>: View {
         .padding(16)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+/// Privacy & Anonymity panel. Same visual language as every other
+/// panel: PanelChrome wrapper, PanelHeader with the sidebar's
+/// hand-raised icon + a subtitle that summarizes which defenses
+/// are active, then PanelGrid of ConfigurationCards. Mirrors the
+/// design pattern used by ConfigurationPanel.
+///
+/// Each toggle / picker change persists to UserDefaults via
+/// `PrivacySettings` AND live-applies through `PrivacyOrchestrator`,
+/// so flipping a setting starts/stops the corresponding Rust
+/// service in-process the moment the user clicks.
+private struct PrivacyPanel: View {
+    @State private var settings: PrivacySettings = PrivacySettings.load()
+
+    private var subtitleText: String {
+        var parts: [String] = []
+        if settings.enableDnsOverQuantumLink { parts.append("DNS Tunneled") }
+        if settings.enableSocks5Proxy { parts.append("SOCKS5 :1080") }
+        if settings.enableOnionRouting { parts.append("\(settings.onionCircuitLength)-hop Onion") }
+        switch settings.coverTrafficLevel {
+        case .off: break
+        case .low: parts.append("Cover: Low")
+        case .medium: parts.append("Cover: Medium")
+        case .high: parts.append("Cover: High")
+        }
+        switch settings.transportObfuscation {
+        case .none: break
+        case .tlsLikeFraming: parts.append("TLS-Disguised")
+        case .obfs4XorScramble: parts.append("Scrambled")
+        }
+        return parts.isEmpty ? "All defenses idle" : parts.joined(separator: " · ")
+    }
+
+    var body: some View {
+        PanelChrome {
+            PanelHeader(tab: .privacy, subtitle: subtitleText)
+
+            PanelGrid {
+                ConfigurationCard(title: "Pluggable Transport", systemImage: "doc.on.doc") {
+                    Picker("Wire shape", selection: $settings.transportObfuscation) {
+                        ForEach(PrivacySettings.TransportObfuscation.allCases, id: \.self) { o in
+                            Text(o.displayName).tag(o)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    Text(settings.transportObfuscation.summary)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                ConfigurationCard(title: "Onion Routing", systemImage: "point.3.connected.trianglepath.dotted") {
+                    Toggle("Route through multiple mesh hops", isOn: $settings.enableOnionRouting)
+                        .toggleStyle(.switch)
+                    if settings.enableOnionRouting {
+                        Stepper(value: $settings.onionCircuitLength, in: 2...5) {
+                            HStack {
+                                Text("Circuit length")
+                                Spacer()
+                                Text("\(settings.onionCircuitLength) hops")
+                                    .foregroundStyle(.tint)
+                                    .font(.callout.weight(.semibold))
+                            }
+                        }
+                        Text("Each additional hop reduces linkability but adds round-trip latency.")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } else {
+                        Text("Single-hop direct path. Lowest latency; no anonymity protection beyond the encrypted tunnel itself.")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+
+                ConfigurationCard(title: "Cover Traffic", systemImage: "waveform.path") {
+                    Picker("Cover level", selection: $settings.coverTrafficLevel) {
+                        ForEach(PrivacySettings.CoverTrafficLevel.allCases, id: \.self) { l in
+                            Text(l.displayName).tag(l)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    Text(settings.coverTrafficLevel.summary)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                ConfigurationCard(title: "Decoy Connections", systemImage: "arrow.triangle.swap") {
+                    Picker("Cadence", selection: $settings.decoyCadence) {
+                        ForEach(PrivacySettings.DecoyCadence.allCases, id: \.self) { c in
+                            Text(c.displayName).tag(c)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    Text(settings.decoyCadence.summary)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                ConfigurationCard(title: "Identity Rotation", systemImage: "arrow.triangle.2.circlepath") {
+                    Picker("Policy", selection: $settings.rotationPolicy) {
+                        ForEach(PrivacySettings.RotationPolicy.allCases, id: \.self) { p in
+                            Text(p.displayName).tag(p)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    Text(settings.rotationPolicy.summary)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                ConfigurationCard(title: "Network Privacy", systemImage: "shield.lefthalf.filled") {
+                    Toggle("DNS-over-QuantumLink", isOn: $settings.enableDnsOverQuantumLink)
+                        .toggleStyle(.switch)
+                    Text("Tunnels DNS queries through the encrypted overlay so the local network sees zero domain names.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    Divider().padding(.vertical, 2)
+
+                    Toggle("SOCKS5 proxy on 127.0.0.1:1080", isOn: $settings.enableSocks5Proxy)
+                        .toggleStyle(.switch)
+                    Text("Per-app routing without system-level utun. Configure your browser proxy to use it; everything else stays on the default network.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+        .onChange(of: settings) { _, newValue in
+            // Persist + live-apply to the Rust orchestrator. The
+            // services start/stop in-process so toggling DNS or
+            // SOCKS5 here changes what's actually listening on
+            // localhost the moment the user releases the toggle.
+            newValue.save()
+            PrivacyOrchestrator.shared.apply(newValue)
+        }
     }
 }
 

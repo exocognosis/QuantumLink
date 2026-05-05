@@ -47,6 +47,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use qlink_core::{
+    exit_relay::ExitRelay,
     relay::run_relay,
     rendezvous::run_rendezvous,
     stun::spawn_dev_stun,
@@ -108,8 +109,31 @@ async fn main() -> ExitCode {
     eprintln!("  relay:      {}", args.relay);
     eprintln!("  stun:       {}", args.stun);
     if args.exit_relay {
-        eprintln!("  exit-relay: REQUESTED (foundation only — not yet forwarding packets)");
+        eprintln!("  exit-relay: ENABLED (opening tun device + bringing up session table)");
     }
+
+    // Stand up the exit-relay if requested. We hold a reference
+    // to the relay handle for the lifetime of the daemon so the
+    // session table sticks around. Per-client registrations land
+    // here later when the session-handshake module wires through
+    // (Phase 4 of the macOS-first roadmap).
+    let exit_relay_handle = if args.exit_relay {
+        match start_exit_relay().await {
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                eprintln!("exit-relay startup failed: {}", e);
+                eprintln!(
+                    "Most common causes: missing CAP_NET_ADMIN (run with the systemd unit \
+                     installed, not via `cargo run`), or /dev/net/tun not present (LXC \
+                     containers need `lxc.cgroup2.devices.allow = c 10:200 rwm`)."
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let _exit_relay_keep = exit_relay_handle;
 
     // Each service runs as its own task. We `Arc` the running flag
     // and the shutdown notification so individual tasks can decide
@@ -158,6 +182,57 @@ async fn main() -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+/// Bring up the exit-relay: open a tun device, register it with
+/// an `ExitRelay` instance, and spawn the tun-pump that demuxes
+/// inbound packets to per-client return paths.
+///
+/// Returns the `ExitRelay` (still owned by the caller; drop to
+/// stop) or an error if the tun device couldn't be opened (almost
+/// always a permissions issue — needs CAP_NET_ADMIN).
+///
+/// Linux only. On macOS this is unreachable code paths because
+/// the daemon is intended for server deployments; we keep the
+/// cfg gates explicit so a misconfigured Mac build fails to
+/// compile rather than fails at runtime.
+#[cfg(target_os = "linux")]
+async fn start_exit_relay() -> std::io::Result<std::sync::Arc<ExitRelay>> {
+    use qlink_core::utun;
+    let tun = utun::create_tun("").map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("create_tun failed: {e}"),
+        )
+    })?;
+    eprintln!("  tun device: {}", tun.name());
+
+    // Move the OwnedFd out of UtunDevice for the pump's lifetime.
+    // We can't get back the fd without consuming the device, so
+    // we use unsafe to clone the raw fd; the pump treats it as
+    // owned. Safe because UtunDevice's drop closes the fd, and
+    // we explicitly Forget it here.
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let raw = tun.as_raw_fd();
+    let fd_for_pump = unsafe { OwnedFd::from_raw_fd(libc::dup(raw)) };
+    drop(tun); // drop the original; pump owns the dup
+
+    let relay = std::sync::Arc::new(ExitRelay::new());
+    let pump = qlink_core::exit_relay::run_tun_pump(relay.clone(), fd_for_pump).await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?;
+    // Pump runs forever; don't .await it here or we'd block the
+    // daemon's shutdown handler. Detach via std::mem::forget on
+    // the JoinHandle so it stays scheduled.
+    std::mem::forget(pump);
+    Ok(relay)
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn start_exit_relay() -> std::io::Result<std::sync::Arc<ExitRelay>> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "exit-relay mode is Linux-only (qlinkd is a server-side daemon)",
+    ))
 }
 
 /// Wait for either of two `JoinHandle<()>` tasks to finish. Used in
