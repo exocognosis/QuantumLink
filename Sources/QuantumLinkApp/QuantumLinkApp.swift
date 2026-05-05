@@ -1892,6 +1892,151 @@ private struct NetworkOverview: View {
                     InfoRow(label: "Relay", value: "\(status.metrics.relayPeerCount)")
                     InfoRow(label: "Replay Drops", value: "\(status.metrics.replayDrops)")
                 }
+
+                RealTunnelingCard()
+            }
+        }
+    }
+}
+
+/// Card on the Network panel that exposes the QuantumLinkHelper
+/// install + test flow. Without this UI, the helper code paths
+/// would be dead weight from the user's perspective; this is the
+/// hook that turns "we have a privileged helper" into "I can click
+/// a button to authorize it."
+private struct RealTunnelingCard: View {
+    @State private var helperStatus: QuantumLinkHelper.Status = .notInstalled
+    @State private var testResult: TestResult = .idle
+    @State private var isInstalling = false
+
+    enum TestResult: Equatable {
+        case idle
+        case opening
+        case opened(name: String)
+        case error(String)
+    }
+
+    var body: some View {
+        ConfigurationCard(title: "Real Tunneling", systemImage: "lock.shield") {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 8) {
+                    statusBadge
+                    Text(statusLabel)
+                        .font(.callout)
+                        .foregroundStyle(.primary)
+                }
+
+                Text(statusBlurb)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                HStack(spacing: 10) {
+                    if helperStatus == .notInstalled {
+                        Button(isInstalling ? "Authorizing…" : "Authorize Helper") {
+                            authorizeHelper()
+                        }
+                        .disabled(isInstalling)
+                        .buttonStyle(.borderedProminent)
+                    } else {
+                        Button("Test Open utun") { testOpen() }
+                            .disabled(testResult == .opening)
+                    }
+                    Button("Refresh Status") { refreshStatus() }
+                }
+
+                switch testResult {
+                case .idle:
+                    EmptyView()
+                case .opening:
+                    Text("Requesting utun device from helper…")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                case .opened(let name):
+                    Label("Helper opened \(name)", systemImage: "checkmark.seal.fill")
+                        .foregroundStyle(.green)
+                        .font(.callout)
+                case .error(let msg):
+                    Label(msg, systemImage: "exclamationmark.triangle")
+                        .foregroundStyle(.orange)
+                        .font(.callout)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+        .onAppear { refreshStatus() }
+    }
+
+    private var statusBadge: some View {
+        Image(systemName: helperStatus == .running ? "checkmark.circle.fill"
+                          : helperStatus == .installedNotRunning ? "pause.circle.fill"
+                          : "xmark.circle.fill")
+            .foregroundStyle(helperStatus == .running ? .green
+                             : helperStatus == .installedNotRunning ? .orange
+                             : .secondary)
+    }
+
+    private var statusLabel: String {
+        switch helperStatus {
+        case .notInstalled: return "Privileged helper not installed"
+        case .installedNotRunning: return "Helper installed, not running"
+        case .running: return "Helper running — utun ready on demand"
+        }
+    }
+
+    private var statusBlurb: String {
+        switch helperStatus {
+        case .notInstalled:
+            return "QuantumLink can use a small privileged helper to open the macOS utun device directly — no Apple Developer entitlement required. One-time admin password authorization."
+        case .installedNotRunning:
+            return "Helper is installed but launchd hasn't started it yet. This usually resolves within a few seconds; click Refresh."
+        case .running:
+            return "Helper is running and listening on /var/run/quantumlink-helper.sock. Test Open utun to verify the SCM_RIGHTS file-descriptor handoff works on your kernel."
+        }
+    }
+
+    private func refreshStatus() {
+        helperStatus = QuantumLinkHelper.shared.status()
+    }
+
+    private func authorizeHelper() {
+        isInstalling = true
+        testResult = .idle
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                try QuantumLinkHelper.shared.install()
+                DispatchQueue.main.async {
+                    isInstalling = false
+                    refreshStatus()
+                }
+            } catch {
+                let message = (error as? LocalizedError)?.errorDescription
+                    ?? error.localizedDescription
+                DispatchQueue.main.async {
+                    isInstalling = false
+                    testResult = .error(message)
+                    refreshStatus()
+                }
+            }
+        }
+    }
+
+    private func testOpen() {
+        testResult = .opening
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                let result = try QuantumLinkHelper.shared.openTun()
+                // Close the FD immediately — this is just a smoke test.
+                Darwin.close(result.fileDescriptor)
+                DispatchQueue.main.async {
+                    testResult = .opened(name: result.interfaceName)
+                }
+            } catch {
+                let message = (error as? LocalizedError)?.errorDescription
+                    ?? error.localizedDescription
+                DispatchQueue.main.async {
+                    testResult = .error(message)
+                }
             }
         }
     }

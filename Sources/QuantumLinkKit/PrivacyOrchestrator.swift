@@ -30,6 +30,7 @@ public final class PrivacyOrchestrator: @unchecked Sendable {
         case dnsResolver
         case socks5Proxy
         case coverTraffic
+        case decoyRunner
     }
 
     public struct Status: Sendable {
@@ -53,6 +54,8 @@ public final class PrivacyOrchestrator: @unchecked Sendable {
     private var dnsHandle: OpaquePointer?
     private var socks5Handle: OpaquePointer?
     private var coverHandle: OpaquePointer?
+    private var decoyHandle: OpaquePointer?
+    private var lastAppliedDecoyCadence: PrivacySettings.DecoyCadence = .off
     private var status: Status = .empty
 
     private init() {
@@ -160,6 +163,46 @@ public final class PrivacyOrchestrator: @unchecked Sendable {
             running.remove(.coverTraffic)
         }
 
+        // --- Pluggable transport (config setter, no handle) -------------
+        bridge.setTransportObfuscation(settings.transportObfuscation.ffiCode)
+
+        // --- Onion routing (config setter, no handle) -------------------
+        bridge.setOnionRouting(
+            enabled: settings.enableOnionRouting,
+            length: UInt32(settings.onionCircuitLength)
+        )
+
+        // --- Identity rotation policy ----------------------------------
+        bridge.setRotationPolicy(settings.rotationPolicy.ffiCode)
+
+        // --- Decoy runner ---------------------------------------------
+        // Cadence change requires teardown + respawn since the
+        // running task captures the cadence at spawn time.
+        let cadenceCode = settings.decoyCadence.ffiCode
+        let cadenceChanged = settings.decoyCadence != lastAppliedDecoyCadence
+        if cadenceCode == 0 {
+            // Off — destroy any running runner.
+            if let h = decoyHandle {
+                bridge.decoyDestroy(h)
+                decoyHandle = nil
+                running.remove(.decoyRunner)
+            }
+        } else if cadenceChanged || decoyHandle == nil {
+            // Either cadence shifted or runner isn't up — restart.
+            if let h = decoyHandle {
+                bridge.decoyDestroy(h)
+                decoyHandle = nil
+            }
+            if let h = bridge.decoyCreate(cadence: cadenceCode) {
+                decoyHandle = h
+                running.insert(.decoyRunner)
+                errors.removeValue(forKey: .decoyRunner)
+            } else {
+                errors[.decoyRunner] = "failed to start decoy runner"
+            }
+        }
+        lastAppliedDecoyCadence = settings.decoyCadence
+
         // --- Read back bound addresses for the status surface ---------
         let dnsAddr = dnsHandle.flatMap { bridge.dnsLocalAddr($0) }
         let socksAddr = socks5Handle.flatMap { bridge.socksLocalAddr($0) }
@@ -193,7 +236,44 @@ public final class PrivacyOrchestrator: @unchecked Sendable {
             bridge.coverDestroy(h)
             coverHandle = nil
         }
+        if let h = decoyHandle {
+            bridge.decoyDestroy(h)
+            decoyHandle = nil
+        }
         status = .empty
+    }
+}
+
+// MARK: - FFI code translation
+
+extension PrivacySettings.TransportObfuscation {
+    var ffiCode: UInt8 {
+        switch self {
+        case .none: return 0
+        case .tlsLikeFraming: return 1
+        case .obfs4XorScramble: return 2
+        }
+    }
+}
+
+extension PrivacySettings.DecoyCadence {
+    var ffiCode: UInt8 {
+        switch self {
+        case .off: return 0
+        case .light: return 1
+        case .steady: return 2
+        case .aggressive: return 3
+        }
+    }
+}
+
+extension PrivacySettings.RotationPolicy {
+    var ffiCode: UInt8 {
+        switch self {
+        case .manual: return 0
+        case .weekly: return 1
+        case .daily: return 2
+        }
     }
 }
 
@@ -216,6 +296,14 @@ private final class PrivacyFFIBridge {
     typealias CoverRate = @convention(c) (OpaquePointer) -> UInt64
     typealias CoverDestroy = @convention(c) (OpaquePointer) -> Void
 
+    typealias SetTransport = @convention(c) (UInt8) -> Void
+    typealias SetOnion = @convention(c) (UInt32, UInt32) -> Void
+    typealias SetRotation = @convention(c) (UInt8) -> Void
+
+    typealias DecoyCreate = @convention(c) (UInt8, UnsafePointer<Int8>?) -> OpaquePointer?
+    typealias DecoyDestroy = @convention(c) (OpaquePointer) -> Void
+    typealias DecoyCount = @convention(c) () -> Int
+
     typealias StringFree = @convention(c) (UnsafeMutablePointer<Int8>) -> Void
 
     let dnsCreateFn: DnsCreate
@@ -227,24 +315,32 @@ private final class PrivacyFFIBridge {
     let coverCreateFn: CoverCreate
     let coverRateFn: CoverRate
     let coverDestroyFn: CoverDestroy
+    let setTransportFn: SetTransport
+    let setOnionFn: SetOnion
+    let setRotationFn: SetRotation
+    let decoyCreateFn: DecoyCreate
+    let decoyDestroyFn: DecoyDestroy
+    let decoyCountFn: DecoyCount
     let stringFreeFn: StringFree
 
     static func bestEffort() -> PrivacyFFIBridge? {
-        // Use RTLD_DEFAULT so we resolve symbols from whatever's
-        // already linked into the process — the qlink_core dylib
-        // is a dependency of QuantumLinkKit so by the time this
-        // runs it's been loaded.
         let handle = UnsafeMutableRawPointer(bitPattern: -2) // RTLD_DEFAULT
-        guard let dnsCreate = sym(handle, "qlink_dns_resolver_create") else { return nil }
-        guard let dnsLocal = sym(handle, "qlink_dns_resolver_local_addr") else { return nil }
-        guard let dnsDestroy = sym(handle, "qlink_dns_resolver_destroy") else { return nil }
-        guard let socksCreate = sym(handle, "qlink_socks5_proxy_create") else { return nil }
-        guard let socksLocal = sym(handle, "qlink_socks5_proxy_local_addr") else { return nil }
-        guard let socksDestroy = sym(handle, "qlink_socks5_proxy_destroy") else { return nil }
-        guard let coverCreate = sym(handle, "qlink_cover_traffic_create") else { return nil }
-        guard let coverRate = sym(handle, "qlink_cover_traffic_rate_bps") else { return nil }
-        guard let coverDestroy = sym(handle, "qlink_cover_traffic_destroy") else { return nil }
-        guard let stringFree = sym(handle, "qlink_string_free") else { return nil }
+        guard let dnsCreate = sym(handle, "qlink_dns_resolver_create"),
+              let dnsLocal = sym(handle, "qlink_dns_resolver_local_addr"),
+              let dnsDestroy = sym(handle, "qlink_dns_resolver_destroy"),
+              let socksCreate = sym(handle, "qlink_socks5_proxy_create"),
+              let socksLocal = sym(handle, "qlink_socks5_proxy_local_addr"),
+              let socksDestroy = sym(handle, "qlink_socks5_proxy_destroy"),
+              let coverCreate = sym(handle, "qlink_cover_traffic_create"),
+              let coverRate = sym(handle, "qlink_cover_traffic_rate_bps"),
+              let coverDestroy = sym(handle, "qlink_cover_traffic_destroy"),
+              let setTransport = sym(handle, "qlink_set_transport_obfuscation"),
+              let setOnion = sym(handle, "qlink_set_onion_routing"),
+              let setRotation = sym(handle, "qlink_set_rotation_policy"),
+              let decoyCreate = sym(handle, "qlink_decoy_create"),
+              let decoyDestroy = sym(handle, "qlink_decoy_destroy"),
+              let decoyCount = sym(handle, "qlink_decoy_completed_count"),
+              let stringFree = sym(handle, "qlink_string_free") else { return nil }
         return PrivacyFFIBridge(
             dnsCreateFn: unsafeBitCast(dnsCreate, to: DnsCreate.self),
             dnsLocalAddrFn: unsafeBitCast(dnsLocal, to: DnsLocalAddr.self),
@@ -255,6 +351,12 @@ private final class PrivacyFFIBridge {
             coverCreateFn: unsafeBitCast(coverCreate, to: CoverCreate.self),
             coverRateFn: unsafeBitCast(coverRate, to: CoverRate.self),
             coverDestroyFn: unsafeBitCast(coverDestroy, to: CoverDestroy.self),
+            setTransportFn: unsafeBitCast(setTransport, to: SetTransport.self),
+            setOnionFn: unsafeBitCast(setOnion, to: SetOnion.self),
+            setRotationFn: unsafeBitCast(setRotation, to: SetRotation.self),
+            decoyCreateFn: unsafeBitCast(decoyCreate, to: DecoyCreate.self),
+            decoyDestroyFn: unsafeBitCast(decoyDestroy, to: DecoyDestroy.self),
+            decoyCountFn: unsafeBitCast(decoyCount, to: DecoyCount.self),
             stringFreeFn: unsafeBitCast(stringFree, to: StringFree.self)
         )
     }
@@ -269,6 +371,12 @@ private final class PrivacyFFIBridge {
         coverCreateFn: @escaping CoverCreate,
         coverRateFn: @escaping CoverRate,
         coverDestroyFn: @escaping CoverDestroy,
+        setTransportFn: @escaping SetTransport,
+        setOnionFn: @escaping SetOnion,
+        setRotationFn: @escaping SetRotation,
+        decoyCreateFn: @escaping DecoyCreate,
+        decoyDestroyFn: @escaping DecoyDestroy,
+        decoyCountFn: @escaping DecoyCount,
         stringFreeFn: @escaping StringFree
     ) {
         self.dnsCreateFn = dnsCreateFn
@@ -280,8 +388,26 @@ private final class PrivacyFFIBridge {
         self.coverCreateFn = coverCreateFn
         self.coverRateFn = coverRateFn
         self.coverDestroyFn = coverDestroyFn
+        self.setTransportFn = setTransportFn
+        self.setOnionFn = setOnionFn
+        self.setRotationFn = setRotationFn
+        self.decoyCreateFn = decoyCreateFn
+        self.decoyDestroyFn = decoyDestroyFn
+        self.decoyCountFn = decoyCountFn
         self.stringFreeFn = stringFreeFn
     }
+
+    // Convenience helpers for the new symbols.
+    func setTransportObfuscation(_ code: UInt8) { setTransportFn(code) }
+    func setOnionRouting(enabled: Bool, length: UInt32) {
+        setOnionFn(enabled ? 1 : 0, length)
+    }
+    func setRotationPolicy(_ code: UInt8) { setRotationFn(code) }
+    func decoyCreate(cadence: UInt8) -> OpaquePointer? {
+        decoyCreateFn(cadence, nil) // built-in pool
+    }
+    func decoyDestroy(_ h: OpaquePointer) { decoyDestroyFn(h) }
+    func decoyCompletedCount() -> Int { decoyCountFn() }
 
     // Convenience helpers that take care of the C-string memory
     // management on the way out.

@@ -36,9 +36,13 @@ use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 
 use crate::cover_traffic::{CoverTrafficLevel, CoverTrafficScheduler};
+use crate::decoy::{DecoyCadence, DecoyPool};
+use crate::decoy_runner::spawn_decoy_loop;
 use crate::dns_over_qlink::{
     DirectUdpTransport, StubResolver, StubResolverConfig, DEFAULT_STUB_BIND,
 };
+use crate::pluggable_transport::TransportObfuscation;
+use crate::runtime_config;
 use crate::socks5_proxy::{Socks5Connector, Socks5Proxy, TargetAddress, DEFAULT_BIND};
 
 // =============================================================================
@@ -367,6 +371,188 @@ pub unsafe extern "C" fn qlink_cover_traffic_rate_bps(
 pub unsafe extern "C" fn qlink_cover_traffic_destroy(
     handle: *mut QlinkCoverTrafficHandle,
 ) {
+    if handle.is_null() {
+        return;
+    }
+    drop(Box::from_raw(handle));
+}
+
+// =============================================================================
+// Pluggable transport (config setter)
+// =============================================================================
+
+/// Set the active transport obfuscation. Mapping:
+/// 0 = None, 1 = TLS-disguised, 2 = obfs4-style scramble.
+/// Out-of-range values default to TLS-disguised.
+#[no_mangle]
+pub extern "C" fn qlink_set_transport_obfuscation(value: u8) {
+    let chosen = match value {
+        0 => TransportObfuscation::None,
+        2 => TransportObfuscation::Obfs4XorScramble,
+        _ => TransportObfuscation::TlsLikeFraming,
+    };
+    runtime_config::set_transport_obfuscation(chosen);
+}
+
+/// Read the current obfuscation. Useful for the GUI's status
+/// display.
+#[no_mangle]
+pub extern "C" fn qlink_get_transport_obfuscation() -> u8 {
+    match runtime_config::current_transport_obfuscation() {
+        TransportObfuscation::None => 0,
+        TransportObfuscation::TlsLikeFraming => 1,
+        TransportObfuscation::Obfs4XorScramble => 2,
+    }
+}
+
+// =============================================================================
+// Onion routing (config setter)
+// =============================================================================
+
+/// Set the onion-routing config. `enabled` is non-zero to enable;
+/// `circuit_length` is clamped to 1..=5 (3 is the recommended default).
+#[no_mangle]
+pub extern "C" fn qlink_set_onion_routing(enabled: u32, circuit_length: u32) {
+    runtime_config::set_onion_routing(enabled != 0, circuit_length);
+}
+
+/// Read the current onion-routing config. Returns `(enabled, length)`
+/// packed as `(u32, u32)` via out-pointers (caller passes mutable
+/// pointers; either may be NULL to skip).
+#[no_mangle]
+pub unsafe extern "C" fn qlink_get_onion_routing(
+    enabled_out: *mut u32,
+    length_out: *mut u32,
+) {
+    let (enabled, length) = runtime_config::current_onion_routing();
+    if let Some(slot) = enabled_out.as_mut() {
+        *slot = if enabled { 1 } else { 0 };
+    }
+    if let Some(slot) = length_out.as_mut() {
+        *slot = length;
+    }
+}
+
+// =============================================================================
+// Identity rotation (policy setter + key-age tracker)
+// =============================================================================
+
+/// Set the rotation policy. Mapping:
+/// 0 = Manual, 1 = Weekly, 2 = Daily.
+#[no_mangle]
+pub extern "C" fn qlink_set_rotation_policy(policy: u8) {
+    runtime_config::set_rotation_policy(policy);
+}
+
+#[no_mangle]
+pub extern "C" fn qlink_get_rotation_policy() -> u8 {
+    runtime_config::current_rotation_policy()
+}
+
+/// Stamp the device-keypair-creation time so the rotation timer
+/// has something to compare against. Called once at app startup
+/// (or after a manual key rotation) with the unix-seconds
+/// timestamp.
+#[no_mangle]
+pub extern "C" fn qlink_set_key_created_at(unix_seconds: u64) {
+    runtime_config::set_key_created_at(unix_seconds);
+}
+
+/// Read the current key age in seconds. The GUI uses this to show
+/// "you rotated 3 days ago" status text. Returns 0 if the creation
+/// timestamp hasn't been set.
+#[no_mangle]
+pub extern "C" fn qlink_get_key_age_secs() -> u64 {
+    runtime_config::current_key_age_secs()
+}
+
+// =============================================================================
+// Decoy connections runtime
+// =============================================================================
+
+pub struct QlinkDecoyHandle {
+    _runtime: Runtime,
+    cadence_marker: u8,
+    _task: tokio::task::JoinHandle<()>,
+}
+
+/// Start the decoy-connection loop. `cadence` mapping:
+/// 0 = Off (returns NULL), 1 = Light, 2 = Steady, 3 = Aggressive.
+/// Pass NULL for `targets_csv` to use the built-in popular-sites pool.
+#[no_mangle]
+pub unsafe extern "C" fn qlink_decoy_create(
+    cadence: u8,
+    targets_csv: *const c_char,
+) -> *mut QlinkDecoyHandle {
+    let cadence_enum = match cadence {
+        0 => return ptr::null_mut(),
+        1 => DecoyCadence::Light,
+        2 => DecoyCadence::Steady,
+        3 => DecoyCadence::Aggressive,
+        _ => DecoyCadence::Steady,
+    };
+
+    let pool = if targets_csv.is_null() {
+        DecoyPool::default_pool()
+    } else {
+        let csv = match CStr::from_ptr(targets_csv).to_str() {
+            Ok(s) => s,
+            Err(_) => return ptr::null_mut(),
+        };
+        let targets: Vec<String> = csv
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if targets.is_empty() {
+            DecoyPool::default_pool()
+        } else {
+            DecoyPool::custom(targets)
+        }
+    };
+
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(_) => return ptr::null_mut(),
+    };
+
+    let task = runtime.spawn(async move {
+        let inner = spawn_decoy_loop(pool, cadence_enum);
+        // The inner JoinHandle is the actual driver; we await it
+        // here so this outer task lives for the same lifetime.
+        let _ = inner.await;
+    });
+
+    let handle = Box::new(QlinkDecoyHandle {
+        _runtime: runtime,
+        cadence_marker: cadence,
+        _task: task,
+    });
+    Box::into_raw(handle)
+}
+
+/// Read back the cadence the handle was created with. Useful for
+/// the GUI's "decoys running" indicator.
+#[no_mangle]
+pub unsafe extern "C" fn qlink_decoy_cadence(handle: *const QlinkDecoyHandle) -> u8 {
+    handle.as_ref().map(|h| h.cadence_marker).unwrap_or(0)
+}
+
+/// Read the running count of completed decoy fetches. The GUI
+/// polls this for live activity counters on the Privacy panel.
+#[no_mangle]
+pub extern "C" fn qlink_decoy_completed_count() -> usize {
+    use std::sync::atomic::Ordering;
+    runtime_config::DECOY_FETCHES_COMPLETED.load(Ordering::Relaxed)
+}
+
+/// Stop the decoy loop and free the handle.
+#[no_mangle]
+pub unsafe extern "C" fn qlink_decoy_destroy(handle: *mut QlinkDecoyHandle) {
     if handle.is_null() {
         return;
     }

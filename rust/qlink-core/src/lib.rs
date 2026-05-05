@@ -1,6 +1,7 @@
 pub mod cover_traffic;
 pub mod crypto;
 pub mod decoy;
+pub mod decoy_runner;
 pub mod discovery;
 pub mod dns_over_qlink;
 pub mod error;
@@ -24,6 +25,7 @@ pub mod relay;
 pub mod rendezvous;
 pub mod replay;
 pub mod routing;
+pub mod runtime_config;
 pub mod socks5_proxy;
 pub mod stun;
 pub mod synthetic_wan;
