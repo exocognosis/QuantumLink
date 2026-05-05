@@ -21,5 +21,6 @@ pub mod stun;
 pub mod synthetic_wan;
 pub mod tracing_bridge;
 pub mod traversal;
+pub mod utun;
 
 pub use error::{QlinkError, Result};

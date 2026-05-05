@@ -1307,6 +1307,7 @@ dependencies = [
  "getrandom 0.3.4",
  "hkdf",
  "hmac 0.12.1",
+ "libc",
  "mdns-sd",
  "ml-dsa",
  "ml-kem",
