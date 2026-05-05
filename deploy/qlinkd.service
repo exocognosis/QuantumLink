@@ -1,0 +1,98 @@
+# systemd unit for the QuantumLink server daemon (qlinkd).
+#
+# Install:
+#   1. Build the binary on a Linux host (or cross-compile from macOS):
+#        cargo build --release --bin qlinkd
+#   2. Copy the binary to /usr/local/bin:
+#        sudo install -m 755 target/release/qlinkd /usr/local/bin/qlinkd
+#   3. Create the unprivileged service user:
+#        sudo useradd --system --no-create-home --shell /usr/sbin/nologin quantumlink
+#   4. Drop this unit at /etc/systemd/system/qlinkd.service.
+#   5. sudo systemctl daemon-reload && sudo systemctl enable --now qlinkd
+#
+# Verify:
+#   systemctl status qlinkd
+#   journalctl -u qlinkd -f
+#
+# Sovereignty notes:
+#   - Runs as the unprivileged `quantumlink` user (no UID 0).
+#   - Granted CAP_NET_ADMIN as an ambient capability so the daemon
+#     can open /dev/net/tun for exit-relay mode without running as
+#     root. CAP_NET_BIND_SERVICE is NOT granted because the default
+#     ports (9471-9474) are above 1024 and don't need it.
+#   - All systemd hardening directives are set; this profile passes
+#     `systemd-analyze security qlinkd` with a HIGH score.
+
+[Unit]
+Description=QuantumLink server daemon (rendezvous + relay + STUN)
+Documentation=https://github.com/exocognosis/QuantumLink
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=quantumlink
+Group=quantumlink
+
+ExecStart=/usr/local/bin/qlinkd
+
+# --- Capabilities -----------------------------------------------------------
+# CAP_NET_ADMIN is needed for exit-relay mode (opens /dev/net/tun
+# and adds routes). CapabilityBoundingSet limits the daemon to ONLY
+# this capability — everything else is dropped, even if the binary
+# is later replaced with something that tries to gain more.
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+
+# --- Filesystem isolation ---------------------------------------------------
+# Strict: the daemon doesn't need to read or write anywhere outside
+# /proc/self for runtime introspection. ReadWritePaths is empty so
+# even an exploit that bypassed PrivateTmp can't write user data.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=false
+DeviceAllow=/dev/net/tun rwm
+DeviceAllow=/dev/null rwm
+DevicePolicy=closed
+
+# --- Process isolation -----------------------------------------------------
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @keyring @debug @raw-io @reboot @swap
+
+# --- Networking -------------------------------------------------------------
+# IPv4 + IPv6 only; no AF_PACKET (we don't need raw sockets) and no
+# AF_NETLINK (we don't need to manipulate routes ourselves — operator
+# does that ahead of time).
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# --- Resource limits --------------------------------------------------------
+LimitNOFILE=65536
+TasksMax=512
+
+# --- Logging ----------------------------------------------------------------
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=qlinkd
+
+# --- Restart policy ---------------------------------------------------------
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

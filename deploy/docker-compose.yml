@@ -1,0 +1,91 @@
+# One-line self-hosted QuantumLink coordinator + relay.
+#
+# Usage:
+#   1. Clone the repo on the server you want to host on.
+#   2. cd deploy/
+#   3. docker compose up -d
+#
+# Verify:
+#   docker compose ps
+#   docker compose logs -f qlinkd
+#
+# Persistence:
+#   By default the rendezvous + relay state is in-memory only and
+#   gets wiped on container restart — that's fine for a coordinator
+#   because peer records are short-lived (peers republish on a
+#   timer). Operators who want to persist state across restarts
+#   uncomment the `volumes` block below.
+#
+# Sovereignty:
+#   This compose file is the entire deployment. There's no
+#   docker-compose-prod.yml, no overlay, no extra image registry,
+#   no telemetry sidecar. What you see is what runs. The qlinkd
+#   image is built from this repo's Dockerfile (also in deploy/);
+#   inspect it before running `docker compose up`.
+#
+# Network model:
+#   Host networking is used because the daemon needs raw access to
+#   binding the four service ports. If your host has a firewall
+#   (ufw / iptables / cloud security group), open these:
+#     9471/tcp  rendezvous
+#     9472/tcp  relay
+#     9473/udp  STUN
+#     9474/udp  exit relay (when --exit-relay is enabled)
+#
+
+version: "3.9"
+
+services:
+  qlinkd:
+    image: quantumlink/qlinkd:latest
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: qlinkd
+
+    # Host networking is the simplest path to "all four service
+    # ports are reachable on the public IP" without bridge-mode
+    # port forwarding. Switch to `ports:` if you'd rather isolate.
+    network_mode: host
+
+    # CAP_NET_ADMIN lets qlinkd open /dev/net/tun for exit-relay
+    # mode. NET_RAW is granted only if you intend to use ICMP-based
+    # health checks; not needed by the core daemon.
+    cap_add:
+      - NET_ADMIN
+    cap_drop:
+      - ALL
+
+    # /dev/net/tun is required for exit-relay mode. Mounting it
+    # into the container costs nothing for non-exit deployments.
+    devices:
+      - /dev/net/tun:/dev/net/tun
+
+    # `--init` ensures correct signal forwarding so SIGTERM from
+    # `docker compose down` actually shuts qlinkd down cleanly.
+    init: true
+
+    restart: unless-stopped
+
+    # Default args mirror the systemd unit. Override via:
+    #   environment:
+    #     QLINKD_ARGS: "--rendezvous 0.0.0.0:9471 --exit-relay"
+    command:
+      - "qlinkd"
+
+    # Uncomment to persist state across restarts:
+    # volumes:
+    #   - qlinkd-state:/var/lib/qlinkd
+
+    healthcheck:
+      # Cheap TCP-port-up check on the rendezvous service. A failed
+      # check triggers `unless-stopped` -> restart.
+      test: ["CMD-SHELL", "nc -z localhost 9471 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+# Uncomment alongside the volumes block above:
+# volumes:
+#   qlinkd-state:

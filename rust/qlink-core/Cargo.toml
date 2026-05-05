@@ -22,7 +22,12 @@ path = "src/bin/perfgate.rs"
 name = "qlinkhelper"
 path = "src/bin/qlinkhelper.rs"
 
+[[bin]]
+name = "qlinkd"
+path = "src/bin/qlinkd.rs"
+
 [dependencies]
+async-trait = "0.1"
 base64 = "0.22"
 bytes = "1"
 chacha20poly1305 = "0.10"
@@ -51,7 +56,7 @@ sha1 = "0.10"
 sha2 = "0.10"
 slh-dsa = { version = "0.2.0-rc.4", features = ["zeroize"] }
 thiserror = "1"
-tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 zeroize = { version = "1", features = ["derive"] }

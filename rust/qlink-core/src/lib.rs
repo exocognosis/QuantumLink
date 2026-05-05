@@ -1,5 +1,6 @@
 pub mod crypto;
 pub mod discovery;
+pub mod dns_over_qlink;
 pub mod error;
 pub mod ffi;
 pub mod ice;
@@ -17,6 +18,7 @@ pub mod relay;
 pub mod rendezvous;
 pub mod replay;
 pub mod routing;
+pub mod socks5_proxy;
 pub mod stun;
 pub mod synthetic_wan;
 pub mod tracing_bridge;
