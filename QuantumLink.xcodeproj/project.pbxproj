@@ -34,6 +34,7 @@
 		9E65A25527CAA428BE426AF3 /* PerAppVPNPayload.swift in Sources */ = {isa = PBXBuildFile; fileRef = D4752E5DD6C0A59760684256 /* PerAppVPNPayload.swift */; };
 		A5C4564A2B06FC2C24DA702D /* QuantumLinkKit.framework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = D92CC20FE0D9A2AF59177575 /* QuantumLinkKit.framework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		AD35511B82839DFB7B075089 /* PeerStoreKey.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0724D1E06213136E00FBF875 /* PeerStoreKey.swift */; };
+		B018084DA5CE6C05106AAEFA /* PrivacyOrchestrator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 053DDC80BD69A29E505F88B5 /* PrivacyOrchestrator.swift */; };
 		B493369D4EF03860C6FF778C /* MobileConfigEnvelope.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C52F0E44CCC367DEBA3EF35 /* MobileConfigEnvelope.swift */; };
 		BB1462F88A7017370BF9F443 /* VPNOnDemandRules.swift in Sources */ = {isa = PBXBuildFile; fileRef = A448961AC221A5C4241BCDEE /* VPNOnDemandRules.swift */; };
 		BDC60441CCCF384C8B08BC17 /* TunnelMessages.swift in Sources */ = {isa = PBXBuildFile; fileRef = CE830C8CCA2137B2F188374A /* TunnelMessages.swift */; };
@@ -127,6 +128,7 @@
 
 /* Begin PBXFileReference section */
 		018DCCD04A8D80C521D61530 /* UpdateController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UpdateController.swift; sourceTree = "<group>"; };
+		053DDC80BD69A29E505F88B5 /* PrivacyOrchestrator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrivacyOrchestrator.swift; sourceTree = "<group>"; };
 		0724D1E06213136E00FBF875 /* PeerStoreKey.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerStoreKey.swift; sourceTree = "<group>"; };
 		0A3D7560CBFFAB7F8C3240F6 /* PrivacyDefaults.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrivacyDefaults.swift; sourceTree = "<group>"; };
 		0ABE92DEDDCBD267BBDA34BD /* DytallixLogo.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = DytallixLogo.png; sourceTree = "<group>"; };
@@ -267,6 +269,7 @@
 				89CDAC11B3550F2270623606 /* PKCS12IdentityLoader.swift */,
 				79F6EBBA9B34F64F2F7DB673 /* PQCAlgorithm.swift */,
 				0A3D7560CBFFAB7F8C3240F6 /* PrivacyDefaults.swift */,
+				053DDC80BD69A29E505F88B5 /* PrivacyOrchestrator.swift */,
 				DBA7D91F22A63C0CD787C960 /* PrivacySettings.swift */,
 				BA743417C501D79576742C41 /* QuantumLinkHelper.swift */,
 				3CFD4CE180956CC84DFBAE01 /* RustCoreBridge.swift */,
@@ -505,6 +508,7 @@
 				AD35511B82839DFB7B075089 /* PeerStoreKey.swift in Sources */,
 				9E65A25527CAA428BE426AF3 /* PerAppVPNPayload.swift in Sources */,
 				752BC11107DD37C469873D6E /* PrivacyDefaults.swift in Sources */,
+				B018084DA5CE6C05106AAEFA /* PrivacyOrchestrator.swift in Sources */,
 				204600153DE7F6CFCF33247F /* PrivacySettings.swift in Sources */,
 				628048C8B2D725EE53B78670 /* QuantumLinkHelper.swift in Sources */,
 				F8A548992048AEDE38FEE484 /* RustCoreBridge.swift in Sources */,

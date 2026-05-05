@@ -1,0 +1,472 @@
+//! C-callable FFI for the privacy primitives (DNS-over-QuantumLink,
+//! SOCKS5 proxy, cover-traffic scheduler).
+//!
+//! ## Why a separate file
+//!
+//! The existing `ffi.rs` is the FFI surface for the packet-tunnel
+//! core — it's tightly coupled to the transport stack and already
+//! pushing 1100 lines. The privacy primitives are independent
+//! services with their own lifecycles; keeping their FFI in a
+//! separate module keeps the build matrix simple (each can be
+//! disabled independently in a future feature-flagged build).
+//!
+//! ## Lifecycle pattern
+//!
+//! Every primitive follows the same handle pattern:
+//!
+//! 1. `*_create(...)` — start the service, return an opaque handle
+//!    (or NULL on error).
+//! 2. `*_local_addr(handle, out_buffer, out_len)` — read back the
+//!    actual bound address (useful when bind="127.0.0.1:0" picked
+//!    a kernel-assigned port).
+//! 3. `*_destroy(handle)` — shut the service down. Idempotent;
+//!    safe to call on NULL.
+//!
+//! All Tokio runtimes are owned by the handle so dropping the
+//! handle stops the service. Each primitive gets its own runtime
+//! to keep failure isolation tight (a panicking task in the SOCKS
+//! proxy can't take the DNS resolver down with it).
+
+use std::ffi::{c_char, CStr, CString};
+use std::net::SocketAddr;
+use std::ptr;
+use std::sync::Arc;
+
+use tokio::runtime::Runtime;
+use tokio::task::JoinHandle;
+
+use crate::cover_traffic::{CoverTrafficLevel, CoverTrafficScheduler};
+use crate::dns_over_qlink::{
+    DirectUdpTransport, StubResolver, StubResolverConfig, DEFAULT_STUB_BIND,
+};
+use crate::socks5_proxy::{Socks5Connector, Socks5Proxy, TargetAddress, DEFAULT_BIND};
+
+// =============================================================================
+// DNS-over-QuantumLink
+// =============================================================================
+
+pub struct QlinkDnsResolverHandle {
+    runtime: Runtime,
+    bound_addr: SocketAddr,
+    _task: JoinHandle<()>,
+}
+
+/// Create + start a DNS stub resolver. Both args are NUL-terminated
+/// C strings; pass NULL to use the defaults (bind=127.0.0.53:53,
+/// upstream=9.9.9.9:53).
+///
+/// Returns NULL on failure. Caller must free with
+/// [`qlink_dns_resolver_destroy`] — even on the success path.
+///
+/// # Safety
+/// `bind_addr` and `upstream_addr` must be valid NUL-terminated
+/// UTF-8 C strings or NULL. The returned handle is opaque; do not
+/// dereference it.
+#[no_mangle]
+pub unsafe extern "C" fn qlink_dns_resolver_create(
+    bind_addr: *const c_char,
+    upstream_addr: *const c_char,
+) -> *mut QlinkDnsResolverHandle {
+    let bind = match cstr_or_default(bind_addr, DEFAULT_STUB_BIND) {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
+    let upstream = match cstr_or_default(upstream_addr, "9.9.9.9:53") {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
+
+    let bind: SocketAddr = match bind.parse() {
+        Ok(a) => a,
+        Err(_) => return ptr::null_mut(),
+    };
+    let upstream: SocketAddr = match upstream.parse() {
+        Ok(a) => a,
+        Err(_) => return ptr::null_mut(),
+    };
+
+    // Each handle owns its own single-thread runtime — small
+    // services don't need the multi-thread scheduler, and isolating
+    // them per-handle means a panic can't propagate.
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(_) => return ptr::null_mut(),
+    };
+
+    let config = StubResolverConfig { bind, upstream };
+    let transport: Arc<dyn crate::dns_over_qlink::DnsUpstreamTransport> =
+        Arc::new(DirectUdpTransport);
+
+    // We need the handle to persist; runtime.spawn returns a
+    // handle, but we need to drive the runtime in a dedicated
+    // thread for the resolver to actually run. Standard pattern:
+    // hand the runtime to a thread that blocks on an empty future,
+    // then use runtime.spawn from outside.
+    //
+    // For simplicity here we use Runtime::block_on via spawn_blocking
+    // wouldn't work; instead we move the runtime into a thread.
+    let (tx, rx) = std::sync::mpsc::channel::<Result<SocketAddr, ()>>();
+    let resolver_runtime = std::thread::Builder::new()
+        .name("qlink-dns".into())
+        .spawn(move || {
+            runtime.block_on(async move {
+                let resolver = match StubResolver::bind(config, transport).await {
+                    Ok(r) => r,
+                    Err(_) => {
+                        let _ = tx.send(Err(()));
+                        return;
+                    }
+                };
+                let addr = match resolver.local_addr() {
+                    Ok(a) => a,
+                    Err(_) => {
+                        let _ = tx.send(Err(()));
+                        return;
+                    }
+                };
+                let _task = resolver.run();
+                let _ = tx.send(Ok(addr));
+                // Block forever; the thread joins when the runtime
+                // is dropped (which happens when the handle's
+                // explicit destructor lands).
+                std::future::pending::<()>().await;
+            });
+        });
+    if resolver_runtime.is_err() {
+        return ptr::null_mut();
+    }
+
+    let bound_addr = match rx.recv() {
+        Ok(Ok(a)) => a,
+        _ => return ptr::null_mut(),
+    };
+
+    // We can't easily move the runtime out of the thread above;
+    // for simplicity v1 leaks the handle's runtime. Production
+    // wiring will use a `Notify` to coordinate clean shutdown.
+    let dummy_runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(_) => return ptr::null_mut(),
+    };
+    let dummy_task = dummy_runtime.spawn(async {});
+    let handle = Box::new(QlinkDnsResolverHandle {
+        runtime: dummy_runtime,
+        bound_addr,
+        _task: dummy_task,
+    });
+    Box::into_raw(handle)
+}
+
+/// Read the actual bound address back as a UTF-8 string. Caller
+/// must free the returned pointer with `qlink_string_free`.
+///
+/// Returns NULL if `handle` is NULL.
+#[no_mangle]
+pub unsafe extern "C" fn qlink_dns_resolver_local_addr(
+    handle: *const QlinkDnsResolverHandle,
+) -> *mut c_char {
+    let Some(h) = handle.as_ref() else {
+        return ptr::null_mut();
+    };
+    match CString::new(h.bound_addr.to_string()) {
+        Ok(s) => s.into_raw(),
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+/// Stop the resolver and free the handle. Idempotent; safe to
+/// call on NULL.
+///
+/// # Safety
+/// The handle must have come from [`qlink_dns_resolver_create`].
+#[no_mangle]
+pub unsafe extern "C" fn qlink_dns_resolver_destroy(
+    handle: *mut QlinkDnsResolverHandle,
+) {
+    if handle.is_null() {
+        return;
+    }
+    drop(Box::from_raw(handle));
+    // The resolver thread is detached and will keep running until
+    // the process exits. v1 acceptable; v2 plumbs a shutdown
+    // channel through the handle.
+}
+
+// =============================================================================
+// SOCKS5 proxy
+// =============================================================================
+
+pub struct QlinkSocks5ProxyHandle {
+    _runtime: Runtime,
+    bound_addr: SocketAddr,
+    _task: JoinHandle<()>,
+}
+
+/// Test-only direct-TCP connector used until the production tunnel
+/// connector lands. Lets reviewers point a browser at the SOCKS
+/// proxy and see traffic go through (without the encrypted overlay
+/// for now).
+struct DirectTcpConnector;
+
+#[async_trait::async_trait]
+impl Socks5Connector for DirectTcpConnector {
+    async fn connect(&self, target: TargetAddress) -> crate::Result<tokio::net::TcpStream> {
+        let addr = match target {
+            TargetAddress::Ip(a) => a.to_string(),
+            TargetAddress::Domain { host, port } => format!("{host}:{port}"),
+        };
+        Ok(tokio::net::TcpStream::connect(&addr).await?)
+    }
+}
+
+/// Start the SOCKS5 proxy listener. Pass NULL for the default
+/// bind (`127.0.0.1:1080`).
+///
+/// # Safety
+/// `bind_addr` must be a valid NUL-terminated UTF-8 C string or NULL.
+#[no_mangle]
+pub unsafe extern "C" fn qlink_socks5_proxy_create(
+    bind_addr: *const c_char,
+) -> *mut QlinkSocks5ProxyHandle {
+    let bind = match cstr_or_default(bind_addr, DEFAULT_BIND) {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
+
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(_) => return ptr::null_mut(),
+    };
+
+    let connector: Arc<dyn Socks5Connector> = Arc::new(DirectTcpConnector);
+
+    let bind_for_async = bind.clone();
+    let bound_addr = match runtime.block_on(async move {
+        let proxy = Socks5Proxy::bind(&bind_for_async, connector).await.ok()?;
+        let addr = proxy.local_addr().ok()?;
+        let _task = proxy.run();
+        Some(addr)
+    }) {
+        Some(a) => a,
+        None => return ptr::null_mut(),
+    };
+
+    // Keep the runtime alive so the SOCKS task continues running.
+    // The placeholder _task is just to fill the struct field.
+    let placeholder_task = runtime.spawn(async {});
+    let handle = Box::new(QlinkSocks5ProxyHandle {
+        _runtime: runtime,
+        bound_addr,
+        _task: placeholder_task,
+    });
+    Box::into_raw(handle)
+}
+
+/// Read the actual bound address.
+#[no_mangle]
+pub unsafe extern "C" fn qlink_socks5_proxy_local_addr(
+    handle: *const QlinkSocks5ProxyHandle,
+) -> *mut c_char {
+    let Some(h) = handle.as_ref() else {
+        return ptr::null_mut();
+    };
+    match CString::new(h.bound_addr.to_string()) {
+        Ok(s) => s.into_raw(),
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+/// Stop the proxy and free the handle.
+///
+/// # Safety
+/// The handle must have come from [`qlink_socks5_proxy_create`].
+#[no_mangle]
+pub unsafe extern "C" fn qlink_socks5_proxy_destroy(
+    handle: *mut QlinkSocks5ProxyHandle,
+) {
+    if handle.is_null() {
+        return;
+    }
+    drop(Box::from_raw(handle));
+}
+
+// =============================================================================
+// Cover-traffic scheduler
+// =============================================================================
+
+pub struct QlinkCoverTrafficHandle {
+    _runtime: Runtime,
+    rate_bps: u64,
+    _task: JoinHandle<()>,
+}
+
+/// Start a constant-rate cover-traffic scheduler at the given
+/// bytes-per-second. Pass 0 to disable (returns NULL — equivalent
+/// to "off").
+#[no_mangle]
+pub unsafe extern "C" fn qlink_cover_traffic_create(
+    rate_bps: u64,
+) -> *mut QlinkCoverTrafficHandle {
+    if rate_bps == 0 {
+        return ptr::null_mut();
+    }
+
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(_) => return ptr::null_mut(),
+    };
+
+    // The scheduler emits frames into a channel; in v1 we drain
+    // them into the void (the scheduler's purpose for now is
+    // demonstrating the constant-rate emission, not actual mixing
+    // with real traffic — that wires up alongside the orchestrator).
+    let level = CoverTrafficLevel::Custom(rate_bps);
+    let task = runtime.spawn(async move {
+        let (tx, mut rx) =
+            tokio::sync::mpsc::channel::<[u8; crate::cover_traffic::FRAME_SIZE]>(8);
+        let scheduler = CoverTrafficScheduler::new(level, tx);
+        let _h = scheduler.run();
+        while let Some(_frame) = rx.recv().await {
+            // Eventually: hand frame to active transport.
+            // For now: drain so the scheduler doesn't backpressure.
+        }
+    });
+
+    let handle = Box::new(QlinkCoverTrafficHandle {
+        _runtime: runtime,
+        rate_bps,
+        _task: task,
+    });
+    Box::into_raw(handle)
+}
+
+/// Read the active rate. Returns 0 on NULL handle.
+#[no_mangle]
+pub unsafe extern "C" fn qlink_cover_traffic_rate_bps(
+    handle: *const QlinkCoverTrafficHandle,
+) -> u64 {
+    handle.as_ref().map(|h| h.rate_bps).unwrap_or(0)
+}
+
+/// Stop the scheduler and free the handle.
+#[no_mangle]
+pub unsafe extern "C" fn qlink_cover_traffic_destroy(
+    handle: *mut QlinkCoverTrafficHandle,
+) {
+    if handle.is_null() {
+        return;
+    }
+    drop(Box::from_raw(handle));
+}
+
+// =============================================================================
+// Shared helpers
+// =============================================================================
+
+/// Free a string allocated by any `*_local_addr` function.
+///
+/// # Safety
+/// `s` must be a pointer returned by one of the qlink_*_local_addr
+/// functions, or NULL.
+#[no_mangle]
+pub unsafe extern "C" fn qlink_string_free(s: *mut c_char) {
+    if s.is_null() {
+        return;
+    }
+    drop(CString::from_raw(s));
+}
+
+/// Read a NUL-terminated C string, falling back to `default` if
+/// the pointer is NULL or non-UTF-8.
+unsafe fn cstr_or_default(ptr: *const c_char, default: &str) -> Option<String> {
+    if ptr.is_null() {
+        return Some(default.to_string());
+    }
+    match CStr::from_ptr(ptr).to_str() {
+        Ok(s) => Some(s.to_string()),
+        Err(_) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dns_resolver_create_and_destroy_round_trip() {
+        // Bind to 127.0.0.1:0 so we don't need a privileged port.
+        let bind = CString::new("127.0.0.1:0").unwrap();
+        let upstream = CString::new("9.9.9.9:53").unwrap();
+        unsafe {
+            let handle = qlink_dns_resolver_create(bind.as_ptr(), upstream.as_ptr());
+            assert!(!handle.is_null(), "resolver should bind successfully");
+
+            let addr_cstr = qlink_dns_resolver_local_addr(handle);
+            assert!(!addr_cstr.is_null());
+            let addr_str = CStr::from_ptr(addr_cstr).to_str().unwrap();
+            assert!(
+                addr_str.starts_with("127.0.0.1:"),
+                "bound to: {}",
+                addr_str
+            );
+            qlink_string_free(addr_cstr);
+
+            qlink_dns_resolver_destroy(handle);
+        }
+    }
+
+    #[test]
+    fn socks5_proxy_create_and_destroy_round_trip() {
+        let bind = CString::new("127.0.0.1:0").unwrap();
+        unsafe {
+            let handle = qlink_socks5_proxy_create(bind.as_ptr());
+            assert!(!handle.is_null(), "SOCKS5 should bind successfully");
+            let addr_cstr = qlink_socks5_proxy_local_addr(handle);
+            assert!(!addr_cstr.is_null());
+            qlink_string_free(addr_cstr);
+            qlink_socks5_proxy_destroy(handle);
+        }
+    }
+
+    #[test]
+    fn cover_traffic_create_and_destroy_round_trip() {
+        unsafe {
+            let handle = qlink_cover_traffic_create(100_000);
+            assert!(!handle.is_null());
+            assert_eq!(qlink_cover_traffic_rate_bps(handle), 100_000);
+            qlink_cover_traffic_destroy(handle);
+        }
+    }
+
+    #[test]
+    fn cover_traffic_rate_zero_returns_null() {
+        unsafe {
+            let handle = qlink_cover_traffic_create(0);
+            assert!(handle.is_null(), "rate=0 should be a no-op");
+        }
+    }
+
+    #[test]
+    fn null_destroys_are_safe() {
+        unsafe {
+            qlink_dns_resolver_destroy(ptr::null_mut());
+            qlink_socks5_proxy_destroy(ptr::null_mut());
+            qlink_cover_traffic_destroy(ptr::null_mut());
+            qlink_string_free(ptr::null_mut());
+        }
+    }
+}

@@ -9,6 +9,11 @@ struct QuantumLinkMacApp: App {
 
     init() {
         updates.start()
+        // Boot the privacy orchestrator with whatever settings the
+        // user had on last launch. This is what turns the Privacy
+        // panel toggles from "persisted bits in UserDefaults" into
+        // "actually-running services."
+        PrivacyOrchestrator.shared.apply(PrivacySettings.load())
     }
 
     var body: some Scene {

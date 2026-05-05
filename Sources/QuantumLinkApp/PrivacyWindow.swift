@@ -139,6 +139,10 @@ struct PrivacyView: View {
             // settings UI; the explicit Save button is for users
             // who want a clear "applied" signal.
             newValue.save()
+            // Live-apply: starting/stopping the relevant Rust
+            // services in-process. This is what makes the toggles
+            // actually do something instead of just persisting bits.
+            PrivacyOrchestrator.shared.apply(newValue)
         }
     }
 
