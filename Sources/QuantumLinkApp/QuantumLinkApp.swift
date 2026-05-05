@@ -131,7 +131,7 @@ private struct DashboardView: View {
                 }
 
                 Section("Network") {
-                    ForEach([SidebarTab.network, .peers, .routes, .security, .diagnostics]) { tab in
+                    ForEach([SidebarTab.network, .peers, .routes, .security, .privacy, .diagnostics]) { tab in
                         SidebarItem(tab: tab)
                             .tag(tab)
                     }
@@ -413,6 +413,7 @@ private enum SidebarTab: CaseIterable, Hashable, Identifiable {
     case peers
     case routes
     case security
+    case privacy
     case diagnostics
     case configuration
 
@@ -428,6 +429,7 @@ private enum SidebarTab: CaseIterable, Hashable, Identifiable {
         case .peers: "Peers"
         case .routes: "Routes"
         case .security: "Security"
+        case .privacy: "Privacy"
         case .diagnostics: "Diagnostics"
         case .configuration: "Configuration"
         }
@@ -443,6 +445,7 @@ private enum SidebarTab: CaseIterable, Hashable, Identifiable {
         case .peers: "desktopcomputer.and.arrow.down"
         case .routes: "arrow.triangle.branch"
         case .security: "lock.shield"
+        case .privacy: "hand.raised"
         case .diagnostics: "waveform.path.ecg"
         case .configuration: "slider.horizontal.3"
         }
@@ -574,6 +577,8 @@ private struct DashboardDetailView: View {
                 RoutesDetail(status: status)
             case .security:
                 SecurityDetail(status: status, configuration: configuration)
+            case .privacy:
+                PrivacyView()
             case .diagnostics:
                 DiagnosticsDetail(status: status)
             case .configuration:
