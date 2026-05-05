@@ -1,4 +1,6 @@
+pub mod cover_traffic;
 pub mod crypto;
+pub mod decoy;
 pub mod discovery;
 pub mod dns_over_qlink;
 pub mod error;
@@ -10,9 +12,11 @@ pub mod mdns_discovery;
 pub mod mesh_connection;
 pub mod mesh_transport;
 pub mod metrics_endpoint;
+pub mod onion_router;
 pub mod packet_core;
 pub mod peer_acl;
 pub mod peer_store;
+pub mod pluggable_transport;
 pub mod quic_transport;
 pub mod relay;
 pub mod rendezvous;
