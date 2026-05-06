@@ -1906,15 +1906,12 @@ private struct NetworkOverview: View {
 /// a button to authorize it."
 private struct RealTunnelingCard: View {
     @State private var helperStatus: QuantumLinkHelper.Status = .notInstalled
-    @State private var testResult: TestResult = .idle
+    @State private var tunnelState: RealTunnelingController.State = .idle
+    @State private var metrics: RealTunnelingController.Metrics = .empty
     @State private var isInstalling = false
+    @State private var lastError: String?
 
-    enum TestResult: Equatable {
-        case idle
-        case opening
-        case opened(name: String)
-        case error(String)
-    }
+    private let metricsTimer = Timer.publish(every: 1.0, on: .main, in: .common).autoconnect()
 
     var body: some View {
         ConfigurationCard(title: "Real Tunneling", systemImage: "lock.shield") {
@@ -1938,33 +1935,88 @@ private struct RealTunnelingCard: View {
                         }
                         .disabled(isInstalling)
                         .buttonStyle(.borderedProminent)
+                    } else if case .running = tunnelState {
+                        Button("Stop Real Tunneling") { stopTunnel() }
+                            .buttonStyle(.bordered)
                     } else {
-                        Button("Test Open utun") { testOpen() }
-                            .disabled(testResult == .opening)
+                        Button("Start Real Tunneling") { startTunnel() }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(tunnelState == .starting)
                     }
                     Button("Refresh Status") { refreshStatus() }
                 }
 
-                switch testResult {
-                case .idle:
-                    EmptyView()
-                case .opening:
-                    Text("Requesting utun device from helper…")
+                if case .running(let name) = tunnelState {
+                    metricsSection(interfaceName: name)
+                }
+
+                if case .starting = tunnelState {
+                    Text("Opening utun device + adopting FD into pump…")
                         .font(.callout)
                         .foregroundStyle(.secondary)
-                case .opened(let name):
-                    Label("Helper opened \(name)", systemImage: "checkmark.seal.fill")
-                        .foregroundStyle(.green)
-                        .font(.callout)
-                case .error(let msg):
-                    Label(msg, systemImage: "exclamationmark.triangle")
+                }
+
+                if let lastError {
+                    Label(lastError, systemImage: "exclamationmark.triangle")
                         .foregroundStyle(.orange)
                         .font(.callout)
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
         }
-        .onAppear { refreshStatus() }
+        .onAppear {
+            refreshStatus()
+            tunnelState = RealTunnelingController.shared.state
+            metrics = RealTunnelingController.shared.metrics()
+        }
+        .onReceive(metricsTimer) { _ in
+            // Cheap poll every second while running. The Rust side
+            // counters are atomic so this doesn't take any locks
+            // beyond the one in the controller itself.
+            tunnelState = RealTunnelingController.shared.state
+            if case .running = tunnelState {
+                metrics = RealTunnelingController.shared.metrics()
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func metricsSection(interfaceName: String) -> some View {
+        Divider().padding(.vertical, 2)
+        VStack(alignment: .leading, spacing: 8) {
+            Label("Bridged on \(interfaceName)", systemImage: "checkmark.seal.fill")
+                .foregroundStyle(.green)
+                .font(.callout.weight(.semibold))
+            HStack(spacing: 16) {
+                metricsCell(label: "OS → App", packets: metrics.packetsOSToApp, bytes: metrics.bytesOSToApp)
+                metricsCell(label: "App → OS", packets: metrics.packetsAppToOS, bytes: metrics.bytesAppToOS)
+            }
+            if metrics.readErrors > 0 || metrics.writeErrors > 0 {
+                Text("Errors — read: \(metrics.readErrors) · write: \(metrics.writeErrors)")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func metricsCell(label: String, packets: UInt64, bytes: UInt64) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text("\(packets) pkts")
+                .font(.callout.monospacedDigit().weight(.semibold))
+            Text(formatBytes(bytes))
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private func formatBytes(_ b: UInt64) -> String {
+        if b < 1024 { return "\(b) B" }
+        if b < 1024 * 1024 { return String(format: "%.1f KB", Double(b) / 1024.0) }
+        return String(format: "%.2f MB", Double(b) / (1024.0 * 1024.0))
     }
 
     private var statusBadge: some View {
@@ -1991,7 +2043,10 @@ private struct RealTunnelingCard: View {
         case .installedNotRunning:
             return "Helper is installed but launchd hasn't started it yet. This usually resolves within a few seconds; click Refresh."
         case .running:
-            return "Helper is running and listening on /var/run/quantumlink-helper.sock. Test Open utun to verify the SCM_RIGHTS file-descriptor handoff works on your kernel."
+            if case .running = tunnelState {
+                return "utun bridged into the QuantumLink pump. The OS is now sending packets to QuantumLink and accepting injections back. Live counters below tick on every captured / injected packet."
+            }
+            return "Helper is running and listening on /var/run/quantumlink-helper.sock. Click Start Real Tunneling to open utun and adopt it into the packet pump."
         }
     }
 
@@ -2001,7 +2056,7 @@ private struct RealTunnelingCard: View {
 
     private func authorizeHelper() {
         isInstalling = true
-        testResult = .idle
+        lastError = nil
         DispatchQueue.global(qos: .userInitiated).async {
             do {
                 try QuantumLinkHelper.shared.install()
@@ -2014,31 +2069,39 @@ private struct RealTunnelingCard: View {
                     ?? error.localizedDescription
                 DispatchQueue.main.async {
                     isInstalling = false
-                    testResult = .error(message)
+                    lastError = message
                     refreshStatus()
                 }
             }
         }
     }
 
-    private func testOpen() {
-        testResult = .opening
+    private func startTunnel() {
+        lastError = nil
+        tunnelState = .starting
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                let result = try QuantumLinkHelper.shared.openTun()
-                // Close the FD immediately — this is just a smoke test.
-                Darwin.close(result.fileDescriptor)
+                try RealTunnelingController.shared.start()
                 DispatchQueue.main.async {
-                    testResult = .opened(name: result.interfaceName)
+                    tunnelState = RealTunnelingController.shared.state
+                    metrics = RealTunnelingController.shared.metrics()
                 }
             } catch {
                 let message = (error as? LocalizedError)?.errorDescription
                     ?? error.localizedDescription
                 DispatchQueue.main.async {
-                    testResult = .error(message)
+                    lastError = message
+                    tunnelState = RealTunnelingController.shared.state
                 }
             }
         }
+    }
+
+    private func stopTunnel() {
+        RealTunnelingController.shared.stop()
+        tunnelState = RealTunnelingController.shared.state
+        metrics = .empty
+        lastError = nil
     }
 }
 

@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		0080B9D76F803A261254EC2E /* UpdateController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 018DCCD04A8D80C521D61530 /* UpdateController.swift */; };
+		02D7C4D75A262C7C0E934977 /* RealTunnelingController.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1003BF4C99DBA48DBADEEB2 /* RealTunnelingController.swift */; };
 		13496DF739C89F70337D6F07 /* MeshController.swift in Sources */ = {isa = PBXBuildFile; fileRef = DF820A9F9CCAEA86D8EA078F /* MeshController.swift */; };
 		15A7D9804A6A15235E7D4F79 /* PrivacyWindow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4BC374746EBDA92E9351CECC /* PrivacyWindow.swift */; };
 		1632A89C57DF4F86E14672AB /* qlink-core.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = EDC7B517D582011D0D8A28AC /* qlink-core.xcframework */; };
@@ -162,6 +163,7 @@
 		C424795D28EBCDC65FD2C2BE /* SecureEnclaveTrustKey.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SecureEnclaveTrustKey.swift; sourceTree = "<group>"; };
 		C904E70EE886B09966B02446 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		CE830C8CCA2137B2F188374A /* TunnelMessages.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TunnelMessages.swift; sourceTree = "<group>"; };
+		D1003BF4C99DBA48DBADEEB2 /* RealTunnelingController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealTunnelingController.swift; sourceTree = "<group>"; };
 		D4752E5DD6C0A59760684256 /* PerAppVPNPayload.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PerAppVPNPayload.swift; sourceTree = "<group>"; };
 		D8CFB6720236F06FE00FBE60 /* NetworkPathObserver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NetworkPathObserver.swift; sourceTree = "<group>"; };
 		D92CC20FE0D9A2AF59177575 /* QuantumLinkKit.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = QuantumLinkKit.framework; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -272,6 +274,7 @@
 				053DDC80BD69A29E505F88B5 /* PrivacyOrchestrator.swift */,
 				DBA7D91F22A63C0CD787C960 /* PrivacySettings.swift */,
 				BA743417C501D79576742C41 /* QuantumLinkHelper.swift */,
+				D1003BF4C99DBA48DBADEEB2 /* RealTunnelingController.swift */,
 				3CFD4CE180956CC84DFBAE01 /* RustCoreBridge.swift */,
 				72743AB640C6BB80EDEEE2F3 /* RustTracingForwarder.swift */,
 				C424795D28EBCDC65FD2C2BE /* SecureEnclaveTrustKey.swift */,
@@ -511,6 +514,7 @@
 				B018084DA5CE6C05106AAEFA /* PrivacyOrchestrator.swift in Sources */,
 				204600153DE7F6CFCF33247F /* PrivacySettings.swift in Sources */,
 				628048C8B2D725EE53B78670 /* QuantumLinkHelper.swift in Sources */,
+				02D7C4D75A262C7C0E934977 /* RealTunnelingController.swift in Sources */,
 				F8A548992048AEDE38FEE484 /* RustCoreBridge.swift in Sources */,
 				96867D0D0BF1F15233E18C28 /* RustTracingForwarder.swift in Sources */,
 				E9DDF52D843390080D1EB274 /* SecureEnclaveTrustKey.swift in Sources */,

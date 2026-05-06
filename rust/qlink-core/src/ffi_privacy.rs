@@ -560,6 +560,131 @@ pub unsafe extern "C" fn qlink_decoy_destroy(handle: *mut QlinkDecoyHandle) {
 }
 
 // =============================================================================
+// utun pump
+// =============================================================================
+
+/// Holds the running pump task + the channel ends. Swift drops the
+/// handle to stop both halves and close the FD.
+pub struct QlinkUtunPumpHandle {
+    runtime: Runtime,
+    pump: std::sync::Mutex<Option<crate::utun_pump::UtunPumpHandle>>,
+    /// Receiving end of OS→app packets. Held internally; the Swift
+    /// reviewer build doesn't actually drain these yet (no exit
+    /// peer to send them to), but holding the receiver alive keeps
+    /// the channel from closing and stalling the OS-read half.
+    _outbound_rx: std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<Vec<u8>>>>,
+    /// Sending end of app→OS packets. Same — held but unused in the
+    /// reviewer build because there's no incoming traffic to inject
+    /// yet.
+    _inbound_tx: std::sync::Mutex<Option<tokio::sync::mpsc::Sender<Vec<u8>>>>,
+}
+
+/// Snapshot of pump counters. ABI-stable so Swift can read it via
+/// a `qlink_utun_pump_metrics` call.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct QlinkUtunPumpMetrics {
+    pub packets_os_to_app: u64,
+    pub packets_app_to_os: u64,
+    pub bytes_os_to_app: u64,
+    pub bytes_app_to_os: u64,
+    pub read_errors: u64,
+    pub write_errors: u64,
+}
+
+/// Adopt a utun FD (typically returned by the privileged helper
+/// over SCM_RIGHTS) and start the read/write pump.
+///
+/// On success returns an opaque handle. On failure returns NULL.
+/// The FD ownership transfers to the pump; caller must NOT close
+/// it after this call returns.
+///
+/// # Safety
+/// `fd` must be a valid open utun/tun file descriptor.
+#[no_mangle]
+pub unsafe extern "C" fn qlink_utun_pump_create(fd: i32) -> *mut QlinkUtunPumpHandle {
+    use std::os::fd::FromRawFd;
+    if fd < 0 {
+        return ptr::null_mut();
+    }
+    let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(_) => return ptr::null_mut(),
+    };
+
+    let result = runtime.block_on(async move {
+        crate::utun_pump::spawn_utun_pump(owned)
+    });
+    match result {
+        Ok((pump, outbound_rx, inbound_tx)) => {
+            let handle = Box::new(QlinkUtunPumpHandle {
+                runtime,
+                pump: std::sync::Mutex::new(Some(pump)),
+                _outbound_rx: std::sync::Mutex::new(Some(outbound_rx)),
+                _inbound_tx: std::sync::Mutex::new(Some(inbound_tx)),
+            });
+            Box::into_raw(handle)
+        }
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+/// Read the pump's running counters into the caller-provided
+/// output struct. Out-parameter style instead of return-by-value
+/// because Swift's `@convention(c)` typealiases can't return
+/// non-Objective-C-bridged structs directly.
+///
+/// # Safety
+/// `out` must be a valid pointer to a writable
+/// `QlinkUtunPumpMetrics`. NULL is allowed (silently no-ops).
+#[no_mangle]
+pub unsafe extern "C" fn qlink_utun_pump_metrics(
+    handle: *const QlinkUtunPumpHandle,
+    out: *mut QlinkUtunPumpMetrics,
+) {
+    if out.is_null() {
+        return;
+    }
+    let snapshot = handle
+        .as_ref()
+        .and_then(|h| h.pump.lock().ok().and_then(|guard| guard.as_ref().map(|p| p.metrics())));
+    let value = match snapshot {
+        Some(s) => QlinkUtunPumpMetrics {
+            packets_os_to_app: s.packets_os_to_app,
+            packets_app_to_os: s.packets_app_to_os,
+            bytes_os_to_app: s.bytes_os_to_app,
+            bytes_app_to_os: s.bytes_app_to_os,
+            read_errors: s.read_errors,
+            write_errors: s.write_errors,
+        },
+        None => QlinkUtunPumpMetrics::default(),
+    };
+    *out = value;
+}
+
+/// Stop the pump and close the FD.
+#[no_mangle]
+pub unsafe extern "C" fn qlink_utun_pump_destroy(handle: *mut QlinkUtunPumpHandle) {
+    if handle.is_null() {
+        return;
+    }
+    let mut handle = Box::from_raw(handle);
+    if let Ok(mut guard) = handle.pump.lock() {
+        // Dropping the inner UtunPumpHandle aborts both halves.
+        guard.take();
+    }
+    // Drop runtime last so any spawn_blocking from pump shutdown
+    // has a place to run.
+    drop(handle.runtime);
+}
+
+// =============================================================================
 // Shared helpers
 // =============================================================================
 
