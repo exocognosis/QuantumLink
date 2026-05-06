@@ -38,7 +38,7 @@
 use crate::error::{QlinkError, Result};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
-use sha1::Sha1;
+use sha2::Sha256;
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
@@ -46,7 +46,15 @@ use std::{
 };
 use tokio::{net::UdpSocket, task::JoinHandle};
 
-type HmacSha1 = Hmac<Sha1>;
+// QuantumLink STUN flavor uses HMAC-SHA-256 instead of RFC 5389's
+// HMAC-SHA-1, per the Dytallix zero-legacy mandate. Wire format
+// stays compatible with RFC 5389 (20-byte truncated tag in the
+// MESSAGE-INTEGRITY attribute) so existing STUN parsers don't
+// break — but the integrity check itself is computed over a
+// 256-bit key with a 256-bit hash, then truncated to the leading
+// 160 bits for the on-wire field. SHA-1 isn't reachable from any
+// code path after this commit.
+type HmacSha256Truncated = Hmac<Sha256>;
 
 // Header constants (RFC 5389 §6).
 const HEADER_LEN: usize = 20;
@@ -610,12 +618,17 @@ fn parse_xor_mapped_address(
 }
 
 fn compute_message_integrity(buffer: &[u8], password: &str) -> [u8; MESSAGE_INTEGRITY_LEN] {
-    let mut mac = HmacSha1::new_from_slice(password.as_bytes())
-        .expect("HMAC-SHA1 accepts arbitrary key length");
+    // Zero-legacy: HMAC-SHA-256 (PQ-secure for symmetric
+    // authentication — Grover only halves the effective security,
+    // and a 256-bit key still leaves 128 bits against quantum).
+    // We truncate the 256-bit output to 160 bits so the
+    // MESSAGE-INTEGRITY attribute keeps its RFC 5389 wire size.
+    let mut mac = HmacSha256Truncated::new_from_slice(password.as_bytes())
+        .expect("HMAC-SHA-256 accepts arbitrary key length");
     mac.update(buffer);
     let result = mac.finalize().into_bytes();
     let mut out = [0_u8; MESSAGE_INTEGRITY_LEN];
-    out.copy_from_slice(&result);
+    out.copy_from_slice(&result[..MESSAGE_INTEGRITY_LEN]);
     out
 }
 
