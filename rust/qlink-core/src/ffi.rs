@@ -17,7 +17,9 @@ use std::{
 use tokio::runtime::Runtime;
 
 static VERSION: &[u8] = b"0.1.0\0";
-static SUITE: &[u8] = b"QLINK-FIPS203-MLKEM768-HKDFSHA256-v1\0";
+// Default suite ID surfaced via FFI. v2 = post zero-legacy
+// migration: pure ML-KEM-768, no X25519 hybrid.
+static SUITE: &[u8] = b"QLINK-FIPS203-MLKEM768-HKDFSHA256-v2\0";
 
 pub struct QlinkTunnelCoreHandle {
     core: Mutex<PacketTunnelCore>,

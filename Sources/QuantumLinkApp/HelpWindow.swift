@@ -291,7 +291,7 @@ private struct GettingStartedSection: View {
 
             HelpStep(number: 2,
                      title: "Generate your device keypair",
-                     text: "First launch creates a hybrid X25519 + ML-KEM-768 keypair backed by the macOS Keychain and a Secure Enclave trust key. You don't need to manage these manually.")
+                     text: "First launch creates a pure ML-KEM-768 keypair (FIPS 203 post-quantum) backed by the macOS Keychain and a Secure Enclave trust key. Zero classical crypto. You don't need to manage these manually.")
 
             HelpStep(number: 3,
                      title: "Add at least one peer",
@@ -318,7 +318,7 @@ private struct ConnectingPeersSection: View {
 
             HelpQA(
                 question: "What's a public-key fingerprint?",
-                answer: "It's a short, human-readable summary of a peer's hybrid public key (X25519 + ML-KEM-768 concatenated and hashed). Verifying fingerprints out-of-band — read them aloud, send via Signal, swap on paper — defeats man-in-the-middle attempts at first contact."
+                answer: "It's a short, human-readable summary of a peer's pure post-quantum public key (ML-KEM-768 hashed). Verifying fingerprints out-of-band — read them aloud, send via Signal, swap on paper — defeats man-in-the-middle attempts at first contact."
             )
 
             HelpQA(
@@ -377,7 +377,7 @@ private struct CryptographySection: View {
 
             HelpQA(
                 question: "Key exchange",
-                answer: "Hybrid X25519 + ML-KEM-768 (FIPS 203). Each handshake derives a session key by concatenating the X25519 shared secret with the ML-KEM ciphertext output and feeding the pair into HKDF-SHA-256."
+                answer: "Pure ML-KEM-768 (FIPS 203). Each handshake derives a session key by feeding the ML-KEM shared secret into HKDF-SHA-256, mixed with the per-handshake transcript hash. No X25519, no classical ECDH — zero-legacy post-quantum, per the Dytallix mandate."
             )
 
             HelpQA(

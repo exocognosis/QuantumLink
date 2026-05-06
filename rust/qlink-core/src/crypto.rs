@@ -1,3 +1,16 @@
+// QuantumLink "zero-legacy" PQC suite.
+//
+// As of protocol v2 (commit landing alongside the
+// Dytallix zero-legacy mandate), the handshake is **pure
+// post-quantum**: ML-KEM-768 (FIPS 203) for key exchange, ML-DSA-65
+// (FIPS 204) or SLH-DSA-SHA2-128s (FIPS 205) for signatures, HKDF-
+// SHA-256 for KDF, ChaCha20-Poly1305 for symmetric AEAD. No
+// X25519, no classical ECDH, no fallback paths.
+//
+// Wire-protocol break vs v1: protocol-version byte bumped to 2.
+// Old peers (v1, hybrid X25519+ML-KEM) cannot talk to new peers (v2,
+// pure ML-KEM). Suite identifiers no longer carry the "HYBRID"
+// marker because there is no hybrid mode.
 use crate::error::{QlinkError, Result};
 use hkdf::Hkdf;
 use ml_dsa::{
@@ -18,17 +31,14 @@ use slh_dsa::{
     Sha2_128s, Signature as SlhSignature, SigningKey as SlhSigningKey,
     VerifyingKey as SlhVerifyingKey,
 };
-use x25519_dalek::{PublicKey, StaticSecret};
 
-pub const SUITE_V1: &str = "QLINK-HYBRID-X25519-MLKEM768-HKDFSHA256-v1";
-pub const SUITE_FIPS203: &str = "QLINK-FIPS203-MLKEM768-HKDFSHA256-v1";
-pub const SUITE_FIPS204: &str = "QLINK-FIPS204-MLDSA65-HKDFSHA256-v1";
-pub const SUITE_FIPS205: &str = "QLINK-FIPS205-SLHDSA-SHA2-128S-HKDFSHA256-v1";
-pub const PROTOCOL_VERSION: u8 = 1;
+pub const SUITE_FIPS203: &str = "QLINK-FIPS203-MLKEM768-HKDFSHA256-v2";
+pub const SUITE_FIPS204: &str = "QLINK-FIPS204-MLDSA65-HKDFSHA256-v2";
+pub const SUITE_FIPS205: &str = "QLINK-FIPS205-SLHDSA-SHA2-128S-HKDFSHA256-v2";
+pub const PROTOCOL_VERSION: u8 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QlinkCryptoSuite {
-    LegacyHybrid,
     Fips203MlKem,
     Fips204MlDsa,
     Fips205SlhDsa,
@@ -37,7 +47,6 @@ pub enum QlinkCryptoSuite {
 impl QlinkCryptoSuite {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::LegacyHybrid => SUITE_V1,
             Self::Fips203MlKem => SUITE_FIPS203,
             Self::Fips204MlDsa => SUITE_FIPS204,
             Self::Fips205SlhDsa => SUITE_FIPS205,
@@ -47,9 +56,7 @@ impl QlinkCryptoSuite {
     fn device_signature_algorithm(self) -> DeviceSignatureAlgorithm {
         match self {
             Self::Fips205SlhDsa => DeviceSignatureAlgorithm::SlhDsaSha2_128s,
-            Self::LegacyHybrid | Self::Fips203MlKem | Self::Fips204MlDsa => {
-                DeviceSignatureAlgorithm::MlDsa65
-            }
+            Self::Fips203MlKem | Self::Fips204MlDsa => DeviceSignatureAlgorithm::MlDsa65,
         }
     }
 }
@@ -58,7 +65,9 @@ impl QlinkCryptoSuite {
 pub struct InitiatorHello {
     pub version: u8,
     pub suite: String,
-    pub initiator_x25519_pub: [u8; 32],
+    /// Random nonce contributed by the initiator. Mixed into the
+    /// transcript hash so a passive observer can't replay an old
+    /// handshake.
     pub initiator_nonce: [u8; 32],
 }
 
@@ -66,7 +75,11 @@ pub struct InitiatorHello {
 pub struct ResponderHello {
     pub version: u8,
     pub suite: String,
-    pub responder_x25519_pub: [u8; 32],
+    /// Per-session ML-KEM-768 encapsulation key. The responder
+    /// generates a fresh KEM keypair per handshake; the public
+    /// key (this field) is sent to the initiator so it can
+    /// encapsulate to it. Forward secrecy comes from this being
+    /// per-session.
     pub responder_mlkem768_ek: Vec<u8>,
     pub responder_nonce: [u8; 32],
 }
@@ -75,6 +88,9 @@ pub struct ResponderHello {
 pub struct InitiatorFinish {
     pub version: u8,
     pub suite: String,
+    /// ML-KEM-768 ciphertext: result of the initiator's encapsulate
+    /// against the responder's public key. Decapsulating recovers
+    /// the shared secret on the responder side.
     pub mlkem768_ciphertext: Vec<u8>,
     pub transcript_hash: [u8; 32],
 }
@@ -88,12 +104,10 @@ pub struct SessionKeys {
 }
 
 pub struct InitiatorState {
-    x25519_secret: StaticSecret,
     hello: InitiatorHello,
 }
 
 pub struct ResponderState {
-    x25519_secret: StaticSecret,
     mlkem768_secret: DecapsulationKey,
     hello: ResponderHello,
 }
@@ -112,9 +126,6 @@ impl InitiatorState {
             )));
         }
 
-        let responder_x25519_pub = PublicKey::from(responder.responder_x25519_pub);
-        let x25519_shared = self.x25519_secret.diffie_hellman(&responder_x25519_pub);
-
         let ek_bytes = responder
             .responder_mlkem768_ek
             .as_slice()
@@ -128,7 +139,6 @@ impl InitiatorState {
 
         let transcript_hash = hash_transcript(&self.hello, responder)?;
         let (tx_key, rx_key) = derive_directional_keys(
-            x25519_shared.as_bytes(),
             mlkem_shared.as_slice(),
             &transcript_hash,
             &responder.suite,
@@ -175,9 +185,6 @@ impl ResponderState {
             return Err(QlinkError::Protocol("transcript hash mismatch".into()));
         }
 
-        let initiator_x25519_pub = PublicKey::from(initiator.initiator_x25519_pub);
-        let x25519_shared = self.x25519_secret.diffie_hellman(&initiator_x25519_pub);
-
         let ciphertext: Ciphertext = finish
             .mlkem768_ciphertext
             .as_slice()
@@ -186,7 +193,6 @@ impl ResponderState {
         let mlkem_shared = self.mlkem768_secret.decapsulate(&ciphertext);
 
         let (tx_key, rx_key) = derive_directional_keys(
-            x25519_shared.as_bytes(),
             mlkem_shared.as_slice(),
             &expected_hash,
             &self.hello.suite,
@@ -208,17 +214,13 @@ pub fn start_handshake() -> InitiatorState {
 
 pub fn start_handshake_for_suite(suite: &str) -> Result<InitiatorState> {
     let suite = suite_from_identifier(suite)?;
-    let x25519_secret = StaticSecret::random_from_rng(OsRng);
-    let x25519_pub = PublicKey::from(&x25519_secret);
     let mut nonce = [0_u8; 32];
     getrandom::fill(&mut nonce).expect("OS randomness unavailable");
 
     Ok(InitiatorState {
-        x25519_secret,
         hello: InitiatorHello {
             version: PROTOCOL_VERSION,
             suite: suite.as_str().to_string(),
-            initiator_x25519_pub: x25519_pub.to_bytes(),
             initiator_nonce: nonce,
         },
     })
@@ -227,19 +229,15 @@ pub fn start_handshake_for_suite(suite: &str) -> Result<InitiatorState> {
 pub fn answer_handshake(initiator: &InitiatorHello) -> Result<ResponderState> {
     validate_suite(initiator.version, &initiator.suite)?;
 
-    let x25519_secret = StaticSecret::random_from_rng(OsRng);
-    let x25519_pub = PublicKey::from(&x25519_secret);
     let (mlkem768_secret, mlkem768_public) = MlKem768::generate_keypair();
     let mut nonce = [0_u8; 32];
     getrandom::fill(&mut nonce).map_err(|err| QlinkError::Crypto(err.to_string()))?;
 
     Ok(ResponderState {
-        x25519_secret,
         mlkem768_secret,
         hello: ResponderHello {
             version: PROTOCOL_VERSION,
             suite: initiator.suite.clone(),
-            responder_x25519_pub: x25519_pub.to_bytes(),
             responder_mlkem768_ek: mlkem768_public.to_bytes().as_slice().to_vec(),
             responder_nonce: nonce,
         },
@@ -446,7 +444,6 @@ pub fn validate_suite_name(suite: &str) -> Result<()> {
 
 pub fn suite_from_identifier(suite: &str) -> Result<QlinkCryptoSuite> {
     match suite {
-        SUITE_V1 => Ok(QlinkCryptoSuite::LegacyHybrid),
         SUITE_FIPS203 => Ok(QlinkCryptoSuite::Fips203MlKem),
         SUITE_FIPS204 => Ok(QlinkCryptoSuite::Fips204MlDsa),
         SUITE_FIPS205 => Ok(QlinkCryptoSuite::Fips205SlhDsa),
@@ -481,22 +478,23 @@ enum Direction {
 }
 
 fn derive_directional_keys(
-    x25519_shared: &[u8],
     mlkem_shared: &[u8],
     transcript_hash: &[u8; 32],
     suite: &str,
     direction: Direction,
 ) -> Result<([u8; 32], [u8; 32])> {
-    let mut ikm =
-        Vec::with_capacity(x25519_shared.len() + mlkem_shared.len() + transcript_hash.len());
-    ikm.extend_from_slice(x25519_shared);
+    let mut ikm = Vec::with_capacity(mlkem_shared.len() + transcript_hash.len());
     ikm.extend_from_slice(mlkem_shared);
     ikm.extend_from_slice(transcript_hash);
 
     let hkdf = Hkdf::<Sha256>::new(Some(transcript_hash), &ikm);
     let mut okm = [0_u8; 64];
-    let mut info = Vec::with_capacity(b"QuantumLink hybrid session keys v1".len() + suite.len());
-    info.extend_from_slice(b"QuantumLink hybrid session keys v1");
+    // Info string updated for v2: drops the "hybrid" marker since
+    // there is no hybrid mode anymore. Pure-PQ session-key
+    // derivation only.
+    let info_label: &[u8] = b"QuantumLink session keys v2 (pure-PQC)";
+    let mut info = Vec::with_capacity(info_label.len() + suite.len());
+    info.extend_from_slice(info_label);
     info.extend_from_slice(suite.as_bytes());
     hkdf.expand(&info, &mut okm)
         .map_err(|_| QlinkError::Crypto("HKDF expand failed".into()))?;
@@ -517,7 +515,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hybrid_handshake_round_trip() {
+    fn handshake_rejects_mismatched_initiator_suite() {
+        // After the v2 zero-legacy migration, the handshake is
+        // pure ML-KEM. This test guards the suite-mismatch error
+        // path: if we hand the responder an InitiatorHello that
+        // claims a *different* suite than the one the responder
+        // bound to, the responder's `finish` must reject.
         let initiator = start_handshake();
         let responder = answer_handshake(initiator.hello()).unwrap();
         let responder_hello = responder.hello().clone();
@@ -527,8 +530,9 @@ mod tests {
             .finish(
                 &InitiatorHello {
                     version: PROTOCOL_VERSION,
-                    suite: SUITE_V1.to_string(),
-                    initiator_x25519_pub: PublicKey::from([0_u8; 32]).to_bytes(),
+                    // Deliberately pick a *different* suite than the
+                    // responder bound to. This must error.
+                    suite: SUITE_FIPS205.to_string(),
                     initiator_nonce: [0_u8; 32],
                 },
                 &finish,
@@ -539,7 +543,7 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_handshake_establishes_matching_directional_keys() {
+    fn pure_pq_handshake_establishes_matching_directional_keys() {
         let initiator = start_handshake();
         let initiator_hello = initiator.hello().clone();
         let responder = answer_handshake(&initiator_hello).unwrap();

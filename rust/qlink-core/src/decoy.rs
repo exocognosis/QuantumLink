@@ -26,7 +26,7 @@
 //! over one) can tell that "the same user came back" across
 //! sessions, even if individual sessions are perfectly anonymous.
 //!
-//! Rotation regenerates the device's hybrid X25519+ML-KEM keypair
+//! Rotation regenerates the device's pure ML-KEM-768 keypair
 //! on a schedule — daily by default for users in adversarial
 //! environments, monthly for normal users. Each rotation produces
 //! a new fingerprint that peers must re-verify, so it's not free

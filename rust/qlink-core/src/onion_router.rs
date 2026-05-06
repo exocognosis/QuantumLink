@@ -37,7 +37,7 @@
 //!    discovery service if it wants to use peers it doesn't know
 //!    personally).
 //! 2. Client establishes a hop-by-hop key exchange:
-//!    - With entry: hybrid X25519+ML-KEM via direct handshake.
+//!    - With entry: pure ML-KEM-768 KEM via direct handshake (zero-legacy v2).
 //!    - With middle: handshake tunneled through entry.
 //!    - With exit: handshake tunneled through middle.
 //!    Each handshake produces an independent session key for that
