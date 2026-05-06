@@ -126,6 +126,21 @@ if [[ ! -d "$APP_PATH" ]]; then
   exit 1
 fi
 
+# Stage 3.5: Build the privileged helper binary and embed it into
+# the app bundle's Contents/MacOS/. The helper opens utun on
+# behalf of the unprivileged GUI; the GUI's "Authorize Helper"
+# button copies this binary out to /usr/local/libexec via an
+# osascript admin prompt.
+echo "==> Building qlinkhelper + embedding in bundle"
+cargo build --manifest-path "$ROOT/rust/qlink-core/Cargo.toml" --bin qlinkhelper --release
+HELPER_BINARY="$ROOT/target/release/qlinkhelper"
+if [[ ! -x "$HELPER_BINARY" ]]; then
+  echo "qlinkhelper binary missing at $HELPER_BINARY" >&2
+  exit 1
+fi
+cp "$HELPER_BINARY" "$APP_PATH/Contents/MacOS/qlinkhelper"
+chmod 755 "$APP_PATH/Contents/MacOS/qlinkhelper"
+
 # Stage 4: Belt-and-braces. Some embedded binaries (Sparkle's
 # Updater.app, qlink-core.framework, the tunnel extension) might
 # need an explicit pass to ensure every nested Mach-O carries the

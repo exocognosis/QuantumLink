@@ -1938,6 +1938,8 @@ private struct RealTunnelingCard: View {
                     } else if case .running = tunnelState {
                         Button("Stop Real Tunneling") { stopTunnel() }
                             .buttonStyle(.bordered)
+                        Button("Ping bridge") { pingBridge() }
+                            .help("Ping 10.42.0.2 — the bridge's point-to-point peer. Round-trips through the utun pump so the OS→App counters should tick.")
                     } else {
                         Button("Start Real Tunneling") { startTunnel() }
                             .buttonStyle(.borderedProminent)
@@ -2102,6 +2104,26 @@ private struct RealTunnelingCard: View {
         tunnelState = RealTunnelingController.shared.state
         metrics = .empty
         lastError = nil
+    }
+
+    /// Send a few ICMP echo requests to the bridge's point-to-point
+    /// peer (10.42.0.2). The OS routes them to the utun, our pump
+    /// captures them, and the counter ticks. This is the smallest
+    /// reviewer-visible proof that the FD bridge actually carries
+    /// packets — no remote server needed.
+    private func pingBridge() {
+        DispatchQueue.global(qos: .userInitiated).async {
+            // -c 3 = 3 packets, -W 500 = 500ms timeout. We don't
+            // care about the output — `ping` exiting fires the
+            // packets through the system network stack regardless.
+            let task = Process()
+            task.launchPath = "/sbin/ping"
+            task.arguments = ["-c", "3", "-W", "500", "10.42.0.2"]
+            task.standardOutput = Pipe()
+            task.standardError = Pipe()
+            try? task.run()
+            task.waitUntilExit()
+        }
     }
 }
 

@@ -119,7 +119,32 @@ fn handle_client(mut stream: UnixStream) -> std::io::Result<()> {
 fn open_tun() -> std::io::Result<UtunDevice> {
     use qlink_core::utun::create_utun;
     // unit=0 → kernel picks first free utun number.
-    create_utun(0).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+    let device = create_utun(0)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+
+    // Configure the interface with a point-to-point address so the
+    // kernel auto-installs a /32 route to it. Without an address,
+    // the device exists but no traffic ever reaches it — defeating
+    // the whole point of the bridge for the reviewer demo path.
+    //
+    // 10.42.0.1 is the local Mac side; 10.42.0.2 is what callers
+    // can ping to verify the OS routes packets into our pump.
+    let name = device.name().to_string();
+    eprintln!("qlinkhelper: configuring {} as 10.42.0.1 -> 10.42.0.2", name);
+    let status = std::process::Command::new("/sbin/ifconfig")
+        .args([&name, "inet", "10.42.0.1", "10.42.0.2", "up"])
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(s) => {
+            eprintln!("qlinkhelper: ifconfig non-zero exit ({}); device opened but unreachable", s);
+        }
+        Err(e) => {
+            eprintln!("qlinkhelper: ifconfig spawn failed: {}; device opened but unreachable", e);
+        }
+    }
+
+    Ok(device)
 }
 
 #[cfg(target_os = "linux")]
