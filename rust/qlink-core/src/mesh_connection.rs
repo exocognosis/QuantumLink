@@ -658,8 +658,7 @@ impl MeshConnector {
         // without also forging the rendezvous-published public key, which
         // requires the device private key.
         let mut all_endpoints: Vec<CandidateEndpoint> = record.body.endpoints.clone();
-        let expected_fingerprint =
-            compute_public_key_fingerprint(&record.body.device_public_key);
+        let expected_fingerprint = compute_public_key_fingerprint(&record.body.device_public_key);
         for observation in self.mdns_cache.observations_for(remote_peer_id) {
             if observation.announcement.public_key_fingerprint != expected_fingerprint {
                 tracing::debug!(
@@ -670,8 +669,7 @@ impl MeshConnector {
             }
             for address in &observation.addresses {
                 let already_listed = all_endpoints.iter().any(|existing| {
-                    existing.port == address.port()
-                        && existing.address == address.ip().to_string()
+                    existing.port == address.port() && existing.address == address.ip().to_string()
                 });
                 if already_listed {
                     continue;

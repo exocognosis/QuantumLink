@@ -279,7 +279,8 @@ impl Visit for MessageVisitor {
         if field.name() == "message" {
             self.message = value.to_string();
         } else {
-            self.fields.push((field.name().to_string(), value.to_string()));
+            self.fields
+                .push((field.name().to_string(), value.to_string()));
         }
     }
 }
@@ -342,7 +343,10 @@ mod tests {
         // quote characters to the rendered field value — that's the
         // exact thing the visitor preserves so consumers can tell
         // string-typed fields from numeric ones.
-        assert_eq!(v.into_message(), "rendezvous lookup failed error=\"timeout\"");
+        assert_eq!(
+            v.into_message(),
+            "rendezvous lookup failed error=\"timeout\""
+        );
     }
 
     #[test]

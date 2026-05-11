@@ -7,42 +7,53 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		10494F4C0B1727AE064587B8 /* TunnelMessages.swift in Sources */ = {isa = PBXBuildFile; fileRef = 05C690897769368FB01B42F5 /* TunnelMessages.swift */; };
-		12827AF3DF6C8451AB7FD168 /* NetworkPathObserver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 014931759332B4303AAE3535 /* NetworkPathObserver.swift */; };
+		02EF2DC42300D4C2F0125F4B /* KeychainSecretStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 563E52CBFCDF010C7E8CADE7 /* KeychainSecretStore.swift */; };
+		0D8813FEE370BFF30149E572 /* ManagedConfiguration.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3D954AB71C9CB5D0003643C3 /* ManagedConfiguration.swift */; };
 		1632A89C57DF4F86E14672AB /* qlink-core.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = EDC7B517D582011D0D8A28AC /* qlink-core.xcframework */; };
-		17447D192D0C83B22F7DB547 /* MeshController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 61E7CF83C18846086F35A9E7 /* MeshController.swift */; };
-		176A992579127299F281CBAD /* ManagedConfiguration.swift in Sources */ = {isa = PBXBuildFile; fileRef = 76280BD17AA93AC1BF59F5E3 /* ManagedConfiguration.swift */; };
-		1880944D8D04148CE29313A7 /* TunnelPacketPump.swift in Sources */ = {isa = PBXBuildFile; fileRef = 10A601E3FD553A3514AD9CFA /* TunnelPacketPump.swift */; };
-		1AC1C78956FC3D41D6A593D9 /* TransportSmokeRunner.swift in Sources */ = {isa = PBXBuildFile; fileRef = 17D9E6F37EAF4E37FC7BCA1B /* TransportSmokeRunner.swift */; };
-		1B4ADABC6F5FF46A23910049 /* PQCAlgorithm.swift in Sources */ = {isa = PBXBuildFile; fileRef = 741BF62A3CE9D2B6B0CFE3D6 /* PQCAlgorithm.swift */; };
-		1F34813D34606A172375089D /* UpdateController.swift in Sources */ = {isa = PBXBuildFile; fileRef = D2D52F620B3D7346FE0F5CA5 /* UpdateController.swift */; };
+		171D549ED7C76D5CE8EAF25C /* DeviceKeypairStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7FA0D6D51F73D0A22468A7D2 /* DeviceKeypairStore.swift */; };
 		20C1470CDA9AF7D8164D09C6 /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = 64768C04397936AFD94F31B6 /* Sparkle */; };
-		212E4C11F02AC2006D6D40B8 /* PacketTunnelProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = 622F0E1A0D46CB701CE3648B /* PacketTunnelProvider.swift */; };
 		22A090260753D0E7CE0C573C /* qlink-core.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = EDC7B517D582011D0D8A28AC /* qlink-core.xcframework */; };
+		24C1D3D510AB969290F9ED89 /* PrivacyDefaults.swift in Sources */ = {isa = PBXBuildFile; fileRef = BF925FAC57D2992D1EA5A0A7 /* PrivacyDefaults.swift */; };
+		289A4183FF159C7BC18673A9 /* QuantumLinkApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = B58B03FCB1FF4F9D09AFDB89 /* QuantumLinkApp.swift */; };
+		2D708BC2773C301FEA3D44D3 /* IPv4CIDR.swift in Sources */ = {isa = PBXBuildFile; fileRef = 779F3B1FA51EA0FB23BC840B /* IPv4CIDR.swift */; };
+		2EE331282E6CE83DFD3AE489 /* TunnelPacketPump.swift in Sources */ = {isa = PBXBuildFile; fileRef = 617C17909F5BAA5F0D60F903 /* TunnelPacketPump.swift */; };
+		337A67D96A0E089E5BAE656B /* CodeRequirementExtractor.swift in Sources */ = {isa = PBXBuildFile; fileRef = FC2331DAAA0DA8F1E8980D34 /* CodeRequirementExtractor.swift */; };
 		342A76F85A3A664B4BA040C6 /* qlink-core.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = EDC7B517D582011D0D8A28AC /* qlink-core.xcframework */; };
-		3F7989674BC50009B4B361BA /* ConfigurationValidation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1C85B3BA288DB904BA35682A /* ConfigurationValidation.swift */; };
-		456CD41994E52D1A20C75E5C /* SecureEnclaveTrustKey.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6A7F33FC4F86E04F20C182A3 /* SecureEnclaveTrustKey.swift */; };
+		3B0471E73DE318C5E960A50C /* SupportBundleExporter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 490849425229FDF2C20E8611 /* SupportBundleExporter.swift */; };
+		3EA3E09C91AE637F8777694F /* RustCoreBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = DFE42248A8F36EC755A38D6C /* RustCoreBridge.swift */; };
+		46BB56E0CD5F2B792F581D47 /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9EDF854AAF8C13B854A524A6 /* Models.swift */; };
 		48F0564F68C9EED14930DD05 /* qlink-core.xcframework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = EDC7B517D582011D0D8A28AC /* qlink-core.xcframework */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		4ACC39A42731ED9EBFBD72C4 /* KillSwitchWatchdog.swift in Sources */ = {isa = PBXBuildFile; fileRef = FF8469DFCA41321AA99A9D93 /* KillSwitchWatchdog.swift */; };
+		55C35974724F20AE71FE0BAD /* TunnelProfileManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5B37ACA6BBB22DFE550BF88 /* TunnelProfileManager.swift */; };
+		5759DBEC566310CA9502EAAE /* DytallixLogo.png in Resources */ = {isa = PBXBuildFile; fileRef = 70943746FB367B27FD9427F2 /* DytallixLogo.png */; };
+		5A7F60034BE5B575445A5E6D /* VPNOnDemandRules.swift in Sources */ = {isa = PBXBuildFile; fileRef = E7D494ADA1D34E4E4C0BEB1D /* VPNOnDemandRules.swift */; };
 		5C3A5A2FA3E5F51C4A59C914 /* QuantumLinkKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = D92CC20FE0D9A2AF59177575 /* QuantumLinkKit.framework */; };
-		61405C4770248A2D53BF50E1 /* KeychainSecretStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 66C03621A8573D7583BC34F9 /* KeychainSecretStore.swift */; };
-		65D56EF03E7F09EF0A5A6394 /* QuantumLinkApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB0EC54BC35090C69CBCA3C7 /* QuantumLinkApp.swift */; };
-		70D4C0786FA722DEF3AD7766 /* IPv4CIDR.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6638E8FEED141A073C2F23BF /* IPv4CIDR.swift */; };
+		5E71F005F04E74C746265EAB /* PacketTunnelProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = D133A4E65AB9881BFB74384A /* PacketTunnelProvider.swift */; };
+		6F6BE8F07C7CE44317E53575 /* RustTracingForwarder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3E2C95F4A9760743D238E550 /* RustTracingForwarder.swift */; };
+		6FA7E30177F74675C53EA4CB /* MobileConfigEnvelope.swift in Sources */ = {isa = PBXBuildFile; fileRef = 416C1FA1749CEC5AA9D8CA55 /* MobileConfigEnvelope.swift */; };
 		71F77A40F970E754F81C5DBF /* qlink-core.xcframework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = EDC7B517D582011D0D8A28AC /* qlink-core.xcframework */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
-		8560D5B16853E127008F5498 /* TunnelProfileManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4675BC3AB5D78AB3A218EED5 /* TunnelProfileManager.swift */; };
+		79A2682C82AC0DE70193DA68 /* TransportSmokeRunner.swift in Sources */ = {isa = PBXBuildFile; fileRef = D0D7543AF5DE2400480CDA03 /* TransportSmokeRunner.swift */; };
+		7F2E669B81E1E8882B79FA21 /* TunnelTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9811E1588DB77CAD12C1B6DB /* TunnelTransport.swift */; };
+		8039434E3B883A3A3EBD6CB2 /* ConfigurationValidation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 133DC0E4BE52E97EBE7A84F0 /* ConfigurationValidation.swift */; };
 		87A3A7DBB75C8AC3A3F19667 /* QuantumLinkTunnel.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = B2ADBBAC868814D2271A0F8A /* QuantumLinkTunnel.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
-		9730E24F206381048637928E /* PrivacyDefaults.swift in Sources */ = {isa = PBXBuildFile; fileRef = A6537A5FDA558FABBEFBF574 /* PrivacyDefaults.swift */; };
 		974C3C18CBE6797309D7732F /* QuantumLinkKit.framework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = D92CC20FE0D9A2AF59177575 /* QuantumLinkKit.framework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
+		9A3177AF9E865A57721CEE96 /* MeshController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2F33398915A6FACC6B50B761 /* MeshController.swift */; };
+		9AF48A39FC223E2795875830 /* TunnelMessages.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6DD7899906485CB6BC6FC178 /* TunnelMessages.swift */; };
+		A34B5E40C757D7799D544637 /* PerAppVPNPayload.swift in Sources */ = {isa = PBXBuildFile; fileRef = BF4D4FA21EEBD9023C4E86C1 /* PerAppVPNPayload.swift */; };
 		A5C4564A2B06FC2C24DA702D /* QuantumLinkKit.framework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = D92CC20FE0D9A2AF59177575 /* QuantumLinkKit.framework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
-		A6A2B6B801D8C1587866DDCF /* DytallixLogo.png in Resources */ = {isa = PBXBuildFile; fileRef = E7DD7DBCF0760685D2346E10 /* DytallixLogo.png */; };
-		AD70782D65F27D92ABB4AC1C /* ConnectionProfile.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A14F5E581F0839E703AEA9F /* ConnectionProfile.swift */; };
-		B30B68C45DC2F4819C86853D /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = E78B1664BCA3FD6E64FCEBB6 /* Models.swift */; };
+		A9A32CE68DA2FAE8A73755AE /* UpdateController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 24F140EE51271CB6075C87E3 /* UpdateController.swift */; };
+		AE3D6D8112D91034EF51B0DE /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = F2C5C4D750D6CEE2D3114B3B /* Assets.xcassets */; };
+		C8D3AFF8A827D44D077CEFBC /* NetworkPathObserver.swift in Sources */ = {isa = PBXBuildFile; fileRef = D33C04288273A0E3AAD18C3F /* NetworkPathObserver.swift */; };
+		CCC46CAB108D003794A16959 /* PQCAlgorithm.swift in Sources */ = {isa = PBXBuildFile; fileRef = B7BFE3CCB52618FA0E94B122 /* PQCAlgorithm.swift */; };
 		CCDE04FA90BA1A3FA66528C2 /* QuantumLinkKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = D92CC20FE0D9A2AF59177575 /* QuantumLinkKit.framework */; };
-		CD44014AF45542896F88AA59 /* DeploymentMode.swift in Sources */ = {isa = PBXBuildFile; fileRef = 50349553ADB008396F5A394E /* DeploymentMode.swift */; };
-		D41F6F6FB1E304D6B097EEBD /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6E2D12E4EAD141A405A06046 /* main.swift */; };
-		E2B3108760830B1CFC1FB2C9 /* RustCoreBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = D32B1E348431BFAE9ACAB46F /* RustCoreBridge.swift */; };
-		ED9C7F8AA8703972CF266A6F /* SupportBundleExporter.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0C6FAF1D93216184C581494 /* SupportBundleExporter.swift */; };
-		F174D9107C69090999E59E64 /* TunnelTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9385997D870BFFEFE52CF0F /* TunnelTransport.swift */; };
+		D1BE7A4C2E343AEF4D72F7F0 /* SecureEnclaveTrustKey.swift in Sources */ = {isa = PBXBuildFile; fileRef = DED0D67C3F183BA7AECE1E6B /* SecureEnclaveTrustKey.swift */; };
+		D36CCB42ACFAF00B36FDB8E2 /* PeerStoreKey.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6F1180CB53BA91C1FA55667C /* PeerStoreKey.swift */; };
+		DCD978A8BF258BDBD6ED6932 /* DeploymentMode.swift in Sources */ = {isa = PBXBuildFile; fileRef = 98DB8022DC339FDD6AAB19D8 /* DeploymentMode.swift */; };
+		EAB0650FB037C580760AF19B /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = 45177B5A8BAABA45918AA0FB /* main.swift */; };
 		F32D58B97706401EEEDD5041 /* QuantumLinkKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = D92CC20FE0D9A2AF59177575 /* QuantumLinkKit.framework */; };
+		F4C8474A00E097B7A459E9CE /* PKCS12IdentityLoader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 31E4D959CCDB4E64302551A4 /* PKCS12IdentityLoader.swift */; };
+		FE56B93381D8240C49155504 /* MobileConfigSigner.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6B321A6CFC0C27EBE6D17781 /* MobileConfigSigner.swift */; };
+		FFA8737A8004F53D7A429675 /* ConnectionProfile.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2F574704E060BDC63F0F5C7F /* ConnectionProfile.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -115,36 +126,47 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
-		014931759332B4303AAE3535 /* NetworkPathObserver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NetworkPathObserver.swift; sourceTree = "<group>"; };
-		05C690897769368FB01B42F5 /* TunnelMessages.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TunnelMessages.swift; sourceTree = "<group>"; };
-		10A601E3FD553A3514AD9CFA /* TunnelPacketPump.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TunnelPacketPump.swift; sourceTree = "<group>"; };
-		17D9E6F37EAF4E37FC7BCA1B /* TransportSmokeRunner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TransportSmokeRunner.swift; sourceTree = "<group>"; };
-		1C85B3BA288DB904BA35682A /* ConfigurationValidation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConfigurationValidation.swift; sourceTree = "<group>"; };
+		133DC0E4BE52E97EBE7A84F0 /* ConfigurationValidation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConfigurationValidation.swift; sourceTree = "<group>"; };
+		24F140EE51271CB6075C87E3 /* UpdateController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UpdateController.swift; sourceTree = "<group>"; };
 		257E5D1E74CC7BBABDBF724F /* QuantumLinkSmoke */ = {isa = PBXFileReference; includeInIndex = 0; path = QuantumLinkSmoke; sourceTree = BUILT_PRODUCTS_DIR; };
-		4675BC3AB5D78AB3A218EED5 /* TunnelProfileManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TunnelProfileManager.swift; sourceTree = "<group>"; };
+		2F33398915A6FACC6B50B761 /* MeshController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MeshController.swift; sourceTree = "<group>"; };
+		2F574704E060BDC63F0F5C7F /* ConnectionProfile.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectionProfile.swift; sourceTree = "<group>"; };
+		31E4D959CCDB4E64302551A4 /* PKCS12IdentityLoader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PKCS12IdentityLoader.swift; sourceTree = "<group>"; };
+		3D954AB71C9CB5D0003643C3 /* ManagedConfiguration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ManagedConfiguration.swift; sourceTree = "<group>"; };
+		3E2C95F4A9760743D238E550 /* RustTracingForwarder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RustTracingForwarder.swift; sourceTree = "<group>"; };
+		416C1FA1749CEC5AA9D8CA55 /* MobileConfigEnvelope.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MobileConfigEnvelope.swift; sourceTree = "<group>"; };
+		45177B5A8BAABA45918AA0FB /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
 		48FCF5CE3166FFAF864596D5 /* QuantumLink.unsigned.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = QuantumLink.unsigned.xcconfig; sourceTree = "<group>"; };
-		4A14F5E581F0839E703AEA9F /* ConnectionProfile.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectionProfile.swift; sourceTree = "<group>"; };
+		490849425229FDF2C20E8611 /* SupportBundleExporter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SupportBundleExporter.swift; sourceTree = "<group>"; };
 		4F8A84FA8EEF2E3F80809E5B /* QuantumLink.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = QuantumLink.app; sourceTree = BUILT_PRODUCTS_DIR; };
-		50349553ADB008396F5A394E /* DeploymentMode.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeploymentMode.swift; sourceTree = "<group>"; };
-		61E7CF83C18846086F35A9E7 /* MeshController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MeshController.swift; sourceTree = "<group>"; };
-		622F0E1A0D46CB701CE3648B /* PacketTunnelProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PacketTunnelProvider.swift; sourceTree = "<group>"; };
-		6638E8FEED141A073C2F23BF /* IPv4CIDR.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IPv4CIDR.swift; sourceTree = "<group>"; };
-		66C03621A8573D7583BC34F9 /* KeychainSecretStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeychainSecretStore.swift; sourceTree = "<group>"; };
-		6A7F33FC4F86E04F20C182A3 /* SecureEnclaveTrustKey.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SecureEnclaveTrustKey.swift; sourceTree = "<group>"; };
-		6E2D12E4EAD141A405A06046 /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
-		741BF62A3CE9D2B6B0CFE3D6 /* PQCAlgorithm.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PQCAlgorithm.swift; sourceTree = "<group>"; };
-		76280BD17AA93AC1BF59F5E3 /* ManagedConfiguration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ManagedConfiguration.swift; sourceTree = "<group>"; };
-		A6537A5FDA558FABBEFBF574 /* PrivacyDefaults.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrivacyDefaults.swift; sourceTree = "<group>"; };
-		A9385997D870BFFEFE52CF0F /* TunnelTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TunnelTransport.swift; sourceTree = "<group>"; };
-		AB0EC54BC35090C69CBCA3C7 /* QuantumLinkApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuantumLinkApp.swift; sourceTree = "<group>"; };
+		563E52CBFCDF010C7E8CADE7 /* KeychainSecretStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeychainSecretStore.swift; sourceTree = "<group>"; };
+		617C17909F5BAA5F0D60F903 /* TunnelPacketPump.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TunnelPacketPump.swift; sourceTree = "<group>"; };
+		6B321A6CFC0C27EBE6D17781 /* MobileConfigSigner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MobileConfigSigner.swift; sourceTree = "<group>"; };
+		6DD7899906485CB6BC6FC178 /* TunnelMessages.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TunnelMessages.swift; sourceTree = "<group>"; };
+		6F1180CB53BA91C1FA55667C /* PeerStoreKey.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerStoreKey.swift; sourceTree = "<group>"; };
+		70943746FB367B27FD9427F2 /* DytallixLogo.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = DytallixLogo.png; sourceTree = "<group>"; };
+		779F3B1FA51EA0FB23BC840B /* IPv4CIDR.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IPv4CIDR.swift; sourceTree = "<group>"; };
+		7FA0D6D51F73D0A22468A7D2 /* DeviceKeypairStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeviceKeypairStore.swift; sourceTree = "<group>"; };
+		9811E1588DB77CAD12C1B6DB /* TunnelTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TunnelTransport.swift; sourceTree = "<group>"; };
+		98DB8022DC339FDD6AAB19D8 /* DeploymentMode.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeploymentMode.swift; sourceTree = "<group>"; };
+		9EDF854AAF8C13B854A524A6 /* Models.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Models.swift; sourceTree = "<group>"; };
 		B2ADBBAC868814D2271A0F8A /* QuantumLinkTunnel.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = QuantumLinkTunnel.appex; sourceTree = BUILT_PRODUCTS_DIR; };
-		C0C6FAF1D93216184C581494 /* SupportBundleExporter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SupportBundleExporter.swift; sourceTree = "<group>"; };
-		D2D52F620B3D7346FE0F5CA5 /* UpdateController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UpdateController.swift; sourceTree = "<group>"; };
-		D32B1E348431BFAE9ACAB46F /* RustCoreBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RustCoreBridge.swift; sourceTree = "<group>"; };
+		B58B03FCB1FF4F9D09AFDB89 /* QuantumLinkApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuantumLinkApp.swift; sourceTree = "<group>"; };
+		B7BFE3CCB52618FA0E94B122 /* PQCAlgorithm.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PQCAlgorithm.swift; sourceTree = "<group>"; };
+		BF4D4FA21EEBD9023C4E86C1 /* PerAppVPNPayload.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PerAppVPNPayload.swift; sourceTree = "<group>"; };
+		BF925FAC57D2992D1EA5A0A7 /* PrivacyDefaults.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrivacyDefaults.swift; sourceTree = "<group>"; };
+		D0D7543AF5DE2400480CDA03 /* TransportSmokeRunner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TransportSmokeRunner.swift; sourceTree = "<group>"; };
+		D133A4E65AB9881BFB74384A /* PacketTunnelProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PacketTunnelProvider.swift; sourceTree = "<group>"; };
+		D33C04288273A0E3AAD18C3F /* NetworkPathObserver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NetworkPathObserver.swift; sourceTree = "<group>"; };
 		D92CC20FE0D9A2AF59177575 /* QuantumLinkKit.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = QuantumLinkKit.framework; sourceTree = BUILT_PRODUCTS_DIR; };
-		E78B1664BCA3FD6E64FCEBB6 /* Models.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Models.swift; sourceTree = "<group>"; };
-		E7DD7DBCF0760685D2346E10 /* DytallixLogo.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = DytallixLogo.png; sourceTree = "<group>"; };
+		DED0D67C3F183BA7AECE1E6B /* SecureEnclaveTrustKey.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SecureEnclaveTrustKey.swift; sourceTree = "<group>"; };
+		DFE42248A8F36EC755A38D6C /* RustCoreBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RustCoreBridge.swift; sourceTree = "<group>"; };
+		E5B37ACA6BBB22DFE550BF88 /* TunnelProfileManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TunnelProfileManager.swift; sourceTree = "<group>"; };
+		E7D494ADA1D34E4E4C0BEB1D /* VPNOnDemandRules.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VPNOnDemandRules.swift; sourceTree = "<group>"; };
 		EDC7B517D582011D0D8A28AC /* qlink-core.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = "qlink-core.xcframework"; path = "build/qlink-core.xcframework"; sourceTree = "<group>"; };
+		F2C5C4D750D6CEE2D3114B3B /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		FC2331DAAA0DA8F1E8980D34 /* CodeRequirementExtractor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodeRequirementExtractor.swift; sourceTree = "<group>"; };
+		FF8469DFCA41321AA99A9D93 /* KillSwitchWatchdog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KillSwitchWatchdog.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -179,17 +201,6 @@
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
-		165561AD981A9A43489AEAC7 /* Sources */ = {
-			isa = PBXGroup;
-			children = (
-				76DA2EF9CC22F98F0F595782 /* QuantumLinkApp */,
-				C14C4BEC8D8CE089036FCD28 /* QuantumLinkKit */,
-				D50C8DFC5C832E0540C0B0F6 /* QuantumLinkSmoke */,
-				28EB7832D42E000AE5DBF302 /* QuantumLinkTunnel */,
-			);
-			path = Sources;
-			sourceTree = "<group>";
-		};
 		23BE07CB39CAB42498A82944 /* Frameworks */ = {
 			isa = PBXGroup;
 			children = (
@@ -198,21 +209,20 @@
 			name = Frameworks;
 			sourceTree = "<group>";
 		};
-		28EB7832D42E000AE5DBF302 /* QuantumLinkTunnel */ = {
+		30BC430A0B47386A4957AC94 /* Resources */ = {
 			isa = PBXGroup;
 			children = (
-				622F0E1A0D46CB701CE3648B /* PacketTunnelProvider.swift */,
+				70943746FB367B27FD9427F2 /* DytallixLogo.png */,
 			);
-			path = QuantumLinkTunnel;
+			path = Resources;
 			sourceTree = "<group>";
 		};
-		3FD649C24A8D84396C36F136 /* QuantumLink */ = {
+		4449FF115E2988D636F07F8D /* QuantumLinkSmoke */ = {
 			isa = PBXGroup;
 			children = (
-				165561AD981A9A43489AEAC7 /* Sources */,
+				45177B5A8BAABA45918AA0FB /* main.swift */,
 			);
-			name = QuantumLink;
-			path = .;
+			path = QuantumLinkSmoke;
 			sourceTree = "<group>";
 		};
 		49C450E6D8719B8B7FE2BE6E /* Products */ = {
@@ -226,14 +236,59 @@
 			name = Products;
 			sourceTree = "<group>";
 		};
-		76DA2EF9CC22F98F0F595782 /* QuantumLinkApp */ = {
+		4CFC99560286821E10426031 /* Sources */ = {
 			isa = PBXGroup;
 			children = (
-				AB0EC54BC35090C69CBCA3C7 /* QuantumLinkApp.swift */,
-				D2D52F620B3D7346FE0F5CA5 /* UpdateController.swift */,
-				F90FC10896D985B15D04F5B3 /* Resources */,
+				D8CC1673092A4A516A175EBF /* QuantumLinkApp */,
+				9322D787BC9D5E0BFBD09B2A /* QuantumLinkKit */,
+				4449FF115E2988D636F07F8D /* QuantumLinkSmoke */,
+				7CC5E9674EC9EED02CE09B59 /* QuantumLinkTunnel */,
 			);
-			path = QuantumLinkApp;
+			path = Sources;
+			sourceTree = "<group>";
+		};
+		7CC5E9674EC9EED02CE09B59 /* QuantumLinkTunnel */ = {
+			isa = PBXGroup;
+			children = (
+				D133A4E65AB9881BFB74384A /* PacketTunnelProvider.swift */,
+			);
+			path = QuantumLinkTunnel;
+			sourceTree = "<group>";
+		};
+		9322D787BC9D5E0BFBD09B2A /* QuantumLinkKit */ = {
+			isa = PBXGroup;
+			children = (
+				FC2331DAAA0DA8F1E8980D34 /* CodeRequirementExtractor.swift */,
+				133DC0E4BE52E97EBE7A84F0 /* ConfigurationValidation.swift */,
+				2F574704E060BDC63F0F5C7F /* ConnectionProfile.swift */,
+				98DB8022DC339FDD6AAB19D8 /* DeploymentMode.swift */,
+				7FA0D6D51F73D0A22468A7D2 /* DeviceKeypairStore.swift */,
+				779F3B1FA51EA0FB23BC840B /* IPv4CIDR.swift */,
+				563E52CBFCDF010C7E8CADE7 /* KeychainSecretStore.swift */,
+				FF8469DFCA41321AA99A9D93 /* KillSwitchWatchdog.swift */,
+				3D954AB71C9CB5D0003643C3 /* ManagedConfiguration.swift */,
+				2F33398915A6FACC6B50B761 /* MeshController.swift */,
+				416C1FA1749CEC5AA9D8CA55 /* MobileConfigEnvelope.swift */,
+				6B321A6CFC0C27EBE6D17781 /* MobileConfigSigner.swift */,
+				9EDF854AAF8C13B854A524A6 /* Models.swift */,
+				D33C04288273A0E3AAD18C3F /* NetworkPathObserver.swift */,
+				6F1180CB53BA91C1FA55667C /* PeerStoreKey.swift */,
+				BF4D4FA21EEBD9023C4E86C1 /* PerAppVPNPayload.swift */,
+				31E4D959CCDB4E64302551A4 /* PKCS12IdentityLoader.swift */,
+				B7BFE3CCB52618FA0E94B122 /* PQCAlgorithm.swift */,
+				BF925FAC57D2992D1EA5A0A7 /* PrivacyDefaults.swift */,
+				DFE42248A8F36EC755A38D6C /* RustCoreBridge.swift */,
+				3E2C95F4A9760743D238E550 /* RustTracingForwarder.swift */,
+				DED0D67C3F183BA7AECE1E6B /* SecureEnclaveTrustKey.swift */,
+				490849425229FDF2C20E8611 /* SupportBundleExporter.swift */,
+				D0D7543AF5DE2400480CDA03 /* TransportSmokeRunner.swift */,
+				6DD7899906485CB6BC6FC178 /* TunnelMessages.swift */,
+				617C17909F5BAA5F0D60F903 /* TunnelPacketPump.swift */,
+				E5B37ACA6BBB22DFE550BF88 /* TunnelProfileManager.swift */,
+				9811E1588DB77CAD12C1B6DB /* TunnelTransport.swift */,
+				E7D494ADA1D34E4E4C0BEB1D /* VPNOnDemandRules.swift */,
+			);
+			path = QuantumLinkKit;
 			sourceTree = "<group>";
 		};
 		A66EB87A5FB5F8723ED4F430 /* config */ = {
@@ -245,56 +300,34 @@
 			path = macos/config;
 			sourceTree = "<group>";
 		};
-		C14C4BEC8D8CE089036FCD28 /* QuantumLinkKit */ = {
-			isa = PBXGroup;
-			children = (
-				1C85B3BA288DB904BA35682A /* ConfigurationValidation.swift */,
-				4A14F5E581F0839E703AEA9F /* ConnectionProfile.swift */,
-				50349553ADB008396F5A394E /* DeploymentMode.swift */,
-				6638E8FEED141A073C2F23BF /* IPv4CIDR.swift */,
-				66C03621A8573D7583BC34F9 /* KeychainSecretStore.swift */,
-				76280BD17AA93AC1BF59F5E3 /* ManagedConfiguration.swift */,
-				61E7CF83C18846086F35A9E7 /* MeshController.swift */,
-				E78B1664BCA3FD6E64FCEBB6 /* Models.swift */,
-				014931759332B4303AAE3535 /* NetworkPathObserver.swift */,
-				741BF62A3CE9D2B6B0CFE3D6 /* PQCAlgorithm.swift */,
-				A6537A5FDA558FABBEFBF574 /* PrivacyDefaults.swift */,
-				D32B1E348431BFAE9ACAB46F /* RustCoreBridge.swift */,
-				6A7F33FC4F86E04F20C182A3 /* SecureEnclaveTrustKey.swift */,
-				C0C6FAF1D93216184C581494 /* SupportBundleExporter.swift */,
-				17D9E6F37EAF4E37FC7BCA1B /* TransportSmokeRunner.swift */,
-				05C690897769368FB01B42F5 /* TunnelMessages.swift */,
-				10A601E3FD553A3514AD9CFA /* TunnelPacketPump.swift */,
-				4675BC3AB5D78AB3A218EED5 /* TunnelProfileManager.swift */,
-				A9385997D870BFFEFE52CF0F /* TunnelTransport.swift */,
-			);
-			path = QuantumLinkKit;
-			sourceTree = "<group>";
-		};
 		C179390FE065C0DFBB9002C6 = {
 			isa = PBXGroup;
 			children = (
 				A66EB87A5FB5F8723ED4F430 /* config */,
-				3FD649C24A8D84396C36F136 /* QuantumLink */,
+				FD68815CFE25BF02ED00D985 /* QuantumLink-remote-check */,
 				23BE07CB39CAB42498A82944 /* Frameworks */,
 				49C450E6D8719B8B7FE2BE6E /* Products */,
 			);
 			sourceTree = "<group>";
 		};
-		D50C8DFC5C832E0540C0B0F6 /* QuantumLinkSmoke */ = {
+		D8CC1673092A4A516A175EBF /* QuantumLinkApp */ = {
 			isa = PBXGroup;
 			children = (
-				6E2D12E4EAD141A405A06046 /* main.swift */,
+				F2C5C4D750D6CEE2D3114B3B /* Assets.xcassets */,
+				B58B03FCB1FF4F9D09AFDB89 /* QuantumLinkApp.swift */,
+				24F140EE51271CB6075C87E3 /* UpdateController.swift */,
+				30BC430A0B47386A4957AC94 /* Resources */,
 			);
-			path = QuantumLinkSmoke;
+			path = QuantumLinkApp;
 			sourceTree = "<group>";
 		};
-		F90FC10896D985B15D04F5B3 /* Resources */ = {
+		FD68815CFE25BF02ED00D985 /* QuantumLink-remote-check */ = {
 			isa = PBXGroup;
 			children = (
-				E7DD7DBCF0760685D2346E10 /* DytallixLogo.png */,
+				4CFC99560286821E10426031 /* Sources */,
 			);
-			path = Resources;
+			name = "QuantumLink-remote-check";
+			path = .;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -433,7 +466,8 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				A6A2B6B801D8C1587866DDCF /* DytallixLogo.png in Resources */,
+				AE3D6D8112D91034EF51B0DE /* Assets.xcassets in Resources */,
+				5759DBEC566310CA9502EAAE /* DytallixLogo.png in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -444,25 +478,35 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				3F7989674BC50009B4B361BA /* ConfigurationValidation.swift in Sources */,
-				AD70782D65F27D92ABB4AC1C /* ConnectionProfile.swift in Sources */,
-				CD44014AF45542896F88AA59 /* DeploymentMode.swift in Sources */,
-				70D4C0786FA722DEF3AD7766 /* IPv4CIDR.swift in Sources */,
-				61405C4770248A2D53BF50E1 /* KeychainSecretStore.swift in Sources */,
-				176A992579127299F281CBAD /* ManagedConfiguration.swift in Sources */,
-				17447D192D0C83B22F7DB547 /* MeshController.swift in Sources */,
-				B30B68C45DC2F4819C86853D /* Models.swift in Sources */,
-				12827AF3DF6C8451AB7FD168 /* NetworkPathObserver.swift in Sources */,
-				1B4ADABC6F5FF46A23910049 /* PQCAlgorithm.swift in Sources */,
-				9730E24F206381048637928E /* PrivacyDefaults.swift in Sources */,
-				E2B3108760830B1CFC1FB2C9 /* RustCoreBridge.swift in Sources */,
-				456CD41994E52D1A20C75E5C /* SecureEnclaveTrustKey.swift in Sources */,
-				ED9C7F8AA8703972CF266A6F /* SupportBundleExporter.swift in Sources */,
-				1AC1C78956FC3D41D6A593D9 /* TransportSmokeRunner.swift in Sources */,
-				10494F4C0B1727AE064587B8 /* TunnelMessages.swift in Sources */,
-				1880944D8D04148CE29313A7 /* TunnelPacketPump.swift in Sources */,
-				8560D5B16853E127008F5498 /* TunnelProfileManager.swift in Sources */,
-				F174D9107C69090999E59E64 /* TunnelTransport.swift in Sources */,
+				337A67D96A0E089E5BAE656B /* CodeRequirementExtractor.swift in Sources */,
+				8039434E3B883A3A3EBD6CB2 /* ConfigurationValidation.swift in Sources */,
+				FFA8737A8004F53D7A429675 /* ConnectionProfile.swift in Sources */,
+				DCD978A8BF258BDBD6ED6932 /* DeploymentMode.swift in Sources */,
+				171D549ED7C76D5CE8EAF25C /* DeviceKeypairStore.swift in Sources */,
+				2D708BC2773C301FEA3D44D3 /* IPv4CIDR.swift in Sources */,
+				02EF2DC42300D4C2F0125F4B /* KeychainSecretStore.swift in Sources */,
+				4ACC39A42731ED9EBFBD72C4 /* KillSwitchWatchdog.swift in Sources */,
+				0D8813FEE370BFF30149E572 /* ManagedConfiguration.swift in Sources */,
+				9A3177AF9E865A57721CEE96 /* MeshController.swift in Sources */,
+				6FA7E30177F74675C53EA4CB /* MobileConfigEnvelope.swift in Sources */,
+				FE56B93381D8240C49155504 /* MobileConfigSigner.swift in Sources */,
+				46BB56E0CD5F2B792F581D47 /* Models.swift in Sources */,
+				C8D3AFF8A827D44D077CEFBC /* NetworkPathObserver.swift in Sources */,
+				F4C8474A00E097B7A459E9CE /* PKCS12IdentityLoader.swift in Sources */,
+				CCC46CAB108D003794A16959 /* PQCAlgorithm.swift in Sources */,
+				D36CCB42ACFAF00B36FDB8E2 /* PeerStoreKey.swift in Sources */,
+				A34B5E40C757D7799D544637 /* PerAppVPNPayload.swift in Sources */,
+				24C1D3D510AB969290F9ED89 /* PrivacyDefaults.swift in Sources */,
+				3EA3E09C91AE637F8777694F /* RustCoreBridge.swift in Sources */,
+				6F6BE8F07C7CE44317E53575 /* RustTracingForwarder.swift in Sources */,
+				D1BE7A4C2E343AEF4D72F7F0 /* SecureEnclaveTrustKey.swift in Sources */,
+				3B0471E73DE318C5E960A50C /* SupportBundleExporter.swift in Sources */,
+				79A2682C82AC0DE70193DA68 /* TransportSmokeRunner.swift in Sources */,
+				9AF48A39FC223E2795875830 /* TunnelMessages.swift in Sources */,
+				2EE331282E6CE83DFD3AE489 /* TunnelPacketPump.swift in Sources */,
+				55C35974724F20AE71FE0BAD /* TunnelProfileManager.swift in Sources */,
+				7F2E669B81E1E8882B79FA21 /* TunnelTransport.swift in Sources */,
+				5A7F60034BE5B575445A5E6D /* VPNOnDemandRules.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -470,8 +514,8 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				65D56EF03E7F09EF0A5A6394 /* QuantumLinkApp.swift in Sources */,
-				1F34813D34606A172375089D /* UpdateController.swift in Sources */,
+				289A4183FF159C7BC18673A9 /* QuantumLinkApp.swift in Sources */,
+				A9A32CE68DA2FAE8A73755AE /* UpdateController.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -479,7 +523,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				212E4C11F02AC2006D6D40B8 /* PacketTunnelProvider.swift in Sources */,
+				5E71F005F04E74C746265EAB /* PacketTunnelProvider.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -487,7 +531,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				D41F6F6FB1E304D6B097EEBD /* main.swift in Sources */,
+				EAB0650FB037C580760AF19B /* main.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

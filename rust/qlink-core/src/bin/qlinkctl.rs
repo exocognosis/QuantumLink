@@ -373,7 +373,13 @@ async fn run_publish_self(
     let mut sequence: u64 = 1;
     loop {
         let record = handle
-            .publish_self(keypair.as_ref(), rendezvous_url, ttl_seconds, sequence, vec![])
+            .publish_self(
+                keypair.as_ref(),
+                rendezvous_url,
+                ttl_seconds,
+                sequence,
+                vec![],
+            )
             .await?;
         println!(
             "published sequence={sequence} expires_at_unix={}",
@@ -415,7 +421,10 @@ fn load_or_generate_keypair(keyfile: Option<&str>) -> qlink_core::Result<DeviceK
         let mut seed = [0_u8; 32];
         seed.copy_from_slice(&bytes);
         let keypair = DeviceKeypair::from_seed(seed)?;
-        eprintln!("loaded device keypair from {path} (peer_id={})", keypair.public_key().peer_id());
+        eprintln!(
+            "loaded device keypair from {path} (peer_id={})",
+            keypair.public_key().peer_id()
+        );
         return Ok(keypair);
     }
     let keypair = DeviceKeypair::generate()?;

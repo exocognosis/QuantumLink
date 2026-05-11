@@ -316,25 +316,25 @@ impl FilePeerStore {
                     return BTreeMap::new();
                 };
                 match serde_json::from_slice::<EncryptedFormat>(bytes) {
-                    Ok(envelope) => Self::decrypt_envelope(&envelope, key).unwrap_or_else(
-                        |reason| {
+                    Ok(envelope) => {
+                        Self::decrypt_envelope(&envelope, key).unwrap_or_else(|reason| {
                             tracing::warn!(
                                 ?reason,
                                 "peer store v2 envelope failed to decrypt; treating as empty"
                             );
                             BTreeMap::new()
-                        },
-                    ),
+                        })
+                    }
                     Err(_) => {
-                        tracing::warn!("peer store v2 envelope failed to decode; treating as empty");
+                        tracing::warn!(
+                            "peer store v2 envelope failed to decode; treating as empty"
+                        );
                         BTreeMap::new()
                     }
                 }
             }
             _ => {
-                tracing::warn!(
-                    "peer store on disk has unknown version; treating as empty"
-                );
+                tracing::warn!("peer store on disk has unknown version; treating as empty");
                 BTreeMap::new()
             }
         }
@@ -378,10 +378,7 @@ impl FilePeerStore {
         }
     }
 
-    fn try_persist(
-        &self,
-        snapshot: &BTreeMap<String, BTreeMap<String, PeerRecord>>,
-    ) -> Result<()> {
+    fn try_persist(&self, snapshot: &BTreeMap<String, BTreeMap<String, PeerRecord>>) -> Result<()> {
         // Snapshot the current key under the lock, then delegate.
         // The split-out `try_persist_with_key` is also used by
         // `rotate_key` to write under a new key before swapping.
@@ -772,11 +769,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("peers.json");
         // Plausibly-shaped JSON but a future schema version.
-        fs::write(
-            &path,
-            br#"{"version":99,"meshes":{}}"#,
-        )
-        .unwrap();
+        fs::write(&path, br#"{"version":99,"meshes":{}}"#).unwrap();
 
         let store = open_file_peer_store(&path).unwrap();
         assert_eq!(store.len(), 0);

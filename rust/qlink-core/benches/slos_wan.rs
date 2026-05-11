@@ -85,7 +85,8 @@ fn run_post_event_recovery_through_wan(profile: WanProfile) {
         let mut direct_count = 0_usize;
         let mut relay_count = 0_usize;
         for _ in 0..SAMPLE_COUNT {
-            env.connector.handle_network_event(NetworkEvent::PathChanged);
+            env.connector
+                .handle_network_event(NetworkEvent::PathChanged);
             let started = Instant::now();
             match env.connector.connect(&env.remote_peer_id).await {
                 Ok((link, outcome)) => {

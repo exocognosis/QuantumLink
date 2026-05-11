@@ -221,7 +221,9 @@ fn main() {
     let baseline: Baseline = serde_json::from_str(&baseline_text)
         .unwrap_or_else(|err| fail(format!("failed to parse baseline JSON: {err}")));
 
-    let threshold = cli.threshold_pct.unwrap_or(baseline.regression_threshold_pct);
+    let threshold = cli
+        .threshold_pct
+        .unwrap_or(baseline.regression_threshold_pct);
     if !threshold.is_finite() || threshold <= 0.0 {
         fail(format!("threshold_pct must be > 0; got {threshold}"));
     }
@@ -313,7 +315,10 @@ fn main() {
         "{:<46}  {:<10}  {:>11}  {:>11}  {:>9}  {}",
         "metric", "kind", "baseline", "observed", "delta", "status"
     );
-    println!("{}", "-".repeat(46 + 2 + 10 + 2 + 11 + 2 + 11 + 2 + 9 + 2 + 9));
+    println!(
+        "{}",
+        "-".repeat(46 + 2 + 10 + 2 + 11 + 2 + 11 + 2 + 9 + 2 + 9)
+    );
     for row in &rows {
         let observed_disp = row
             .observed_ms
@@ -334,8 +339,14 @@ fn main() {
         );
     }
 
-    let regressed: Vec<&Row> = rows.iter().filter(|r| r.status == Status::Regressed).collect();
-    let missing: Vec<&Row> = rows.iter().filter(|r| r.status == Status::Missing).collect();
+    let regressed: Vec<&Row> = rows
+        .iter()
+        .filter(|r| r.status == Status::Regressed)
+        .collect();
+    let missing: Vec<&Row> = rows
+        .iter()
+        .filter(|r| r.status == Status::Missing)
+        .collect();
 
     println!();
     println!(
@@ -389,7 +400,11 @@ mod tests {
         assert_eq!(parse_duration_ms("1.9ms"), Some(1.9));
         assert_eq!(parse_duration_ms("1.6s"), Some(1_600.0));
         assert_eq!(parse_duration_ms("garbage"), None);
-        assert_eq!(parse_duration_ms("1.9 ms"), None, "no spaces in Debug output");
+        assert_eq!(
+            parse_duration_ms("1.9 ms"),
+            None,
+            "no spaces in Debug output"
+        );
     }
 
     #[test]
@@ -406,7 +421,10 @@ slo_wan.cable.direct_warm: n=15 p50=160.4ms p90=189.5ms p99=199.9ms max=199.9ms
         assert_eq!(parsed.get("slo.direct_warm").copied(), Some(1.9));
         assert_eq!(parsed.get("slo.post_event_recovery").copied(), Some(2.0));
         assert_eq!(parsed.get("slo.relay_fallback").copied(), Some(204.9));
-        assert_eq!(parsed.get("slo_wan.cable.direct_warm").copied(), Some(160.4));
+        assert_eq!(
+            parsed.get("slo_wan.cable.direct_warm").copied(),
+            Some(160.4)
+        );
         assert_eq!(parsed.len(), 4);
     }
 
@@ -446,7 +464,10 @@ slo.relay_fallback.lan: n=15 p50=204.6ms p90=206.5ms p99=207.0ms max=207.0ms
 
     #[test]
     fn strip_label_annotation_only_strips_trailing_paren_block() {
-        assert_eq!(strip_label_annotation("slo.direct_warm.lan"), "slo.direct_warm.lan");
+        assert_eq!(
+            strip_label_annotation("slo.direct_warm.lan"),
+            "slo.direct_warm.lan"
+        );
         assert_eq!(
             strip_label_annotation("slo.direct_warm.cable (direct=15 relay=0)"),
             "slo.direct_warm.cable"

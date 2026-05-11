@@ -525,9 +525,7 @@ impl MeshTransportHandle {
                 let peers_provider = peers.clone();
                 let aggregate_provider = aggregate.clone();
                 let provider: crate::metrics_endpoint::MetricsSnapshotProvider =
-                    Arc::new(move || {
-                        mesh_transport_snapshot(&peers_provider, &aggregate_provider)
-                    });
+                    Arc::new(move || mesh_transport_snapshot(&peers_provider, &aggregate_provider));
                 Some(runtime.block_on(spawn_metrics_endpoint(bind, provider))?)
             }
             None => None,
@@ -618,9 +616,10 @@ impl MeshTransportHandle {
         sequence: u64,
         overlay_routes: Vec<String>,
     ) -> Result<PeerRecord> {
-        let runtime = self.runtime.as_ref().ok_or_else(|| {
-            QlinkError::Protocol("mesh transport runtime is shut down".into())
-        })?;
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or_else(|| QlinkError::Protocol("mesh transport runtime is shut down".into()))?;
         runtime.block_on(self.publish_self(
             keypair,
             rendezvous_url,
@@ -723,16 +722,18 @@ impl MeshTransportHandle {
     /// Spawns a session manager for a new remote peer. Idempotent: if
     /// the peer is already active, this is a no-op.
     pub fn add_peer(&self, remote_peer_id: &str) -> Result<()> {
-        let mut peers = self.peers.lock().map_err(|_| {
-            QlinkError::Protocol("mesh transport peers mutex poisoned".into())
-        })?;
+        let mut peers = self
+            .peers
+            .lock()
+            .map_err(|_| QlinkError::Protocol("mesh transport peers mutex poisoned".into()))?;
         if peers.contains_key(remote_peer_id) {
             return Ok(());
         }
 
-        let runtime = self.runtime.as_ref().ok_or_else(|| {
-            QlinkError::Protocol("mesh transport runtime is shut down".into())
-        })?;
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or_else(|| QlinkError::Protocol("mesh transport runtime is shut down".into()))?;
 
         let shared = Arc::new(SharedState::new());
         let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -797,9 +798,10 @@ impl MeshTransportHandle {
     /// (call `add_peer` first) or if its outbound channel is closed.
     pub fn send_frame_to(&self, remote_peer_id: &str, frame: Vec<u8>) -> Result<()> {
         let len = frame.len() as u64;
-        let peers = self.peers.lock().map_err(|_| {
-            QlinkError::Protocol("mesh transport peers mutex poisoned".into())
-        })?;
+        let peers = self
+            .peers
+            .lock()
+            .map_err(|_| QlinkError::Protocol("mesh transport peers mutex poisoned".into()))?;
         let session = peers.get(remote_peer_id).ok_or_else(|| {
             QlinkError::Protocol(format!(
                 "mesh transport has no active session for peer {remote_peer_id}"
@@ -866,10 +868,7 @@ impl MeshTransportHandle {
             // The aggregate `network_event_count` is reported even on a
             // per-peer query because every active peer saw the same
             // events fan out from `handle_network_event`.
-            network_event_count: self
-                .aggregate
-                .network_event_count
-                .load(Ordering::Relaxed),
+            network_event_count: self.aggregate.network_event_count.load(Ordering::Relaxed),
             reconnect_count: raw.reconnect_count,
         })
     }
@@ -945,10 +944,7 @@ impl MeshTransportHandle {
             bytes_received: totals.bytes_received,
             send_failures: totals.send_failures,
             receive_failures: totals.receive_failures,
-            network_event_count: self
-                .aggregate
-                .network_event_count
-                .load(Ordering::Relaxed),
+            network_event_count: self.aggregate.network_event_count.load(Ordering::Relaxed),
             reconnect_count: totals.reconnect_count,
         }
     }
@@ -1988,8 +1984,12 @@ mod tests {
         }
 
         // Send "ping-A" to peer A and "ping-B" to peer B.
-        handle.send_frame_to(&peer_a_id, b"ping-A".to_vec()).unwrap();
-        handle.send_frame_to(&peer_b_id, b"ping-B".to_vec()).unwrap();
+        handle
+            .send_frame_to(&peer_a_id, b"ping-A".to_vec())
+            .unwrap();
+        handle
+            .send_frame_to(&peer_b_id, b"ping-B".to_vec())
+            .unwrap();
 
         // Collect echoes; expect each one back tagged with its source.
         let mut got_a = false;
@@ -2008,8 +2008,14 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        assert!(got_a, "peer A's echo did not arrive tagged with its peer_id");
-        assert!(got_b, "peer B's echo did not arrive tagged with its peer_id");
+        assert!(
+            got_a,
+            "peer A's echo did not arrive tagged with its peer_id"
+        );
+        assert!(
+            got_b,
+            "peer B's echo did not arrive tagged with its peer_id"
+        );
 
         // Aggregate metrics should sum traffic across both peers.
         let aggregate = handle.metrics();
@@ -2098,9 +2104,7 @@ mod tests {
 
         // Wait for Ready then remove the peer.
         let mut waited = 0;
-        while handle.peer_state_code(&remote_peer_id)
-            != Some(MeshTransportState::Ready.as_code())
-        {
+        while handle.peer_state_code(&remote_peer_id) != Some(MeshTransportState::Ready.as_code()) {
             if waited > 3_000 {
                 panic!("peer did not reach Ready");
             }
@@ -2297,7 +2301,9 @@ mod tests {
 
     /// Helper for the responder tests: build a dialer (client endpoint
     /// + connected QUIC session) targeting the handle's responder.
-    async fn dial_responder(handle: &MeshTransportHandle) -> crate::quic_transport::QuicDatagramSession {
+    async fn dial_responder(
+        handle: &MeshTransportHandle,
+    ) -> crate::quic_transport::QuicDatagramSession {
         let server_addr = handle
             .responder_local_addr()
             .expect("responder must be enabled");
@@ -2522,7 +2528,13 @@ mod tests {
         // refuse rather than mint a record peers can't authenticate.
         let other_key = DeviceKeypair::generate().unwrap();
         let err = handle
-            .publish_self(&other_key, &rendezvous.local_addr().to_string(), 120, 1, vec![])
+            .publish_self(
+                &other_key,
+                &rendezvous.local_addr().to_string(),
+                120,
+                1,
+                vec![],
+            )
             .await
             .expect_err("mismatched keypair must be rejected");
         assert!(

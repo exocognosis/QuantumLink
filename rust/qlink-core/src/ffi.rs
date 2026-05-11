@@ -9,8 +9,7 @@ use crate::{
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     os::raw::c_char,
-    ptr, slice,
-    str,
+    ptr, slice, str,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -587,9 +586,7 @@ pub unsafe extern "C" fn qlink_mesh_transport_last_error(
 /// Returns an owned handle that the caller frees with
 /// `qlink_device_keypair_destroy`. Returns null on failure.
 #[no_mangle]
-pub unsafe extern "C" fn qlink_device_keypair_generate(
-    out_seed: *mut u8,
-) -> *mut DeviceKeypair {
+pub unsafe extern "C" fn qlink_device_keypair_generate(out_seed: *mut u8) -> *mut DeviceKeypair {
     if out_seed.is_null() {
         return ptr::null_mut();
     }
@@ -612,9 +609,7 @@ pub unsafe extern "C" fn qlink_device_keypair_generate(
 /// previously emitted by `qlink_device_keypair_generate`. Returns
 /// null if the seed pointer is invalid or the bytes don't decode.
 #[no_mangle]
-pub unsafe extern "C" fn qlink_device_keypair_from_seed(
-    seed: *const u8,
-) -> *mut DeviceKeypair {
+pub unsafe extern "C" fn qlink_device_keypair_from_seed(seed: *const u8) -> *mut DeviceKeypair {
     let Some(seed_slice) = borrowed_slice(seed, 32) else {
         return ptr::null_mut();
     };
@@ -684,7 +679,10 @@ pub unsafe extern "C" fn qlink_mesh_transport_create_with_keypair(
     let config: MeshTransportConfig = match serde_json::from_slice(config_bytes) {
         Ok(cfg) => cfg,
         Err(error) => {
-            tracing::warn!(?error, "qlink_mesh_transport_create_with_keypair config decode failed");
+            tracing::warn!(
+                ?error,
+                "qlink_mesh_transport_create_with_keypair config decode failed"
+            );
             return ptr::null_mut();
         }
     };
@@ -701,7 +699,10 @@ pub unsafe extern "C" fn qlink_mesh_transport_create_with_keypair(
     let owned_keypair = match DeviceKeypair::from_seed(seed) {
         Ok(kp) => Arc::new(kp),
         Err(error) => {
-            tracing::warn!(?error, "qlink_mesh_transport_create_with_keypair seed decode failed");
+            tracing::warn!(
+                ?error,
+                "qlink_mesh_transport_create_with_keypair seed decode failed"
+            );
             return ptr::null_mut();
         }
     };

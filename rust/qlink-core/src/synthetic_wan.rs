@@ -33,11 +33,7 @@
 
 use crate::error::Result;
 use std::{net::SocketAddr, sync::Arc, time::Duration};
-use tokio::{
-    net::UdpSocket,
-    sync::RwLock,
-    task::JoinHandle,
-};
+use tokio::{net::UdpSocket, sync::RwLock, task::JoinHandle};
 
 /// Network profile applied symmetrically to both directions.
 #[derive(Debug, Clone, Copy)]
@@ -274,14 +270,14 @@ mod tests {
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let mut buffer = [0_u8; 64];
         let started = Instant::now();
-        client.send_to(b"ping", proxy.client_facing_addr()).await.unwrap();
-        let _ = tokio::time::timeout(
-            Duration::from_secs(1),
-            client.recv_from(&mut buffer),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        client
+            .send_to(b"ping", proxy.client_facing_addr())
+            .await
+            .unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(1), client.recv_from(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
         let rtt = started.elapsed();
         // Loopback profile shouldn't add more than a few ms of harness
         // overhead. Generous bound to avoid CI flakes.
@@ -320,8 +316,14 @@ mod tests {
         let median = rtts[2];
         // Each direction adds 50 ms ± 2 ms jitter → RTT ~100 ± 4 ms,
         // plus modest harness overhead. Generous bounds for CI.
-        assert!(median >= Duration::from_millis(80), "median rtt {median:?} was below floor");
-        assert!(median <= Duration::from_millis(160), "median rtt {median:?} exceeded ceiling");
+        assert!(
+            median >= Duration::from_millis(80),
+            "median rtt {median:?} was below floor"
+        );
+        assert!(
+            median <= Duration::from_millis(160),
+            "median rtt {median:?} exceeded ceiling"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -389,12 +391,9 @@ mod tests {
             let mut buffer = [0_u8; 16];
             // Tight per-attempt timeout because there's no delay
             // configured — packets that aren't dropped come right back.
-            if tokio::time::timeout(
-                Duration::from_millis(50),
-                client.recv_from(&mut buffer),
-            )
-            .await
-            .is_ok()
+            if tokio::time::timeout(Duration::from_millis(50), client.recv_from(&mut buffer))
+                .await
+                .is_ok()
             {
                 received += 1;
             }

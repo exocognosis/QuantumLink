@@ -618,7 +618,10 @@ mod tests {
         // deterministically from the public key) and verify the same
         // signatures — that's the persistence contract.
         assert_eq!(original.public_key().bytes, restored.public_key().bytes);
-        assert_eq!(original.public_key().peer_id(), restored.public_key().peer_id());
+        assert_eq!(
+            original.public_key().peer_id(),
+            restored.public_key().peer_id()
+        );
 
         // Cross-verify: a signature from the restored key validates
         // against the original public key.

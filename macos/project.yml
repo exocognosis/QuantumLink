@@ -48,6 +48,7 @@ targets:
         PRODUCT_NAME: QuantumLink
         PRODUCT_MODULE_NAME: QuantumLink
         PRODUCT_BUNDLE_IDENTIFIER: $(QLINK_APP_BUNDLE_ID)
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         INFOPLIST_FILE: macos/Info/QuantumLink.Info.plist
         CODE_SIGN_ENTITLEMENTS: macos/entitlements/QuantumLink.entitlements
     dependencies:
