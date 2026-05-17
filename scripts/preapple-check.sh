@@ -52,9 +52,9 @@ run "$ROOT/scripts/build-rust-xcframework.sh"
 run "$ROOT/scripts/package-dev-artifacts.sh"
 
 if command -v xcodegen >/dev/null 2>&1; then
-  run "$ROOT/scripts/build-unsigned-xcode.sh"
+  run "$ROOT/scripts/package-macos.sh" --skip-sign --pkg
 else
-  log "Skipping unsigned Xcode project build because xcodegen is not installed"
+  log "Skipping unsigned release package dry run because xcodegen is not installed"
 fi
 
 cat <<'EOF'
@@ -66,4 +66,8 @@ Still blocked on Apple Developer account or Apple-granted capabilities:
 - Developer ID signing
 - Notarization and stapling
 - MDM pre-approval payload validation on managed fleets
+
+Unsigned local release artifacts, when XcodeGen is installed:
+- build/release/QuantumLink.dmg
+- build/release/QuantumLink.pkg
 EOF

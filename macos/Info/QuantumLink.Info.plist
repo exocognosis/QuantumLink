@@ -22,6 +22,8 @@
     <string>$(CURRENT_PROJECT_VERSION)</string>
     <key>LSMinimumSystemVersion</key>
     <string>$(MACOSX_DEPLOYMENT_TARGET)</string>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.utilities</string>
     <key>NSHumanReadableCopyright</key>
     <string>Copyright © 2026 QuantumLink. All rights reserved.</string>
     <key>NSPrincipalClass</key>
@@ -36,4 +38,3 @@
     <integer>86400</integer>
 </dict>
 </plist>
-

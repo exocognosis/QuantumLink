@@ -11,6 +11,9 @@
 #   QLINK_TUNNEL_BUNDLE_ID           - tunnel bundle id, e.g. com.acme.QuantumLink.PacketTunnel
 #   QLINK_SPARKLE_FEED_URL           - public appcast URL
 #   QLINK_SPARKLE_PUBLIC_ED_KEY      - Sparkle EdDSA public key (base64)
+# Optional environment:
+#   QLINK_DEVELOPMENT_TEAM           - Apple Team ID for signed archive builds
+#   QLINK_PROVISIONING_PROFILE       - provisioning profile specifier, if manual signing needs it
 #
 # Usage:
 #   ./scripts/package-macos.sh                # produces signed .app + .dmg
@@ -52,6 +55,21 @@ work_dir="$(pwd)"
 out_dir="${work_dir}/build/release"
 mkdir -p "${out_dir}"
 
+xcode_settings=(
+    "QLINK_APP_BUNDLE_ID=${QLINK_APP_BUNDLE_ID:-com.quantumlink.macos}"
+    "QLINK_TUNNEL_BUNDLE_ID=${QLINK_TUNNEL_BUNDLE_ID:-com.quantumlink.macos.PacketTunnel}"
+    "QLINK_SPARKLE_FEED_URL=${QLINK_SPARKLE_FEED_URL:-}"
+    "QLINK_SPARKLE_PUBLIC_ED_KEY=${QLINK_SPARKLE_PUBLIC_ED_KEY:-}"
+)
+
+if [[ -n "${QLINK_DEVELOPMENT_TEAM:-}" ]]; then
+    xcode_settings+=("DEVELOPMENT_TEAM=${QLINK_DEVELOPMENT_TEAM}")
+fi
+
+if [[ -n "${QLINK_PROVISIONING_PROFILE:-}" ]]; then
+    xcode_settings+=("PROVISIONING_PROFILE_SPECIFIER=${QLINK_PROVISIONING_PROFILE}")
+fi
+
 echo "==> Building Rust XCFramework"
 ./scripts/build-rust-xcframework.sh
 
@@ -71,6 +89,7 @@ if [[ "${skip_sign}" == "true" ]]; then
         -configuration Release \
         -archivePath "${archive_path}" \
         CODE_SIGNING_ALLOWED=NO \
+        "${xcode_settings[@]}" \
         archive
 else
     xcodebuild \
@@ -80,6 +99,7 @@ else
         -archivePath "${archive_path}" \
         CODE_SIGN_STYLE=Manual \
         "CODE_SIGN_IDENTITY=${APPLE_DEVELOPER_ID_APPLICATION}" \
+        "${xcode_settings[@]}" \
         archive
 fi
 

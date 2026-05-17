@@ -16,6 +16,8 @@ jobs:
     env:
       QLINK_APP_BUNDLE_ID: com.quantumlink.macos
       QLINK_TUNNEL_BUNDLE_ID: com.quantumlink.macos.PacketTunnel
+      QLINK_DEVELOPMENT_TEAM: ${{ vars.APPLE_TEAM_ID }}
+      QLINK_PROVISIONING_PROFILE: ${{ vars.QLINK_PROVISIONING_PROFILE }}
       QLINK_SPARKLE_FEED_URL: ${{ vars.QLINK_SPARKLE_FEED_URL }}
       QLINK_SPARKLE_PUBLIC_ED_KEY: ${{ vars.QLINK_SPARKLE_PUBLIC_ED_KEY }}
     steps:
@@ -80,6 +82,12 @@ jobs:
           fi
           echo "APPLE_DEVELOPER_ID_APPLICATION=$identity_name" >> "$GITHUB_ENV"
 
+          installer_line="$(security find-identity -v "$KEYCHAIN_PATH" | grep 'Developer ID Installer' | head -n 1 || true)"
+          installer_name="$(echo "$installer_line" | sed -E 's/.*"([^"]+)"$/\1/')"
+          if [[ -n "$installer_name" ]]; then
+            echo "APPLE_DEVELOPER_ID_INSTALLER=$installer_name" >> "$GITHUB_ENV"
+          fi
+
       - name: Configure notary credentials
         if: steps.signing.outputs.available == 'true'
         env:
@@ -100,9 +108,13 @@ jobs:
       - name: Build and (sign + notarize) macOS app
         run: |
           if [[ "${{ steps.signing.outputs.available }}" == "true" ]]; then
-            ./scripts/package-macos.sh
+            if [[ -n "${APPLE_DEVELOPER_ID_INSTALLER:-}" ]]; then
+              ./scripts/package-macos.sh --pkg
+            else
+              ./scripts/package-macos.sh
+            fi
           else
-            ./scripts/package-macos.sh --skip-sign
+            ./scripts/package-macos.sh --skip-sign --pkg
           fi
 
       - name: Generate appcast (signing required)
