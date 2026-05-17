@@ -22,6 +22,12 @@ This runbook covers everything QuantumLink can validate before an Apple Develope
 
 The script runs Swift tests, Rust formatting, Rust tests, release builds, config validation, Swift transport preflight, Rust loopback smokes, XCFramework generation, and local development artifact packaging. If XcodeGen is installed, it also performs an unsigned release dry run that archives the app and produces local DMG and PKG artifacts.
 
+On macOS, the release dry run builds a universal Rust XCFramework by default. Install both Rust macOS targets before running the full check:
+
+```sh
+rustup target add aarch64-apple-darwin x86_64-apple-darwin
+```
+
 ## Individual Smokes
 
 Validate the example mesh config:
