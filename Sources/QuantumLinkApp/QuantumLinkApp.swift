@@ -226,7 +226,12 @@ private struct DashboardView: View {
         recentConnectionProfilesJSON = encodeConnectionProfiles(
             ConnectionProfileLibrary.addRecent(normalizedProfile, to: recentConnectionProfiles)
         )
-        controller.updateConfiguration(configuration(pqcAlgorithm: normalizedProfile.pqcAlgorithm))
+        controller.updateConfiguration(
+            configuration(
+                pqcAlgorithm: normalizedProfile.pqcAlgorithm,
+                profile: normalizedProfile
+            )
+        )
         Task { await controller.connect() }
     }
 
@@ -246,7 +251,10 @@ private struct DashboardView: View {
         return normalizedProfile
     }
 
-    private func configuration(pqcAlgorithm: PQCAlgorithm) -> TunnelConfiguration {
+    private func configuration(
+        pqcAlgorithm: PQCAlgorithm,
+        profile: ConnectionProfile? = nil
+    ) -> TunnelConfiguration {
         var baseConfiguration = TunnelConfiguration.defaultDevelopment
         baseConfiguration = TunnelConfiguration(
             meshID: baseConfiguration.meshID,
@@ -265,6 +273,9 @@ private struct DashboardView: View {
             mtu: baseConfiguration.mtu,
             crypto: CryptoPolicy(pqcAlgorithm: pqcAlgorithm)
         )
+        if let profile {
+            return deploymentMode.configuration(from: baseConfiguration, profile: profile)
+        }
         return deploymentMode.configuration(from: baseConfiguration)
     }
 
