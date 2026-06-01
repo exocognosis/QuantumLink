@@ -13,6 +13,7 @@ The first implementation should enforce Dytallix registration for public meshes,
 - Let public mesh peers reject unregistered, revoked, or mismatched identities before dialing.
 - Avoid broadcasting wallet addresses by default when privacy-preserving verification is enough.
 - Leave room for later zero-knowledge or commitment-based identity proofs without blocking the MVP.
+- Use real Dytallix wallet, SDK, contract, and registry verification paths. Do not ship mock, simulation, or stub identity-registry behavior.
 
 ## Non-Goals
 
@@ -29,7 +30,7 @@ QuantumLink will add an explicit trust policy derived from mesh type:
 | --- | --- | --- |
 | Public | Required | Reject peers without an active matching Dytallix registry entry. |
 | Private | Preferred | Accept valid QuantumLink peers, but show warnings and diagnostics when registry verification is missing or stale. |
-| Development | Optional | Do not require registry verification; support mock/local registry tests. |
+| Development | Optional | Do not require registry verification; when registry verification is enabled, use the same real Dytallix registry path as public/private meshes. |
 
 The app UX will expose a discovery identity control:
 
@@ -122,7 +123,6 @@ trait IdentityRegistry {
 
 Implementations:
 
-- `MockIdentityRegistry` for tests and dev meshes.
 - `DytallixIdentityRegistry` using `dytallix-sdk` for contract query/call flows.
 
 The verifier should live near discovery and peer connection code, not inside packet encryption. This keeps identity policy separate from the data plane.
@@ -179,7 +179,7 @@ Rust tests:
 - public policy rejects peer record hash mismatch
 - private policy warns but accepts when the QuantumLink peer record is valid
 - dev policy bypasses registry
-- mock registry exercises registration, update, revoke, and lookup
+- registry tests exercise registration, update, revoke, lookup, and binding verification against the real contract state machine and real Dytallix client encoding
 
 Swift tests:
 
@@ -190,16 +190,16 @@ Swift tests:
 
 Integration tests:
 
-- local mock registry with signed peer records
+- local or direct-node Dytallix contract deployment with signed peer records
 - Dytallix SDK-backed client tests behind an opt-in network flag
 - contract schema compatibility tests for register/update/revoke/query
 
 ## Rollout
 
-1. Add the contract model and mock verifier.
-2. Enforce policy in Rust connection decisions with mock registry tests.
-3. Add Dytallix SDK-backed client and contract query support.
-4. Add registration/update contract calls.
+1. Add the real Dytallix contract model and contract tests.
+2. Add the Dytallix SDK-backed registry client and contract query/call support.
+3. Enforce registry policy in Rust connection decisions.
+4. Add registration/update/revoke flows.
 5. Add Swift enrollment and discovery identity UX.
 6. Enable public mesh fail-closed behavior.
 7. Add optional staking and reputation checks after the Dytallix staking/write paths are stable.
