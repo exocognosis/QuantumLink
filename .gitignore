@@ -40,3 +40,4 @@ macos/config/QuantumLink.developer-id.local.xcconfig
 
 # Tooling scratch files
 *.moved-aside
+.worktrees/
