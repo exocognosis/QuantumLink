@@ -3,11 +3,11 @@
 [![CI](https://github.com/exocognosis/QuantumLink/actions/workflows/ci.yml/badge.svg)](https://github.com/exocognosis/QuantumLink/actions/workflows/ci.yml)
 [![Release](https://github.com/exocognosis/QuantumLink/actions/workflows/release.yml/badge.svg)](https://github.com/exocognosis/QuantumLink/actions/workflows/release.yml)
 
-QuantumLink is a macOS-first peer-to-peer mesh VPN scaffold with a server-minimized control plane. The repository contains:
+QuantumLink is a macOS-first peer-to-peer mesh VPN scaffold with a server-minimized control plane and a hybrid cryptographic core. The repository contains:
 
 - A SwiftUI macOS app surface for mesh status, enrollment, and operator controls.
 - A `NEPacketTunnelProvider` implementation scaffold for the packet tunnel extension.
-- A Rust mesh core with ML-KEM-768 session establishment, ML-DSA-65 device credentials, signed peer records, routing helpers, replay protection, and development rendezvous/relay services.
+- A Rust `qlink-core` crate with ML-KEM-768 session establishment, ML-DSA-65 and SLH-DSA device credentials, signed peer records, suite-bound packet-frame encryption, routing helpers, replay protection, QUIC/ICE traversal scaffolding, and development rendezvous/relay services.
 - macOS entitlement examples, deployment notes, and build scripts.
 
 This is a v1 implementation baseline, not a signed/notarized production bundle. Apple signing, Network Extension entitlements, MDM pre-approval, and notarization must be completed in an Apple Developer account before installing the tunnel extension on managed or unmanaged Macs.
@@ -21,6 +21,23 @@ Tracked GitHub automation includes:
 - CI for Swift tests, Rust tests, formatting, local transport smokes, XCFramework generation, and unsigned Xcode project builds.
 - Performance workflows for Rust criterion benches and Swift XCTest performance coverage.
 - Release workflow scaffolding for unsigned builds and optional Developer ID signing/notarization when secrets are configured.
+
+## Cryptographic Implementation
+
+The active protocol implementation lives in `rust/qlink-core`. Its current hybrid design combines post-quantum key establishment and signatures with conventional transcript hashing, HKDF, and AEAD packet framing:
+
+- Protocol version: `1`.
+- Supported suite identifiers:
+  - `QLINK-FIPS203-MLKEM768-HKDFSHA256-v1`
+  - `QLINK-FIPS204-MLDSA65-HKDFSHA256-v1`
+  - `QLINK-FIPS205-SLHDSA-SHA2-128S-HKDFSHA256-v1`
+- Session establishment uses ML-KEM-768. The initiator/responder transcript is hashed with SHA-256 and bound into HKDF-SHA-256 directional key derivation.
+- Device credentials use ML-DSA-65 by default. SLH-DSA-SHA2-128S is implemented for the FIPS 205 suite, but v1 persistence is ML-DSA-seed based.
+- Signed peer records bind peer ID, device public key, routes, short-lived endpoint candidates, ICE credentials, QUIC certificate material, expiration, and sequence number.
+- `PacketTunnelCore` accepts only protected IPv4 routes, normalizes selected IPv4 metadata, and wraps transport frames with ChaCha20-Poly1305 using suite-bound HKDF-derived frame keys.
+- Replay protection is implemented with a monotonic packet-number window.
+
+The Rust core intentionally rejects the legacy `QLINK-HYBRID-X25519-MLKEM768-HKDFSHA256-v1` identifier. There is no X25519 fallback in the current handshake. Production peer sessions still need to wire negotiated session secrets into packet-frame encryption; the current packet-frame keys are development suite-bound keys.
 
 ## Requirements
 
@@ -62,6 +79,8 @@ swift test
 cargo test --workspace
 cargo run -p qlink-core --bin qlinkctl -- simulate-handshake
 cargo run -p qlink-core --bin qlinkctl -- quic-loopback
+cargo run -p qlink-core --bin qlinkctl -- mesh-loopback
+cargo run -p qlink-core --bin qlinkctl -- relay-loopback
 ```
 
 The Swift-side transport facade can also be smoked without a Network Extension entitlement:
@@ -118,6 +137,14 @@ cargo run -p qlink-core --bin qlinkctl -- relay-smoke --server 127.0.0.1:9472
 
 These services are intentionally minimal and are suitable for local protocol work. They are not a hardened public control plane.
 
+Additional `qlinkctl` development commands exercise the current mesh transport surface:
+
+```sh
+cargo run -p qlink-core --bin qlinkctl -- generate-device --json
+cargo run -p qlink-core --bin qlinkctl -- mesh-connect --scenario direct
+cargo run -p qlink-core --bin qlinkctl -- mesh-connect --scenario relay-fallback
+```
+
 ## Development Artifact Package
 
 ```sh
@@ -143,6 +170,8 @@ QuantumLink v1 is structured around these boundaries:
 - No mandatory centralized VPN concentrator in the steady-state data plane.
 - Optional rendezvous, STUN/ICE, and relay paths for bootstrap and hostile NAT/firewall conditions.
 - L3 overlay through `NEPacketTunnelProvider` and `utun`; no kernel extension and no pf-based core design.
-- ML-KEM-768 ephemeral session establishment.
-- ML-DSA-65 device credential support in the Rust core.
+- ML-KEM-768 session establishment without a classical key-exchange fallback.
+- ML-DSA-65 default device credential support, with SLH-DSA-SHA2-128S support for the FIPS 205 suite.
+- Signed, expiring rendezvous records and authenticated inbound identity assertions.
+- Suite-bound ChaCha20-Poly1305 packet-frame protection in the Rust packet core.
 - Local-first diagnostics and opt-in export.
