@@ -4,7 +4,7 @@ QuantumLink assumes passive observers, active on-path attackers, malicious rende
 
 Implemented baseline:
 
-- Hybrid session establishment with X25519 + ML-KEM-768.
+- ML-KEM-768 session establishment without a classical key-exchange fallback.
 - Transcript-bound HKDF-SHA-256 key derivation.
 - Anti-downgrade suite binding through versioned FIPS 203, FIPS 204, and FIPS 205 suite identifiers.
 - ML-DSA-65 and SLH-DSA-SHA2-128S device credential signing and verification.

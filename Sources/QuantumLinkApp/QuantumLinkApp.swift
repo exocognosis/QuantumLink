@@ -336,19 +336,18 @@ private enum AppBrand {
 
 private struct TitleBarBrandView: View {
     var body: some View {
-        HStack(spacing: 8) {
+        Group {
             if let logo = AppBrand.logoImage {
                 Image(nsImage: logo)
                     .resizable()
                     .scaledToFit()
-                    .frame(width: 24, height: 24)
-                    .clipShape(RoundedRectangle(cornerRadius: 5))
+                    .frame(width: 176, height: 48)
+            } else {
+                Text(AppBrand.title)
+                    .font(.headline.weight(.semibold))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
             }
-
-            Text(AppBrand.title)
-                .font(.headline.weight(.semibold))
-                .lineLimit(1)
-                .minimumScaleFactor(0.8)
         }
         .accessibilityElement(children: .combine)
         .accessibilityLabel(AppBrand.title)
@@ -906,8 +905,7 @@ private struct ConnectionLauncherPanel: View {
     }
 
     private var canStart: Bool {
-        !draft.sourceIPAddress.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        && !draft.destinationIPAddress.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        draft.missingRequiredFields(for: deploymentMode).isEmpty
     }
 
     var body: some View {
@@ -964,10 +962,6 @@ private struct ConnectionLauncherPanel: View {
                 }
 
                 GridRow {
-                    LabeledContent("Source IP") {
-                        TextField(overlayAddress, text: $draft.sourceIPAddress)
-                            .textFieldStyle(.roundedBorder)
-                    }
                     LabeledContent("Type") {
                         Picker("Connection Type", selection: $draft.connectionType) {
                             ForEach(QuantumLinkConnectionType.allCases) { type in
@@ -983,31 +977,34 @@ private struct ConnectionLauncherPanel: View {
                             }
                         }
                     }
+                    LabeledContent("Required") {
+                        Text(requiredFieldSummary)
+                            .foregroundStyle(canStart ? Color.secondary : Color.orange)
+                            .lineLimit(1)
+                    }
                 }
+            }
 
-                GridRow {
-                    LabeledContent("Destination IP") {
-                        TextField("100.64.10.10", text: $draft.destinationIPAddress)
-                            .textFieldStyle(.roundedBorder)
-                    }
-                    LabeledContent("Port") {
-                        TextField("Port", text: portBinding)
-                            .textFieldStyle(.roundedBorder)
-                            .frame(width: 96)
-                    }
-                }
+            PanelGrid {
+                AdaptiveDeploymentFields(
+                    draft: $draft,
+                    deploymentMode: deploymentMode,
+                    overlayAddress: overlayAddress
+                )
 
-                GridRow {
-                    Color.clear
-                    Button {
-                        onStart(draft)
-                    } label: {
-                        Label("Connect", systemImage: "bolt.horizontal.circle")
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(!canStart)
+                AdaptiveConnectionFields(draft: $draft)
+            }
+
+            HStack {
+                Spacer()
+                Button {
+                    onStart(draft)
+                } label: {
+                    Label("Connect", systemImage: "bolt.horizontal.circle")
+                        .frame(minWidth: 220)
                 }
+                .buttonStyle(.borderedProminent)
+                .disabled(!canStart)
             }
 
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 300), spacing: 12)], alignment: .leading, spacing: 12) {
@@ -1045,12 +1042,358 @@ private struct ConnectionLauncherPanel: View {
         }
     }
 
+    private var requiredFieldSummary: String {
+        let missing = draft.missingRequiredFields(for: deploymentMode)
+        return missing.isEmpty ? "Ready" : missing.joined(separator: ", ")
+    }
+}
+
+private struct AdaptiveDeploymentFields: View {
+    @Binding var draft: ConnectionProfile
+    let deploymentMode: QuantumLinkDeploymentMode
+    let overlayAddress: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Label("\(deploymentMode.title) Setup", systemImage: deploymentMode.systemImage)
+                .font(.callout.weight(.semibold))
+
+            switch deploymentMode {
+            case .direct:
+                directFields
+            case .mesh:
+                deviceFields(
+                    title: "Mesh Devices",
+                    emptyTitle: "Add at least one peer device",
+                    devices: $draft.deploymentDetails.peerDevices,
+                    defaultRole: .peer
+                )
+            case .localVPN:
+                deviceFields(
+                    title: "LAN Devices",
+                    emptyTitle: "Add at least one LAN device or subnet",
+                    devices: $draft.deploymentDetails.localDevices,
+                    defaultRole: .gateway
+                )
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .topLeading)
+    }
+
+    private var directFields: some View {
+        Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 12) {
+            GridRow {
+                LabeledContent("Local Overlay") {
+                    TextField(overlayAddress, text: $draft.sourceIPAddress)
+                        .textFieldStyle(.roundedBorder)
+                }
+                LabeledContent("Remote Endpoint") {
+                    TextField("89.167.52.129", text: $draft.destinationIPAddress)
+                        .textFieldStyle(.roundedBorder)
+                }
+            }
+            GridRow {
+                LabeledContent("Endpoint Port") {
+                    TextField("9471", text: endpointPortBinding)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 96)
+                }
+                LabeledContent("Protected Prefixes") {
+                    TextField("100.64.0.0/10", text: $draft.deploymentDetails.protectedPrefixesText)
+                        .textFieldStyle(.roundedBorder)
+                }
+            }
+        }
+    }
+
+    private func deviceFields(
+        title: String,
+        emptyTitle: String,
+        devices: Binding<[PeerDeviceProfile]>,
+        defaultRole: PeerDeviceRole
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            LabeledContent("Local Overlay") {
+                TextField(overlayAddress, text: $draft.sourceIPAddress)
+                    .textFieldStyle(.roundedBorder)
+            }
+
+            PeerDeviceList(
+                title: title,
+                emptyTitle: emptyTitle,
+                devices: devices,
+                defaultRole: defaultRole
+            )
+        }
+    }
+
+    private var endpointPortBinding: Binding<String> {
+        Binding(
+            get: { draft.deploymentDetails.directEndpointPort > 0 ? "\(draft.deploymentDetails.directEndpointPort)" : "" },
+            set: { value in
+                draft.deploymentDetails.directEndpointPort = Int(value.filter(\.isNumber)) ?? 0
+            }
+        )
+    }
+}
+
+private struct PeerDeviceList: View {
+    let title: String
+    let emptyTitle: String
+    @Binding var devices: [PeerDeviceProfile]
+    let defaultRole: PeerDeviceRole
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Label(title, systemImage: "desktopcomputer.and.arrow.down")
+                    .font(.callout.weight(.semibold))
+
+                Spacer()
+
+                Button {
+                    devices.append(PeerDeviceProfile(role: defaultRole))
+                } label: {
+                    Image(systemName: "plus")
+                }
+                .help("Add device")
+            }
+
+            if devices.isEmpty {
+                ContentUnavailableView(emptyTitle, systemImage: "plus.circle")
+                    .frame(maxWidth: .infinity, minHeight: 92)
+            } else {
+                VStack(spacing: 8) {
+                    ForEach($devices) { $device in
+                        PeerDeviceEditorRow(device: $device) {
+                            devices.removeAll { $0.id == device.id }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+private struct PeerDeviceEditorRow: View {
+    @Binding var device: PeerDeviceProfile
+    let onRemove: () -> Void
+
+    var body: some View {
+        Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 8) {
+            GridRow {
+                TextField("Alias", text: $device.alias)
+                    .textFieldStyle(.roundedBorder)
+                TextField("Endpoint IP or subnet", text: $device.endpointAddress)
+                    .textFieldStyle(.roundedBorder)
+            }
+            GridRow {
+                TextField("Overlay IP", text: $device.overlayIPAddress)
+                    .textFieldStyle(.roundedBorder)
+                HStack(spacing: 8) {
+                    Picker("Role", selection: $device.role) {
+                        ForEach(PeerDeviceRole.allCases) { role in
+                            Text(role.title)
+                                .tag(role)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+
+                    TextField("Port", text: portBinding)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 72)
+
+                    Button {
+                        onRemove()
+                    } label: {
+                        Image(systemName: "minus.circle")
+                    }
+                    .help("Remove device")
+                }
+            }
+        }
+        .padding(10)
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 8))
+    }
+
     private var portBinding: Binding<String> {
+        Binding(
+            get: { device.port > 0 ? "\(device.port)" : "" },
+            set: { value in
+                device.port = Int(value.filter(\.isNumber)) ?? 0
+            }
+        )
+    }
+}
+
+private struct AdaptiveConnectionFields: View {
+    @Binding var draft: ConnectionProfile
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Label("\(draft.connectionType.title) Details", systemImage: draft.connectionType.systemImage)
+                .font(.callout.weight(.semibold))
+
+            switch draft.connectionType {
+            case .ssh:
+                sshFields
+            case .https:
+                httpsFields
+            case .rdp:
+                rdpFields
+            case .vnc:
+                vncFields
+            case .custom:
+                customFields
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .topLeading)
+    }
+
+    private var sshFields: some View {
+        Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 12) {
+            GridRow {
+                LabeledContent("Username") {
+                    TextField("ubuntu", text: $draft.sshSettings.username)
+                        .textFieldStyle(.roundedBorder)
+                }
+                LabeledContent("SSH Port") {
+                    TextField("22", text: servicePortBinding)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 96)
+                }
+            }
+            GridRow {
+                LabeledContent("Identity File") {
+                    TextField("~/.ssh/id_ed25519", text: $draft.sshSettings.identityFilePath)
+                        .textFieldStyle(.roundedBorder)
+                }
+                LabeledContent("Command") {
+                    TextField("Optional", text: $draft.sshSettings.remoteCommand)
+                        .textFieldStyle(.roundedBorder)
+                }
+            }
+        }
+    }
+
+    private var httpsFields: some View {
+        Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 12) {
+            GridRow {
+                LabeledContent("Host or URL") {
+                    TextField("https://app.example.com", text: $draft.httpsSettings.hostOrURL)
+                        .textFieldStyle(.roundedBorder)
+                }
+                LabeledContent("HTTPS Port") {
+                    TextField("443", text: servicePortBinding)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 96)
+                }
+            }
+            GridRow {
+                LabeledContent("Path") {
+                    TextField("/", text: $draft.httpsSettings.path)
+                        .textFieldStyle(.roundedBorder)
+                }
+                LabeledContent("TLS SNI") {
+                    TextField("Optional", text: $draft.httpsSettings.tlsServerName)
+                        .textFieldStyle(.roundedBorder)
+                }
+            }
+            GridRow {
+                Toggle("Validate TLS", isOn: $draft.httpsSettings.validateTLS)
+                    .toggleStyle(.checkbox)
+                Color.clear
+            }
+        }
+    }
+
+    private var rdpFields: some View {
+        Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 12) {
+            GridRow {
+                LabeledContent("Username") {
+                    TextField("DOMAIN\\user", text: $draft.rdpSettings.username)
+                        .textFieldStyle(.roundedBorder)
+                }
+                LabeledContent("RDP Port") {
+                    TextField("3389", text: servicePortBinding)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 96)
+                }
+            }
+            GridRow {
+                LabeledContent("Domain") {
+                    TextField("Optional", text: $draft.rdpSettings.domain)
+                        .textFieldStyle(.roundedBorder)
+                }
+                LabeledContent("Gateway") {
+                    TextField("Optional RD Gateway", text: $draft.rdpSettings.gatewayHost)
+                        .textFieldStyle(.roundedBorder)
+                }
+            }
+        }
+    }
+
+    private var vncFields: some View {
+        Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 12) {
+            GridRow {
+                LabeledContent("Display") {
+                    TextField(":0", text: $draft.vncSettings.display)
+                        .textFieldStyle(.roundedBorder)
+                }
+                LabeledContent("VNC Port") {
+                    TextField("5900", text: servicePortBinding)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 96)
+                }
+            }
+            GridRow {
+                LabeledContent("Auth") {
+                    Picker("Auth", selection: $draft.vncSettings.authMode) {
+                        ForEach(VNCAuthenticationMode.allCases) { mode in
+                            Text(mode.title)
+                                .tag(mode)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                }
+                LabeledContent("Username") {
+                    TextField("Optional", text: $draft.vncSettings.username)
+                        .textFieldStyle(.roundedBorder)
+                }
+            }
+        }
+    }
+
+    private var customFields: some View {
+        Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 12) {
+            GridRow {
+                LabeledContent("Protocol") {
+                    TextField("postgres, mqtt, admin", text: $draft.customSettings.protocolName)
+                        .textFieldStyle(.roundedBorder)
+                }
+                LabeledContent("Port") {
+                    TextField("Port", text: servicePortBinding)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 96)
+                }
+            }
+            GridRow {
+                LabeledContent("Notes") {
+                    TextField("Optional", text: $draft.customSettings.notes)
+                        .textFieldStyle(.roundedBorder)
+                }
+                Color.clear
+            }
+        }
+    }
+
+    private var servicePortBinding: Binding<String> {
         Binding(
             get: { draft.port > 0 ? "\(draft.port)" : "" },
             set: { value in
-                let digits = value.filter(\.isNumber)
-                draft.port = Int(digits) ?? 0
+                draft.port = Int(value.filter(\.isNumber)) ?? 0
             }
         )
     }
@@ -2178,6 +2521,27 @@ private extension QuantumLinkConnectionType {
         case .rdp: "display"
         case .vnc: "rectangle.connected.to.line.below"
         case .custom: "slider.horizontal.3"
+        }
+    }
+}
+
+private extension PeerDeviceRole {
+    var title: String {
+        switch self {
+        case .peer: "Peer"
+        case .gateway: "Gateway"
+        case .rendezvous: "Rendezvous"
+        case .relay: "Relay"
+        }
+    }
+}
+
+private extension VNCAuthenticationMode {
+    var title: String {
+        switch self {
+        case .none: "None"
+        case .password: "Password"
+        case .userPassword: "User + Password"
         }
     }
 }

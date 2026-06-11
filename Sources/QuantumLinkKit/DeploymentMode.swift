@@ -30,8 +30,8 @@ public enum QuantumLinkDeploymentMode: String, Codable, CaseIterable, Hashable, 
             from: base,
             overlayIPv4Address: sourceIPAddress.isEmpty ? base.overlayIPv4Address : sourceIPAddress,
             tunnelRemoteAddress: destinationIPAddress.isEmpty ? base.tunnelRemoteAddress : destinationIPAddress,
-            protectedRoutes: protectedRoutes(from: base, destinationIPAddress: destinationIPAddress),
-            rendezvousServers: rendezvousServers(from: base, destinationIPAddress: destinationIPAddress),
+            protectedRoutes: protectedRoutes(from: base, destinationIPAddress: destinationIPAddress, profile: profile),
+            rendezvousServers: rendezvousServers(from: base, destinationIPAddress: destinationIPAddress, endpointPort: profile.deploymentDetails.directEndpointPort),
             relayServers: relayServers(from: base, destinationIPAddress: destinationIPAddress),
             crypto: CryptoPolicy(pqcAlgorithm: profile.pqcAlgorithm)
         )
@@ -67,7 +67,8 @@ public enum QuantumLinkDeploymentMode: String, Codable, CaseIterable, Hashable, 
 
     private func protectedRoutes(
         from base: TunnelConfiguration,
-        destinationIPAddress: String?
+        destinationIPAddress: String?,
+        profile: ConnectionProfile? = nil
     ) -> [String] {
         switch self {
         case .mesh:
@@ -76,10 +77,11 @@ public enum QuantumLinkDeploymentMode: String, Codable, CaseIterable, Hashable, 
             }
             return uniqueRoutes(base.protectedRoutes + [hostRoute])
         case .direct:
-            guard let hostRoute = hostRoute(for: destinationIPAddress) else {
-                return base.protectedRoutes
+            if let protectedPrefixes = profile?.deploymentDetails.protectedPrefixes, !protectedPrefixes.isEmpty {
+                return protectedPrefixes
             }
-            return [hostRoute]
+            // The direct endpoint must stay reachable outside the tunnel.
+            return base.protectedRoutes
         case .localVPN:
             return ["0.0.0.0/0"]
         }
@@ -130,10 +132,10 @@ public enum QuantumLinkDeploymentMode: String, Codable, CaseIterable, Hashable, 
         }
     }
 
-    private func rendezvousServers(from base: TunnelConfiguration, destinationIPAddress: String?) -> [String] {
+    private func rendezvousServers(from base: TunnelConfiguration, destinationIPAddress: String?, endpointPort: Int? = nil) -> [String] {
         switch self {
         case .mesh, .direct:
-            if let endpoint = remappedEndpoint(host: destinationIPAddress, from: base.rendezvousServers) {
+            if let endpoint = remappedEndpoint(host: destinationIPAddress, from: base.rendezvousServers, endpointPort: endpointPort) {
                 return [endpoint]
             }
             return base.rendezvousServers
@@ -142,10 +144,10 @@ public enum QuantumLinkDeploymentMode: String, Codable, CaseIterable, Hashable, 
         }
     }
 
-    private func relayServers(from base: TunnelConfiguration, destinationIPAddress: String?) -> [String] {
+    private func relayServers(from base: TunnelConfiguration, destinationIPAddress: String?, endpointPort: Int? = nil) -> [String] {
         switch self {
         case .mesh:
-            if let endpoint = remappedEndpoint(host: destinationIPAddress, from: base.relayServers) {
+            if let endpoint = remappedEndpoint(host: destinationIPAddress, from: base.relayServers, endpointPort: endpointPort) {
                 return [endpoint]
             }
             return base.relayServers
@@ -154,10 +156,13 @@ public enum QuantumLinkDeploymentMode: String, Codable, CaseIterable, Hashable, 
         }
     }
 
-    private func remappedEndpoint(host: String?, from endpoints: [String]) -> String? {
+    private func remappedEndpoint(host: String?, from endpoints: [String], endpointPort: Int? = nil) -> String? {
         guard let host else { return nil }
         let trimmedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedHost.isEmpty, let template = endpoints.first else { return nil }
+        if let endpointPort, endpointPort > 0 {
+            return "\(trimmedHost):\(endpointPort)"
+        }
         guard let colon = template.lastIndex(of: ":") else { return nil }
         let port = template[template.index(after: colon)...]
         guard !port.isEmpty else { return nil }

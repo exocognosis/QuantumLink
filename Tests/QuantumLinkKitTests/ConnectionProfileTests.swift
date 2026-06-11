@@ -66,4 +66,53 @@ final class ConnectionProfileTests: XCTestCase {
         XCTAssertEqual(profile.redactedDisplayName, "SSH [redacted-ip]")
         XCTAssertEqual(profile.redactedRouteSummary, "[redacted-ip] to [redacted-ip]")
     }
+
+    func testSSHProfilesRequireUsernameAndDestinationForDirectConnections() {
+        var profile = ConnectionProfile(
+            sourceIPAddress: "100.127.0.2",
+            destinationIPAddress: "89.167.52.129",
+            connectionType: .ssh
+        )
+
+        XCTAssertTrue(profile.missingRequiredFields(for: .direct).contains("SSH username"))
+
+        profile.sshSettings.username = "ubuntu"
+
+        XCTAssertTrue(profile.missingRequiredFields(for: .direct).isEmpty)
+    }
+
+    func testMeshProfilesRequireAtLeastOnePeerDevice() {
+        var profile = ConnectionProfile(
+            sourceIPAddress: "100.127.0.2",
+            destinationIPAddress: "",
+            connectionType: .custom
+        )
+
+        XCTAssertTrue(profile.missingRequiredFields(for: .mesh).contains("Mesh peer"))
+
+        profile.deploymentDetails.peerDevices = [
+            PeerDeviceProfile(
+                alias: "helsinki",
+                endpointAddress: "89.167.52.129",
+                overlayIPAddress: "100.127.0.10",
+                role: .peer
+            )
+        ]
+
+        XCTAssertFalse(profile.missingRequiredFields(for: .mesh).contains("Mesh peer"))
+    }
+
+    func testStableKeyIncludesConnectionSpecificSettings() {
+        var first = ConnectionProfile(
+            sourceIPAddress: "100.127.0.2",
+            destinationIPAddress: "89.167.52.129",
+            connectionType: .ssh
+        )
+        first.sshSettings.username = "ubuntu"
+
+        var second = first
+        second.sshSettings.username = "root"
+
+        XCTAssertNotEqual(first.stableKey, second.stableKey)
+    }
 }

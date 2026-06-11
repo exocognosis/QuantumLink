@@ -43,7 +43,6 @@ slh-dsa = { version = "0.2.0-rc.4", features = ["zeroize"] }
 thiserror = "1"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tracing = "0.1"
-x25519-dalek = { version = "2", features = ["static_secrets"] }
 zeroize = { version = "1", features = ["derive"] }
 
 [dev-dependencies]

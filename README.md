@@ -7,7 +7,7 @@ QuantumLink is a macOS-first peer-to-peer mesh VPN scaffold with a server-minimi
 
 - A SwiftUI macOS app surface for mesh status, enrollment, and operator controls.
 - A `NEPacketTunnelProvider` implementation scaffold for the packet tunnel extension.
-- A Rust mesh core with hybrid X25519 + ML-KEM-768 session establishment, ML-DSA-65 device credentials, signed peer records, routing helpers, replay protection, and development rendezvous/relay services.
+- A Rust mesh core with ML-KEM-768 session establishment, ML-DSA-65 device credentials, signed peer records, routing helpers, replay protection, and development rendezvous/relay services.
 - macOS entitlement examples, deployment notes, and build scripts.
 
 This is a v1 implementation baseline, not a signed/notarized production bundle. Apple signing, Network Extension entitlements, MDM pre-approval, and notarization must be completed in an Apple Developer account before installing the tunnel extension on managed or unmanaged Macs.
@@ -143,6 +143,6 @@ QuantumLink v1 is structured around these boundaries:
 - No mandatory centralized VPN concentrator in the steady-state data plane.
 - Optional rendezvous, STUN/ICE, and relay paths for bootstrap and hostile NAT/firewall conditions.
 - L3 overlay through `NEPacketTunnelProvider` and `utun`; no kernel extension and no pf-based core design.
-- Hybrid X25519 + ML-KEM-768 ephemeral session establishment.
+- ML-KEM-768 ephemeral session establishment.
 - ML-DSA-65 device credential support in the Rust core.
 - Local-first diagnostics and opt-in export.

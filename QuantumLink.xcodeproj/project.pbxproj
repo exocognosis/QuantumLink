@@ -14,7 +14,6 @@
 		20C1470CDA9AF7D8164D09C6 /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = 64768C04397936AFD94F31B6 /* Sparkle */; };
 		22A090260753D0E7CE0C573C /* qlink-core.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = EDC7B517D582011D0D8A28AC /* qlink-core.xcframework */; };
 		342A76F85A3A664B4BA040C6 /* qlink-core.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = EDC7B517D582011D0D8A28AC /* qlink-core.xcframework */; };
-		344090A8004D9533D8C59BD5 /* SecureEnclaveTrustKey.swift in Sources */ = {isa = PBXBuildFile; fileRef = 541C463627F2AFF3E470783C /* SecureEnclaveTrustKey.swift */; };
 		408C22DEF9E103A9E02731D9 /* DytallixLogo.png in Resources */ = {isa = PBXBuildFile; fileRef = A953B1D60A759C55989BFF2F /* DytallixLogo.png */; };
 		44733C516E5F8CAE98F5C49D /* PeerStoreKey.swift in Sources */ = {isa = PBXBuildFile; fileRef = 755B356193A469A593EACB49 /* PeerStoreKey.swift */; };
 		46D00AA7339D09ADCC7101B1 /* UpdateController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2A5718DAE3708E8BC3E5B01 /* UpdateController.swift */; };
@@ -138,7 +137,6 @@
 		38B176D06E6A6A946D9C7D74 /* MobileConfigSigner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MobileConfigSigner.swift; sourceTree = "<group>"; };
 		48FCF5CE3166FFAF864596D5 /* QuantumLink.unsigned.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = QuantumLink.unsigned.xcconfig; sourceTree = "<group>"; };
 		4F8A84FA8EEF2E3F80809E5B /* QuantumLink.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = QuantumLink.app; sourceTree = BUILT_PRODUCTS_DIR; };
-		541C463627F2AFF3E470783C /* SecureEnclaveTrustKey.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SecureEnclaveTrustKey.swift; sourceTree = "<group>"; };
 		57EACB3E2EB2FC7E12594D82 /* PerAppVPNPayload.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PerAppVPNPayload.swift; sourceTree = "<group>"; };
 		5F8F6A8F3EAAC63BA8A31F5B /* RustCoreBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RustCoreBridge.swift; sourceTree = "<group>"; };
 		6AD70AC5795FCCEB27C7B9F1 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
@@ -280,7 +278,6 @@
 				1BDF64FAD5911962F0B46B13 /* PrivacyDefaults.swift */,
 				5F8F6A8F3EAAC63BA8A31F5B /* RustCoreBridge.swift */,
 				8A06792206D4FDBB18F6302C /* RustTracingForwarder.swift */,
-				541C463627F2AFF3E470783C /* SecureEnclaveTrustKey.swift */,
 				16ED9D1B9632409EA844EC6D /* SupportBundleExporter.swift */,
 				1DB67C6F8AFC55B60F97AA15 /* TransportSmokeRunner.swift */,
 				84FFCCA0952D80CAF8920CF5 /* TunnelMessages.swift */,
@@ -499,7 +496,6 @@
 				0A5EF2946B50D8108716D88F /* PrivacyDefaults.swift in Sources */,
 				55BAB59799BD4D139A9C99B4 /* RustCoreBridge.swift in Sources */,
 				DF6C92D4AF72DB8002FACE2D /* RustTracingForwarder.swift in Sources */,
-				344090A8004D9533D8C59BD5 /* SecureEnclaveTrustKey.swift in Sources */,
 				8EDF47DC79F8DB41CF45FA26 /* SupportBundleExporter.swift in Sources */,
 				91E5F175CBE0378AD3CAEBCF /* TransportSmokeRunner.swift in Sources */,
 				819EC18264B37F3838011067 /* TunnelMessages.swift in Sources */,

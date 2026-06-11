@@ -6,7 +6,7 @@ This runbook covers everything QuantumLink can validate before an Apple Develope
 
 - SwiftUI development app that runs without installing a packet tunnel extension.
 - Packet tunnel provider source that compiles against Network Extension.
-- Rust protocol core with hybrid handshake, device signatures, signed peer records, route policy, replay protection, QUIC DATAGRAM development transport, rendezvous, relay, and STUN parser scaffolding.
+- Rust protocol core with an ML-KEM handshake, device signatures, signed peer records, route policy, replay protection, QUIC DATAGRAM development transport, rendezvous, relay, and STUN parser scaffolding.
 - Swift FFI bridge to the Rust packet core and development QUIC transport.
 - Swift packet-pump integration with fail-closed behavior.
 - Local Swift-to-Rust transport smoke path through `QuantumLinkSmoke`.

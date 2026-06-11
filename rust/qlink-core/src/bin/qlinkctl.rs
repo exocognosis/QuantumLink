@@ -4,7 +4,7 @@ use qlink_core::{
     discovery::{CandidateEndpoint, CandidateType, PeerRecord, UnsignedPeerRecord},
     ice::{perform_ice_check, spawn_dev_ice_responder, IceCheckRequest, IceCredentials},
     local_loopback::{run_local_mesh_loopback, run_relay_loopback},
-    mesh_connection::{MeshConnector, MeshConnectorConfig, PathKind},
+    mesh_connection::{ConnectionOutcome, MeshConnector, MeshConnectorConfig, PathKind},
     mesh_transport::{MeshTransportConfig, MeshTransportHandle},
     packet_core::{FfiRouteMode, PacketTunnelCore, PacketTunnelCoreConfig},
     quic_transport::QuicEndpoint,
@@ -13,6 +13,7 @@ use qlink_core::{
     stun::spawn_dev_stun,
     traversal::gather_local_candidates,
 };
+use serde::Serialize;
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
@@ -101,6 +102,24 @@ enum Command {
         /// rendezvous failure. The parent directory must exist.
         #[arg(long)]
         peer_store: Option<String>,
+    },
+    /// Connect directly to a published peer through rendezvous and send one
+    /// frame over the selected mesh path.
+    DirectSend {
+        #[arg(long, default_value = "127.0.0.1:9471")]
+        rendezvous: String,
+        #[arg(long, default_value = "devmesh")]
+        mesh_id: String,
+        #[arg(long)]
+        remote_peer_id: String,
+        #[arg(long, default_value = "0.0.0.0:0")]
+        bind_addr: String,
+        #[arg(long, default_value = "qlink-direct-smoke")]
+        payload: String,
+        #[arg(long, default_value_t = 5_000)]
+        timeout_ms: u64,
+        #[arg(long)]
+        keyfile: Option<String>,
     },
 }
 
@@ -302,9 +321,155 @@ async fn main() -> qlink_core::Result<()> {
             )
             .await?;
         }
+        Command::DirectSend {
+            rendezvous,
+            mesh_id,
+            remote_peer_id,
+            bind_addr,
+            payload,
+            timeout_ms,
+            keyfile,
+        } => {
+            let run = run_direct_send_detailed(
+                &rendezvous,
+                &mesh_id,
+                &remote_peer_id,
+                &bind_addr,
+                keyfile.as_deref(),
+                payload.as_bytes(),
+                timeout_ms,
+            )
+            .await?;
+            let outcome = &run.outcome;
+            println!("rendezvous={rendezvous}");
+            println!("mesh_id={mesh_id}");
+            println!("remote_peer_id={remote_peer_id}");
+            println!(
+                "selected_path={}",
+                match outcome.path_kind {
+                    PathKind::Direct => "direct",
+                    PathKind::Relay => "relay",
+                }
+            );
+            if let Some(addr) = outcome.remote_addr {
+                println!("selected_remote_addr={addr}");
+            }
+            println!("probe_attempts={}", outcome.attempts.len());
+            println!("payload_bytes={}", payload.as_bytes().len());
+            println!(
+                "phase_timing_json={}",
+                serde_json::to_string(&DirectSendTimingReport::from_run(&run))?
+            );
+            println!("total_elapsed_ms={}", outcome.total_elapsed.as_millis());
+        }
     }
 
     Ok(())
+}
+
+async fn run_direct_send(
+    rendezvous_url: &str,
+    mesh_id: &str,
+    remote_peer_id: &str,
+    bind_addr: &str,
+    keyfile: Option<&str>,
+    payload: &[u8],
+    timeout_ms: u64,
+) -> qlink_core::Result<ConnectionOutcome> {
+    run_direct_send_detailed(
+        rendezvous_url,
+        mesh_id,
+        remote_peer_id,
+        bind_addr,
+        keyfile,
+        payload,
+        timeout_ms,
+    )
+    .await
+    .map(|run| run.outcome)
+}
+
+struct DirectSendRun {
+    outcome: ConnectionOutcome,
+    datagram_delivery_elapsed: Duration,
+}
+
+#[derive(Debug, Serialize)]
+struct DirectSendTimingReport {
+    rendezvous_lookup_ms: u128,
+    direct_probe_wall_clock_ms: u128,
+    quic_connect_ms: Option<u128>,
+    identity_assertion_ms: Option<u128>,
+    relay_connect_ms: Option<u128>,
+    datagram_delivery_ms: u128,
+    total_elapsed_ms: u128,
+}
+
+impl DirectSendTimingReport {
+    fn from_run(run: &DirectSendRun) -> Self {
+        let established_attempt = run.outcome.attempts.iter().find(|attempt| {
+            matches!(
+                attempt.outcome,
+                qlink_core::mesh_connection::ProbeOutcome::Established
+            )
+        });
+        Self {
+            rendezvous_lookup_ms: run.outcome.timings.rendezvous_lookup.as_millis(),
+            direct_probe_wall_clock_ms: run.outcome.timings.direct_probe_wall_clock.as_millis(),
+            quic_connect_ms: established_attempt
+                .and_then(|attempt| attempt.quic_connect_elapsed)
+                .map(|elapsed| elapsed.as_millis()),
+            identity_assertion_ms: established_attempt
+                .and_then(|attempt| attempt.identity_assertion_elapsed)
+                .map(|elapsed| elapsed.as_millis()),
+            relay_connect_ms: run
+                .outcome
+                .timings
+                .relay_connect_elapsed
+                .map(|elapsed| elapsed.as_millis()),
+            datagram_delivery_ms: run.datagram_delivery_elapsed.as_millis(),
+            total_elapsed_ms: run.outcome.total_elapsed.as_millis(),
+        }
+    }
+}
+
+async fn run_direct_send_detailed(
+    rendezvous_url: &str,
+    mesh_id: &str,
+    remote_peer_id: &str,
+    bind_addr: &str,
+    keyfile: Option<&str>,
+    payload: &[u8],
+    timeout_ms: u64,
+) -> qlink_core::Result<DirectSendRun> {
+    let keypair = Arc::new(load_or_generate_keypair(keyfile)?);
+    let local_peer_id = keypair.public_key().peer_id();
+    let bind_addr: SocketAddr = bind_addr
+        .parse()
+        .map_err(|err| qlink_core::QlinkError::Protocol(format!("invalid bind_addr: {err}")))?;
+    let client_endpoint = QuicEndpoint::client(bind_addr, &[])?;
+    let rendezvous_client = RendezvousClient::new(rendezvous_url.to_string());
+    let timeout = Duration::from_millis(timeout_ms);
+    let connector = MeshConnector::new(
+        MeshConnectorConfig::new(mesh_id.to_string(), local_peer_id)
+            .with_local_device_keypair(keypair)
+            .with_overall_deadline(timeout)
+            .with_direct_probe_timeout(timeout.min(Duration::from_millis(1_500)))
+            .with_probe_pacing(Duration::from_millis(50)),
+        rendezvous_client,
+        client_endpoint,
+    );
+
+    let (mut link, outcome) = connector.connect(remote_peer_id).await?;
+    let datagram_started = Instant::now();
+    link.send_frame(payload.to_vec()).await?;
+    let datagram_delivery_elapsed = datagram_started.elapsed();
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    link.close(b"direct-send complete");
+    Ok(DirectSendRun {
+        outcome,
+        datagram_delivery_elapsed,
+    })
 }
 
 async fn run_publish_self(
@@ -724,6 +889,87 @@ fn test_ipv4_packet(destination: [u8; 4]) -> Vec<u8> {
     packet[12..16].copy_from_slice(&[100, 127, 0, 2]);
     packet[16..20].copy_from_slice(&destination);
     packet
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn direct_send_reaches_published_responder() {
+        let rendezvous = spawn_dev_rendezvous().await.unwrap();
+        let rendezvous_url = rendezvous.local_addr().to_string();
+        let remote_key = Arc::new(DeviceKeypair::generate().unwrap());
+        let remote_peer_id = remote_key.public_key().peer_id();
+
+        let remote_handle = tokio::task::spawn_blocking({
+            let rendezvous_url = rendezvous_url.clone();
+            let remote_peer_id = remote_peer_id.clone();
+            let remote_key = remote_key.clone();
+            move || {
+                MeshTransportHandle::new_with_keypair(
+                    MeshTransportConfig {
+                        mesh_id: "devmesh".to_string(),
+                        local_peer_id: remote_peer_id,
+                        remote_peer_id: "qlink_unused".to_string(),
+                        rendezvous_url,
+                        relay_url: None,
+                        bind_addr: "127.0.0.1:0".to_string(),
+                        overall_deadline_ms: 3_000,
+                        direct_probe_timeout_ms: 750,
+                        probe_pacing_ms: 50,
+                        enable_ice: false,
+                        reconnect_initial_backoff_ms: 250,
+                        reconnect_max_backoff_ms: 30_000,
+                        metrics_endpoint_bind_addr: None,
+                        inbound_acl: None,
+                        disable_inbound_responder: false,
+                        peer_store_path: None,
+                        peer_store_key_b64: None,
+                    },
+                    Some(remote_key),
+                )
+            }
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        remote_handle
+            .publish_self(remote_key.as_ref(), &rendezvous_url, 120, 1, vec![])
+            .await
+            .unwrap();
+
+        let outcome = run_direct_send(
+            &rendezvous_url,
+            "devmesh",
+            &remote_peer_id,
+            "127.0.0.1:0",
+            None,
+            b"direct-test-frame",
+            5_000,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.path_kind, PathKind::Direct);
+
+        let inbound = {
+            let mut waited = 0_u64;
+            loop {
+                if let Some(frame) = remote_handle.try_receive_frame_from_any() {
+                    break frame;
+                }
+                if waited > 5_000 {
+                    panic!("published responder never received direct-send payload");
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                waited += 50;
+            }
+        };
+
+        assert_eq!(inbound.frame, b"direct-test-frame".to_vec());
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {

@@ -5,6 +5,7 @@
 
 # Swift Package Manager
 .build/
+.build.*/
 .swiftpm/
 
 # Rust / Cargo build output

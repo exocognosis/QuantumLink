@@ -31,7 +31,7 @@ Overlay allocation uses a keyed recursive permutation over the 22-bit host space
 
 The Rust core exposes versioned internal APIs:
 
-- `HybridHandshake` implements a three-message X25519 + ML-KEM-768 handshake.
+- `PQCHandshake` implements a three-message ML-KEM-768 handshake.
 - Suite selection accepts FIPS 203, FIPS 204, and FIPS 205 identifiers and binds the selected suite into the handshake transcript and key derivation.
 - `DeviceKeypair` implements ML-DSA-65 and SLH-DSA-SHA2-128S signing and verification for device credentials.
 - `PacketTunnelCore` encrypts transport frames with suite-bound AEAD keys before handing them to the transport facade.

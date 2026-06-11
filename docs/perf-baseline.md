@@ -12,7 +12,7 @@ two in sync when refreshing.
 - **Surface**: loopback only. Real WAN numbers will be higher because of
   network RTT, but if the loopback baseline ever exceeds an SLO, no real
   network will save us.
-- **Crypto**: hybrid X25519 + ML-KEM-768 KEM + ML-DSA-65 signatures
+- **Crypto**: ML-KEM-768 KEM + ML-DSA-65 signatures
   (FIPS 203 / 204 suites). ICE checks use HMAC-SHA1 short-term credentials
   per RFC 8445.
 - **Tools**:

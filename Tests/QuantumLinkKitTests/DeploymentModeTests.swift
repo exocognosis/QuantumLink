@@ -48,7 +48,7 @@ final class DeploymentModeTests: XCTestCase {
 
         XCTAssertEqual(configuration.overlayIPv4Address, "100.127.200.245")
         XCTAssertEqual(configuration.tunnelRemoteAddress, "89.167.52.129")
-        XCTAssertEqual(configuration.protectedRoutes, ["89.167.52.129/32"])
+        XCTAssertEqual(configuration.protectedRoutes, ["100.64.0.0/10"])
         XCTAssertEqual(configuration.rendezvousServers, ["89.167.52.129:9471"])
         XCTAssertTrue(configuration.relayServers.isEmpty)
         XCTAssertEqual(configuration.crypto.pqcAlgorithm, .fips205)

@@ -1,4 +1,4 @@
-// swift-tools-version: 6.0
+// swift-tools-version: 5.9
 
 import PackageDescription
 
@@ -8,21 +8,26 @@ let package = Package(
         .macOS(.v14)
     ],
     products: [
-        .executable(name: "QuantumLinkApp", targets: ["QuantumLinkApp"]),
-        .executable(name: "QuantumLinkSmoke", targets: ["QuantumLinkSmoke"]),
-        .executable(name: "QuantumLinkMDM", targets: ["QuantumLinkMDM"]),
+        .executable(name: "QuantumLink", targets: ["QuantumLinkApp"]),
         .library(name: "QuantumLinkKit", targets: ["QuantumLinkKit"]),
-        .library(name: "QuantumLinkTunnel", targets: ["QuantumLinkTunnel"])
+        .executable(name: "QuantumLinkSmoke", targets: ["QuantumLinkSmoke"]),
+        .executable(name: "QuantumLinkMDM", targets: ["QuantumLinkMDM"])
     ],
     targets: [
-        .target(name: "QuantumLinkKit"),
+        .target(
+            name: "QuantumLinkKit",
+            dependencies: []
+        ),
         .executableTarget(
             name: "QuantumLinkApp",
             dependencies: ["QuantumLinkKit"],
             resources: [
-                .process("Assets.xcassets"),
                 .process("Resources")
             ]
+        ),
+        .target(
+            name: "QuantumLinkTunnel",
+            dependencies: ["QuantumLinkKit"]
         ),
         .executableTarget(
             name: "QuantumLinkSmoke",
@@ -30,10 +35,6 @@ let package = Package(
         ),
         .executableTarget(
             name: "QuantumLinkMDM",
-            dependencies: ["QuantumLinkKit"]
-        ),
-        .target(
-            name: "QuantumLinkTunnel",
             dependencies: ["QuantumLinkKit"]
         ),
         .testTarget(
