@@ -3,7 +3,7 @@
 [![CI](https://github.com/exocognosis/QuantumLink/actions/workflows/ci.yml/badge.svg)](https://github.com/exocognosis/QuantumLink/actions/workflows/ci.yml)
 [![Release](https://github.com/exocognosis/QuantumLink/actions/workflows/release.yml/badge.svg)](https://github.com/exocognosis/QuantumLink/actions/workflows/release.yml)
 
-QuantumLink is a macOS-first peer-to-peer mesh VPN scaffold with a server-minimized control plane and a hybrid cryptographic core. The repository contains:
+QuantumLink is a macOS-first peer-to-peer mesh VPN scaffold with a server-minimized control plane and a post-quantum cryptographic core. The repository contains:
 
 - A SwiftUI macOS app surface for mesh status, enrollment, and operator controls.
 - A `NEPacketTunnelProvider` implementation scaffold for the packet tunnel extension.
@@ -24,7 +24,7 @@ Tracked GitHub automation includes:
 
 ## Cryptographic Implementation
 
-The active protocol implementation lives in `rust/qlink-core`. Its current hybrid design combines post-quantum key establishment and signatures with conventional transcript hashing, HKDF, and AEAD packet framing:
+The active protocol implementation lives in `rust/qlink-core`. Its current cryptographic design combines post-quantum key establishment and signatures with conventional transcript hashing, HKDF, and AEAD packet framing:
 
 - Protocol version: `1`.
 - Supported suite identifiers:
@@ -38,6 +38,8 @@ The active protocol implementation lives in `rust/qlink-core`. Its current hybri
 - Replay protection is implemented with a monotonic packet-number window.
 
 The Rust core intentionally rejects the legacy `QLINK-HYBRID-X25519-MLKEM768-HKDFSHA256-v1` identifier. There is no X25519 fallback in the current handshake. Production peer sessions still need to wire negotiated session secrets into packet-frame encryption; the current packet-frame keys are development suite-bound keys.
+
+For the repo-level specification and feature inventory, see `SPEC.md` and `FEATURES.md`.
 
 ## Requirements
 
