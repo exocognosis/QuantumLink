@@ -201,11 +201,10 @@ public enum PrivacyDefaults {
     ///   20-32 trailing chars) so a future format tweak doesn't
     ///   silently start leaking identifiers.
     ///
-    /// Why this is separate from `redactNetworkIdentifiers`: support
-    /// bundles deliberately keep `peer_id`s by design (see
-    /// `SupportBundleRedactionMode` doc comment). Crash reports and
-    /// OS-log output are user-shareable artifacts where we want
-    /// stricter redaction — `redactForLog` combines both.
+    /// Why this is separate from `redactNetworkIdentifiers`: packet-tunnel
+    /// diagnostics, logs, crash reports, and default support bundles all treat
+    /// peer IDs as persistent identifiers. `redactForLog` combines both network
+    /// and peer identifier redaction.
     public static func redactPeerIdentifiers(in value: String) -> String {
         let pattern = #"\bqlink_[A-Za-z0-9_-]{20,32}\b"#
         return value.replacingOccurrences(
