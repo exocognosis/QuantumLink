@@ -1,7 +1,9 @@
 use crate::{
     crypto::DeviceKeypair,
     mesh_connection::NetworkEvent,
-    mesh_transport::{MeshTransportConfig, MeshTransportHandle, MeshTransportState},
+    mesh_transport::{
+        MeshTransportConfig, MeshTransportHandle, MeshTransportState, PeerTrustStatusRaw,
+    },
     packet_core::{PacketDisposition, PacketTunnelCore},
     quic_transport::{QuicDatagramSession, QuicEndpoint},
     tracing_bridge,
@@ -74,6 +76,26 @@ pub struct QlinkTransportMetrics {
     pub bytes_received: u64,
     pub send_failures: u64,
     pub receive_failures: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct QlinkPeerTrustStatus {
+    pub decision_code: u32,
+    pub failure_code: u32,
+    pub checked_at_unix: u64,
+    pub source_code: u32,
+}
+
+impl From<PeerTrustStatusRaw> for QlinkPeerTrustStatus {
+    fn from(value: PeerTrustStatusRaw) -> Self {
+        Self {
+            decision_code: value.decision_code,
+            failure_code: value.failure_code,
+            checked_at_unix: value.checked_at_unix,
+            source_code: value.source_code,
+        }
+    }
 }
 
 #[no_mangle]
@@ -855,6 +877,48 @@ pub unsafe extern "C" fn qlink_mesh_transport_remove_peer(
     handle.remove_peer(peer_id_str);
 }
 
+/// Returns the active managed peer IDs as a newline-separated UTF-8
+/// buffer. The list includes peers whose session managers are currently
+/// failed/backing off, which lets operators see registry-rejected peers
+/// even before any inbound traffic is accepted.
+#[no_mangle]
+pub unsafe extern "C" fn qlink_mesh_transport_peer_ids(
+    handle: *mut MeshTransportHandle,
+    out: *mut QlinkOwnedBuffer,
+) -> bool {
+    let Some(handle) = handle.as_ref() else {
+        return false;
+    };
+    let Some(out) = out.as_mut() else {
+        return false;
+    };
+    let mut peer_ids = handle.peer_ids();
+    peer_ids.sort();
+    *out = owned_buffer_from_vec(peer_ids.join("\n").into_bytes());
+    true
+}
+
+/// Returns retained blocked/rejected peer history as a UTF-8 JSON array.
+/// Each entry contains `peer_id`, `direction`, `failure_code`,
+/// `failure_reason`, `observed_at_unix`, and `checked_at_unix`.
+#[no_mangle]
+pub unsafe extern "C" fn qlink_mesh_transport_blocked_peer_history(
+    handle: *mut MeshTransportHandle,
+    out: *mut QlinkOwnedBuffer,
+) -> bool {
+    let Some(handle) = handle.as_ref() else {
+        return false;
+    };
+    let Some(out) = out.as_mut() else {
+        return false;
+    };
+    let Ok(json) = serde_json::to_vec(&handle.blocked_peer_history()) else {
+        return false;
+    };
+    *out = owned_buffer_from_vec(json);
+    true
+}
+
 /// Per-peer state code (matches `qlink_mesh_transport_state_code`'s
 /// integer mapping: 0=connecting, 1=ready, 2=failed, 3=stopped).
 /// Returns false when the peer isn't active.
@@ -880,6 +944,42 @@ pub unsafe extern "C" fn qlink_mesh_transport_peer_state_code(
     match handle.peer_state_code(peer_id_str) {
         Some(code) => {
             *out = code;
+            true
+        }
+        None => false,
+    }
+}
+
+/// Per-peer Dytallix registry trust decision.
+/// Decision code: 0=unknown, 1=accepted/verified,
+/// 2=accepted without registry for private mesh,
+/// 3=accepted without registry for development mesh.
+/// Failure code: 0=none, 1=required record missing,
+/// 2=revoked, 3=suspended/inactive, 4=expired, 5=mismatch,
+/// 6=lookup failure, 7=verification failure.
+/// Returns false when the peer isn't active.
+#[no_mangle]
+pub unsafe extern "C" fn qlink_mesh_transport_peer_trust_status(
+    handle: *mut MeshTransportHandle,
+    peer_id: *const u8,
+    peer_id_len: usize,
+    out_status: *mut QlinkPeerTrustStatus,
+) -> bool {
+    let Some(handle) = handle.as_ref() else {
+        return false;
+    };
+    let Some(peer_id_bytes) = borrowed_slice(peer_id, peer_id_len) else {
+        return false;
+    };
+    let Ok(peer_id_str) = str::from_utf8(peer_id_bytes) else {
+        return false;
+    };
+    let Some(out) = out_status.as_mut() else {
+        return false;
+    };
+    match handle.peer_trust_status(peer_id_str) {
+        Some(status) => {
+            *out = status.into();
             true
         }
         None => false,
