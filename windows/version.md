@@ -12,7 +12,7 @@ protection, routing helpers, rendezvous, relay, and QUIC/ICE transport.
 
 Implemented in this revision:
 
-- `rust/qlink-core` — shared core, Windows-clean, produces
+- `../qlink-core` — shared core, Windows-clean, produces
   `qlink_core.dll` / `.lib`.
 - `rust/quantumlink-proto` — product models + named-pipe IPC schema
   (ports of `Models.swift`, `TunnelMessages.swift`,
