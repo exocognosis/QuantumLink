@@ -1,0 +1,81 @@
+<Window
+    x:Class="QuantumLink.Windows.MainWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:models="using:QuantumLink.Windows.Models"
+    Title="QuantumLink">
+
+    <Grid Padding="24" RowSpacing="16">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <!-- Header: phase + connect/disconnect -->
+        <StackPanel Grid.Row="0" Orientation="Horizontal" Spacing="16">
+            <TextBlock Text="QuantumLink" Style="{StaticResource TitleTextBlockStyle}" />
+            <TextBlock Text="{x:Bind ViewModel.Phase, Mode=OneWay}"
+                       VerticalAlignment="Center"
+                       Style="{StaticResource SubtitleTextBlockStyle}" />
+            <Button Content="Connect"
+                    Command="{x:Bind ViewModel.ConnectTunnelCommand}"
+                    Visibility="{x:Bind ViewModel.IsConnected, Mode=OneWay, Converter={StaticResource InverseBoolToVisibility}}" />
+            <Button Content="Disconnect"
+                    Command="{x:Bind ViewModel.DisconnectTunnelCommand}"
+                    Visibility="{x:Bind ViewModel.IsConnected, Mode=OneWay, Converter={StaticResource BoolToVisibility}}" />
+        </StackPanel>
+
+        <!-- Status grid -->
+        <Grid Grid.Row="1" ColumnSpacing="32" RowSpacing="4">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="*" />
+            </Grid.ColumnDefinitions>
+            <Grid.RowDefinitions>
+                <RowDefinition /><RowDefinition /><RowDefinition /><RowDefinition /><RowDefinition />
+            </Grid.RowDefinitions>
+
+            <TextBlock Grid.Row="0" Grid.Column="0" Text="Path" Opacity="0.6" />
+            <TextBlock Grid.Row="0" Grid.Column="1" Text="{x:Bind ViewModel.PathType, Mode=OneWay}" />
+            <TextBlock Grid.Row="1" Grid.Column="0" Text="Overlay address" Opacity="0.6" />
+            <TextBlock Grid.Row="1" Grid.Column="1" Text="{x:Bind ViewModel.OverlayAddress, Mode=OneWay}" />
+            <TextBlock Grid.Row="2" Grid.Column="0" Text="Protected routes" Opacity="0.6" />
+            <TextBlock Grid.Row="2" Grid.Column="1" Text="{x:Bind ViewModel.RouteSummary, Mode=OneWay}" />
+            <TextBlock Grid.Row="3" Grid.Column="0" Text="Kill switch" Opacity="0.6" />
+            <TextBlock Grid.Row="3" Grid.Column="1" Text="{x:Bind ViewModel.KillSwitchEngaged, Mode=OneWay}" />
+            <TextBlock Grid.Row="4" Grid.Column="0" Text="Service" Opacity="0.6" />
+            <TextBlock Grid.Row="4" Grid.Column="1" Text="{x:Bind ViewModel.ServiceState, Mode=OneWay}" />
+        </Grid>
+
+        <!-- Peers -->
+        <ListView Grid.Row="2"
+                  ItemsSource="{x:Bind ViewModel.Peers, Mode=OneWay}"
+                  SelectionMode="None">
+            <ListView.ItemTemplate>
+                <DataTemplate x:DataType="models:PeerStatus">
+                    <StackPanel Orientation="Horizontal" Spacing="12" Padding="0,4">
+                        <TextBlock Text="{x:Bind Identity.PeerId}" FontFamily="Consolas" />
+                        <TextBlock Text="{x:Bind PathType}" Opacity="0.6" />
+                        <TextBlock Text="{x:Bind OverlayAddress}" Opacity="0.6" />
+                    </StackPanel>
+                </DataTemplate>
+            </ListView.ItemTemplate>
+        </ListView>
+
+        <!-- Diagnostics -->
+        <StackPanel Grid.Row="3" Spacing="8">
+            <StackPanel Orientation="Horizontal" Spacing="12">
+                <Button Content="Export diagnostics"
+                        Command="{x:Bind ViewModel.ExportDiagnosticsCommand}" />
+                <TextBlock Text="{x:Bind ViewModel.LastError, Mode=OneWay}"
+                           Foreground="{ThemeResource SystemFillColorCriticalBrush}"
+                           VerticalAlignment="Center" />
+            </StackPanel>
+            <TextBlock Text="{x:Bind ViewModel.DiagnosticsText, Mode=OneWay}"
+                       FontFamily="Consolas" FontSize="11"
+                       TextWrapping="Wrap" MaxHeight="160" />
+        </StackPanel>
+    </Grid>
+</Window>
