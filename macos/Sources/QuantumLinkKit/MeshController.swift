@@ -254,8 +254,9 @@ public final class AppMeshController: ObservableObject, MeshControlling {
     }
 
     private func observeTunnelStatusChanges() {
-        statusObserverTask = Task { [weak self] in
+        statusObserverTask = Task { @MainActor [weak self] in
             let notifications = NotificationCenter.default.notifications(named: .NEVPNStatusDidChange)
+                .map { _ in () }
             for await _ in notifications {
                 guard let self else { return }
                 await self.refresh()

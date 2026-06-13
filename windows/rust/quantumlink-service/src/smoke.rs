@@ -21,6 +21,8 @@ use quantumlink_proto::privacy;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+const CLI_SMOKE_STACK_SIZE: usize = 8 * 1024 * 1024;
+
 pub struct SmokeReport {
     pub passed: bool,
     pub summary: serde_json::Value,
@@ -136,6 +138,24 @@ pub fn run_loopback_smoke() -> SmokeReport {
     }
 }
 
+pub fn run_loopback_smoke_on_cli_stack() -> Result<SmokeReport, String> {
+    std::thread::Builder::new()
+        .name("quantumlink-service-smoke".to_string())
+        .stack_size(CLI_SMOKE_STACK_SIZE)
+        .spawn(run_loopback_smoke)
+        .map_err(|error| error.to_string())?
+        .join()
+        .map_err(|panic| {
+            if let Some(message) = panic.downcast_ref::<&str>() {
+                (*message).to_string()
+            } else if let Some(message) = panic.downcast_ref::<String>() {
+                message.clone()
+            } else {
+                "smoke thread panicked".to_string()
+            }
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,6 +163,12 @@ mod tests {
     #[test]
     fn loopback_smoke_passes() {
         let report = run_loopback_smoke();
+        assert!(report.passed, "smoke failed: {}", report.summary);
+    }
+
+    #[test]
+    fn loopback_smoke_passes_on_cli_stack() {
+        let report = run_loopback_smoke_on_cli_stack().expect("smoke thread joins");
         assert!(report.passed, "smoke failed: {}", report.summary);
     }
 }

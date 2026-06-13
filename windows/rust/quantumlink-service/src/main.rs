@@ -102,7 +102,13 @@ fn main() -> std::process::ExitCode {
         }
         Commands::Smoke => {
             init_tracing();
-            let report = quantumlink_service::smoke::run_loopback_smoke();
+            let report = match quantumlink_service::smoke::run_loopback_smoke_on_cli_stack() {
+                Ok(report) => report,
+                Err(error) => {
+                    eprintln!("smoke runner failed: {error}");
+                    return std::process::ExitCode::FAILURE;
+                }
+            };
             println!(
                 "{}",
                 serde_json::to_string_pretty(&report.summary).unwrap_or_default()
