@@ -13,7 +13,7 @@ namespace QuantumLink.Windows.ViewModels;
 public partial class DashboardViewModel : ObservableObject
 {
     private readonly ServicePipeClient _client = new();
-    private System.Timers.Timer? _refreshTimer;
+    private Microsoft.UI.Dispatching.DispatcherQueueTimer? _refreshTimer;
 
     [ObservableProperty] private string _phase = "idle";
     [ObservableProperty] private string _pathType = "unavailable";
@@ -34,8 +34,21 @@ public partial class DashboardViewModel : ObservableObject
             await _client.ConnectAsync();
             ServiceState = "Service connected";
             await RefreshAsync();
-            _refreshTimer = new System.Timers.Timer(TimeSpan.FromSeconds(2));
-            _refreshTimer.Elapsed += async (_, _) => await RefreshAsync();
+
+            var dispatcher = Microsoft.UI.Dispatching.DispatcherQueue.GetForCurrentThread();
+            _refreshTimer = dispatcher.CreateTimer();
+            _refreshTimer.Interval = TimeSpan.FromSeconds(2);
+            _refreshTimer.Tick += async (_, _) =>
+            {
+                try
+                {
+                    await RefreshAsync();
+                }
+                catch (Exception error)
+                {
+                    ServiceState = $"Status refresh failed: {error.Message}";
+                }
+            };
             _refreshTimer.Start();
         }
         catch (Exception error)
