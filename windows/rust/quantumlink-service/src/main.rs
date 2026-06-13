@@ -164,7 +164,10 @@ fn run_console() -> std::process::ExitCode {
     runtime.block_on(async move {
         #[cfg(windows)]
         {
-            tracing::info!(pipe = quantumlink_proto::ipc::PIPE_NAME, "console mode: IPC listening");
+            tracing::info!(
+                pipe = quantumlink_proto::ipc::PIPE_NAME,
+                "console mode: IPC listening"
+            );
             tokio::select! {
                 result = quantumlink_service::win::pipe_server::run(context) => {
                     if let Err(error) = result {

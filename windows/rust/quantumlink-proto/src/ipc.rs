@@ -25,11 +25,17 @@ pub const IPC_SCHEMA_VERSION: u32 = 1;
 /// Commands the UI can issue. Mirrors `TunnelCommand` in
 /// `TunnelMessages.swift` plus Windows service extras.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "command", rename_all = "camelCase")]
+#[serde(
+    tag = "command",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum TunnelCommand {
     /// Schema/version handshake. Must be the first request on a
     /// connection.
-    Hello { schema_version: u32 },
+    Hello {
+        schema_version: u32,
+    },
     /// Bring the tunnel up with the supplied configuration (or the
     /// persisted one when `configuration` is omitted).
     Connect {
@@ -37,11 +43,15 @@ pub enum TunnelCommand {
         configuration: Option<TunnelConfiguration>,
     },
     Disconnect,
-    ReloadConfiguration { configuration: TunnelConfiguration },
+    ReloadConfiguration {
+        configuration: TunnelConfiguration,
+    },
     Status,
     ExportDiagnostics,
     /// Per-peer state probe (multi-peer surface).
-    PeerState { peer_id: String },
+    PeerState {
+        peer_id: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -55,13 +65,26 @@ pub struct PipeRequest {
 
 /// Mirrors `TunnelProviderMessage` in `TunnelMessages.swift`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "camelCase")]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum TunnelProviderMessage {
-    Status { status: TunnelStatus },
-    Diagnostic { text: String },
-    Error { message: String },
+    Status {
+        status: TunnelStatus,
+    },
+    Diagnostic {
+        text: String,
+    },
+    Error {
+        message: String,
+    },
     /// Handshake acknowledgement.
-    HelloAck { schema_version: u32, service_version: String },
+    HelloAck {
+        schema_version: u32,
+        service_version: String,
+    },
     /// Generic success for commands without a payload.
     Ok,
 }

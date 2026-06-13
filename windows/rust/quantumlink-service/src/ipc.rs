@@ -175,6 +175,7 @@ mod tests {
                 .await
                 .unwrap();
         }
+        client_write.shutdown().await.unwrap();
         drop(client_write);
 
         let mut raw = String::new();

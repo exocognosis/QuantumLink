@@ -62,7 +62,10 @@ pub fn apply(adapter_alias: &str, config: &TunnelConfiguration) -> Result<(), En
     // range comes from the explicit routes below, mirroring how the
     // macOS provider set includedRoutes rather than an interface mask.
     run_netsh(&[
-        "interface", "ip", "set", "address",
+        "interface",
+        "ip",
+        "set",
+        "address",
         &format!("name={adapter_alias}"),
         "source=static",
         &format!("addr={overlay_address}"),
@@ -71,7 +74,10 @@ pub fn apply(adapter_alias: &str, config: &TunnelConfiguration) -> Result<(), En
 
     // MTU.
     run_netsh(&[
-        "interface", "ipv4", "set", "subinterface",
+        "interface",
+        "ipv4",
+        "set",
+        "subinterface",
         &format!("\"{adapter_alias}\""),
         &format!("mtu={}", config.mtu),
         "store=active",
@@ -81,7 +87,10 @@ pub fn apply(adapter_alias: &str, config: &TunnelConfiguration) -> Result<(), En
     for route in &config.protected_routes {
         let (address, prefix) = validate_route(route)?;
         run_netsh(&[
-            "interface", "ipv4", "add", "route",
+            "interface",
+            "ipv4",
+            "add",
+            "route",
             &format!("{address}/{prefix}"),
             &format!("interface=\"{adapter_alias}\""),
             "metric=1",
@@ -96,7 +105,10 @@ pub fn apply(adapter_alias: &str, config: &TunnelConfiguration) -> Result<(), En
                 let (address, _) = validate_route(server)?;
                 if index == 0 {
                     run_netsh(&[
-                        "interface", "ip", "set", "dns",
+                        "interface",
+                        "ip",
+                        "set",
+                        "dns",
                         &format!("name={adapter_alias}"),
                         "source=static",
                         &format!("addr={address}"),
@@ -104,7 +116,10 @@ pub fn apply(adapter_alias: &str, config: &TunnelConfiguration) -> Result<(), En
                     ])?;
                 } else {
                     run_netsh(&[
-                        "interface", "ip", "add", "dns",
+                        "interface",
+                        "ip",
+                        "add",
+                        "dns",
                         &format!("name={adapter_alias}"),
                         &format!("addr={address}"),
                         &format!("index={}", index + 1),
@@ -127,7 +142,10 @@ pub fn remove(adapter_alias: &str, config: &TunnelConfiguration) -> Result<(), E
     for route in &config.protected_routes {
         if let Ok((address, prefix)) = validate_route(route) {
             if let Err(error) = run_netsh(&[
-                "interface", "ipv4", "delete", "route",
+                "interface",
+                "ipv4",
+                "delete",
+                "route",
                 &format!("{address}/{prefix}"),
                 &format!("interface=\"{adapter_alias}\""),
                 "store=active",

@@ -1378,7 +1378,57 @@ mod tests {
         quic_transport::QuicCertificate,
         rendezvous::spawn_dev_rendezvous,
     };
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::{
+        net::{IpAddr, Ipv4Addr},
+        time::Instant,
+    };
+
+    async fn wait_for_peer_state(
+        handle: &MeshTransportHandle,
+        peer_id: &str,
+        state: MeshTransportState,
+        timeout: Duration,
+    ) {
+        let started = Instant::now();
+        loop {
+            if handle.peer_state_code(peer_id) == Some(state.as_code()) {
+                return;
+            }
+
+            if started.elapsed() >= timeout {
+                panic!(
+                    "peer {peer_id} did not reach {:?}; current state code={:?}",
+                    state,
+                    handle.peer_state_code(peer_id)
+                );
+            }
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    async fn wait_for_peer_reconnect_count_above(
+        handle: &MeshTransportHandle,
+        peer_id: &str,
+        previous: u64,
+        timeout: Duration,
+    ) -> u64 {
+        let started = Instant::now();
+        loop {
+            let current = handle.peer_metrics(peer_id).unwrap().reconnect_count;
+            if current > previous {
+                return current;
+            }
+
+            if started.elapsed() >= timeout {
+                panic!(
+                    "peer {peer_id} reconnect_count did not advance above {previous}; current={current}"
+                );
+            }
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
 
     #[test]
     fn backoff_doubles_until_cap() {
@@ -2126,18 +2176,21 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn handle_network_event_fans_out_to_all_active_peers() {
-        // Two peers with bogus rendezvous targets so they sit in
+        let rendezvous = spawn_dev_rendezvous().await.unwrap();
+
+        // Two unknown peers on a healthy rendezvous server so they sit in
         // backoff. PathChanged should short-circuit the backoff for
         // BOTH peers — observed via per-peer reconnect_count both
         // bumping after the event.
         let local_key = DeviceKeypair::generate().unwrap();
         let local_peer_id = local_key.public_key().peer_id();
+        let rendezvous_url = rendezvous.local_addr().to_string();
         let handle = tokio::task::spawn_blocking(move || {
             MeshTransportHandle::new(MeshTransportConfig {
                 mesh_id: "devmesh".to_string(),
                 local_peer_id,
                 remote_peer_id: "qlink_does-not-exist-A".to_string(),
-                rendezvous_url: "127.0.0.1:1".to_string(), // unreachable
+                rendezvous_url,
                 relay_url: None,
                 bind_addr: "127.0.0.1:0".to_string(),
                 overall_deadline_ms: 200,
@@ -2159,9 +2212,23 @@ mod tests {
 
         handle.add_peer("qlink_does-not-exist-B").unwrap();
 
-        // Let initial connect attempts fail and the managers park in
-        // backoff.
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        // Wait for initial connect attempts to fail and the managers to park
+        // in backoff before sending the event. Fixed sleeps race slower
+        // Windows CI hosts.
+        wait_for_peer_state(
+            &handle,
+            "qlink_does-not-exist-A",
+            MeshTransportState::Failed,
+            Duration::from_secs(5),
+        )
+        .await;
+        wait_for_peer_state(
+            &handle,
+            "qlink_does-not-exist-B",
+            MeshTransportState::Failed,
+            Duration::from_secs(5),
+        )
+        .await;
 
         let a_before = handle
             .peer_metrics("qlink_does-not-exist-A")
@@ -2175,15 +2242,20 @@ mod tests {
         handle.handle_network_event(NetworkEvent::PathChanged);
 
         // Both peers should come out of backoff and retry.
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let a_after = handle
-            .peer_metrics("qlink_does-not-exist-A")
-            .unwrap()
-            .reconnect_count;
-        let b_after = handle
-            .peer_metrics("qlink_does-not-exist-B")
-            .unwrap()
-            .reconnect_count;
+        let a_after = wait_for_peer_reconnect_count_above(
+            &handle,
+            "qlink_does-not-exist-A",
+            a_before,
+            Duration::from_secs(5),
+        )
+        .await;
+        let b_after = wait_for_peer_reconnect_count_above(
+            &handle,
+            "qlink_does-not-exist-B",
+            b_before,
+            Duration::from_secs(5),
+        )
+        .await;
         assert!(
             a_after > a_before,
             "peer A reconnect_count did not advance ({a_before} → {a_after})"

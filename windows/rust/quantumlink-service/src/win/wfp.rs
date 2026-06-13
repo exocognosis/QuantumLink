@@ -29,11 +29,12 @@ use std::net::Ipv4Addr;
 use windows::core::GUID;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::NetworkManagement::WindowsFilteringPlatform::{
-    FwpmEngineClose0, FwpmEngineOpen0, FwpmFilterAdd0, FwpmSubLayerAdd0, FWPM_CONDITION_IP_LOCAL_INTERFACE,
-    FWPM_CONDITION_IP_REMOTE_ADDRESS, FWPM_FILTER0, FWPM_FILTER_CONDITION0,
-    FWPM_LAYER_ALE_AUTH_CONNECT_V4, FWPM_SESSION0, FWPM_SESSION_FLAG_DYNAMIC, FWPM_SUBLAYER0,
-    FWP_ACTION_BLOCK, FWP_ACTION_PERMIT, FWP_ACTION_TYPE, FWP_MATCH_EQUAL, FWP_UINT64, FWP_UINT8,
-    FWP_V4_ADDR_AND_MASK, FWP_V4_ADDR_MASK,
+    FwpmEngineClose0, FwpmEngineOpen0, FwpmFilterAdd0, FwpmSubLayerAdd0,
+    FWPM_CONDITION_IP_LOCAL_INTERFACE, FWPM_CONDITION_IP_REMOTE_ADDRESS, FWPM_FILTER0,
+    FWPM_FILTER_CONDITION0, FWPM_LAYER_ALE_AUTH_CONNECT_V4, FWPM_SESSION0,
+    FWPM_SESSION_FLAG_DYNAMIC, FWPM_SUBLAYER0, FWP_ACTION_BLOCK, FWP_ACTION_PERMIT,
+    FWP_ACTION_TYPE, FWP_MATCH_EQUAL, FWP_UINT64, FWP_UINT8, FWP_V4_ADDR_AND_MASK,
+    FWP_V4_ADDR_MASK,
 };
 use windows::Win32::System::Rpc::RPC_C_AUTHN_DEFAULT;
 
@@ -186,9 +187,10 @@ impl KillSwitchGuard {
             subLayerKey: SUBLAYER_KEY,
             weight: windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_VALUE0 {
                 r#type: FWP_UINT8,
-                Anonymous: windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_VALUE0_0 {
-                    uint8: weight_value,
-                },
+                Anonymous:
+                    windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_VALUE0_0 {
+                        uint8: weight_value,
+                    },
             },
             numFilterConditions: conditions.len() as u32,
             filterCondition: conditions.as_ptr() as *mut FWPM_FILTER_CONDITION0,

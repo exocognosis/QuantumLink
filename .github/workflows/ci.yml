@@ -68,8 +68,9 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install XcodeGen
         run: brew install xcodegen
-      - name: Build shared core
-        run: cargo build -p qlink-core --release
+      - name: Build Rust XCFramework
+        working-directory: macos
+        run: QLINK_RUST_TARGETS="$(rustc -vV | awk '/^host:/ { print $2 }')" ./scripts/build-rust-xcframework.sh
       - name: Generate unsigned project
         working-directory: macos
         run: ./scripts/generate-xcode-project.sh

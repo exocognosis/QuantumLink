@@ -113,8 +113,14 @@ mod tests {
 
     #[test]
     fn family_detection_uses_version_nibble() {
-        assert_eq!(protocol_family_for_packet(&[0x45, 0, 0, 20]), PROTOCOL_FAMILY_IPV4);
-        assert_eq!(protocol_family_for_packet(&[0x60, 0, 0, 0]), PROTOCOL_FAMILY_IPV6);
+        assert_eq!(
+            protocol_family_for_packet(&[0x45, 0, 0, 20]),
+            PROTOCOL_FAMILY_IPV4
+        );
+        assert_eq!(
+            protocol_family_for_packet(&[0x60, 0, 0, 0]),
+            PROTOCOL_FAMILY_IPV6
+        );
     }
 
     #[test]

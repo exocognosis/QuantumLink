@@ -110,7 +110,10 @@ mod tests {
     fn missing_config_yields_privacy_defaults() {
         let dir = tempfile::tempdir().unwrap();
         let config = load_or_default(dir.path());
-        assert_eq!(config.protected_routes, vec![privacy::OVERLAY_CIDR.to_string()]);
+        assert_eq!(
+            config.protected_routes,
+            vec![privacy::OVERLAY_CIDR.to_string()]
+        );
         assert!(config.mesh_id.starts_with("mesh-"));
     }
 }

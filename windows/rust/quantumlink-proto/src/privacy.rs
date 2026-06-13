@@ -130,7 +130,10 @@ mod tests {
         let address = random_overlay_ipv4(&[]).unwrap();
         let octets: Vec<u8> = address.split('.').map(|o| o.parse().unwrap()).collect();
         assert_eq!(octets[0], 100);
-        assert!((64..128).contains(&octets[1]), "address {address} outside /10");
+        assert!(
+            (64..128).contains(&octets[1]),
+            "address {address} outside /10"
+        );
         assert_ne!(address, TUNNEL_GATEWAY_IPV4);
     }
 

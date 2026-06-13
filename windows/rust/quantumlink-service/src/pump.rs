@@ -329,7 +329,8 @@ mod tests {
         assert_eq!(result.transport_frames_emitted, 1);
 
         let frame = sink.sent.borrow()[0].clone();
-        pump.accept_transport_frame(&frame, Some("qlink_peer")).unwrap();
+        pump.accept_transport_frame(&frame, Some("qlink_peer"))
+            .unwrap();
         let restored = pump.pop_tunnel_packet().expect("decrypted packet");
         assert_eq!(restored.protocol_family, 2);
         assert_eq!(&restored.bytes[16..20], &packet[16..20]);
@@ -348,9 +349,7 @@ mod tests {
         let result = pump.handle_packets(&[(2, &packet)], &sink);
         assert_eq!(result.dropped_fail_closed, 1);
         assert_eq!(result.queued_for_transport, 0);
-        assert!(pump
-            .accept_transport_frame(b"frame", None)
-            .is_err());
+        assert!(pump.accept_transport_frame(b"frame", None).is_err());
     }
 
     #[test]

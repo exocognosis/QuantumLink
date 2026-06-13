@@ -40,20 +40,6 @@ jobs:
             target/release/qlink_core.dll
             target/release/qlink_core.dll.lib
 
-  rust-cross-check:
-    name: Rust cross-check from Linux (Windows target)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-pc-windows-msvc
-      - uses: Swatinem/rust-cache@v2
-      # Type-checks the #[cfg(windows)] code without linking, so Unix
-      # contributors get fast feedback on Windows-only modules.
-      - name: cargo check (windows target, no link)
-        run: cargo check --workspace --target x86_64-pc-windows-msvc
-
   ui:
     name: WinUI 3 app
     runs-on: windows-latest

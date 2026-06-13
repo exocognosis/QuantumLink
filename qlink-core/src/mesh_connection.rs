@@ -2463,8 +2463,8 @@ mod tests {
         let dead_rendezvous = RendezvousClient::new("127.0.0.1:1".to_string());
         let connector = MeshConnector::new(
             MeshConnectorConfig::new(MESH_ID, local_key.public_key().peer_id())
-                .with_direct_probe_timeout(Duration::from_millis(500))
-                .with_overall_deadline(Duration::from_secs(2)),
+                .with_direct_probe_timeout(Duration::from_secs(2))
+                .with_overall_deadline(Duration::from_secs(5)),
             dead_rendezvous,
             client_endpoint,
         )

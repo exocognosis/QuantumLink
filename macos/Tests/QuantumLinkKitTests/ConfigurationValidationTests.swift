@@ -4,7 +4,11 @@ import XCTest
 
 final class ConfigurationValidationTests: XCTestCase {
     func testExampleConfigurationDecodesAndValidates() throws {
-        let url = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent() // QuantumLinkKitTests
+            .deletingLastPathComponent() // Tests
+            .deletingLastPathComponent() // macos
+            .deletingLastPathComponent() // repo root
             .appendingPathComponent("config/mesh.example.json")
 
         let report = try ConfigurationValidator.loadAndValidate(url: url)

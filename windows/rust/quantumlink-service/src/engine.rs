@@ -119,7 +119,9 @@ impl PlatformNetwork for DevPlatform {
 
     fn engage_kill_switch(&self, _config: &TunnelConfiguration) -> Result<(), EngineError> {
         if self.fail_kill_switch.load(Ordering::SeqCst) {
-            return Err(EngineError::Platform("dev kill switch forced failure".into()));
+            return Err(EngineError::Platform(
+                "dev kill switch forced failure".into(),
+            ));
         }
         self.engaged.store(true, Ordering::SeqCst);
         Ok(())
@@ -281,16 +283,14 @@ impl TunnelEngine {
         // 5. Transport.
         let transport = match config.rendezvous_servers.first() {
             Some(rendezvous_url) => {
-                let mesh = self.build_mesh_transport(
-                    &config,
-                    rendezvous_url,
-                    &keypair,
-                    &peer_store_key,
-                )?;
+                let mesh =
+                    self.build_mesh_transport(&config, rendezvous_url, &keypair, &peer_store_key)?;
                 Arc::new(ActiveTransport::Mesh(Arc::new(mesh)))
             }
             None => {
-                tracing::info!("no rendezvous server configured; using local echo transport (development)");
+                tracing::info!(
+                    "no rendezvous server configured; using local echo transport (development)"
+                );
                 Arc::new(ActiveTransport::LocalEcho(Mutex::new(VecDeque::new())))
             }
         };
@@ -777,10 +777,7 @@ mod tests {
             ) -> Result<(), EngineError> {
                 Ok(())
             }
-            fn engage_kill_switch(
-                &self,
-                config: &TunnelConfiguration,
-            ) -> Result<(), EngineError> {
+            fn engage_kill_switch(&self, config: &TunnelConfiguration) -> Result<(), EngineError> {
                 self.inner.engage_kill_switch(config)
             }
             fn disengage_kill_switch(&self) -> Result<(), EngineError> {
