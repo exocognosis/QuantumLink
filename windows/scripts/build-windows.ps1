@@ -17,17 +17,18 @@ $ErrorActionPreference = "Stop"
 # workspace and its single target/ output dir, shared with the macOS silo).
 $root = Split-Path -Parent $PSScriptRoot
 $repoRoot = Split-Path -Parent $root
-$target = Join-Path $repoRoot "target\release"
+$rustTarget = "x86_64-pc-windows-msvc"
+$target = Join-Path $repoRoot "target\$rustTarget\release"
 Set-Location $root
 
 Write-Host "==> Rust: test workspace" -ForegroundColor Cyan
-cargo test --workspace
+cargo test --workspace --target $rustTarget
 
 Write-Host "==> Rust: data-plane smoke" -ForegroundColor Cyan
-cargo run -p quantumlink-service -- smoke
+cargo run -p quantumlink-service --target $rustTarget -- smoke
 
 Write-Host "==> Rust: release build (service + core DLL)" -ForegroundColor Cyan
-cargo build --release -p quantumlink-service -p qlink-core
+cargo build --release --target $rustTarget -p quantumlink-service -p qlink-core
 
 Write-Host "==> UI: publish" -ForegroundColor Cyan
 dotnet publish ui\QuantumLink.Windows -c Release -r win-x64 -o ui\publish
