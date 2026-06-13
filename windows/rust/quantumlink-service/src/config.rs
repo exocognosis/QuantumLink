@@ -72,8 +72,17 @@ pub fn save_configuration(root: &Path, config: &TunnelConfiguration) -> io::Resu
     let bytes = serde_json::to_vec_pretty(config)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     let temp = root.join(format!("{CONFIG_FILE}.tmp"));
+    let final_path = root.join(CONFIG_FILE);
+
     std::fs::write(&temp, bytes)?;
-    std::fs::rename(&temp, root.join(CONFIG_FILE))?;
+
+    #[cfg(windows)]
+    {
+        // std::fs::rename() does not replace an existing destination on Windows.
+        let _ = std::fs::remove_file(&final_path);
+    }
+
+    std::fs::rename(&temp, &final_path)?;
     Ok(())
 }
 
