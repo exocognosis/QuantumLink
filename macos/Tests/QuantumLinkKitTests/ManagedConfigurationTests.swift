@@ -75,4 +75,40 @@ final class ManagedConfigurationTests: XCTestCase {
         XCTAssertEqual(result.configuration.routeMode, .protectedPrefixesOnly)
         XCTAssertTrue(result.isManaged)
     }
+
+    func testManagedDytallixIdentityKeysOverlayBase() {
+        let base = TunnelConfiguration.defaultDevelopment
+        let managed: [String: Any] = [
+            "meshTrustPolicy": "public_required",
+            "discoveryIdentityMode": "public_wallet",
+            "dytallixEndpoint": "https://dytallix.example",
+            "dytallixContractAddress": "0x9a9671441249ee2c364f9b4bc8049e61b082449a",
+            "dytallixNetworkId": "dytallix-testnet",
+            "dytallixChainId": "dytallix-testnet-1",
+            "dytallixAllowedRpcEndpoints": ["https://dytallix.example"],
+            "publishWalletAddress": true
+        ]
+
+        let result = ManagedConfigurationLoader.apply(managed: managed, to: base)
+
+        XCTAssertEqual(result.configuration.meshTrustPolicy, .publicRequired)
+        XCTAssertEqual(result.configuration.discoveryIdentityMode, .publicWallet)
+        XCTAssertEqual(result.configuration.dytallixIdentity?.endpoint, "https://dytallix.example")
+        XCTAssertEqual(
+            result.configuration.dytallixIdentity?.contractAddress,
+            "0x9a9671441249ee2c364f9b4bc8049e61b082449a"
+        )
+        XCTAssertEqual(result.configuration.dytallixIdentity?.publishWalletAddress, true)
+        XCTAssertEqual(result.configuration.dytallixIdentity?.networkID, "dytallix-testnet")
+        XCTAssertEqual(result.configuration.dytallixIdentity?.chainID, "dytallix-testnet-1")
+        XCTAssertEqual(
+            result.configuration.dytallixIdentity?.allowedRPCEndpoints,
+            ["https://dytallix.example"]
+        )
+        XCTAssertTrue(result.appliedKeys.contains("dytallixEndpoint"))
+        XCTAssertTrue(result.appliedKeys.contains("dytallixContractAddress"))
+        XCTAssertTrue(result.appliedKeys.contains("dytallixNetworkId"))
+        XCTAssertTrue(result.appliedKeys.contains("dytallixChainId"))
+        XCTAssertTrue(result.appliedKeys.contains("dytallixAllowedRpcEndpoints"))
+    }
 }

@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 use qlink_core::{
     crypto::{answer_handshake, start_handshake, DeviceKeypair},
     discovery::{CandidateEndpoint, CandidateType, PeerRecord, UnsignedPeerRecord},
+    dytallix_identity::MeshTrustPolicy,
     ice::{perform_ice_check, spawn_dev_ice_responder, IceCheckRequest, IceCredentials},
     local_loopback::{run_local_mesh_loopback, run_relay_loopback},
     mesh_connection::{ConnectionOutcome, MeshConnector, MeshConnectorConfig, PathKind},
@@ -414,19 +415,12 @@ impl DirectSendTimingReport {
             )
         });
         Self {
-            rendezvous_lookup_ms: run.outcome.timings.rendezvous_lookup.as_millis(),
-            direct_probe_wall_clock_ms: run.outcome.timings.direct_probe_wall_clock.as_millis(),
+            rendezvous_lookup_ms: 0,
+            direct_probe_wall_clock_ms: run.outcome.total_elapsed.as_millis(),
             quic_connect_ms: established_attempt
-                .and_then(|attempt| attempt.quic_connect_elapsed)
-                .map(|elapsed| elapsed.as_millis()),
-            identity_assertion_ms: established_attempt
-                .and_then(|attempt| attempt.identity_assertion_elapsed)
-                .map(|elapsed| elapsed.as_millis()),
-            relay_connect_ms: run
-                .outcome
-                .timings
-                .relay_connect_elapsed
-                .map(|elapsed| elapsed.as_millis()),
+                .map(|attempt| attempt.elapsed.as_millis()),
+            identity_assertion_ms: None,
+            relay_connect_ms: None,
             datagram_delivery_ms: run.datagram_delivery_elapsed.as_millis(),
             total_elapsed_ms: run.outcome.total_elapsed.as_millis(),
         }
@@ -517,6 +511,8 @@ async fn run_publish_self(
                 disable_inbound_responder: false,
                 peer_store_path: peer_store_for_handle,
                 peer_store_key_b64: None,
+                mesh_trust_policy: MeshTrustPolicy::DevelopmentOptional,
+                dytallix_identity: None,
             },
             Some(keypair_for_handle),
         )
@@ -926,6 +922,8 @@ mod tests {
                         disable_inbound_responder: false,
                         peer_store_path: None,
                         peer_store_key_b64: None,
+                        mesh_trust_policy: MeshTrustPolicy::DevelopmentOptional,
+                        dytallix_identity: None,
                     },
                     Some(remote_key),
                 )

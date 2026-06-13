@@ -1,6 +1,10 @@
 use crate::{
     crypto::DeviceKeypair,
     discovery::{CandidateEndpoint, CandidateType},
+    dytallix_identity::{
+        verify_registry_binding, DytallixIdentityRegistry, MeshTrustPolicy, RegistryDecision,
+        RegistryNodeRecord,
+    },
     error::{QlinkError, Result},
     ice::{perform_ice_check, IceCheckRequest, IceCredentials},
     inbound_identity::send_inbound_assertion,
@@ -14,7 +18,9 @@ use crate::{
 };
 use std::{
     collections::HashMap,
+    future::Future,
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    pin::Pin,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -27,7 +33,23 @@ const DEFAULT_OVERALL_DEADLINE: Duration = Duration::from_secs(3);
 /// for operators familiar with ICE.
 const DEFAULT_PROBE_PACING: Duration = Duration::from_millis(50);
 
-#[derive(Debug, Clone)]
+pub trait IdentityRegistryLookup: Send + Sync {
+    fn lookup<'a>(
+        &'a self,
+        peer_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<RegistryNodeRecord>>> + Send + 'a>>;
+}
+
+impl IdentityRegistryLookup for DytallixIdentityRegistry {
+    fn lookup<'a>(
+        &'a self,
+        peer_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<RegistryNodeRecord>>> + Send + 'a>> {
+        Box::pin(async move { DytallixIdentityRegistry::lookup(self, peer_id).await })
+    }
+}
+
+#[derive(Clone)]
 pub struct MeshConnectorConfig {
     pub mesh_id: String,
     pub local_peer_id: String,
@@ -58,6 +80,37 @@ pub struct MeshConnectorConfig {
     /// behavior; remote responders that require assertions will close
     /// the connection).
     pub local_device_keypair: Option<Arc<DeviceKeypair>>,
+    /// Registry policy applied after signed peer-record verification and
+    /// before any direct or relay probing. Defaults to development-optional
+    /// so existing private/dev meshes keep working until callers opt into
+    /// public fail-closed policy.
+    pub mesh_trust_policy: MeshTrustPolicy,
+    /// Optional registry lookup client. Public meshes without a lookup still
+    /// fail closed because `verify_registry_binding(None, PublicRequired)`
+    /// rejects before dialing.
+    pub identity_registry_lookup: Option<Arc<dyn IdentityRegistryLookup>>,
+}
+
+impl std::fmt::Debug for MeshConnectorConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MeshConnectorConfig")
+            .field("mesh_id", &self.mesh_id)
+            .field("local_peer_id", &self.local_peer_id)
+            .field("direct_probe_timeout", &self.direct_probe_timeout)
+            .field("overall_deadline", &self.overall_deadline)
+            .field("probe_pacing", &self.probe_pacing)
+            .field("local_ice_credentials", &self.local_ice_credentials)
+            .field("ice_check_timeout", &self.ice_check_timeout)
+            .field("relay_server", &self.relay_server)
+            .field("peer_acl", &self.peer_acl)
+            .field("local_device_keypair", &self.local_device_keypair)
+            .field("mesh_trust_policy", &self.mesh_trust_policy)
+            .field(
+                "identity_registry_lookup_configured",
+                &self.identity_registry_lookup.is_some(),
+            )
+            .finish()
+    }
 }
 
 impl MeshConnectorConfig {
@@ -73,6 +126,8 @@ impl MeshConnectorConfig {
             relay_server: None,
             peer_acl: None,
             local_device_keypair: None,
+            mesh_trust_policy: MeshTrustPolicy::DevelopmentOptional,
+            identity_registry_lookup: None,
         }
     }
 
@@ -113,6 +168,19 @@ impl MeshConnectorConfig {
 
     pub fn with_ice_check_timeout(mut self, timeout: Duration) -> Self {
         self.ice_check_timeout = Some(timeout);
+        self
+    }
+
+    pub fn with_mesh_trust_policy(mut self, policy: MeshTrustPolicy) -> Self {
+        self.mesh_trust_policy = policy;
+        self
+    }
+
+    pub fn with_identity_registry_lookup(
+        mut self,
+        lookup: Arc<dyn IdentityRegistryLookup>,
+    ) -> Self {
+        self.identity_registry_lookup = Some(lookup);
         self
     }
 }
@@ -173,12 +241,6 @@ pub struct ProbeAttempt {
     pub address: SocketAddr,
     pub elapsed: Duration,
     pub outcome: ProbeOutcome,
-    /// Time spent in the QUIC connect/TLS handshake phase for this
-    /// candidate. `None` when the probe failed before QUIC was attempted.
-    pub quic_connect_elapsed: Option<Duration>,
-    /// Time spent sending the post-QUIC inbound identity assertion. `None`
-    /// when no local keypair is configured or QUIC never established.
-    pub identity_assertion_elapsed: Option<Duration>,
     /// When the ICE pre-check succeeded, this is the round-trip time of the
     /// authenticated STUN binding request. `None` when ICE was disabled or
     /// the check did not complete.
@@ -196,16 +258,25 @@ pub struct ConnectionOutcome {
     pub path_kind: PathKind,
     pub remote_addr: Option<SocketAddr>,
     pub attempts: Vec<ProbeAttempt>,
-    pub timings: ConnectionPhaseTimings,
     pub total_elapsed: Duration,
     pub used_cached_path: bool,
+    pub registry_decision: RegistryDecision,
+    pub peer_record_source: PeerRecordSource,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-pub struct ConnectionPhaseTimings {
-    pub rendezvous_lookup: Duration,
-    pub direct_probe_wall_clock: Duration,
-    pub relay_connect_elapsed: Option<Duration>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerRecordSource {
+    RendezvousLive,
+    PeerStoreCache,
+}
+
+impl PeerRecordSource {
+    pub fn trust_source_code(self) -> u32 {
+        match self {
+            Self::RendezvousLive => 1,
+            Self::PeerStoreCache => 2,
+        }
+    }
 }
 
 pub struct DirectLink {
@@ -589,16 +660,15 @@ impl MeshConnector {
         //
         // If rendezvous fails (timeout, server down, transient
         // network) and we have a cached record for this peer, we use
-        // it. The signature and expiry are re-verified below — a cache
-        // hit isn't a trust shortcut, just a freshness fallback.
-        let rendezvous_started = Instant::now();
-        let lookup_result = self
+        // it. The signature is re-verified below — a cache hit isn't
+        // a trust shortcut, just a fallback source. Cached records are
+        // still fully re-verified before use, including expiry, and an
+        // expired cached record is rejected by `record.verify(...)`.
+        let (record, peer_record_source) = match self
             .rendezvous
             .lookup(&self.config.mesh_id, remote_peer_id)
-            .await;
-        let rendezvous_lookup_elapsed = rendezvous_started.elapsed();
-
-        let record = match lookup_result {
+            .await
+        {
             Ok(Some(fresh)) => {
                 // Pre-verify before writing through so we never cache
                 // a record we wouldn't trust. Verification runs again
@@ -608,7 +678,7 @@ impl MeshConnector {
                 if fresh.verify(&self.config.mesh_id).is_ok() {
                     self.peer_store.store(&self.config.mesh_id, &fresh);
                 }
-                fresh
+                (fresh, PeerRecordSource::RendezvousLive)
             }
             Ok(None) => {
                 // Rendezvous is healthy but doesn't know this peer.
@@ -620,7 +690,7 @@ impl MeshConnector {
                             peer_id = %remote_peer_id,
                             "peer not found in rendezvous; using cached record"
                         );
-                        cached
+                        (cached, PeerRecordSource::PeerStoreCache)
                     }
                     None => {
                         return Err(QlinkError::Protocol(format!(
@@ -640,13 +710,41 @@ impl MeshConnector {
                             error = %rendezvous_error,
                             "rendezvous lookup failed; falling back to cached record"
                         );
-                        cached
+                        (cached, PeerRecordSource::PeerStoreCache)
                     }
                     None => return Err(rendezvous_error),
                 }
             }
         };
         record.verify(&self.config.mesh_id)?;
+        let registry_record = match self.config.identity_registry_lookup.as_ref() {
+            Some(registry) => match registry.lookup(remote_peer_id).await {
+                Ok(record) => record,
+                Err(error) => match self.config.mesh_trust_policy {
+                    MeshTrustPolicy::PublicRequired => {
+                        return Err(QlinkError::Protocol(format!(
+                            "identity registry lookup failed: {error}"
+                        )));
+                    }
+                    MeshTrustPolicy::PrivatePreferred | MeshTrustPolicy::DevelopmentOptional => {
+                        tracing::warn!(
+                            peer_id = %remote_peer_id,
+                            error = %error,
+                            policy = ?self.config.mesh_trust_policy,
+                            "identity registry lookup failed; continuing without registry verification"
+                        );
+                        None
+                    }
+                },
+            },
+            None => None,
+        };
+        let registry_decision = verify_registry_binding(
+            &record,
+            registry_record.as_ref(),
+            self.config.mesh_trust_policy,
+        )?;
+
         let remote_ice_credentials = record.body.ice_credentials.clone();
         // The signed record carries the remote's QUIC server cert. We trust
         // it for the lifetime of this connect attempt; the ML-DSA signature
@@ -700,7 +798,6 @@ impl MeshConnector {
         let used_cached_path = cached_addr.is_some();
         let had_direct_candidates = !direct_candidates.is_empty();
 
-        let direct_probe_started = Instant::now();
         let probe_outcome = self
             .race_direct_probes(
                 &direct_candidates,
@@ -709,7 +806,6 @@ impl MeshConnector {
                 remote_cert,
             )
             .await;
-        let direct_probe_wall_clock = direct_probe_started.elapsed();
 
         match probe_outcome {
             DirectProbeResult::Established {
@@ -723,13 +819,10 @@ impl MeshConnector {
                     path_kind: PathKind::Direct,
                     remote_addr: Some(address),
                     attempts,
-                    timings: ConnectionPhaseTimings {
-                        rendezvous_lookup: rendezvous_lookup_elapsed,
-                        direct_probe_wall_clock,
-                        relay_connect_elapsed: None,
-                    },
                     total_elapsed: started.elapsed(),
                     used_cached_path,
+                    registry_decision,
+                    peer_record_source,
                 };
                 let link = MeshLink::Direct(DirectLink {
                     remote_addr: address,
@@ -748,22 +841,17 @@ impl MeshConnector {
                     )));
                 };
 
-                let relay_started = Instant::now();
                 let client =
                     RelayClient::connect(server, self.config.local_peer_id.clone()).await?;
-                let relay_connect_elapsed = relay_started.elapsed();
                 let outcome = ConnectionOutcome {
                     remote_peer_id: remote_peer_id.to_string(),
                     path_kind: PathKind::Relay,
                     remote_addr: None,
                     attempts,
-                    timings: ConnectionPhaseTimings {
-                        rendezvous_lookup: rendezvous_lookup_elapsed,
-                        direct_probe_wall_clock,
-                        relay_connect_elapsed: Some(relay_connect_elapsed),
-                    },
                     total_elapsed: started.elapsed(),
                     used_cached_path: false,
+                    registry_decision,
+                    peer_record_source,
                 };
                 let link = MeshLink::Relay(RelayLink {
                     remote_peer_id: remote_peer_id.to_string(),
@@ -915,8 +1003,6 @@ impl MeshConnector {
                                 launched: true,
                                 elapsed: probe_started.elapsed(),
                                 outcome: ProbeOutcome::IceFailed(error.to_string()),
-                                quic_connect_elapsed: None,
-                                identity_assertion_elapsed: None,
                                 ice_round_trip: None,
                                 peer_reflexive_address: None,
                                 session: None,
@@ -939,23 +1025,18 @@ impl MeshConnector {
                         launched: true,
                         elapsed: probe_started.elapsed(),
                         outcome: ProbeOutcome::TimedOut,
-                        quic_connect_elapsed: None,
-                        identity_assertion_elapsed: None,
                         ice_round_trip,
                         peer_reflexive_address,
                         session: None,
                     };
                 }
 
-                let quic_started = Instant::now();
-                let quic_result = tokio::time::timeout(
+                match tokio::time::timeout(
                     remaining_quic_timeout,
                     quic.connect_with_trusted_cert(address, &cert),
                 )
-                .await;
-                let quic_connect_elapsed = quic_started.elapsed();
-
-                match quic_result {
+                .await
+                {
                     Ok(Ok(session)) => {
                         // QUIC handshake done. If we have a local device
                         // keypair, send our inbound identity assertion so
@@ -963,9 +1044,7 @@ impl MeshConnector {
                         // its ACL before any data flows. A failure here
                         // is treated as a probe failure: the connection
                         // exists but won't survive the responder's check.
-                        let mut identity_assertion_elapsed = None;
                         if let Some(keypair) = local_keypair.as_ref() {
-                            let assertion_started = Instant::now();
                             if let Err(error) = send_inbound_assertion(
                                 &session,
                                 keypair.as_ref(),
@@ -982,14 +1061,11 @@ impl MeshConnector {
                                     outcome: ProbeOutcome::Failed(format!(
                                         "inbound assertion send failed: {error}"
                                     )),
-                                    quic_connect_elapsed: Some(quic_connect_elapsed),
-                                    identity_assertion_elapsed: Some(assertion_started.elapsed()),
                                     ice_round_trip,
                                     peer_reflexive_address,
                                     session: None,
                                 };
                             }
-                            identity_assertion_elapsed = Some(assertion_started.elapsed());
                         }
                         ProbeOutcomeRecord {
                             candidate_type,
@@ -997,8 +1073,6 @@ impl MeshConnector {
                             launched: true,
                             elapsed: probe_started.elapsed(),
                             outcome: ProbeOutcome::Established,
-                            quic_connect_elapsed: Some(quic_connect_elapsed),
-                            identity_assertion_elapsed,
                             ice_round_trip,
                             peer_reflexive_address,
                             session: Some(session),
@@ -1010,8 +1084,6 @@ impl MeshConnector {
                         launched: true,
                         elapsed: probe_started.elapsed(),
                         outcome: ProbeOutcome::Failed(error.to_string()),
-                        quic_connect_elapsed: Some(quic_connect_elapsed),
-                        identity_assertion_elapsed: None,
                         ice_round_trip,
                         peer_reflexive_address,
                         session: None,
@@ -1022,8 +1094,6 @@ impl MeshConnector {
                         launched: true,
                         elapsed: probe_started.elapsed(),
                         outcome: ProbeOutcome::TimedOut,
-                        quic_connect_elapsed: Some(quic_connect_elapsed),
-                        identity_assertion_elapsed: None,
                         ice_round_trip,
                         peer_reflexive_address,
                         session: None,
@@ -1065,8 +1135,6 @@ impl MeshConnector {
                         address: addr,
                         elapsed: record.elapsed,
                         outcome: record.outcome.clone(),
-                        quic_connect_elapsed: record.quic_connect_elapsed,
-                        identity_assertion_elapsed: record.identity_assertion_elapsed,
                         ice_round_trip: record.ice_round_trip,
                         peer_reflexive_address: record.peer_reflexive_address,
                     });
@@ -1108,8 +1176,6 @@ struct ProbeOutcomeRecord {
     outcome: ProbeOutcome,
     ice_round_trip: Option<Duration>,
     peer_reflexive_address: Option<SocketAddr>,
-    quic_connect_elapsed: Option<Duration>,
-    identity_assertion_elapsed: Option<Duration>,
     session: Option<QuicDatagramSession>,
 }
 
@@ -1129,8 +1195,6 @@ impl ProbeOutcomeRecord {
             outcome,
             ice_round_trip: None,
             peer_reflexive_address: None,
-            quic_connect_elapsed: None,
-            identity_assertion_elapsed: None,
             session: None,
         }
     }
@@ -1191,11 +1255,14 @@ mod tests {
     use crate::{
         crypto::DeviceKeypair,
         discovery::{PeerRecord, UnsignedPeerRecord},
+        dytallix_identity::{MeshTrustPolicy, RegistryNodeRecord, RegistryNodeStatus},
         quic_transport::QuicEndpoint,
         relay::spawn_dev_relay,
         rendezvous::spawn_dev_rendezvous,
     };
+    use std::future::Future;
     use std::net::Ipv4Addr;
+    use std::pin::Pin;
 
     const MESH_ID: &str = "devmesh";
 
@@ -1256,12 +1323,8 @@ mod tests {
         assert_eq!(link.path_kind(), PathKind::Direct);
         assert_eq!(outcome.path_kind, PathKind::Direct);
         assert_eq!(outcome.remote_addr, Some(server_addr));
-        assert!(outcome.timings.rendezvous_lookup > Duration::ZERO);
-        assert!(outcome.timings.direct_probe_wall_clock > Duration::ZERO);
         assert_eq!(outcome.attempts.len(), 1);
         assert_eq!(outcome.attempts[0].outcome, ProbeOutcome::Established);
-        assert!(outcome.attempts[0].quic_connect_elapsed.is_some());
-        assert_eq!(outcome.attempts[0].identity_assertion_elapsed, None);
         assert!(!outcome.used_cached_path);
 
         assert_eq!(connector.cache().lookup(&remote_peer_id), Some(server_addr));
@@ -1315,9 +1378,6 @@ mod tests {
         assert_eq!(link.path_kind(), PathKind::Relay);
         assert_eq!(outcome.path_kind, PathKind::Relay);
         assert_eq!(outcome.remote_addr, None);
-        assert!(outcome.timings.rendezvous_lookup > Duration::ZERO);
-        assert!(outcome.timings.direct_probe_wall_clock > Duration::ZERO);
-        assert!(outcome.timings.relay_connect_elapsed.is_some());
         assert!(!outcome.attempts.is_empty());
         assert!(outcome.attempts.iter().all(|attempt| {
             matches!(
@@ -1830,6 +1890,309 @@ mod tests {
         assert_eq!(connector.cache().lookup(&remote_peer_id), Some(server_addr));
     }
 
+    #[tokio::test]
+    async fn public_registry_policy_rejects_missing_record_before_probing() {
+        let rendezvous = spawn_dev_rendezvous().await.unwrap();
+        let rendezvous_client = RendezvousClient::new(rendezvous.local_addr().to_string());
+
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let (_unused_server, throwaway_cert) = QuicEndpoint::server(bind).unwrap();
+        let client_endpoint = QuicEndpoint::client(bind, &[throwaway_cert.clone()]).unwrap();
+
+        let local_key = DeviceKeypair::generate().unwrap();
+        let remote_key = DeviceKeypair::generate().unwrap();
+        let remote_peer_id = remote_key.public_key().peer_id();
+        let remote_record = signed_record_with_cert(
+            &remote_key,
+            vec![CandidateEndpoint {
+                candidate_type: CandidateType::Host,
+                address: "192.0.2.1".to_string(),
+                port: 4433,
+                priority: 120,
+            }],
+            1,
+            throwaway_cert.as_der().to_vec(),
+        );
+        rendezvous_client
+            .publish(MESH_ID, remote_record)
+            .await
+            .unwrap();
+
+        let registry = Arc::new(TestRegistryLookup::default());
+        let connector = MeshConnector::new(
+            MeshConnectorConfig::new(MESH_ID, local_key.public_key().peer_id())
+                .with_mesh_trust_policy(MeshTrustPolicy::PublicRequired)
+                .with_identity_registry_lookup(registry.clone())
+                .with_direct_probe_timeout(Duration::from_secs(30))
+                .with_overall_deadline(Duration::from_secs(30)),
+            rendezvous_client,
+            client_endpoint,
+        );
+
+        let error = connector.connect(&remote_peer_id).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("registry record required by public mesh trust policy"),
+            "public policy must fail on missing registry before probing: {error}"
+        );
+        assert_eq!(registry.lookup_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn public_registry_policy_accepts_active_matching_record_before_later_connect_failure() {
+        let rendezvous = spawn_dev_rendezvous().await.unwrap();
+        let rendezvous_client = RendezvousClient::new(rendezvous.local_addr().to_string());
+
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let (_unused_server, throwaway_cert) = QuicEndpoint::server(bind).unwrap();
+        let client_endpoint = QuicEndpoint::client(bind, &[throwaway_cert.clone()]).unwrap();
+
+        let local_key = DeviceKeypair::generate().unwrap();
+        let remote_key = DeviceKeypair::generate().unwrap();
+        let remote_peer_id = remote_key.public_key().peer_id();
+        let remote_record =
+            signed_record_with_cert(&remote_key, vec![], 1, throwaway_cert.as_der().to_vec());
+        let registry_record = RegistryNodeRecord::from_peer_record(
+            "daddr:owner:connector-test",
+            &remote_record,
+            RegistryNodeStatus::Active,
+            1_725_000_000,
+        )
+        .unwrap();
+        rendezvous_client
+            .publish(MESH_ID, remote_record)
+            .await
+            .unwrap();
+
+        let registry = Arc::new(TestRegistryLookup::with_record(registry_record));
+        let connector = MeshConnector::new(
+            MeshConnectorConfig::new(MESH_ID, local_key.public_key().peer_id())
+                .with_mesh_trust_policy(MeshTrustPolicy::PublicRequired)
+                .with_identity_registry_lookup(registry.clone()),
+            rendezvous_client,
+            client_endpoint,
+        );
+
+        let error = connector.connect(&remote_peer_id).await.unwrap_err();
+        assert!(
+            error.to_string().contains("no direct candidate"),
+            "matching registry should pass; later no-candidate failure proves dial continued: {error}"
+        );
+        assert_eq!(registry.lookup_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn public_registry_policy_rejects_revoked_or_mismatched_record() {
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let (_unused_server, throwaway_cert) = QuicEndpoint::server(bind).unwrap();
+        let cert_der = throwaway_cert.as_der().to_vec();
+        let local_key = DeviceKeypair::generate().unwrap();
+
+        for expected in [
+            "registry record is revoked",
+            "latest_peer_record_hash_hex mismatch",
+        ] {
+            let rendezvous = spawn_dev_rendezvous().await.unwrap();
+            let rendezvous_client = RendezvousClient::new(rendezvous.local_addr().to_string());
+            let remote_key = DeviceKeypair::generate().unwrap();
+            let remote_peer_id = remote_key.public_key().peer_id();
+            let remote_record = signed_record_with_cert(&remote_key, vec![], 1, cert_der.clone());
+
+            let mut registry_record = RegistryNodeRecord::from_peer_record(
+                "daddr:owner:connector-test",
+                &remote_record,
+                RegistryNodeStatus::Active,
+                1_725_000_000,
+            )
+            .unwrap();
+            if expected == "registry record is revoked" {
+                registry_record.status = RegistryNodeStatus::Revoked;
+            } else {
+                registry_record.latest_peer_record_hash_hex = "00".repeat(32);
+            }
+
+            rendezvous_client
+                .publish(MESH_ID, remote_record)
+                .await
+                .unwrap();
+
+            let connector = MeshConnector::new(
+                MeshConnectorConfig::new(MESH_ID, local_key.public_key().peer_id())
+                    .with_mesh_trust_policy(MeshTrustPolicy::PublicRequired)
+                    .with_identity_registry_lookup(Arc::new(TestRegistryLookup::with_record(
+                        registry_record,
+                    ))),
+                RendezvousClient::new(rendezvous.local_addr().to_string()),
+                QuicEndpoint::client(bind, &[throwaway_cert.clone()]).unwrap(),
+            );
+
+            let error = connector.connect(&remote_peer_id).await.unwrap_err();
+            assert!(
+                error.to_string().contains(expected),
+                "expected `{expected}` for public registry rejection, got: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn private_registry_policy_accepts_missing_record() {
+        let rendezvous = spawn_dev_rendezvous().await.unwrap();
+        let rendezvous_client = RendezvousClient::new(rendezvous.local_addr().to_string());
+
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let (_unused_server, throwaway_cert) = QuicEndpoint::server(bind).unwrap();
+        let client_endpoint = QuicEndpoint::client(bind, &[throwaway_cert.clone()]).unwrap();
+
+        let local_key = DeviceKeypair::generate().unwrap();
+        let remote_key = DeviceKeypair::generate().unwrap();
+        let remote_peer_id = remote_key.public_key().peer_id();
+        let remote_record =
+            signed_record_with_cert(&remote_key, vec![], 1, throwaway_cert.as_der().to_vec());
+        rendezvous_client
+            .publish(MESH_ID, remote_record)
+            .await
+            .unwrap();
+
+        let connector = MeshConnector::new(
+            MeshConnectorConfig::new(MESH_ID, local_key.public_key().peer_id())
+                .with_mesh_trust_policy(MeshTrustPolicy::PrivatePreferred)
+                .with_identity_registry_lookup(Arc::new(TestRegistryLookup::default())),
+            rendezvous_client,
+            client_endpoint,
+        );
+
+        let error = connector.connect(&remote_peer_id).await.unwrap_err();
+        assert!(
+            error.to_string().contains("no direct candidate"),
+            "private policy should accept missing registry and fail later: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn private_registry_policy_treats_lookup_error_as_missing_record() {
+        let rendezvous = spawn_dev_rendezvous().await.unwrap();
+        let rendezvous_client = RendezvousClient::new(rendezvous.local_addr().to_string());
+
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let (_unused_server, throwaway_cert) = QuicEndpoint::server(bind).unwrap();
+        let client_endpoint = QuicEndpoint::client(bind, &[throwaway_cert.clone()]).unwrap();
+
+        let local_key = DeviceKeypair::generate().unwrap();
+        let remote_key = DeviceKeypair::generate().unwrap();
+        let remote_peer_id = remote_key.public_key().peer_id();
+        let remote_record =
+            signed_record_with_cert(&remote_key, vec![], 1, throwaway_cert.as_der().to_vec());
+        rendezvous_client
+            .publish(MESH_ID, remote_record)
+            .await
+            .unwrap();
+
+        let registry = Arc::new(TestRegistryLookup::with_error("registry unavailable"));
+        let connector = MeshConnector::new(
+            MeshConnectorConfig::new(MESH_ID, local_key.public_key().peer_id())
+                .with_mesh_trust_policy(MeshTrustPolicy::PrivatePreferred)
+                .with_identity_registry_lookup(registry.clone()),
+            rendezvous_client,
+            client_endpoint,
+        );
+
+        let error = connector.connect(&remote_peer_id).await.unwrap_err();
+        assert!(
+            error.to_string().contains("no direct candidate"),
+            "private policy should continue past registry lookup errors and fail later: {error}"
+        );
+        assert_eq!(registry.lookup_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn development_registry_policy_treats_lookup_error_as_missing_record() {
+        let rendezvous = spawn_dev_rendezvous().await.unwrap();
+        let rendezvous_client = RendezvousClient::new(rendezvous.local_addr().to_string());
+
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let (_unused_server, throwaway_cert) = QuicEndpoint::server(bind).unwrap();
+        let client_endpoint = QuicEndpoint::client(bind, &[throwaway_cert.clone()]).unwrap();
+
+        let local_key = DeviceKeypair::generate().unwrap();
+        let remote_key = DeviceKeypair::generate().unwrap();
+        let remote_peer_id = remote_key.public_key().peer_id();
+        let remote_record =
+            signed_record_with_cert(&remote_key, vec![], 1, throwaway_cert.as_der().to_vec());
+        rendezvous_client
+            .publish(MESH_ID, remote_record)
+            .await
+            .unwrap();
+
+        let registry = Arc::new(TestRegistryLookup::with_error("registry unavailable"));
+        let connector = MeshConnector::new(
+            MeshConnectorConfig::new(MESH_ID, local_key.public_key().peer_id())
+                .with_mesh_trust_policy(MeshTrustPolicy::DevelopmentOptional)
+                .with_identity_registry_lookup(registry.clone()),
+            rendezvous_client,
+            client_endpoint,
+        );
+
+        let error = connector.connect(&remote_peer_id).await.unwrap_err();
+        assert!(
+            error.to_string().contains("no direct candidate"),
+            "development policy should continue past registry lookup errors and fail later: {error}"
+        );
+        assert_eq!(registry.lookup_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn public_registry_policy_rejects_lookup_error_before_probing() {
+        let rendezvous = spawn_dev_rendezvous().await.unwrap();
+        let rendezvous_client = RendezvousClient::new(rendezvous.local_addr().to_string());
+
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let (_unused_server, throwaway_cert) = QuicEndpoint::server(bind).unwrap();
+        let client_endpoint = QuicEndpoint::client(bind, &[throwaway_cert.clone()]).unwrap();
+
+        let local_key = DeviceKeypair::generate().unwrap();
+        let remote_key = DeviceKeypair::generate().unwrap();
+        let remote_peer_id = remote_key.public_key().peer_id();
+        let remote_record = signed_record_with_cert(
+            &remote_key,
+            vec![CandidateEndpoint {
+                candidate_type: CandidateType::Host,
+                address: "192.0.2.1".to_string(),
+                port: 4433,
+                priority: 120,
+            }],
+            1,
+            throwaway_cert.as_der().to_vec(),
+        );
+        rendezvous_client
+            .publish(MESH_ID, remote_record)
+            .await
+            .unwrap();
+
+        let registry = Arc::new(TestRegistryLookup::with_error("registry unavailable"));
+        let connector = MeshConnector::new(
+            MeshConnectorConfig::new(MESH_ID, local_key.public_key().peer_id())
+                .with_mesh_trust_policy(MeshTrustPolicy::PublicRequired)
+                .with_identity_registry_lookup(registry.clone())
+                .with_direct_probe_timeout(Duration::from_secs(30))
+                .with_overall_deadline(Duration::from_secs(30)),
+            rendezvous_client,
+            client_endpoint,
+        );
+
+        let started = Instant::now();
+        let error = connector.connect(&remote_peer_id).await.unwrap_err();
+        assert!(
+            error.to_string().contains("registry unavailable"),
+            "public policy should propagate lookup errors before probing: {error}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "public lookup error should reject before long direct probe timeout"
+        );
+        assert_eq!(registry.lookup_count(), 1);
+    }
+
     fn build_test_connector_no_quic() -> MeshConnector {
         // For event-handling tests we never actually probe; a server-side
         // QUIC endpoint pair is the cheapest way to construct a valid client.
@@ -2015,113 +2378,6 @@ mod tests {
             "wrong cert must fail or time out the QUIC handshake: {:?}",
             direct_attempt.outcome
         );
-    }
-
-    #[tokio::test]
-    async fn stale_certificate_after_rotation_fails_direct_and_falls_back_to_relay() {
-        let rendezvous = spawn_dev_rendezvous().await.unwrap();
-        let rendezvous_client = RendezvousClient::new(rendezvous.local_addr().to_string());
-        let relay = spawn_dev_relay().await.unwrap();
-
-        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-        let (old_server_endpoint, old_cert) = QuicEndpoint::server(bind).unwrap();
-        drop(old_server_endpoint);
-
-        let (rotated_server_endpoint, _rotated_cert) = QuicEndpoint::server(bind).unwrap();
-        let rotated_addr = rotated_server_endpoint.local_addr().unwrap();
-
-        let _accept_loop = tokio::spawn(async move {
-            loop {
-                match rotated_server_endpoint.accept_one().await {
-                    Ok(session) => {
-                        tokio::spawn(async move {
-                            let _ = session.receive_frame().await;
-                        });
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-
-        let client_endpoint = QuicEndpoint::client(bind, &[]).unwrap();
-        let local_key = DeviceKeypair::generate().unwrap();
-        let remote_key = DeviceKeypair::generate().unwrap();
-        let remote_peer_id = remote_key.public_key().peer_id();
-
-        let stale_record = signed_record_with_cert(
-            &remote_key,
-            vec![CandidateEndpoint {
-                candidate_type: CandidateType::Host,
-                address: rotated_addr.ip().to_string(),
-                port: rotated_addr.port(),
-                priority: 120,
-            }],
-            1,
-            old_cert.as_der().to_vec(),
-        );
-        rendezvous_client
-            .publish(MESH_ID, stale_record)
-            .await
-            .unwrap();
-
-        let connector = MeshConnector::new(
-            MeshConnectorConfig::new(MESH_ID, local_key.public_key().peer_id())
-                .with_direct_probe_timeout(Duration::from_millis(500))
-                .with_overall_deadline(Duration::from_secs(2))
-                .with_relay_server(relay.local_addr().to_string()),
-            rendezvous_client,
-            client_endpoint,
-        );
-
-        let (_link, outcome) = connector.connect(&remote_peer_id).await.unwrap();
-        assert_eq!(outcome.path_kind, PathKind::Relay);
-        let attempt = outcome
-            .attempts
-            .iter()
-            .find(|attempt| attempt.address == rotated_addr)
-            .expect("rotated address should have been probed");
-        assert!(matches!(
-            attempt.outcome,
-            ProbeOutcome::Failed(_) | ProbeOutcome::TimedOut
-        ));
-        assert!(attempt.quic_connect_elapsed.is_some());
-    }
-
-    #[tokio::test]
-    async fn expired_peer_record_from_rendezvous_is_rejected_before_direct_probe() {
-        let local_key = DeviceKeypair::generate().unwrap();
-        let remote_key = DeviceKeypair::generate().unwrap();
-        let remote_peer_id = remote_key.public_key().peer_id();
-        let expired_record = signed_record_with_ttl(
-            &remote_key,
-            vec![CandidateEndpoint {
-                candidate_type: CandidateType::Host,
-                address: "127.0.0.1".to_string(),
-                port: 1,
-                priority: 120,
-            }],
-            0,
-            1,
-            b"test-cert".to_vec(),
-        );
-
-        let peer_store: Arc<dyn PeerStore> = Arc::new(InMemoryPeerStore::new());
-        peer_store.store(MESH_ID, &expired_record);
-
-        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-        let (_unused_server, throwaway_cert) = QuicEndpoint::server(bind).unwrap();
-        let client_endpoint = QuicEndpoint::client(bind, &[throwaway_cert]).unwrap();
-        let connector = MeshConnector::new(
-            MeshConnectorConfig::new(MESH_ID, local_key.public_key().peer_id())
-                .with_direct_probe_timeout(Duration::from_millis(100))
-                .with_overall_deadline(Duration::from_millis(300)),
-            RendezvousClient::new("127.0.0.1:1".to_string()),
-            client_endpoint,
-        )
-        .with_peer_store(peer_store);
-
-        let error = connector.connect(&remote_peer_id).await.unwrap_err();
-        assert!(matches!(error, QlinkError::RecordExpired));
     }
 
     // === mDNS observation integration tests ===
@@ -2401,7 +2657,8 @@ mod tests {
         )
         .with_peer_store(peer_store.clone());
 
-        let (_link, _outcome) = connector.connect(&remote_peer_id).await.unwrap();
+        let (_link, outcome) = connector.connect(&remote_peer_id).await.unwrap();
+        assert_eq!(outcome.peer_record_source, PeerRecordSource::RendezvousLive);
 
         let cached = peer_store
             .load(MESH_ID, &remote_peer_id)
@@ -2477,6 +2734,7 @@ mod tests {
         assert_eq!(link.path_kind(), PathKind::Direct);
         assert_eq!(outcome.path_kind, PathKind::Direct);
         assert_eq!(outcome.remote_addr, Some(server_addr));
+        assert_eq!(outcome.peer_record_source, PeerRecordSource::PeerStoreCache);
     }
 
     #[tokio::test]
@@ -2538,11 +2796,12 @@ mod tests {
         )
         .with_peer_store(peer_store);
 
-        let (link, _outcome) = connector
+        let (link, outcome) = connector
             .connect(&remote_peer_id)
             .await
             .expect("rendezvous-not-found must fall back to cache");
         assert_eq!(link.path_kind(), PathKind::Direct);
+        assert_eq!(outcome.peer_record_source, PeerRecordSource::PeerStoreCache);
     }
 
     fn signed_record(
@@ -2563,26 +2822,60 @@ mod tests {
         sequence: u64,
         cert_der: Vec<u8>,
     ) -> PeerRecord {
-        signed_record_with_ttl(keypair, endpoints, 60, sequence, cert_der)
-    }
-
-    fn signed_record_with_ttl(
-        keypair: &DeviceKeypair,
-        endpoints: Vec<CandidateEndpoint>,
-        ttl_seconds: u64,
-        sequence: u64,
-        cert_der: Vec<u8>,
-    ) -> PeerRecord {
         let body = UnsignedPeerRecord::new(
             MESH_ID,
             "test-peer",
             keypair.public_key(),
             endpoints,
             vec!["100.127.0.10/32".to_string()],
-            ttl_seconds,
+            60,
             sequence,
         )
         .with_device_certificate(cert_der);
         PeerRecord::signed(body, keypair).unwrap()
+    }
+
+    #[derive(Default)]
+    struct TestRegistryLookup {
+        record: Mutex<Option<RegistryNodeRecord>>,
+        error: Mutex<Option<String>>,
+        lookups: Mutex<usize>,
+    }
+
+    impl TestRegistryLookup {
+        fn with_record(record: RegistryNodeRecord) -> Self {
+            Self {
+                record: Mutex::new(Some(record)),
+                error: Mutex::new(None),
+                lookups: Mutex::new(0),
+            }
+        }
+
+        fn with_error(message: impl Into<String>) -> Self {
+            Self {
+                record: Mutex::new(None),
+                error: Mutex::new(Some(message.into())),
+                lookups: Mutex::new(0),
+            }
+        }
+
+        fn lookup_count(&self) -> usize {
+            *self.lookups.lock().unwrap()
+        }
+    }
+
+    impl IdentityRegistryLookup for TestRegistryLookup {
+        fn lookup<'a>(
+            &'a self,
+            _peer_id: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<RegistryNodeRecord>>> + Send + 'a>> {
+            Box::pin(async move {
+                *self.lookups.lock().unwrap() += 1;
+                if let Some(message) = self.error.lock().unwrap().clone() {
+                    return Err(QlinkError::Protocol(message));
+                }
+                Ok(self.record.lock().unwrap().clone())
+            })
+        }
     }
 }

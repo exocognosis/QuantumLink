@@ -1,5 +1,6 @@
 pub mod crypto;
 pub mod discovery;
+pub mod dytallix_identity;
 pub mod error;
 pub mod ffi;
 pub mod ice;

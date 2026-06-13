@@ -14,11 +14,13 @@ else
   TARGETS="$HOST_TARGET"
 fi
 BUILD_DIR="$ROOT/build"
+CARGO_TARGET_ROOT="${QLINK_CARGO_TARGET_DIR:-$REPO_ROOT/target}"
 HEADER_DIR="$BUILD_DIR/qlink-core-headers"
 UNIVERSAL_DIR="$BUILD_DIR/qlink-core-universal"
 XCFRAMEWORK="$BUILD_DIR/qlink-core.xcframework"
 
 mkdir -p "$BUILD_DIR"
+mkdir -p "$CARGO_TARGET_ROOT"
 find "$BUILD_DIR" -maxdepth 1 \( -name 'qlink-core*.xcframework' -o -name 'qlink-core-headers*' -o -name 'qlink-core-universal*' \) -exec rm -rf {} +
 mkdir -p "$HEADER_DIR"
 cp "$REPO_ROOT/qlink-core/include/qlink_core.h" "$HEADER_DIR/qlink_core.h"
@@ -39,8 +41,8 @@ EOF
     exit 1
   fi
 
-  (cd "$REPO_ROOT" && cargo build -p qlink-core --release --target "$target")
-  LIB="$REPO_ROOT/target/$target/release/libqlink_core.a"
+  (cd "$REPO_ROOT" && CARGO_TARGET_DIR="$CARGO_TARGET_ROOT" cargo build -p qlink-core --release --target "$target")
+  LIB="$CARGO_TARGET_ROOT/$target/release/libqlink_core.a"
   if [[ ! -f "$LIB" ]]; then
     echo "Missing Rust static library: $LIB" >&2
     exit 1

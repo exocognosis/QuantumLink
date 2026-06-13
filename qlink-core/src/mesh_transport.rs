@@ -27,7 +27,10 @@
 
 use crate::{
     crypto::DeviceKeypair,
-    discovery::{CandidateEndpoint, CandidateType, PeerRecord, UnsignedPeerRecord},
+    discovery::{now_unix, CandidateEndpoint, CandidateType, PeerRecord, UnsignedPeerRecord},
+    dytallix_identity::{
+        DytallixIdentityRegistry, DytallixRegistryLookupConfig, MeshTrustPolicy, RegistryDecision,
+    },
     error::{QlinkError, Result},
     ice::IceCredentials,
     inbound_identity::{
@@ -35,6 +38,7 @@ use crate::{
     },
     mesh_connection::{
         MeshConnector, MeshConnectorConfig, NetworkEvent, NetworkEventResponse, PathKind,
+        PeerRecordSource,
     },
     metrics_endpoint::{spawn_metrics_endpoint, MetricsEndpoint, MetricsSnapshot},
     peer_acl::PeerAcl,
@@ -45,7 +49,7 @@ use crate::{
     rendezvous::RendezvousClient,
     traversal::HOST_PRIORITY,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     net::SocketAddr,
@@ -92,6 +96,165 @@ pub struct MeshTransportRawMetrics {
     pub reconnect_count: u64,
 }
 
+pub const PEER_TRUST_DECISION_UNKNOWN: u32 = 0;
+pub const PEER_TRUST_DECISION_ACCEPTED: u32 = 1;
+pub const PEER_TRUST_DECISION_ACCEPTED_WITHOUT_REGISTRY_PRIVATE: u32 = 2;
+pub const PEER_TRUST_DECISION_ACCEPTED_WITHOUT_REGISTRY_DEVELOPMENT: u32 = 3;
+pub const PEER_TRUST_FAILURE_NONE: u32 = 0;
+pub const PEER_TRUST_FAILURE_REGISTRY_REQUIRED: u32 = 1;
+pub const PEER_TRUST_FAILURE_REGISTRY_REVOKED: u32 = 2;
+pub const PEER_TRUST_FAILURE_REGISTRY_SUSPENDED: u32 = 3;
+pub const PEER_TRUST_FAILURE_REGISTRY_EXPIRED: u32 = 4;
+pub const PEER_TRUST_FAILURE_REGISTRY_MISMATCH: u32 = 5;
+pub const PEER_TRUST_FAILURE_REGISTRY_LOOKUP: u32 = 6;
+pub const PEER_TRUST_FAILURE_REGISTRY_VERIFICATION: u32 = 7;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockedPeerDirection {
+    Inbound,
+    Outbound,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BlockedPeerHistoryEntry {
+    pub peer_id: String,
+    pub direction: BlockedPeerDirection,
+    pub failure_code: u32,
+    pub failure_reason: String,
+    pub observed_at_unix: u64,
+    pub checked_at_unix: u64,
+}
+
+#[derive(Debug, Default)]
+pub struct BlockedPeerHistory {
+    entries: StdMutex<HashMap<(String, BlockedPeerDirection), BlockedPeerHistoryEntry>>,
+}
+
+impl BlockedPeerHistory {
+    pub fn new() -> Self {
+        Self {
+            entries: StdMutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn record(
+        &self,
+        peer_id: &str,
+        direction: BlockedPeerDirection,
+        failure_code: u32,
+        failure_reason: &str,
+        checked_at_unix: Option<u64>,
+    ) {
+        let observed_at_unix = now_unix();
+        let entry = BlockedPeerHistoryEntry {
+            peer_id: peer_id.to_string(),
+            direction,
+            failure_code,
+            failure_reason: failure_reason.to_string(),
+            observed_at_unix,
+            checked_at_unix: checked_at_unix.unwrap_or(observed_at_unix),
+        };
+        if let Ok(mut guard) = self.entries.lock() {
+            guard.insert((entry.peer_id.clone(), direction), entry);
+        }
+    }
+
+    pub fn snapshot(&self) -> Vec<BlockedPeerHistoryEntry> {
+        let mut entries: Vec<BlockedPeerHistoryEntry> = self
+            .entries
+            .lock()
+            .map(|guard| guard.values().cloned().collect())
+            .unwrap_or_default();
+        entries.sort_by(|lhs, rhs| {
+            lhs.peer_id
+                .cmp(&rhs.peer_id)
+                .then_with(|| lhs.direction.cmp(&rhs.direction))
+        });
+        entries
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PeerTrustStatusRaw {
+    pub decision_code: u32,
+    pub failure_code: u32,
+    pub checked_at_unix: u64,
+    pub source_code: u32,
+}
+
+impl PeerTrustStatusRaw {
+    fn from_registry_decision(decision: RegistryDecision, source: PeerRecordSource) -> Self {
+        Self {
+            decision_code: registry_decision_code(decision),
+            failure_code: PEER_TRUST_FAILURE_NONE,
+            checked_at_unix: now_unix(),
+            source_code: source.trust_source_code(),
+        }
+    }
+
+    fn from_failure_message(message: &str) -> Option<Self> {
+        let failure_code = registry_failure_code(message)?;
+        Some(Self {
+            decision_code: PEER_TRUST_DECISION_UNKNOWN,
+            failure_code,
+            checked_at_unix: now_unix(),
+            source_code: PEER_TRUST_SOURCE_UNKNOWN,
+        })
+    }
+}
+
+const PEER_TRUST_SOURCE_UNKNOWN: u32 = 0;
+
+fn registry_decision_code(decision: RegistryDecision) -> u32 {
+    match decision {
+        RegistryDecision::Accepted => PEER_TRUST_DECISION_ACCEPTED,
+        RegistryDecision::AcceptedWithoutRegistryPrivate => {
+            PEER_TRUST_DECISION_ACCEPTED_WITHOUT_REGISTRY_PRIVATE
+        }
+        RegistryDecision::AcceptedWithoutRegistryDevelopment => {
+            PEER_TRUST_DECISION_ACCEPTED_WITHOUT_REGISTRY_DEVELOPMENT
+        }
+    }
+}
+
+fn registry_failure_code(message: &str) -> Option<u32> {
+    if message.contains("registry record required by public mesh trust policy") {
+        return Some(PEER_TRUST_FAILURE_REGISTRY_REQUIRED);
+    }
+    if message.contains("registry record has expired") {
+        return Some(PEER_TRUST_FAILURE_REGISTRY_EXPIRED);
+    }
+    if message.contains("registry record is revoked") {
+        return Some(PEER_TRUST_FAILURE_REGISTRY_REVOKED);
+    }
+    if message.contains("registry record is suspended")
+        || message.contains("registry record is not active")
+    {
+        return Some(PEER_TRUST_FAILURE_REGISTRY_SUSPENDED);
+    }
+    if message.contains("identity registry lookup failed") {
+        return Some(PEER_TRUST_FAILURE_REGISTRY_LOOKUP);
+    }
+    let registry_binding_mismatch = [
+        "peer_id mismatch",
+        "device_public_key_hash_hex mismatch",
+        "latest_peer_record_hash_hex mismatch",
+        "pqc_binding_hash_hex mismatch",
+        "node_signing_public_key_hash_hex mismatch",
+        "transport_public_key_hash_hex mismatch",
+    ]
+    .iter()
+    .any(|pattern| message.contains(pattern));
+    if registry_binding_mismatch || (message.contains("registry") && message.contains("mismatch")) {
+        return Some(PEER_TRUST_FAILURE_REGISTRY_MISMATCH);
+    }
+    if message.contains("registry") {
+        return Some(PEER_TRUST_FAILURE_REGISTRY_VERIFICATION);
+    }
+    None
+}
+
 /// Per-peer session state. One instance per active remote peer.
 ///
 /// The fields that matter to operators (state, path_kind, last_error,
@@ -104,6 +267,7 @@ struct SharedState {
     state: StdMutex<MeshTransportState>,
     path_kind: StdMutex<Option<PathKind>>,
     last_error: StdMutex<Option<String>>,
+    peer_trust: StdMutex<PeerTrustStatusRaw>,
     frames_sent: AtomicU64,
     frames_received: AtomicU64,
     bytes_sent: AtomicU64,
@@ -119,6 +283,7 @@ impl SharedState {
             state: StdMutex::new(MeshTransportState::Connecting),
             path_kind: StdMutex::new(None),
             last_error: StdMutex::new(None),
+            peer_trust: StdMutex::new(PeerTrustStatusRaw::default()),
             frames_sent: AtomicU64::new(0),
             frames_received: AtomicU64::new(0),
             bytes_sent: AtomicU64::new(0),
@@ -160,6 +325,29 @@ impl SharedState {
         if let Ok(mut guard) = self.last_error.lock() {
             *guard = error;
         }
+    }
+
+    fn set_peer_trust_decision(&self, decision: RegistryDecision, source: PeerRecordSource) {
+        if let Ok(mut guard) = self.peer_trust.lock() {
+            *guard = PeerTrustStatusRaw::from_registry_decision(decision, source);
+        }
+    }
+
+    fn set_peer_trust_failure_message(&self, message: &str) -> Option<PeerTrustStatusRaw> {
+        let Some(status) = PeerTrustStatusRaw::from_failure_message(message) else {
+            return None;
+        };
+        if let Ok(mut guard) = self.peer_trust.lock() {
+            *guard = status;
+        }
+        Some(status)
+    }
+
+    fn peer_trust_status(&self) -> PeerTrustStatusRaw {
+        self.peer_trust
+            .lock()
+            .map(|guard| *guard)
+            .unwrap_or_default()
     }
 
     /// Per-peer metrics only. Transport-level fields like
@@ -271,6 +459,10 @@ pub struct MeshTransportConfig {
     /// can leave this `None` and rely on file mode 0o600.
     #[serde(default)]
     pub peer_store_key_b64: Option<String>,
+    #[serde(default = "default_mesh_trust_policy")]
+    pub mesh_trust_policy: MeshTrustPolicy,
+    #[serde(default)]
+    pub dytallix_identity: Option<DytallixRegistryLookupConfig>,
 }
 
 fn default_overall_deadline_ms() -> u64 {
@@ -287,6 +479,9 @@ fn default_reconnect_initial_backoff_ms() -> u64 {
 }
 fn default_reconnect_max_backoff_ms() -> u64 {
     30_000
+}
+fn default_mesh_trust_policy() -> MeshTrustPolicy {
+    MeshTrustPolicy::DevelopmentOptional
 }
 
 /// A frame received from a specific remote peer. Multi-peer transports
@@ -349,6 +544,9 @@ pub struct MeshTransportHandle {
     /// Transport-level counters that aren't per-peer (today: just the
     /// network-event count).
     aggregate: Arc<AggregateState>,
+    /// Retained trust/ACL rejection history. Kept outside `peers` so
+    /// rejected or removed peers remain visible to diagnostics.
+    blocked_peer_history: Arc<BlockedPeerHistory>,
     /// Held only when the operator opted into the OpenMetrics endpoint via
     /// `metrics_endpoint_bind_addr`. Drop aborts the listener task.
     metrics_endpoint: StdMutex<Option<MetricsEndpoint>>,
@@ -444,7 +642,8 @@ impl MeshTransportHandle {
             MeshConnectorConfig::new(config.mesh_id.clone(), config.local_peer_id.clone())
                 .with_overall_deadline(Duration::from_millis(config.overall_deadline_ms))
                 .with_direct_probe_timeout(Duration::from_millis(config.direct_probe_timeout_ms))
-                .with_probe_pacing(Duration::from_millis(config.probe_pacing_ms));
+                .with_probe_pacing(Duration::from_millis(config.probe_pacing_ms))
+                .with_mesh_trust_policy(config.mesh_trust_policy);
         if let Some(relay) = config.relay_url.clone() {
             connector_config = connector_config.with_relay_server(relay);
         }
@@ -465,6 +664,10 @@ impl MeshTransportHandle {
                 )));
             }
             connector_config = connector_config.with_local_device_keypair(keypair);
+        }
+        if let Some(registry_config) = config.dytallix_identity.clone() {
+            let registry = DytallixIdentityRegistry::from_lookup_config(registry_config)?;
+            connector_config = connector_config.with_identity_registry_lookup(Arc::new(registry));
         }
 
         // Resolve the configured persistence path, if any, into a
@@ -509,6 +712,7 @@ impl MeshTransportHandle {
         };
 
         let aggregate = Arc::new(AggregateState::new());
+        let blocked_peer_history = Arc::new(BlockedPeerHistory::new());
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<InboundFrame>();
         let peers: Arc<StdMutex<HashMap<String, PerPeerSession>>> =
             Arc::new(StdMutex::new(HashMap::new()));
@@ -541,11 +745,13 @@ impl MeshTransportHandle {
                 let inbound_acl = config.inbound_acl.clone().map(Arc::new);
                 let mesh_id = config.mesh_id.clone();
                 let inbound_tx_responder = inbound_tx.clone();
+                let blocked_peer_history_responder = blocked_peer_history.clone();
                 let task = runtime.spawn(run_responder_loop(
                     endpoint,
                     mesh_id,
                     inbound_acl,
                     inbound_tx_responder,
+                    blocked_peer_history_responder,
                 ));
                 Some(task)
             }
@@ -561,6 +767,7 @@ impl MeshTransportHandle {
             inbound_tx,
             inbound_rx: TokioMutex::new(inbound_rx),
             aggregate,
+            blocked_peer_history,
             metrics_endpoint: StdMutex::new(metrics_endpoint),
             server_certificate_der,
             responder_local_addr,
@@ -749,6 +956,7 @@ impl MeshTransportHandle {
             shutdown_rx,
             shared.clone(),
             self.backoff,
+            self.blocked_peer_history.clone(),
         ));
 
         peers.insert(
@@ -792,6 +1000,13 @@ impl MeshTransportHandle {
             .lock()
             .map(|peers| peers.keys().cloned().collect())
             .unwrap_or_default()
+    }
+
+    /// Snapshot of retained trust/ACL rejection history. Entries are
+    /// owned values so callers can serialize or inspect them after the
+    /// history mutex has been released.
+    pub fn blocked_peer_history(&self) -> Vec<BlockedPeerHistoryEntry> {
+        self.blocked_peer_history.snapshot()
     }
 
     /// Sends a frame to a specific peer. Errors if the peer isn't active
@@ -852,6 +1067,14 @@ impl MeshTransportHandle {
         let session = peers.get(remote_peer_id)?;
         let guard = session.shared.last_error.lock().ok()?;
         guard.clone()
+    }
+
+    pub fn peer_trust_status(&self, remote_peer_id: &str) -> Option<PeerTrustStatusRaw> {
+        self.peers
+            .lock()
+            .ok()?
+            .get(remote_peer_id)
+            .map(|session| session.shared.peer_trust_status())
     }
 
     pub fn peer_metrics(&self, remote_peer_id: &str) -> Option<MeshTransportRawMetrics> {
@@ -1034,6 +1257,7 @@ async fn run_responder_loop(
     expected_mesh_id: String,
     inbound_acl: Option<Arc<PeerAcl>>,
     inbound_tx: mpsc::UnboundedSender<InboundFrame>,
+    _blocked_peer_history: Arc<BlockedPeerHistory>,
 ) {
     loop {
         let session = match server.accept_one().await {
@@ -1250,6 +1474,7 @@ async fn run_session_manager(
     mut shutdown_rx: mpsc::UnboundedReceiver<()>,
     shared: Arc<SharedState>,
     backoff: BackoffConfig,
+    blocked_peer_history: Arc<BlockedPeerHistory>,
 ) {
     let mut first_attempt = true;
     let mut consecutive_failures: u32 = 0;
@@ -1264,11 +1489,23 @@ async fn run_session_manager(
         let (mut link, path_kind) = match connector.connect(&remote_peer_id).await {
             Ok((link, outcome)) => {
                 shared.set_last_error(None);
+                shared
+                    .set_peer_trust_decision(outcome.registry_decision, outcome.peer_record_source);
                 consecutive_failures = 0;
                 (link, outcome.path_kind)
             }
             Err(error) => {
-                shared.set_last_error(Some(error.to_string()));
+                let error_message = error.to_string();
+                if let Some(status) = shared.set_peer_trust_failure_message(&error_message) {
+                    blocked_peer_history.record(
+                        &remote_peer_id,
+                        BlockedPeerDirection::Outbound,
+                        status.failure_code,
+                        &error_message,
+                        Some(status.checked_at_unix),
+                    );
+                }
+                shared.set_last_error(Some(error_message));
                 shared.set_state(MeshTransportState::Failed);
                 consecutive_failures = consecutive_failures.saturating_add(1);
                 // Sleep for the backoff window OR until a reachability-
@@ -1458,6 +1695,228 @@ mod tests {
         assert_eq!(cfg.delay_for(u32::MAX), Duration::from_secs(60));
     }
 
+    #[test]
+    fn shared_state_retains_registry_decision_for_status_export() {
+        let shared = SharedState::new();
+
+        assert_eq!(
+            shared.peer_trust_status().decision_code,
+            PEER_TRUST_DECISION_UNKNOWN
+        );
+
+        shared
+            .set_peer_trust_decision(RegistryDecision::Accepted, PeerRecordSource::RendezvousLive);
+        let status = shared.peer_trust_status();
+
+        assert_eq!(status.decision_code, PEER_TRUST_DECISION_ACCEPTED);
+        assert_eq!(status.failure_code, PEER_TRUST_FAILURE_NONE);
+        assert!(status.checked_at_unix > 0);
+        assert_eq!(
+            status.source_code,
+            PeerRecordSource::RendezvousLive.trust_source_code()
+        );
+    }
+
+    #[test]
+    fn shared_state_retains_registry_failure_for_status_export() {
+        let shared = SharedState::new();
+
+        shared.set_peer_trust_failure_message("registry record has expired");
+        let status = shared.peer_trust_status();
+
+        assert_eq!(status.decision_code, PEER_TRUST_DECISION_UNKNOWN);
+        assert_eq!(status.failure_code, PEER_TRUST_FAILURE_REGISTRY_EXPIRED);
+        assert!(status.checked_at_unix > 0);
+    }
+
+    #[test]
+    fn registry_failure_code_classifies_operator_visible_registry_failures() {
+        let cases = [
+            (
+                "registry record required by public mesh trust policy",
+                PEER_TRUST_FAILURE_REGISTRY_REQUIRED,
+            ),
+            (
+                "registry record is revoked",
+                PEER_TRUST_FAILURE_REGISTRY_REVOKED,
+            ),
+            (
+                "registry record is suspended",
+                PEER_TRUST_FAILURE_REGISTRY_SUSPENDED,
+            ),
+            (
+                "registry record is not active",
+                PEER_TRUST_FAILURE_REGISTRY_SUSPENDED,
+            ),
+            (
+                "registry record has expired",
+                PEER_TRUST_FAILURE_REGISTRY_EXPIRED,
+            ),
+            (
+                "device_public_key_hash_hex mismatch",
+                PEER_TRUST_FAILURE_REGISTRY_MISMATCH,
+            ),
+            (
+                "registry binding mismatch",
+                PEER_TRUST_FAILURE_REGISTRY_MISMATCH,
+            ),
+            (
+                "identity registry lookup failed: node not found",
+                PEER_TRUST_FAILURE_REGISTRY_LOOKUP,
+            ),
+            (
+                "registry response failed verification",
+                PEER_TRUST_FAILURE_REGISTRY_VERIFICATION,
+            ),
+        ];
+
+        for (message, expected) in cases {
+            assert_eq!(registry_failure_code(message), Some(expected), "{message}");
+        }
+        assert_eq!(registry_failure_code("ordinary transport failure"), None);
+    }
+
+    #[test]
+    fn blocked_peer_history_records_outbound_registry_failure() {
+        let history = BlockedPeerHistory::new();
+
+        history.record(
+            "qlink_remote",
+            BlockedPeerDirection::Outbound,
+            PEER_TRUST_FAILURE_REGISTRY_REVOKED,
+            "registry record is revoked",
+            None,
+        );
+        let snapshot = history.snapshot();
+
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].peer_id, "qlink_remote");
+        assert_eq!(snapshot[0].direction, BlockedPeerDirection::Outbound);
+        assert_eq!(
+            snapshot[0].failure_code,
+            PEER_TRUST_FAILURE_REGISTRY_REVOKED
+        );
+        assert_eq!(snapshot[0].failure_reason, "registry record is revoked");
+        assert!(snapshot[0].observed_at_unix > 0);
+        assert!(snapshot[0].checked_at_unix > 0);
+    }
+
+    #[test]
+    fn blocked_peer_history_keeps_latest_entry_for_peer_direction() {
+        let history = BlockedPeerHistory::new();
+
+        history.record(
+            "qlink_remote",
+            BlockedPeerDirection::Inbound,
+            PEER_TRUST_FAILURE_REGISTRY_REQUIRED,
+            "first rejection",
+            Some(10),
+        );
+        history.record(
+            "qlink_remote",
+            BlockedPeerDirection::Inbound,
+            PEER_TRUST_FAILURE_REGISTRY_EXPIRED,
+            "latest rejection",
+            Some(20),
+        );
+        let snapshot = history.snapshot();
+
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].direction, BlockedPeerDirection::Inbound);
+        assert_eq!(
+            snapshot[0].failure_code,
+            PEER_TRUST_FAILURE_REGISTRY_EXPIRED
+        );
+        assert_eq!(snapshot[0].failure_reason, "latest rejection");
+        assert_eq!(snapshot[0].checked_at_unix, 20);
+    }
+
+    #[test]
+    fn mesh_transport_config_decodes_identity_defaults() {
+        let config: MeshTransportConfig = serde_json::from_value(serde_json::json!({
+            "meshId": "devmesh",
+            "localPeerId": "qlink_local",
+            "remotePeerId": "qlink_remote",
+            "rendezvousUrl": "127.0.0.1:9471",
+            "bindAddr": "127.0.0.1:0"
+        }))
+        .unwrap();
+
+        assert_eq!(
+            config.mesh_trust_policy,
+            crate::dytallix_identity::MeshTrustPolicy::DevelopmentOptional
+        );
+        assert!(config.dytallix_identity.is_none());
+    }
+
+    #[test]
+    fn mesh_transport_config_decodes_registry_and_wires_connector() {
+        let config: MeshTransportConfig = serde_json::from_value(serde_json::json!({
+            "meshId": "public-mesh",
+            "localPeerId": "qlink_local",
+            "remotePeerId": "qlink_remote",
+            "rendezvousUrl": "127.0.0.1:1",
+            "bindAddr": "127.0.0.1:0",
+            "overallDeadlineMs": 1,
+            "directProbeTimeoutMs": 1,
+            "probePacingMs": 1,
+            "reconnectInitialBackoffMs": 1,
+            "reconnectMaxBackoffMs": 1,
+            "disableInboundResponder": true,
+            "meshTrustPolicy": "public_required",
+            "dytallixIdentity": {
+                "endpoint": "https://dytallix.example",
+                "contractAddress": "1111111111111111111111111111111111111111",
+                "publishWalletAddress": false,
+                "networkId": "dytallix-testnet",
+                "chainId": "dytallix-testnet-1",
+                "allowedRpcEndpoints": ["https://dytallix.example"]
+            }
+        }))
+        .unwrap();
+
+        let identity = config.dytallix_identity.as_ref().unwrap();
+        assert_eq!(
+            identity.contract_address,
+            "0x1111111111111111111111111111111111111111"
+        );
+        assert_eq!(identity.network_id.as_deref(), Some("dytallix-testnet"));
+        assert_eq!(identity.chain_id.as_deref(), Some("dytallix-testnet-1"));
+        assert_eq!(
+            identity.allowed_rpc_endpoints,
+            vec!["https://dytallix.example".to_string()]
+        );
+
+        let handle = MeshTransportHandle::new(config).unwrap();
+
+        assert_eq!(
+            handle.connector.config().mesh_trust_policy,
+            crate::dytallix_identity::MeshTrustPolicy::PublicRequired
+        );
+        assert!(handle.connector.config().identity_registry_lookup.is_some());
+    }
+
+    #[test]
+    fn mesh_transport_config_rejects_registry_wallet_fields() {
+        let err = serde_json::from_value::<MeshTransportConfig>(serde_json::json!({
+            "meshId": "public-mesh",
+            "localPeerId": "qlink_local",
+            "remotePeerId": "qlink_remote",
+            "rendezvousUrl": "127.0.0.1:1",
+            "bindAddr": "127.0.0.1:0",
+            "meshTrustPolicy": "public_required",
+            "dytallixIdentity": {
+                "endpoint": "https://dytallix.example",
+                "contractAddress": "0x1111111111111111111111111111111111111111",
+                "keystorePath": "/tmp/qlink-dytallix-keystore",
+                "walletName": "default"
+            }
+        }))
+        .unwrap_err();
+
+        assert!(err.to_string().contains("unknown field"));
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn mesh_transport_connects_and_round_trips_a_frame() {
         // Stand up a dev rendezvous + a "remote peer" QUIC server.
@@ -1530,6 +1989,8 @@ mod tests {
                 disable_inbound_responder: true,
                 peer_store_path: None,
                 peer_store_key_b64: None,
+                mesh_trust_policy: MeshTrustPolicy::DevelopmentOptional,
+                dytallix_identity: None,
             })
             .expect("transport construction must succeed")
         })
@@ -1600,6 +2061,8 @@ mod tests {
                 disable_inbound_responder: true,
                 peer_store_path: None,
                 peer_store_key_b64: None,
+                mesh_trust_policy: MeshTrustPolicy::DevelopmentOptional,
+                dytallix_identity: None,
             })
             .unwrap()
         })
@@ -1649,6 +2112,8 @@ mod tests {
                 disable_inbound_responder: true,
                 peer_store_path: None,
                 peer_store_key_b64: None,
+                mesh_trust_policy: MeshTrustPolicy::DevelopmentOptional,
+                dytallix_identity: None,
             })
             .unwrap()
         })
@@ -1738,6 +2203,8 @@ mod tests {
                 disable_inbound_responder: true,
                 peer_store_path: None,
                 peer_store_key_b64: None,
+                mesh_trust_policy: MeshTrustPolicy::DevelopmentOptional,
+                dytallix_identity: None,
             })
             .expect("transport construction with metrics endpoint must succeed")
         })
@@ -1849,6 +2316,8 @@ mod tests {
                 disable_inbound_responder: true,
                 peer_store_path: None,
                 peer_store_key_b64: None,
+                mesh_trust_policy: MeshTrustPolicy::DevelopmentOptional,
+                dytallix_identity: None,
             })
             .unwrap()
         })
@@ -2002,6 +2471,8 @@ mod tests {
                 disable_inbound_responder: true,
                 peer_store_path: None,
                 peer_store_key_b64: None,
+                mesh_trust_policy: MeshTrustPolicy::DevelopmentOptional,
+                dytallix_identity: None,
             })
             .expect("transport new")
         })
@@ -2146,6 +2617,8 @@ mod tests {
                 disable_inbound_responder: true,
                 peer_store_path: None,
                 peer_store_key_b64: None,
+                mesh_trust_policy: MeshTrustPolicy::DevelopmentOptional,
+                dytallix_identity: None,
             })
             .expect("transport new")
         })
@@ -2204,6 +2677,8 @@ mod tests {
                 disable_inbound_responder: true,
                 peer_store_path: None,
                 peer_store_key_b64: None,
+                mesh_trust_policy: MeshTrustPolicy::DevelopmentOptional,
+                dytallix_identity: None,
             })
             .expect("transport new")
         })
@@ -2298,6 +2773,8 @@ mod tests {
                     disable_inbound_responder: true,
                     peer_store_path: None,
                     peer_store_key_b64: None,
+                    mesh_trust_policy: MeshTrustPolicy::DevelopmentOptional,
+                    dytallix_identity: None,
                 })
                 .unwrap()
             })
@@ -2362,6 +2839,8 @@ mod tests {
                     disable_inbound_responder: false,
                     peer_store_path: None,
                     peer_store_key_b64: None,
+                    mesh_trust_policy: MeshTrustPolicy::DevelopmentOptional,
+                    dytallix_identity: None,
                 },
                 local_device_keypair,
             )

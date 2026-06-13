@@ -22,10 +22,11 @@ xcodebuild -version || true
 if command -v xcodegen >/dev/null 2>&1; then
   xcodegen --version
 else
-  echo "xcodegen=missing (unsigned Xcode project build will be skipped)"
+  echo "xcodegen=missing"
 fi
 
 run swift test
+run "$ROOT/scripts/macos-release-readiness.sh"
 run cargo fmt --all -- --check
 run cargo test --workspace
 run cargo build --workspace --release
@@ -54,8 +55,13 @@ run "$ROOT/scripts/package-dev-artifacts.sh"
 
 if command -v xcodegen >/dev/null 2>&1; then
   run "$ROOT/scripts/package-macos.sh" --skip-sign --pkg
+elif [[ "${QLINK_ALLOW_SKIP_XCODEGEN:-false}" == "true" ]]; then
+  log "Skipping unsigned release package dry run because xcodegen is not installed and QLINK_ALLOW_SKIP_XCODEGEN=true"
 else
-  log "Skipping unsigned release package dry run because xcodegen is not installed"
+  echo "xcodegen is required for unsigned release package dry run." >&2
+  echo "Install it with: brew install xcodegen" >&2
+  echo "Set QLINK_ALLOW_SKIP_XCODEGEN=true only for non-packaging CI lanes." >&2
+  exit 1
 fi
 
 cat <<'EOF'
