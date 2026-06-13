@@ -106,6 +106,7 @@ jobs:
           echo "APPLE_NOTARY_PROFILE=QLINK_RELEASE_NOTARY" >> "$GITHUB_ENV"
 
       - name: Build and (sign + notarize) macOS app
+        working-directory: macos
         run: |
           if [[ "${{ steps.signing.outputs.available }}" == "true" ]]; then
             if [[ -n "${APPLE_DEVELOPER_ID_INSTALLER:-}" ]]; then
@@ -119,6 +120,7 @@ jobs:
 
       - name: Generate appcast (signing required)
         if: steps.signing.outputs.available == 'true' && env.QLINK_SPARKLE_FEED_URL != ''
+        working-directory: macos
         run: |
           # Sparkle's sign_update tool needs the EdDSA private key in the
           # keychain. CI imports it from secrets just like the Developer ID cert.

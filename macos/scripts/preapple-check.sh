@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$ROOT/.." && pwd)"
 cd "$ROOT"
 
 log() {
@@ -29,7 +30,7 @@ run cargo fmt --all -- --check
 run cargo test --workspace
 run cargo build --workspace --release
 
-DYLIB="$ROOT/target/release/libqlink_core.dylib"
+DYLIB="$REPO_ROOT/target/release/libqlink_core.dylib"
 
 log "Swift dylib-backed integration tests"
 QLINK_CORE_DYLIB="$DYLIB" swift test --filter RustCoreBridgeTests
@@ -43,10 +44,10 @@ run swift run QuantumLinkSmoke preflight \
   --mode dev-quic-loopback \
   --dylib "$DYLIB"
 
-run "$ROOT/target/release/qlinkctl" simulate-handshake
-run "$ROOT/target/release/qlinkctl" quic-loopback
-run "$ROOT/target/release/qlinkctl" mesh-loopback
-run "$ROOT/target/release/qlinkctl" relay-loopback
+run "$REPO_ROOT/target/release/qlinkctl" simulate-handshake
+run "$REPO_ROOT/target/release/qlinkctl" quic-loopback
+run "$REPO_ROOT/target/release/qlinkctl" mesh-loopback
+run "$REPO_ROOT/target/release/qlinkctl" relay-loopback
 
 run "$ROOT/scripts/build-rust-xcframework.sh"
 run "$ROOT/scripts/package-dev-artifacts.sh"

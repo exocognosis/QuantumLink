@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$ROOT/.." && pwd)"
 DIST_DIR="$ROOT/build/dist"
 STAGE="$DIST_DIR/QuantumLink-dev"
 ARCHIVE="$DIST_DIR/QuantumLink-dev.tar.gz"
@@ -15,9 +16,9 @@ SWIFT_RELEASE_BIN="$(swift build -c release --show-bin-path)"
 rm -rf "$STAGE" "$ARCHIVE"
 mkdir -p "$STAGE/bin" "$STAGE/lib" "$STAGE/config" "$STAGE/docs"
 
-cp "$ROOT/target/release/qlinkctl" "$STAGE/bin/qlinkctl"
+cp "$REPO_ROOT/target/release/qlinkctl" "$STAGE/bin/qlinkctl"
 cp "$SWIFT_RELEASE_BIN/QuantumLinkSmoke" "$STAGE/bin/QuantumLinkSmoke"
-cp "$ROOT/target/release/libqlink_core.dylib" "$STAGE/lib/libqlink_core.dylib"
+cp "$REPO_ROOT/target/release/libqlink_core.dylib" "$STAGE/lib/libqlink_core.dylib"
 cp "$ROOT/config/mesh.example.json" "$STAGE/config/mesh.example.json"
 cp "$ROOT/README.md" "$STAGE/README.md"
 cp "$ROOT/docs/architecture.md" "$STAGE/docs/architecture.md"

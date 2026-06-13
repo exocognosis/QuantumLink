@@ -1,4 +1,11 @@
 [workspace]
-members = ["rust/qlink-core"]
+members = [
+    "qlink-core",
+    "windows/rust/quantumlink-proto",
+    "windows/rust/quantumlink-service",
+]
 resolver = "2"
 
+[profile.release]
+lto = "thin"
+codegen-units = 1

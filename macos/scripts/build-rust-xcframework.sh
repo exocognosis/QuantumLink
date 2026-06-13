@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# ROOT = macOS silo (macos/); REPO_ROOT = monorepo root (holds the shared
+# qlink-core crate and the Cargo workspace target/ dir).
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$ROOT/.." && pwd)"
 HOST_TARGET="$(rustc -vV | awk '/^host:/ { print $2 }')"
 if [[ -n "${QLINK_RUST_TARGETS:-}" ]]; then
   TARGETS="$QLINK_RUST_TARGETS"
@@ -18,7 +21,7 @@ XCFRAMEWORK="$BUILD_DIR/qlink-core.xcframework"
 mkdir -p "$BUILD_DIR"
 find "$BUILD_DIR" -maxdepth 1 \( -name 'qlink-core*.xcframework' -o -name 'qlink-core-headers*' -o -name 'qlink-core-universal*' \) -exec rm -rf {} +
 mkdir -p "$HEADER_DIR"
-cp "$ROOT/rust/qlink-core/include/qlink_core.h" "$HEADER_DIR/qlink_core.h"
+cp "$REPO_ROOT/qlink-core/include/qlink_core.h" "$HEADER_DIR/qlink_core.h"
 
 ARGS=()
 DARWIN_LIBS=()
@@ -36,8 +39,8 @@ EOF
     exit 1
   fi
 
-  cargo build -p qlink-core --release --target "$target"
-  LIB="$ROOT/target/$target/release/libqlink_core.a"
+  (cd "$REPO_ROOT" && cargo build -p qlink-core --release --target "$target")
+  LIB="$REPO_ROOT/target/$target/release/libqlink_core.a"
   if [[ ! -f "$LIB" ]]; then
     echo "Missing Rust static library: $LIB" >&2
     exit 1

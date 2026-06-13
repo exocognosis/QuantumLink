@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$ROOT/.." && pwd)"
 cd "$ROOT"
 
 PEERS=5
@@ -13,7 +14,7 @@ BASE_PORT=9800
 LISTEN_HOST="127.0.0.1"
 MESH_ID="lan-sim-$(date -u +%Y%m%d%H%M%S)"
 LOG_ROOT="$ROOT/build/security-harness"
-QLINK_BIN="${QLINK_BIN:-$ROOT/target/release/qlinkctl}"
+QLINK_BIN="${QLINK_BIN:-$REPO_ROOT/target/release/qlinkctl}"
 BUILD=1
 
 usage() {
@@ -77,7 +78,7 @@ if [[ -n "$PEER_SCALES" ]]; then
     if [[ "$BUILD" -eq 0 || "$first" -eq 0 ]]; then
       args+=(--skip-build)
     fi
-    if [[ "$QLINK_BIN" != "$ROOT/target/release/qlinkctl" ]]; then
+    if [[ "$QLINK_BIN" != "$REPO_ROOT/target/release/qlinkctl" ]]; then
       args+=(--qlink-bin "$QLINK_BIN")
     fi
     "$0" "${args[@]}"

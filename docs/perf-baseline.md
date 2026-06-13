@@ -25,7 +25,7 @@ two in sync when refreshing.
   - `swift test --filter RustMeshTransportPerformanceTests` — XCTClockMetric
     coverage of the Swift FFI path (gated on `QLINK_CORE_DYLIB`).
 
-The bench helpers live in `rust/qlink-core/benches/common/mod.rs`.
+The bench helpers live in `qlink-core/benches/common/mod.rs`.
 
 ## Product SLO targets
 
@@ -100,7 +100,7 @@ surface expands.
 Loopback measurements answer "is the floor low enough?" The synthetic WAN
 harness answers "what should operators actually expect?" The harness wraps
 the connector's QUIC traffic in a forwarding proxy (in-process Rust,
-[`synthetic_wan::WanProxy`](../rust/qlink-core/src/synthetic_wan.rs)) that
+[`synthetic_wan::WanProxy`](../qlink-core/src/synthetic_wan.rs)) that
 injects per-direction delay, jitter, and loss.
 
 ### Profiles
@@ -173,7 +173,7 @@ QLINK_CORE_DYLIB="$PWD/target/release/libqlink_core.dylib" \
 ## Regression gating
 
 CI runs the same suites on a `macos-15` runner and then runs
-`perfgate` (the binary at `rust/qlink-core/src/bin/perfgate.rs`) to
+`perfgate` (the binary at `qlink-core/src/bin/perfgate.rs`) to
 diff observed values against `perf-baseline.json`. Any metric that
 regresses past the baseline's `regression_threshold_pct` (currently
 `20.0`) fails the `Performance` workflow.
