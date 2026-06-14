@@ -42,6 +42,10 @@ jobs:
       # Build the shared core dylib once at the workspace root.
       - name: Build shared core
         run: cargo build -p qlink-core --release
+      # The XCFramework step builds a universal (arm64 + x86_64) static
+      # library, so both Apple targets must be installed.
+      - name: Install Apple Rust targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
       - name: Swift tests
         working-directory: macos
         run: swift test
@@ -73,7 +77,10 @@ jobs:
         run: QLINK_RUST_TARGETS="$(rustc -vV | awk '/^host:/ { print $2 }')" ./scripts/build-rust-xcframework.sh
       - name: Generate unsigned project
         working-directory: macos
-        run: ./scripts/generate-xcode-project.sh
+        # generate-xcode-project.sh re-runs build-rust-xcframework.sh; keep it
+        # host-only (matching the step above) so it does not require the
+        # x86_64 cross-target, which this smoke job does not install.
+        run: QLINK_RUST_TARGETS="$(rustc -vV | awk '/^host:/ { print $2 }')" ./scripts/generate-xcode-project.sh
       - name: Build unsigned app target
         working-directory: macos
         run: |

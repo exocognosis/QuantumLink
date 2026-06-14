@@ -19,10 +19,10 @@ mkdir -p "$STAGE/bin" "$STAGE/lib" "$STAGE/config" "$STAGE/docs"
 cp "$REPO_ROOT/target/release/qlinkctl" "$STAGE/bin/qlinkctl"
 cp "$SWIFT_RELEASE_BIN/QuantumLinkSmoke" "$STAGE/bin/QuantumLinkSmoke"
 cp "$REPO_ROOT/target/release/libqlink_core.dylib" "$STAGE/lib/libqlink_core.dylib"
-cp "$ROOT/config/mesh.example.json" "$STAGE/config/mesh.example.json"
-cp "$ROOT/README.md" "$STAGE/README.md"
-cp "$ROOT/docs/architecture.md" "$STAGE/docs/architecture.md"
-cp "$ROOT/docs/security.md" "$STAGE/docs/security.md"
+cp "$REPO_ROOT/config/mesh.example.json" "$STAGE/config/mesh.example.json"
+cp "$REPO_ROOT/README.md" "$STAGE/README.md"
+cp "$REPO_ROOT/docs/architecture.md" "$STAGE/docs/architecture.md"
+cp "$REPO_ROOT/docs/security.md" "$STAGE/docs/security.md"
 
 cat > "$STAGE/RUNBOOK.md" <<'EOF'
 # QuantumLink Development Artifact Runbook
