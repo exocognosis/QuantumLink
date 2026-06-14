@@ -435,6 +435,31 @@ public final class RustMeshTransport: TunnelTransporting {
         return RustMeshTransportState(rawValue: raw)
     }
 
+    /// Peer IDs the multi-peer transport is currently managing
+    /// (populated via `addPeer`; the connector dials them in the
+    /// background). Empty when the transport hasn't started or has no
+    /// peers configured.
+    public var managedPeerIDs: [String] {
+        guard let handle else { return [] }
+        return library.meshTransportPeerIDs(handle: handle) ?? []
+    }
+
+    /// Recently blocked peers the connector recorded after a trust
+    /// failure, surfaced for status + diagnostics. Empty when the
+    /// transport hasn't started.
+    public var blockedPeerHistory: [RustBlockedPeerHistoryEntry] {
+        guard let handle else { return [] }
+        return library.meshTransportBlockedPeerHistory(handle: handle) ?? []
+    }
+
+    /// Per-peer Dytallix trust status as last evaluated by the Rust
+    /// connector. `nil` when the transport hasn't started or the peer
+    /// has no recorded trust evaluation.
+    public func peerTrustStatus(_ peerID: String) -> RustMeshPeerTrustStatus? {
+        guard let handle else { return nil }
+        return library.meshTransportPeerTrustStatus(handle: handle, peerID: peerID)
+    }
+
     /// Sends a frame to a specific peer. Use this when `addPeer` /
     /// `removePeer` has populated multiple peers and the caller
     /// knows which one to target. For single-peer back-compat, use

@@ -21,10 +21,10 @@
                        Style="{StaticResource SubtitleTextBlockStyle}" />
             <Button Content="Connect"
                     Command="{x:Bind ViewModel.ConnectTunnelCommand}"
-                    Visibility="{x:Bind ViewModel.IsConnected, Mode=OneWay, Converter={StaticResource InverseBoolToVisibility}}" />
+                    Visibility="{x:Bind ViewModel.ConnectButtonVisibility, Mode=OneWay}" />
             <Button Content="Disconnect"
                     Command="{x:Bind ViewModel.DisconnectTunnelCommand}"
-                    Visibility="{x:Bind ViewModel.IsConnected, Mode=OneWay, Converter={StaticResource BoolToVisibility}}" />
+                    Visibility="{x:Bind ViewModel.DisconnectButtonVisibility, Mode=OneWay}" />
         </StackPanel>
 
         <!-- Status grid -->

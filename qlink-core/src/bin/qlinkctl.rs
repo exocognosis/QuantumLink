@@ -417,8 +417,7 @@ impl DirectSendTimingReport {
         Self {
             rendezvous_lookup_ms: 0,
             direct_probe_wall_clock_ms: run.outcome.total_elapsed.as_millis(),
-            quic_connect_ms: established_attempt
-                .map(|attempt| attempt.elapsed.as_millis()),
+            quic_connect_ms: established_attempt.map(|attempt| attempt.elapsed.as_millis()),
             identity_assertion_ms: None,
             relay_connect_ms: None,
             datagram_delivery_ms: run.datagram_delivery_elapsed.as_millis(),
