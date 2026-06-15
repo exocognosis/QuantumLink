@@ -255,8 +255,16 @@ public final class AppMeshController: ObservableObject, MeshControlling {
 
     private func observeTunnelStatusChanges() {
         statusObserverTask = Task { [weak self] in
-            let notifications = NotificationCenter.default.notifications(named: .NEVPNStatusDidChange)
-            for await _ in notifications {
+            // `NotificationCenter.notifications(named:)` yields non-Sendable
+            // `Notification` values. Under the Swift 6 language mode the Xcode
+            // project builds with (SWIFT_VERSION = 6.0), those cannot cross
+            // this @MainActor Task's isolation boundary, so iterating the raw
+            // sequence fails to compile. We only need the change signal, not
+            // the notification, so map the sequence to `Void` first.
+            let statusChanges = NotificationCenter.default
+                .notifications(named: .NEVPNStatusDidChange)
+                .map { _ in () }
+            for await _ in statusChanges {
                 guard let self else { return }
                 await self.refresh()
             }
