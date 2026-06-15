@@ -1,4 +1,10 @@
 [workspace]
-members = ["rust/qlink-core"]
+members = [
+    "rust/qlink-core",
+    "steam/steamos/rust/qlink-game",
+    "steam/steamos/rust/qlink-proto",
+    "steam/steamos/rust/qlink-linux",
+    "steam/steamos/rust/qlinkd",
+    "steam/steamos/rust/qlinkctl",
+]
 resolver = "2"
-

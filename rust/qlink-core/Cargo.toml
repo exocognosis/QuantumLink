@@ -11,7 +11,7 @@ path = "src/lib.rs"
 crate-type = ["rlib", "staticlib", "cdylib"]
 
 [[bin]]
-name = "qlinkctl"
+name = "qlink-devctl"
 path = "src/bin/qlinkctl.rs"
 
 [[bin]]
