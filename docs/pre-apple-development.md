@@ -24,7 +24,7 @@ This runbook covers everything QuantumLink can validate before an Apple Develope
 ## One-Command Local Validation
 
 ```sh
-./scripts/preapple-check.sh
+./macos/scripts/preapple-check.sh
 ```
 
 The script runs Swift tests, Rust formatting, Rust tests, release builds, config validation, Swift transport preflight, Rust loopback smokes, XCFramework generation, and local development artifact packaging. If XcodeGen is installed, it also performs an unsigned release dry run that archives the app and produces local DMG and PKG artifacts.
@@ -189,7 +189,7 @@ until real peer telemetry is reported by the transport.
 
 ```sh
 brew install xcodegen
-./scripts/build-unsigned-xcode.sh
+./macos/scripts/build-unsigned-xcode.sh
 ```
 
 This only proves the local Xcode project can generate and build unsigned targets. It does not make the packet tunnel installable.
@@ -198,7 +198,7 @@ This only proves the local Xcode project can generate and build unsigned targets
 
 ```sh
 brew install xcodegen
-./scripts/package-macos.sh --skip-sign --pkg
+./macos/scripts/package-macos.sh --skip-sign --pkg
 ```
 
 This validates the release packaging shape before Apple credentials exist:
@@ -249,7 +249,7 @@ Required signed-release environment:
 ## Development Artifact Package
 
 ```sh
-./scripts/package-dev-artifacts.sh
+./macos/scripts/package-dev-artifacts.sh
 ```
 
 The package is written to `build/dist/QuantumLink-dev.tar.gz` and includes local CLI tools, the Rust dylib, example config, and a short runbook. It is not signed or notarized.
@@ -303,7 +303,7 @@ export QLINK_SPARKLE_FEED_URL="https://updates.example.com/quantumlink/appcast.x
 export QLINK_SPARKLE_PUBLIC_ED_KEY="BASE64-SPARKLE-PUBLIC-KEY"
 ```
 
-7. Run `./scripts/package-macos.sh --pkg` locally and verify `codesign`, `notarytool`, `stapler`, and PKG generation.
+7. Run `./macos/scripts/package-macos.sh --pkg` locally and verify `codesign`, `notarytool`, `stapler`, and PKG generation.
 8. Configure GitHub release secrets and variables:
 
 ```text

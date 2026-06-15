@@ -1,0 +1,52 @@
+name: windows-ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  rust-windows:
+    name: Rust (x86_64-pc-windows-msvc)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check workspace
+        run: cargo check --workspace --all-targets
+
+      - name: Test workspace
+        run: cargo test --workspace
+
+      - name: Data-plane smoke (pump fail-closed invariants)
+        run: cargo run -p quantumlink-service -- smoke
+
+      - name: Build release artifacts (service + core DLL)
+        run: cargo build --release -p quantumlink-service -p qlink-core
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: quantumlink-windows-rust
+          path: |
+            target/release/quantumlink-service.exe
+            target/release/qlink_core.dll
+            target/release/qlink_core.dll.lib
+
+  ui:
+    name: WinUI 3 app
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Build UI
+        run: dotnet build windows/ui/QuantumLink.Windows -c Release -p:Platform=x64

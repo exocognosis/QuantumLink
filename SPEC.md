@@ -2,7 +2,7 @@
 
 QuantumLink is a macOS-first peer-to-peer mesh VPN scaffold. The implementation target is a server-minimized L3 overlay: peers exchange traffic directly when possible, use rendezvous for discovery, and fall back to relay paths when direct connectivity is unavailable. It does not require a centralized VPN concentrator in the steady-state data plane.
 
-This specification reflects the current repository implementation, especially `rust/qlink-core`.
+This specification reflects the current repository implementation, especially `qlink-core`.
 
 ## Runtime Surfaces
 

@@ -6,17 +6,19 @@ on:
   pull_request:
 
 jobs:
-  test:
-    name: Swift and Rust tests
+  rust:
+    name: Rust workspace (shared core + cross-platform silo code)
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       - name: Show toolchain
         run: |
-          swift --version
           rustc --version
           cargo --version
-          xcodebuild -version
+      # Workspace covers qlink-core plus the Windows silo's cross-platform
+      # crates (quantumlink-proto, the non-Windows parts of
+      # quantumlink-service). Windows-only modules are cfg-gated and built
+      # in windows-ci.yml.
       - name: Rust tests
         run: cargo test --workspace
       - name: Rust formatting
@@ -27,20 +29,40 @@ jobs:
         run: |
           cargo run -p qlink-core --bin qlinkctl -- mesh-loopback
           cargo run -p qlink-core --bin qlinkctl -- relay-loopback
+
+  macos:
+    name: macOS silo (Swift + XCFramework)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show toolchain
+        run: |
+          swift --version
+          xcodebuild -version
+      # Build the shared core dylib once at the workspace root.
+      - name: Build shared core
+        run: cargo build -p qlink-core --release
+      # The XCFramework step builds a universal (arm64 + x86_64) static
+      # library, so both Apple targets must be installed.
+      - name: Install Apple Rust targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
       - name: Swift tests
+        working-directory: macos
         run: swift test
       - name: Swift transport smoke
+        working-directory: macos
         run: |
-          cargo build --workspace --release
-          swift run QuantumLinkSmoke validate-config --config config/mesh.example.json
+          swift run QuantumLinkSmoke validate-config --config ../config/mesh.example.json
           swift run QuantumLinkSmoke preflight \
-            --config config/mesh.example.json \
+            --config ../config/mesh.example.json \
             --transport \
             --mode dev-quic-loopback \
-            --dylib "$PWD/target/release/libqlink_core.dylib"
+            --dylib "$PWD/../target/release/libqlink_core.dylib"
       - name: Rust XCFramework
+        working-directory: macos
         run: ./scripts/build-rust-xcframework.sh
       - name: Development artifact package
+        working-directory: macos
         run: ./scripts/package-dev-artifacts.sh
 
   xcodegen-smoke:
@@ -50,9 +72,17 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install XcodeGen
         run: brew install xcodegen
+      - name: Build Rust XCFramework
+        working-directory: macos
+        run: QLINK_RUST_TARGETS="$(rustc -vV | awk '/^host:/ { print $2 }')" ./scripts/build-rust-xcframework.sh
       - name: Generate unsigned project
-        run: ./scripts/generate-xcode-project.sh
+        working-directory: macos
+        # generate-xcode-project.sh re-runs build-rust-xcframework.sh; keep it
+        # host-only (matching the step above) so it does not require the
+        # x86_64 cross-target, which this smoke job does not install.
+        run: QLINK_RUST_TARGETS="$(rustc -vV | awk '/^host:/ { print $2 }')" ./scripts/generate-xcode-project.sh
       - name: Build unsigned app target
+        working-directory: macos
         run: |
           xcodebuild \
             -project QuantumLink.xcodeproj \

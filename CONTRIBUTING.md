@@ -22,7 +22,7 @@ Optional but recommended:
 Run the full pre-Apple validation pass before opening a pull request:
 
 ```sh
-./scripts/preapple-check.sh
+./macos/scripts/preapple-check.sh
 ```
 
 For focused iteration:
