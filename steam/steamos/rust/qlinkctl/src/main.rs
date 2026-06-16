@@ -1,17 +1,27 @@
 use qlink_proto::InviteCode;
+#[cfg(unix)]
 use qlinkctl::{format_status, status_from_daemon};
+#[cfg(unix)]
 use std::path::Path;
 
 fn main() {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
-        Some("status") => match status_from_daemon(Path::new("/run/quantumlink/qlinkd.sock")) {
-            Ok(status) => println!("{}", format_status(&status).expect("status serializes")),
-            Err(error) => {
-                eprintln!("{error}");
+        Some("status") => {
+            #[cfg(unix)]
+            match status_from_daemon(Path::new("/run/quantumlink/qlinkd.sock")) {
+                Ok(status) => println!("{}", format_status(&status).expect("status serializes")),
+                Err(error) => {
+                    eprintln!("{error}");
+                    std::process::exit(1);
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                eprintln!("error: status command is not supported on this platform");
                 std::process::exit(1);
             }
-        },
+        }
         Some("invite") => match args.next().as_deref() {
             Some("decode") => {
                 let Some(encoded) = args.next() else {

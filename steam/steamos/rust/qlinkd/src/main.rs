@@ -1,4 +1,6 @@
-use qlinkd::{load_config_or_default, run_resident, DaemonEngine, DaemonPaths, RuntimeMode};
+use qlinkd::{load_config_or_default, DaemonEngine, DaemonPaths, RuntimeMode};
+#[cfg(unix)]
+use qlinkd::run_resident;
 
 fn main() {
     let mode = RuntimeMode::from_args(std::env::args().skip(1));
@@ -27,8 +29,14 @@ fn main() {
             );
         }
         RuntimeMode::RunResident => {
+            #[cfg(unix)]
             if let Err(error) = run_resident(engine) {
                 eprintln!("qlinkd failed: {error}");
+                std::process::exit(1);
+            }
+            #[cfg(not(unix))]
+            {
+                eprintln!("error: resident mode is not supported on this platform");
                 std::process::exit(1);
             }
         }
