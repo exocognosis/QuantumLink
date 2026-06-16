@@ -2,7 +2,7 @@
 set -euo pipefail
 
 MODE="${1:-run}"
-PRODUCT_NAME="QuantumLinkApp"
+PRODUCT_NAME="QuantumLink"
 APP_NAME="QuantumLink"
 PROCESS_NAME="QuantumLinkApp"
 BUNDLE_ID="com.quantumlink.macos"
