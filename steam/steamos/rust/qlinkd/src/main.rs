@@ -28,17 +28,20 @@ fn main() {
                 engine.paths().socket.display()
             );
         }
-        RuntimeMode::RunResident => {
-            #[cfg(unix)]
-            if let Err(error) = run_resident(engine) {
-                eprintln!("qlinkd failed: {error}");
-                std::process::exit(1);
-            }
-            #[cfg(not(unix))]
-            {
-                eprintln!("error: resident mode is not supported on this platform");
-                std::process::exit(1);
-            }
-        }
+        RuntimeMode::RunResident => run_resident_command(engine),
     }
+}
+
+#[cfg(unix)]
+fn run_resident_command(engine: DaemonEngine) {
+    if let Err(error) = run_resident(engine) {
+        eprintln!("qlinkd failed: {error}");
+        std::process::exit(1);
+    }
+}
+
+#[cfg(not(unix))]
+fn run_resident_command(_engine: DaemonEngine) {
+    eprintln!("qlinkd resident mode is only supported on Unix-like SteamOS hosts");
+    std::process::exit(2);
 }

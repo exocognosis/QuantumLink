@@ -7,21 +7,7 @@ use std::path::Path;
 fn main() {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
-        Some("status") => {
-            #[cfg(unix)]
-            match status_from_daemon(Path::new("/run/quantumlink/qlinkd.sock")) {
-                Ok(status) => println!("{}", format_status(&status).expect("status serializes")),
-                Err(error) => {
-                    eprintln!("{error}");
-                    std::process::exit(1);
-                }
-            }
-            #[cfg(not(unix))]
-            {
-                eprintln!("error: status command is not supported on this platform");
-                std::process::exit(1);
-            }
-        }
+        Some("status") => status_command(),
         Some("invite") => match args.next().as_deref() {
             Some("decode") => {
                 let Some(encoded) = args.next() else {
@@ -49,4 +35,21 @@ fn main() {
             std::process::exit(2);
         }
     }
+}
+
+#[cfg(unix)]
+fn status_command() {
+    match status_from_daemon(Path::new("/run/quantumlink/qlinkd.sock")) {
+        Ok(status) => println!("{}", format_status(&status).expect("status serializes")),
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn status_command() {
+    eprintln!("qlinkctl status is only supported on Unix-like SteamOS hosts");
+    std::process::exit(2);
 }
