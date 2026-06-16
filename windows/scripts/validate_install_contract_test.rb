@@ -1,6 +1,9 @@
 # frozen_string_literal: true
 
 require "minitest/autorun"
+require "json"
+require "open3"
+require "tmpdir"
 
 class ValidateInstallContractTest < Minitest::Test
   SCRIPT_PATH = File.expand_path("validate-install.ps1", __dir__)
@@ -14,6 +17,9 @@ class ValidateInstallContractTest < Minitest::Test
     ExpectedServiceName
     ExpectedStatePath
     ExpectedUiExe
+    SettleTimeoutSeconds
+    SettleIntervalSeconds
+    IncludeHostIdentifiers
   ].freeze
 
   REQUIRED_REPORT_KEYS = %w[
@@ -63,8 +69,8 @@ class ValidateInstallContractTest < Minitest::Test
   end
 
   def test_service_existence_check_does_not_require_running_state
-    assert_match(/\$report\.service\s*=\s*Get-QuantumLinkServiceValidation\s+-Name\s+\$ExpectedServiceName\s+-ExpectPresent\b/, @script)
-    refute_match(/\$report\.service\s*=\s*Get-QuantumLinkServiceValidation\s+-Name\s+\$ExpectedServiceName\s+-ExpectPresent\s+-RequireRunning\b/, @script)
+    assert_match(/\$service\s*=\s*Get-QuantumLinkServiceValidation\s+-Name\s+\$ServiceName\s+-ExpectPresent\b/, @script)
+    refute_match(/Get-QuantumLinkServiceValidation[^\n]*-RequireRunning/, @script)
     refute_match(/exists but is not running/, @script)
   end
 
@@ -87,11 +93,75 @@ class ValidateInstallContractTest < Minitest::Test
     assert_match(/Get-NetAdapter\b/, @script)
     assert_match(/Get-NetRoute\b/, @script)
     assert_match(/netsh\.exe/, @script)
-    assert_match(/wfp"\s*,\s*"show"\s*,\s*"filters"\s*,\s*"file=-"/, @script)
+    assert_match(/wfp"\s*,\s*"show"\s*,\s*"filters"\s*,\s*"verbose=on"/, @script)
     assert_match(/wfp"\s*,\s*"show"\s*,\s*"state"\s*,\s*"file=-"/, @script)
     assert_match(/sublayers\s*=\s*\$null/, @script)
-    assert_match(/\$sublayers\s*=\s*Get-QuantumLinkWfpReferences\s+-Name\s+"WFP sublayers"\s+-Arguments\s+@\("wfp",\s*"show",\s*"state",\s*"file=-"\)/, @script)
+    assert_match(/Select-QuantumLinkWfpSublayerReferences/, @script)
+    refute_match(/\$sublayers\s*=\s*Get-QuantumLinkWfpReferences\s+-Name\s+"WFP sublayers"/, @script)
     assert_match(/\$snapshot\.wfp\.sublayers\s*=\s*\$sublayers/, @script)
-    assert_match(/\$filters\.referenceCount\s*\+\s*\$sublayers\.referenceCount/, @script)
+    assert_match(/\$filterQuery\.Report\.referenceCount\s*\+\s*\$sublayers\.referenceCount/, @script)
+  end
+
+  def test_install_and_uninstall_checks_are_bounded_by_settle_polling
+    assert_match(/\[int\]\$SettleTimeoutSeconds\s*=\s*\d+/, @script)
+    assert_match(/\[int\]\$SettleIntervalSeconds\s*=\s*\d+/, @script)
+    assert_match(/function Wait-QuantumLinkValidation\b/, @script)
+    assert_match(/attempts\s*=\s*@\(\)/, @script)
+    assert_match(/timedOut\s*=\s*\$false/, @script)
+    assert_match(/\$report\.installWait\s*=/, @script)
+    assert_match(/\$report\.uninstallWait\s*=/, @script)
+  end
+
+  def test_redacts_host_identifiers_and_adapter_mac_addresses_by_default
+    assert_match(/\[switch\]\$IncludeHostIdentifiers/, @script)
+    assert_match(/computerName\s*=\s*\(ConvertTo-QuantumLinkEvidenceValue/, @script)
+    assert_match(/userName\s*=\s*\(ConvertTo-QuantumLinkEvidenceValue/, @script)
+    assert_match(/macAddress\s*=\s*\(ConvertTo-QuantumLinkEvidenceValue/, @script)
+  end
+
+  def test_contract_mode_emits_parseable_json_when_pwsh_is_available
+    pwsh = find_executable("pwsh")
+    skip "pwsh is not available in this environment" unless pwsh
+
+    Dir.mktmpdir("qlink-contract") do |dir|
+      report_path = File.join(dir, "report.json")
+      stdout, stderr, status = Open3.capture3(
+        pwsh,
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        SCRIPT_PATH,
+        "-ContractOnly",
+        "-ReportPath",
+        report_path
+      )
+
+      assert status.success?, "expected contract mode to exit 0\nstdout=#{stdout}\nstderr=#{stderr}"
+      assert File.file?(report_path), "expected report at #{report_path}"
+
+      report = JSON.parse(File.read(report_path))
+      REQUIRED_REPORT_KEYS.each do |key|
+        assert report.key?(key), "missing report key #{key}"
+      end
+
+      assert_equal "1.0", report.fetch("schemaVersion")
+      assert_equal true, report.fetch("passed")
+      assert_kind_of Hash, report.fetch("host")
+      assert_kind_of Hash, report.fetch("elevation")
+      assert_kind_of Hash, report.fetch("residualFindings")
+      assert_kind_of Array, report.fetch("failures")
+    end
+  end
+
+  private
+
+  def find_executable(name)
+    ENV.fetch("PATH", "").split(File::PATH_SEPARATOR).each do |dir|
+      candidate = File.join(dir, name)
+      return candidate if File.executable?(candidate) && !File.directory?(candidate)
+    end
+
+    nil
   end
 end

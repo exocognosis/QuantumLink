@@ -18,6 +18,9 @@ param(
     [string]$ExpectedServiceName = "QuantumLinkService",
     [string]$ExpectedStatePath = "C:\ProgramData\QuantumLink",
     [string]$ExpectedUiExe = "C:\Program Files\QuantumLink\QuantumLink.Windows.exe",
+    [int]$SettleTimeoutSeconds = 60,
+    [int]$SettleIntervalSeconds = 2,
+    [switch]$IncludeHostIdentifiers,
     [switch]$ContractOnly
 )
 
@@ -64,6 +67,43 @@ function Limit-ValidationString {
     return ($text.Substring(0, $MaxLength) + "...[truncated]")
 }
 
+function ConvertTo-QuantumLinkEvidenceValue {
+    param(
+        [AllowNull()]
+        [object]$Value,
+
+        [switch]$Include
+    )
+
+    if ($Include) {
+        return (Limit-ValidationString -Value $Value)
+    }
+
+    if ($null -eq $Value) {
+        return $null
+    }
+
+    return "[redacted]"
+}
+
+function ConvertTo-QuantumLinkNativeArgument {
+    param(
+        [AllowNull()]
+        [object]$Argument
+    )
+
+    if ($null -eq $Argument) {
+        return '""'
+    }
+
+    $text = [string]$Argument
+    if ($text -match '[\s"]') {
+        return '"' + ($text -replace '"', '\"') + '"'
+    }
+
+    return $text
+}
+
 function New-SkippedValidationSection {
     param(
         [Parameter(Mandatory = $true)]
@@ -88,6 +128,10 @@ function Test-QuantumLinkAdministrator {
 }
 
 function Get-QuantumLinkHostSnapshot {
+    param(
+        [switch]$IncludeIdentifiers
+    )
+
     $os = $null
     $osError = $null
 
@@ -110,8 +154,8 @@ function Get-QuantumLinkHostSnapshot {
     }
 
     return [ordered]@{
-        computerName = $env:COMPUTERNAME
-        userName = [System.Environment]::UserName
+        computerName = (ConvertTo-QuantumLinkEvidenceValue -Value $env:COMPUTERNAME -Include:$IncludeIdentifiers)
+        userName = (ConvertTo-QuantumLinkEvidenceValue -Value ([System.Environment]::UserName) -Include:$IncludeIdentifiers)
         osCaption = $osCaption
         osVersion = $osVersion
         osBuild = $osBuild
@@ -161,6 +205,68 @@ function Get-QuantumLinkMsiSnapshot {
     return $snapshot
 }
 
+function Invoke-QuantumLinkNativeProcess {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Command,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$Arguments
+    )
+
+    $stdoutPath = [System.IO.Path]::GetTempFileName()
+    $stderrPath = [System.IO.Path]::GetTempFileName()
+    $argumentLine = (($Arguments | ForEach-Object { ConvertTo-QuantumLinkNativeArgument -Argument $_ }) -join " ")
+
+    $result = [ordered]@{
+        command = $Command
+        arguments = $Arguments
+        argumentLine = $argumentLine
+        exitCode = $null
+        stdout = @()
+        stderr = @()
+        output = @()
+        error = $null
+    }
+
+    try {
+        $process = Start-Process `
+            -FilePath $Command `
+            -ArgumentList $argumentLine `
+            -Wait `
+            -PassThru `
+            -NoNewWindow `
+            -RedirectStandardOutput $stdoutPath `
+            -RedirectStandardError $stderrPath `
+            -ErrorAction Stop
+
+        $result.exitCode = [int]$process.ExitCode
+
+        if (Test-Path -LiteralPath $stdoutPath -PathType Leaf) {
+            $result.stdout = @(Get-Content -LiteralPath $stdoutPath -ErrorAction SilentlyContinue)
+        }
+        if (Test-Path -LiteralPath $stderrPath -PathType Leaf) {
+            $result.stderr = @(Get-Content -LiteralPath $stderrPath -ErrorAction SilentlyContinue)
+        }
+
+        $result.output = @($result.stdout + $result.stderr)
+    } catch {
+        $result.error = $_.Exception.Message
+        if (Test-Path -LiteralPath $stdoutPath -PathType Leaf) {
+            $result.stdout = @(Get-Content -LiteralPath $stdoutPath -ErrorAction SilentlyContinue)
+        }
+        if (Test-Path -LiteralPath $stderrPath -PathType Leaf) {
+            $result.stderr = @(Get-Content -LiteralPath $stderrPath -ErrorAction SilentlyContinue)
+        }
+        $result.output = @($result.stdout + $result.stderr)
+    } finally {
+        Remove-Item -LiteralPath $stdoutPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $stderrPath -Force -ErrorAction SilentlyContinue
+    }
+
+    return $result
+}
+
 function Invoke-QuantumLinkMsiExec {
     param(
         [Parameter(Mandatory = $true)]
@@ -185,15 +291,29 @@ function Invoke-QuantumLinkMsiExec {
         startedAt = (Get-ValidationTimestamp)
         endedAt = $null
         exitCode = $null
+        stdout = @()
+        stderr = @()
         passed = $false
         error = $null
     }
 
     try {
-        & msiexec.exe @arguments | Out-Null
-        $result.exitCode = [int]$LASTEXITCODE
+        $native = Invoke-QuantumLinkNativeProcess -Command "msiexec.exe" -Arguments $arguments
+        $result.exitCode = $native.exitCode
+        $result.stdout = @(
+            $native.stdout |
+                Select-Object -First 10 |
+                ForEach-Object { Limit-ValidationString -Value $_ }
+        )
+        $result.stderr = @(
+            $native.stderr |
+                Select-Object -First 10 |
+                ForEach-Object { Limit-ValidationString -Value $_ }
+        )
         $result.passed = ($result.exitCode -eq 0)
-        if (-not $result.passed) {
+        if ($native.error) {
+            $result.error = $native.error
+        } elseif (-not $result.passed) {
             $result.error = "msiexec.exe exited with code $($result.exitCode)."
         }
     } catch {
@@ -402,7 +522,52 @@ function Get-QuantumLinkUiBinaryValidation {
     return $result
 }
 
-function Get-QuantumLinkWfpReferences {
+function New-QuantumLinkWfpReferenceReport {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$Arguments,
+
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [object]$ExitCode,
+
+        [AllowEmptyCollection()]
+        [string[]]$MatchingLines,
+
+        [AllowNull()]
+        [string]$Error
+    )
+
+    $result = [ordered]@{
+        command = "netsh.exe"
+        arguments = $Arguments
+        exitCode = $ExitCode
+        referenceCount = $MatchingLines.Count
+        references = @()
+        truncated = $false
+        passed = $false
+        error = $Error
+    }
+
+    $result.references = @(
+        $MatchingLines |
+            Select-Object -First $script:MaxCollectionItems |
+            ForEach-Object { Limit-ValidationString -Value $_ }
+    )
+    $result.truncated = ($MatchingLines.Count -gt $script:MaxCollectionItems)
+    $result.passed = (($ExitCode -eq 0) -and [string]::IsNullOrWhiteSpace($Error))
+
+    if ((-not $result.passed) -and [string]::IsNullOrWhiteSpace($result.error)) {
+        $result.error = "$Name query failed with exit code $ExitCode."
+    }
+
+    return $result
+}
+
+function Invoke-QuantumLinkWfpQuery {
     param(
         [Parameter(Mandatory = $true)]
         [string]$Name,
@@ -411,47 +576,74 @@ function Get-QuantumLinkWfpReferences {
         [string[]]$Arguments
     )
 
-    $result = [ordered]@{
-        command = "netsh.exe"
-        arguments = $Arguments
-        exitCode = $null
-        referenceCount = 0
-        references = @()
-        truncated = $false
-        passed = $false
-        error = $null
-    }
+    $native = Invoke-QuantumLinkNativeProcess -Command "netsh.exe" -Arguments $Arguments
+    $output = @($native.output | ForEach-Object { [string]$_ })
+    $matchingLines = @($output | Where-Object { $_ -match "QuantumLink" })
 
-    try {
-        $output = @(& netsh.exe @Arguments 2>&1)
-        $result.exitCode = [int]$LASTEXITCODE
-        $matchingLines = @(
+    $errorText = $native.error
+    if ([string]::IsNullOrWhiteSpace($errorText) -and ($native.exitCode -ne 0)) {
+        $errorLines = @(
             $output |
-                ForEach-Object { [string]$_ } |
-                Where-Object { $_ -match "QuantumLink" }
-        )
-        $result.referenceCount = $matchingLines.Count
-        $result.references = @(
-            $matchingLines |
-                Select-Object -First $script:MaxCollectionItems |
+                Select-Object -First 10 |
                 ForEach-Object { Limit-ValidationString -Value $_ }
         )
-        $result.truncated = ($matchingLines.Count -gt $script:MaxCollectionItems)
-        $result.passed = ($result.exitCode -eq 0)
-
-        if (-not $result.passed) {
-            $errorLines = @(
-                $output |
-                    Select-Object -First 10 |
-                    ForEach-Object { Limit-ValidationString -Value $_ }
-            )
-            $result.error = "$Name query failed. Output: $($errorLines -join ' | ')"
-        }
-    } catch {
-        $result.error = $_.Exception.Message
+        $errorText = "$Name query failed. Output: $($errorLines -join ' | ')"
     }
 
-    return $result
+    return [pscustomobject]@{
+        Report = (New-QuantumLinkWfpReferenceReport `
+            -Name $Name `
+            -Arguments $Arguments `
+            -ExitCode $native.exitCode `
+            -MatchingLines $matchingLines `
+            -Error $errorText)
+        Lines = $output
+    }
+}
+
+function Select-QuantumLinkWfpSublayerReferences {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$StateReport,
+
+        [AllowEmptyCollection()]
+        [string[]]$StateLines
+    )
+
+    $matchingLines = [System.Collections.ArrayList]::new()
+    $lineCount = $StateLines.Count
+
+    for ($index = 0; $index -lt $lineCount; $index++) {
+        $line = [string]$StateLines[$index]
+        if ($line -notmatch "QuantumLink") {
+            continue
+        }
+
+        $start = [Math]::Max(0, $index - 5)
+        $end = [Math]::Min($lineCount - 1, $index + 5)
+        $window = @($StateLines[$start..$end] | ForEach-Object { [string]$_ })
+        $hasSublayerContext = @($window | Where-Object { $_ -match "(?i)sublayer" }).Count -gt 0
+
+        if ($hasSublayerContext) {
+            foreach ($windowLine in $window) {
+                if ($windowLine -match "QuantumLink") {
+                    [void]$matchingLines.Add($windowLine)
+                }
+            }
+        }
+    }
+
+    $dedupedLines = @($matchingLines | Select-Object -Unique)
+    $report = New-QuantumLinkWfpReferenceReport `
+        -Name "WFP sublayers" `
+        -Arguments $StateReport.arguments `
+        -ExitCode $StateReport.exitCode `
+        -MatchingLines $dedupedLines `
+        -Error $StateReport.error
+    $report["source"] = "wfp.state"
+    $report["selection"] = "QuantumLink references with nearby sublayer context"
+
+    return $report
 }
 
 function Get-QuantumLinkNetworkSnapshot {
@@ -500,7 +692,7 @@ function Get-QuantumLinkNetworkSnapshot {
                         name = $_.Name
                         interfaceDescription = $_.InterfaceDescription
                         status = $_.Status
-                        macAddress = $_.MacAddress
+                        macAddress = (ConvertTo-QuantumLinkEvidenceValue -Value $_.MacAddress -Include:$IncludeHostIdentifiers)
                         ifIndex = $_.ifIndex
                         linkSpeed = [string]$_.LinkSpeed
                     }
@@ -539,15 +731,15 @@ function Get-QuantumLinkNetworkSnapshot {
         $snapshot.passed = $false
     }
 
-    $filters = Get-QuantumLinkWfpReferences -Name "WFP filters" -Arguments @("wfp", "show", "filters", "file=-")
-    $state = Get-QuantumLinkWfpReferences -Name "WFP state" -Arguments @("wfp", "show", "state", "file=-")
-    $sublayers = Get-QuantumLinkWfpReferences -Name "WFP sublayers" -Arguments @("wfp", "show", "state", "file=-")
-    $snapshot.wfp.filters = $filters
-    $snapshot.wfp.state = $state
+    $filterQuery = Invoke-QuantumLinkWfpQuery -Name "WFP filters" -Arguments @("wfp", "show", "filters", "verbose=on")
+    $stateQuery = Invoke-QuantumLinkWfpQuery -Name "WFP state" -Arguments @("wfp", "show", "state", "file=-")
+    $sublayers = Select-QuantumLinkWfpSublayerReferences -StateReport $stateQuery.Report -StateLines $stateQuery.Lines
+    $snapshot.wfp.filters = $filterQuery.Report
+    $snapshot.wfp.state = $stateQuery.Report
     $snapshot.wfp.sublayers = $sublayers
-    $snapshot.wfp.totalReferenceCount = $filters.referenceCount + $sublayers.referenceCount
+    $snapshot.wfp.totalReferenceCount = $filterQuery.Report.referenceCount + $sublayers.referenceCount
 
-    if ((-not $filters.passed) -or (-not $state.passed) -or (-not $sublayers.passed)) {
+    if ((-not $filterQuery.Report.passed) -or (-not $stateQuery.Report.passed) -or (-not $sublayers.passed)) {
         $snapshot.passed = $false
     }
 
@@ -718,6 +910,176 @@ function Get-QuantumLinkResidualFindings {
     }
 }
 
+function Test-QuantumLinkInstallFootprint {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ServiceName,
+
+        [Parameter(Mandatory = $true)]
+        [string]$StatePath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$UiExe
+    )
+
+    $service = Get-QuantumLinkServiceValidation -Name $ServiceName -ExpectPresent
+    $stateDirectory = Get-QuantumLinkStateDirectoryValidation -Path $StatePath
+    $uiBinary = Get-QuantumLinkUiBinaryValidation -Path $UiExe
+    $passed = ($service.passed -and $stateDirectory.passed -and $uiBinary.passed)
+
+    return [ordered]@{
+        passed = $passed
+        summary = "service=$($service.exists); stateDirectory=$($stateDirectory.exists); uiBinary=$($uiBinary.exists)"
+        evidence = [ordered]@{
+            service = $service
+            stateDirectory = $stateDirectory
+            uiBinary = $uiBinary
+        }
+    }
+}
+
+function Test-QuantumLinkResidualCleanup {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ServiceName,
+
+        [Parameter(Mandatory = $true)]
+        [string]$StatePath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$UiExe,
+
+        [switch]$NetworkSkipped
+    )
+
+    if ($NetworkSkipped) {
+        $networkSnapshot = New-SkippedValidationSection -Reason "-SkipNetworkChecks supplied."
+    } else {
+        $networkSnapshot = Get-QuantumLinkNetworkSnapshot
+    }
+
+    $residualFindings = Get-QuantumLinkResidualFindings `
+        -ServiceName $ServiceName `
+        -StatePath $StatePath `
+        -UiExe $UiExe `
+        -NetworkSnapshot $networkSnapshot `
+        -NetworkSkipped:$NetworkSkipped
+
+    $passed = $residualFindings.passed
+    if (-not $NetworkSkipped) {
+        $passed = ($passed -and $networkSnapshot.passed)
+    }
+
+    return [ordered]@{
+        passed = $passed
+        summary = "residualItems=$(@($residualFindings.items).Count)"
+        evidence = [ordered]@{
+            networkAfterUninstall = $networkSnapshot
+            residualFindings = $residualFindings
+        }
+    }
+}
+
+function Wait-QuantumLinkValidation {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+
+        [Parameter(Mandatory = $true)]
+        [int]$TimeoutSeconds,
+
+        [Parameter(Mandatory = $true)]
+        [int]$IntervalSeconds,
+
+        [Parameter(Mandatory = $true)]
+        [scriptblock]$ScriptBlock
+    )
+
+    $boundedTimeoutSeconds = [Math]::Max(0, $TimeoutSeconds)
+    $boundedIntervalSeconds = [Math]::Max(1, $IntervalSeconds)
+    $deadline = (Get-Date).AddSeconds($boundedTimeoutSeconds)
+    $attempts = @()
+    $attemptCount = 0
+    $attemptsTruncated = $false
+    $timedOut = $false
+    $lastEvaluation = $null
+    $lastError = $null
+
+    while ($true) {
+        $attemptCount += 1
+        $attemptAt = Get-ValidationTimestamp
+        $attemptPassed = $false
+        $attemptSummary = $null
+        $lastError = $null
+
+        try {
+            $lastEvaluation = & $ScriptBlock
+            $attemptPassed = [bool]$lastEvaluation.passed
+            $attemptSummary = $lastEvaluation.summary
+        } catch {
+            $lastEvaluation = [ordered]@{
+                passed = $false
+                summary = "validation attempt failed"
+                evidence = $null
+            }
+            $lastError = $_.Exception.Message
+        }
+
+        if ($attempts.Count -lt $script:MaxCollectionItems) {
+            $attempts += [ordered]@{
+                attempt = $attemptCount
+                at = $attemptAt
+                passed = $attemptPassed
+                summary = $attemptSummary
+                error = $lastError
+            }
+        } else {
+            $attemptsTruncated = $true
+        }
+
+        if ($attemptPassed) {
+            return [ordered]@{
+                skipped = $false
+                name = $Name
+                passed = $true
+                timedOut = $false
+                timeoutSeconds = $boundedTimeoutSeconds
+                intervalSeconds = $boundedIntervalSeconds
+                attemptCount = $attemptCount
+                attempts = @($attempts)
+                attemptsTruncated = $attemptsTruncated
+                evidence = $lastEvaluation.evidence
+                error = $null
+            }
+        }
+
+        if ((Get-Date) -ge $deadline) {
+            $timedOut = $true
+            break
+        }
+
+        $remainingSeconds = [Math]::Max(0, ($deadline - (Get-Date)).TotalSeconds)
+        $sleepSeconds = [Math]::Min($boundedIntervalSeconds, $remainingSeconds)
+        if ($sleepSeconds -gt 0) {
+            Start-Sleep -Milliseconds ([int]([Math]::Ceiling($sleepSeconds * 1000)))
+        }
+    }
+
+    return [ordered]@{
+        skipped = $false
+        name = $Name
+        passed = $false
+        timedOut = $timedOut
+        timeoutSeconds = $boundedTimeoutSeconds
+        intervalSeconds = $boundedIntervalSeconds
+        attemptCount = $attemptCount
+        attempts = @($attempts)
+        attemptsTruncated = $attemptsTruncated
+        evidence = $lastEvaluation.evidence
+        error = $lastError
+    }
+}
+
 function New-QuantumLinkBaseReport {
     param(
         [Parameter(Mandatory = $true)]
@@ -727,7 +1089,7 @@ function New-QuantumLinkBaseReport {
     return [ordered]@{
         schemaVersion = $script:SchemaVersion
         generatedAt = (Get-ValidationTimestamp)
-        host = (Get-QuantumLinkHostSnapshot)
+        host = (Get-QuantumLinkHostSnapshot -IncludeIdentifiers:$IncludeHostIdentifiers)
         msi = [ordered]@{}
         elevation = [ordered]@{
             required = $RequiresElevation
@@ -738,8 +1100,10 @@ function New-QuantumLinkBaseReport {
         stateDirectory = (New-SkippedValidationSection -Reason "Not started.")
         uiBinary = (New-SkippedValidationSection -Reason "Not started.")
         networkBeforeUninstall = (New-SkippedValidationSection -Reason "Not started.")
+        installWait = (New-SkippedValidationSection -Reason "Not started.")
         uninstall = (New-SkippedValidationSection -Reason "Not started.")
         networkAfterUninstall = (New-SkippedValidationSection -Reason "Not started.")
+        uninstallWait = (New-SkippedValidationSection -Reason "Not started.")
         residualFindings = (New-SkippedValidationSection -Reason "Not started.")
         failures = @()
         passed = $false
@@ -804,8 +1168,10 @@ function New-QuantumLinkContractReport {
     $report.stateDirectory = New-SkippedValidationSection -Reason $reason
     $report.uiBinary = New-SkippedValidationSection -Reason $reason
     $report.networkBeforeUninstall = New-SkippedValidationSection -Reason $reason
+    $report.installWait = New-SkippedValidationSection -Reason $reason
     $report.uninstall = New-SkippedValidationSection -Reason $reason
     $report.networkAfterUninstall = New-SkippedValidationSection -Reason $reason
+    $report.uninstallWait = New-SkippedValidationSection -Reason $reason
     $report.residualFindings = [ordered]@{
         skipped = $true
         passed = $true
@@ -852,7 +1218,31 @@ function Invoke-QuantumLinkInstallValidation {
         }
     }
 
-    $report.service = Get-QuantumLinkServiceValidation -Name $ExpectedServiceName -ExpectPresent
+    $report.installWait = Wait-QuantumLinkValidation `
+        -Name "Install footprint" `
+        -TimeoutSeconds $SettleTimeoutSeconds `
+        -IntervalSeconds $SettleIntervalSeconds `
+        -ScriptBlock {
+            Test-QuantumLinkInstallFootprint `
+                -ServiceName $ExpectedServiceName `
+                -StatePath $ExpectedStatePath `
+                -UiExe $ExpectedUiExe
+        }
+
+    if ($null -ne $report.installWait.evidence) {
+        $report.service = $report.installWait.evidence.service
+        $report.stateDirectory = $report.installWait.evidence.stateDirectory
+        $report.uiBinary = $report.installWait.evidence.uiBinary
+    }
+
+    if (-not $report.installWait.passed) {
+        if ($report.installWait.timedOut) {
+            $failures += "Install footprint did not settle within $($report.installWait.timeoutSeconds) seconds."
+        } else {
+            $failures += "Install footprint validation failed."
+        }
+    }
+
     if (-not $report.service.passed) {
         if ($report.service.exists) {
             $failures += "Expected service '$ExpectedServiceName' could not be validated."
@@ -860,8 +1250,6 @@ function Invoke-QuantumLinkInstallValidation {
             $failures += "Expected service '$ExpectedServiceName' was not found."
         }
     }
-
-    $report.stateDirectory = Get-QuantumLinkStateDirectoryValidation -Path $ExpectedStatePath
     if (-not $report.stateDirectory.passed) {
         if (-not $report.stateDirectory.exists) {
             $failures += "Expected state directory '$ExpectedStatePath' was not found."
@@ -872,7 +1260,6 @@ function Invoke-QuantumLinkInstallValidation {
         }
     }
 
-    $report.uiBinary = Get-QuantumLinkUiBinaryValidation -Path $ExpectedUiExe
     if (-not $report.uiBinary.passed) {
         $failures += "Expected UI executable '$ExpectedUiExe' was not found."
     }
@@ -889,6 +1276,7 @@ function Invoke-QuantumLinkInstallValidation {
     if ($SkipUninstall) {
         $report.uninstall = New-SkippedValidationSection -Reason "-SkipUninstall supplied."
         $report.networkAfterUninstall = New-SkippedValidationSection -Reason "-SkipUninstall supplied."
+        $report.uninstallWait = New-SkippedValidationSection -Reason "-SkipUninstall supplied."
         $report.residualFindings = [ordered]@{
             skipped = $true
             passed = $true
@@ -904,24 +1292,36 @@ function Invoke-QuantumLinkInstallValidation {
         $failures += "Silent MSI uninstall failed."
     }
 
-    if ($SkipNetworkChecks) {
-        $report.networkAfterUninstall = New-SkippedValidationSection -Reason "-SkipNetworkChecks supplied."
-    } else {
-        $report.networkAfterUninstall = Get-QuantumLinkNetworkSnapshot
-        if (-not $report.networkAfterUninstall.passed) {
-            $failures += "Network snapshot after uninstall could not be fully collected."
+    $report.uninstallWait = Wait-QuantumLinkValidation `
+        -Name "Uninstall cleanup" `
+        -TimeoutSeconds $SettleTimeoutSeconds `
+        -IntervalSeconds $SettleIntervalSeconds `
+        -ScriptBlock {
+            Test-QuantumLinkResidualCleanup `
+                -ServiceName $ExpectedServiceName `
+                -StatePath $ExpectedStatePath `
+                -UiExe $ExpectedUiExe `
+                -NetworkSkipped:$SkipNetworkChecks
         }
+
+    if ($null -ne $report.uninstallWait.evidence) {
+        $report.networkAfterUninstall = $report.uninstallWait.evidence.networkAfterUninstall
+        $report.residualFindings = $report.uninstallWait.evidence.residualFindings
     }
 
-    $report.residualFindings = Get-QuantumLinkResidualFindings `
-        -ServiceName $ExpectedServiceName `
-        -StatePath $ExpectedStatePath `
-        -UiExe $ExpectedUiExe `
-        -NetworkSnapshot $report.networkAfterUninstall `
-        -NetworkSkipped:$SkipNetworkChecks
+    if ((-not $SkipNetworkChecks) -and (-not $report.networkAfterUninstall.passed)) {
+        $failures += "Network snapshot after uninstall could not be fully collected."
+    }
 
     if (-not $report.residualFindings.passed) {
         $failures += "Residual findings remain after uninstall."
+    }
+    if (-not $report.uninstallWait.passed) {
+        if ($report.uninstallWait.timedOut) {
+            $failures += "Uninstall cleanup did not settle within $($report.uninstallWait.timeoutSeconds) seconds."
+        } else {
+            $failures += "Uninstall cleanup validation failed."
+        }
     }
 
     return Complete-QuantumLinkValidation -Report $report -Failures $failures -OutputPath $ReportPath
