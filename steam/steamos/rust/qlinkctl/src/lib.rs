@@ -1,11 +1,12 @@
 use qlink_proto::DaemonStatus;
+
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
+#[cfg(unix)]
 use std::{
     io::{BufRead, BufReader, Write},
     path::Path,
 };
-
-#[cfg(unix)]
-use std::os::unix::net::UnixStream;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ControlError {
@@ -59,8 +60,10 @@ fn parse_status_response(line: &str) -> Result<DaemonStatus, ControlError> {
 mod tests {
     use super::*;
     use qlink_proto::{NetworkPlanState, NetworkStatus, RouteMode};
+    #[cfg(unix)]
     use std::path::PathBuf;
 
+    #[cfg(unix)]
     #[test]
     fn status_reports_daemon_unavailable_when_socket_is_missing() {
         let missing = PathBuf::from("/tmp/qlinkctl-missing-test.sock");
