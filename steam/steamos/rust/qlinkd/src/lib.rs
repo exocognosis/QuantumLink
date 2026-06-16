@@ -5,13 +5,18 @@ use qlink_proto::{
     ConnectionPhase, DaemonConfig, DaemonStatus, NetworkPlanState, NetworkStatus, PeerStatus,
     RouteMode,
 };
-use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+use std::io::ErrorKind;
+#[cfg(unix)]
+use std::io::{BufRead, BufReader, Read, Write};
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
+#[cfg(unix)]
 use std::time::Duration;
 
+#[cfg(unix)]
 const MAX_CONTROL_REQUEST_BYTES: usize = 1024;
+#[cfg(unix)]
 const CONTROL_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq)]

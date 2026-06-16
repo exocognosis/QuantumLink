@@ -1,12 +1,12 @@
 use qlink_proto::DaemonStatus;
 
 #[cfg(unix)]
+use std::os::unix::net::UnixStream;
+#[cfg(unix)]
 use std::{
     io::{BufRead, BufReader, Write},
     path::Path,
 };
-#[cfg(unix)]
-use std::os::unix::net::UnixStream;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ControlError {
