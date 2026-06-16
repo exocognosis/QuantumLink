@@ -1,6 +1,8 @@
 # Support
 
-QuantumLink is currently a development project, not a production support offering.
+QuantumLink uses public GitHub issues for community support and
+reproducible open-source project work. Security-sensitive reports must
+follow `SECURITY.md` instead.
 
 Use GitHub issues for:
 
@@ -8,13 +10,29 @@ Use GitHub issues for:
 - documentation gaps
 - local development workflow problems
 - feature requests with clear use cases
+- reproducible issues in official signed macOS or Windows releases
 
 Include:
 
-- macOS version
-- Xcode and Swift versions
+- platform and OS version
+- QuantumLink app version and release channel
+- installer or package type
+- Xcode and Swift versions for macOS source builds
+- .NET, WiX, and Windows SDK versions for Windows source builds
 - Rust version
 - command run
-- relevant logs with secrets, keys, IPs, and personal data removed
+- relevant logs with secrets, keys, IPs, hostnames, peer identifiers,
+  customer data, and personal data removed
 
-For security-sensitive reports, follow `SECURITY.md` instead of opening a public issue.
+Unsupported in public issues:
+
+- suspected vulnerabilities
+- private customer incidents
+- unredacted logs, support bundles, packet captures, or crash dumps
+- unofficial binaries, unsigned packages, or locally modified release
+  artifacts
+- requests for production signing credentials, hosted relay access, or
+  private release infrastructure
+
+Paid or enterprise support is only available if announced by the
+maintainers through an official support channel.

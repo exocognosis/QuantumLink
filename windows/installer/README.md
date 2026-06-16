@@ -31,9 +31,14 @@ wix build installer\QuantumLink.wxs `
     -ext WixToolset.Util.wixext `
     -o QuantumLink.msi
 
-# 5. Sign (required for distribution)
+# 5. Sign (required for distribution; production certs stay outside source)
 signtool sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 QuantumLink.msi
 ```
+
+Do not commit Authenticode certificates, private keys, timestamping
+credentials, signed MSIs, or local Wintun drops. Production signing is
+handled by private release infrastructure before artifacts are attached
+to GitHub Releases or another official channel named by the maintainers.
 
 ## What install does
 
@@ -54,7 +59,7 @@ signtool sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 QuantumLin
 
 ## Distribution channels
 
-- Direct MSI download (signed).
+- GitHub Releases direct MSI download (signed).
 - Optional `winget` manifest once the MSI is hosted at a stable URL.
 - Enterprise: standard MSI deployment via Intune/SCCM/GPO. Configuration
   can be pre-seeded by dropping a managed `config.json` into

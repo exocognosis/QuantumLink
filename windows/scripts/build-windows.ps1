@@ -45,5 +45,5 @@ if ($Msi) {
         -d UiPublishDir=ui\publish `
         -ext WixToolset.Util.wixext `
         -o QuantumLink.msi
-    Write-Host "Built QuantumLink.msi — remember to signtool before distribution." -ForegroundColor Yellow
+    Write-Host "Built QuantumLink.msi — unsigned local MSI is for validation only; production signing happens outside source before GitHub Release distribution." -ForegroundColor Yellow
 }

@@ -16,6 +16,8 @@ DerivedData/
 *.xcuserstate
 *.xcuserdata/
 xcuserdata/
+macos/*.xcodeproj/
+macos/*.xcodeproj/**
 
 # Generated build and distribution artifacts
 build/
@@ -24,13 +26,20 @@ dist/
 *.ipa
 *.pkg
 *.dmg
+*.msi
+*.wixpdb
+*.cab
 *.dSYM
 *.dSYM.zip
+windows/ui/publish/
+windows/wintun/
 
 # Local signing and release credentials
 macos/config/QuantumLink.developer-id.local.xcconfig
 *.p12
 *.p8
+*.pfx
+*.pvk
 *.mobileprovision
 
 # Local environment and agent settings
@@ -41,4 +50,5 @@ macos/config/QuantumLink.developer-id.local.xcconfig
 
 # Tooling scratch files
 *.moved-aside
+*.blocked-read-*
 .worktrees/
