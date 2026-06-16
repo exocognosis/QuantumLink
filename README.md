@@ -158,6 +158,8 @@ Design boundaries that hold across every edition:
 ## Contributing and support
 
 - Contribution workflow: [`CONTRIBUTING.md`](CONTRIBUTING.md)
+- Threat model: [`THREAT_MODEL.md`](THREAT_MODEL.md)
+- Quantum-specific threats: [`QUANTUM_THREATS.md`](QUANTUM_THREATS.md)
 - Security reporting: [`SECURITY.md`](SECURITY.md)
 - Support expectations: [`SUPPORT.md`](SUPPORT.md)
 - Community expectations: [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md)

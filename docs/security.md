@@ -4,7 +4,7 @@ QuantumLink assumes passive observers, active on-path attackers, malicious rende
 
 Implemented baseline:
 
-- Hybrid session establishment with X25519 + ML-KEM-768.
+- ML-KEM-768 session establishment without a classical key-exchange fallback.
 - Transcript-bound HKDF-SHA-256 key derivation.
 - Anti-downgrade suite binding through versioned FIPS 203, FIPS 204, and FIPS 205 suite identifiers.
 - ML-DSA-65 and SLH-DSA-SHA2-128S device credential signing and verification.
@@ -66,3 +66,5 @@ Not yet production-complete:
 - Full anonymity guarantees. QuantumLink minimizes app/control-plane metadata by default, but outer transport IPs, relay timing, account context, and endpoint behavior can still identify users unless a future relay/egress architecture is built specifically for that threat model.
 
 The development rendezvous and relay binaries are local protocol tools. Do not expose them on the public internet without adding TLS, authentication policy, rate limits, abuse monitoring, durable revocation, and retention controls.
+
+For repository-scoped reviewer guides, see `../THREAT_MODEL.md` and `../QUANTUM_THREATS.md`.
