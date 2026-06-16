@@ -22,6 +22,7 @@ let package = Package(
             name: "QuantumLinkApp",
             dependencies: ["QuantumLinkKit"],
             resources: [
+                .process("Assets.xcassets"),
                 .process("Resources")
             ]
         ),
