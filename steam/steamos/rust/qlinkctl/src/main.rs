@@ -1,15 +1,12 @@
 use qlink_proto::InviteCode;
-use qlinkctl::status_from_daemon;
+use qlinkctl::{format_status, status_from_daemon};
 use std::path::Path;
 
 fn main() {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("status") => match status_from_daemon(Path::new("/run/quantumlink/qlinkd.sock")) {
-            Ok(status) => println!(
-                "{}",
-                serde_json::to_string_pretty(&status).expect("status serializes")
-            ),
+            Ok(status) => println!("{}", format_status(&status).expect("status serializes")),
             Err(error) => {
                 eprintln!("{error}");
                 std::process::exit(1);

@@ -241,6 +241,43 @@ pub struct PeerStatus {
     pub relay_privacy: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum NetworkPlanState {
+    NotStarted,
+    Planned,
+    ApplyFailed,
+    Applied,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkStatus {
+    pub state: NetworkPlanState,
+    pub interface_name: Option<String>,
+    pub route_mode: Option<RouteMode>,
+    pub protected_cidr: Option<String>,
+    pub dry_run: bool,
+    pub commands: Vec<String>,
+    pub nftables_rules: Vec<String>,
+    pub error: Option<String>,
+}
+
+impl NetworkStatus {
+    pub fn not_started() -> Self {
+        Self {
+            state: NetworkPlanState::NotStarted,
+            interface_name: None,
+            route_mode: None,
+            protected_cidr: None,
+            dry_run: true,
+            commands: Vec::new(),
+            nftables_rules: Vec::new(),
+            error: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DaemonStatus {
@@ -248,6 +285,8 @@ pub struct DaemonStatus {
     pub active_party: Option<String>,
     pub peers: Vec<PeerStatus>,
     pub kill_switch: bool,
+    #[serde(default = "NetworkStatus::not_started")]
+    pub network: NetworkStatus,
 }
 
 impl DaemonStatus {
@@ -257,6 +296,7 @@ impl DaemonStatus {
             active_party: None,
             peers: Vec::new(),
             kill_switch,
+            network: NetworkStatus::not_started(),
         }
     }
 }
@@ -328,8 +368,10 @@ mod tests {
 
     #[test]
     fn validation_rejects_invalid_interface_name() {
-        let mut config = DaemonConfig::default();
-        config.interface_name = "qlink/bad".to_string();
+        let config = DaemonConfig {
+            interface_name: "qlink/bad".to_string(),
+            ..DaemonConfig::default()
+        };
 
         let error = config.validate().unwrap_err();
 
@@ -339,8 +381,10 @@ mod tests {
 
     #[test]
     fn validation_rejects_invalid_overlay_cidr() {
-        let mut config = DaemonConfig::default();
-        config.overlay_cidr = "100.64.0.0".to_string();
+        let config = DaemonConfig {
+            overlay_cidr: "100.64.0.0".to_string(),
+            ..DaemonConfig::default()
+        };
 
         let error = config.validate().unwrap_err();
 
@@ -350,8 +394,10 @@ mod tests {
 
     #[test]
     fn validation_rejects_non_canonical_overlay_cidr() {
-        let mut config = DaemonConfig::default();
-        config.overlay_cidr = "100.64.10.2/10".to_string();
+        let config = DaemonConfig {
+            overlay_cidr: "100.64.10.2/10".to_string(),
+            ..DaemonConfig::default()
+        };
 
         let error = config.validate().unwrap_err();
 
@@ -361,8 +407,10 @@ mod tests {
 
     #[test]
     fn validation_rejects_zero_length_overlay_prefix() {
-        let mut config = DaemonConfig::default();
-        config.overlay_cidr = "100.64.0.0/0".to_string();
+        let config = DaemonConfig {
+            overlay_cidr: "100.64.0.0/0".to_string(),
+            ..DaemonConfig::default()
+        };
 
         let error = config.validate().unwrap_err();
 
@@ -372,8 +420,10 @@ mod tests {
 
     #[test]
     fn validation_rejects_invalid_overlay_address() {
-        let mut config = DaemonConfig::default();
-        config.overlay_ipv4_address = "not-an-ip".to_string();
+        let config = DaemonConfig {
+            overlay_ipv4_address: "not-an-ip".to_string(),
+            ..DaemonConfig::default()
+        };
 
         let error = config.validate().unwrap_err();
 
@@ -383,9 +433,11 @@ mod tests {
 
     #[test]
     fn validation_rejects_overlay_address_outside_overlay_cidr() {
-        let mut config = DaemonConfig::default();
-        config.overlay_cidr = "100.64.0.0/10".to_string();
-        config.overlay_ipv4_address = "10.0.0.2".to_string();
+        let config = DaemonConfig {
+            overlay_cidr: "100.64.0.0/10".to_string(),
+            overlay_ipv4_address: "10.0.0.2".to_string(),
+            ..DaemonConfig::default()
+        };
 
         let error = config.validate().unwrap_err();
 
@@ -395,8 +447,10 @@ mod tests {
 
     #[test]
     fn validation_rejects_empty_rendezvous_server_entry() {
-        let mut config = DaemonConfig::default();
-        config.rendezvous_servers = vec!["rv.example:9471".to_string(), " ".to_string()];
+        let config = DaemonConfig {
+            rendezvous_servers: vec!["rv.example:9471".to_string(), " ".to_string()],
+            ..DaemonConfig::default()
+        };
 
         let error = config.validate().unwrap_err();
 
@@ -406,8 +460,10 @@ mod tests {
 
     #[test]
     fn validation_rejects_empty_relay_server_entry() {
-        let mut config = DaemonConfig::default();
-        config.relay_servers = vec!["relay.example:9472".to_string(), "".to_string()];
+        let config = DaemonConfig {
+            relay_servers: vec!["relay.example:9472".to_string(), "".to_string()],
+            ..DaemonConfig::default()
+        };
 
         let error = config.validate().unwrap_err();
 
@@ -417,8 +473,10 @@ mod tests {
 
     #[test]
     fn validation_allows_full_tunnel_route_mode_without_extra_flags() {
-        let mut config = DaemonConfig::default();
-        config.route_mode = RouteMode::FullTunnel;
+        let config = DaemonConfig {
+            route_mode: RouteMode::FullTunnel,
+            ..DaemonConfig::default()
+        };
 
         config.validate().unwrap();
     }
@@ -439,11 +497,49 @@ mod tests {
                 relay_privacy: false,
             }],
             kill_switch: true,
+            network: NetworkStatus {
+                state: NetworkPlanState::Planned,
+                interface_name: Some("qlink0".to_string()),
+                route_mode: Some(RouteMode::GameOnly),
+                protected_cidr: Some("100.64.0.0/10".to_string()),
+                dry_run: true,
+                commands: vec!["ip tuntap add dev qlink0 mode tun".to_string()],
+                nftables_rules: vec!["add table inet qlink".to_string()],
+                error: None,
+            },
         };
 
         let json = serde_json::to_string(&status).unwrap();
         assert!(json.contains("\"activeParty\":\"squad-123\""));
         assert!(json.contains("\"medianRttMs\":24"));
+        assert!(json.contains("\"state\":\"planned\""));
+        assert!(json.contains("\"protectedCidr\":\"100.64.0.0/10\""));
+        assert!(json.contains("\"dryRun\":true"));
+    }
+
+    #[test]
+    fn idle_status_starts_with_network_not_started() {
+        let status = DaemonStatus::idle(true);
+
+        assert_eq!(status.network.state, NetworkPlanState::NotStarted);
+        assert!(status.network.interface_name.is_none());
+        assert!(status.network.commands.is_empty());
+    }
+
+    #[test]
+    fn status_deserializes_legacy_payload_without_network_field() {
+        let status: DaemonStatus = serde_json::from_str(
+            r#"{
+                "phase": "idle",
+                "activeParty": null,
+                "peers": [],
+                "killSwitch": true
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(status.phase, ConnectionPhase::Idle);
+        assert_eq!(status.network, NetworkStatus::not_started());
     }
 
     #[test]

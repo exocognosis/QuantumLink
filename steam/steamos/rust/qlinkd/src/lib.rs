@@ -1,4 +1,8 @@
-use qlink_proto::{ConnectionPhase, DaemonConfig, DaemonStatus, PeerStatus};
+use qlink_linux::{LinuxRuntimePlan, NetworkPlanError};
+use qlink_proto::{
+    ConnectionPhase, DaemonConfig, DaemonStatus, NetworkPlanState, NetworkStatus, PeerStatus,
+    RouteMode,
+};
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -25,9 +29,77 @@ impl Default for DaemonPaths {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetworkRuntimeState {
     NotStarted,
+    Planned {
+        interface_name: String,
+        route_mode: RouteMode,
+        protected_cidr: String,
+        commands: Vec<String>,
+        nftables_rules: Vec<String>,
+    },
+}
+
+impl NetworkRuntimeState {
+    fn planned(config: &DaemonConfig, plan: &LinuxRuntimePlan) -> Self {
+        Self::Planned {
+            interface_name: config.interface_name.clone(),
+            route_mode: config.route_mode,
+            protected_cidr: plan.protected_cidr().to_string(),
+            commands: plan.network.commands.clone(),
+            nftables_rules: plan.nftables.rules.clone(),
+        }
+    }
+
+    fn status(&self) -> NetworkStatus {
+        match self {
+            Self::NotStarted => NetworkStatus::not_started(),
+            Self::Planned {
+                interface_name,
+                route_mode,
+                protected_cidr,
+                commands,
+                nftables_rules,
+            } => NetworkStatus {
+                state: NetworkPlanState::Planned,
+                interface_name: Some(interface_name.clone()),
+                route_mode: Some(*route_mode),
+                protected_cidr: Some(protected_cidr.clone()),
+                dry_run: true,
+                commands: commands.clone(),
+                nftables_rules: nftables_rules.clone(),
+                error: None,
+            },
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum DaemonInitError {
+    NetworkPlan(NetworkPlanError),
+}
+
+impl std::fmt::Display for DaemonInitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NetworkPlan(error) => write!(f, "failed to plan SteamOS networking: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for DaemonInitError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::NetworkPlan(error) => Some(error),
+        }
+    }
+}
+
+impl From<NetworkPlanError> for DaemonInitError {
+    fn from(error: NetworkPlanError) -> Self {
+        Self::NetworkPlan(error)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -56,6 +128,7 @@ impl DaemonRuntimeState {
             active_party: self.active_party.clone(),
             peers: self.peers.clone(),
             kill_switch: self.kill_switch,
+            network: self.network.status(),
         }
     }
 }
@@ -75,6 +148,22 @@ impl DaemonEngine {
             paths,
             runtime,
         }
+    }
+
+    pub fn try_new(config: DaemonConfig, paths: DaemonPaths) -> Result<Self, DaemonInitError> {
+        let plan = LinuxRuntimePlan::from_config(&config)?;
+        let runtime = DaemonRuntimeState {
+            phase: ConnectionPhase::Idle,
+            active_party: None,
+            peers: Vec::new(),
+            kill_switch: config.kill_switch,
+            network: NetworkRuntimeState::planned(&config, &plan),
+        };
+        Ok(Self {
+            config,
+            paths,
+            runtime,
+        })
     }
 
     pub fn status(&self) -> DaemonStatus {
@@ -273,6 +362,43 @@ mod tests {
         assert_eq!(runtime.phase, ConnectionPhase::Idle);
         assert_eq!(runtime.network, NetworkRuntimeState::NotStarted);
         assert!(runtime.peers.is_empty());
+    }
+
+    #[test]
+    fn engine_try_new_builds_dry_run_network_plan_from_config() {
+        let engine = DaemonEngine::try_new(DaemonConfig::default(), DaemonPaths::default())
+            .expect("default config should produce a dry-run network plan");
+        let status = engine.status();
+
+        assert_eq!(status.network.state, NetworkPlanState::Planned);
+        assert_eq!(status.network.interface_name.as_deref(), Some("qlink0"));
+        assert_eq!(
+            status.network.protected_cidr.as_deref(),
+            Some("100.64.0.0/10")
+        );
+        assert!(status.network.dry_run);
+        assert!(status
+            .network
+            .commands
+            .iter()
+            .any(|command| command == "ip addr add 100.64.10.2/32 dev qlink0"));
+        assert!(status
+            .network
+            .nftables_rules
+            .iter()
+            .any(|rule| rule.contains("ip daddr 100.64.0.0/10")));
+    }
+
+    #[test]
+    fn engine_try_new_rejects_invalid_config_before_runtime_starts() {
+        let config = DaemonConfig {
+            interface_name: "qlink/bad".to_string(),
+            ..DaemonConfig::default()
+        };
+
+        let error = DaemonEngine::try_new(config, DaemonPaths::default()).unwrap_err();
+
+        assert!(error.to_string().contains("interfaceName"));
     }
 
     #[cfg(unix)]

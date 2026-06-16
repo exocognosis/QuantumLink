@@ -1,11 +1,74 @@
 use std::{error::Error, fmt};
 
+use qlink_proto::{ConfigValidationError, DaemonConfig, RouteMode};
+
 const DEFAULT_MTU: u16 = 1280;
 const QLINK_FWMARK: u32 = 0x514c;
 const QLINK_ROUTE_TABLE: u32 = 51820;
 const NFT_FAMILY: &str = "inet";
 const NFT_TABLE: &str = "qlink";
-const NFT_OUTPUT_CHAIN: &str = "output";
+const NFT_OUTPUT_HOOK: &str = "output";
+const NFT_ROUTE_OUTPUT_CHAIN: &str = "route_output";
+const NFT_FILTER_OUTPUT_CHAIN: &str = "filter_output";
+const FULL_TUNNEL_CIDR: &str = "0.0.0.0/0";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinuxRuntimePlan {
+    pub network: LinuxNetworkPlan,
+    pub nftables: NftablesPlan,
+    pub protected_cidr: String,
+}
+
+impl LinuxRuntimePlan {
+    pub fn from_config(config: &DaemonConfig) -> Result<Self, NetworkPlanError> {
+        config.validate().map_err(NetworkPlanError::InvalidConfig)?;
+
+        let protected_cidr = protected_cidr_for_route_mode(config).to_string();
+        let overlay_address = format!("{}/32", config.overlay_ipv4_address);
+
+        Ok(Self {
+            network: LinuxNetworkPlan::for_interface(
+                &config.interface_name,
+                &overlay_address,
+                &protected_cidr,
+            ),
+            nftables: NftablesPlan::fail_closed(&config.interface_name, &protected_cidr),
+            protected_cidr,
+        })
+    }
+
+    pub fn protected_cidr(&self) -> &str {
+        &self.protected_cidr
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NetworkPlanError {
+    InvalidConfig(ConfigValidationError),
+}
+
+impl fmt::Display for NetworkPlanError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidConfig(error) => write!(f, "invalid daemon config: {error}"),
+        }
+    }
+}
+
+impl Error for NetworkPlanError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::InvalidConfig(error) => Some(error),
+        }
+    }
+}
+
+fn protected_cidr_for_route_mode(config: &DaemonConfig) -> &str {
+    match config.route_mode {
+        RouteMode::GameOnly | RouteMode::ProtectedPrefixesOnly => &config.overlay_cidr,
+        RouteMode::FullTunnel => FULL_TUNNEL_CIDR,
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetworkOperation {
@@ -259,23 +322,32 @@ impl NftablesPlan {
             NftablesOperation::AddChain {
                 family: NFT_FAMILY.to_string(),
                 table: NFT_TABLE.to_string(),
-                chain: NFT_OUTPUT_CHAIN.to_string(),
+                chain: NFT_ROUTE_OUTPUT_CHAIN.to_string(),
+                chain_type: "route".to_string(),
+                hook: NFT_OUTPUT_HOOK.to_string(),
+                priority: 0,
+                policy: "accept".to_string(),
+            },
+            NftablesOperation::AddChain {
+                family: NFT_FAMILY.to_string(),
+                table: NFT_TABLE.to_string(),
+                chain: NFT_FILTER_OUTPUT_CHAIN.to_string(),
                 chain_type: "filter".to_string(),
-                hook: NFT_OUTPUT_CHAIN.to_string(),
+                hook: NFT_OUTPUT_HOOK.to_string(),
                 priority: 0,
                 policy: "accept".to_string(),
             },
             NftablesOperation::MarkTraffic {
                 family: NFT_FAMILY.to_string(),
                 table: NFT_TABLE.to_string(),
-                chain: NFT_OUTPUT_CHAIN.to_string(),
+                chain: NFT_ROUTE_OUTPUT_CHAIN.to_string(),
                 cidr: protected_cidr.to_string(),
                 mark: QLINK_FWMARK,
             },
             NftablesOperation::DropOutsideInterface {
                 family: NFT_FAMILY.to_string(),
                 table: NFT_TABLE.to_string(),
-                chain: NFT_OUTPUT_CHAIN.to_string(),
+                chain: NFT_FILTER_OUTPUT_CHAIN.to_string(),
                 cidr: protected_cidr.to_string(),
                 interface: interface_name.to_string(),
             },
@@ -302,6 +374,89 @@ fn format_mark(mark: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use qlink_proto::{DaemonConfig, RouteMode};
+
+    #[test]
+    fn runtime_plan_from_default_config_routes_overlay_cidr() {
+        let config = DaemonConfig::default();
+
+        let plan = LinuxRuntimePlan::from_config(&config).expect("default config should plan");
+
+        assert_eq!(plan.protected_cidr, "100.64.0.0/10");
+        assert_eq!(
+            plan.network.commands,
+            vec![
+                "ip tuntap add dev qlink0 mode tun",
+                "ip addr add 100.64.10.2/32 dev qlink0",
+                "ip link set dev qlink0 mtu 1280 up",
+                "ip rule add fwmark 0x514c table 51820",
+                "ip route add 100.64.0.0/10 dev qlink0 table 51820",
+            ]
+        );
+        assert!(plan
+            .nftables
+            .rules
+            .iter()
+            .any(|rule| rule.contains("ip daddr 100.64.0.0/10")));
+    }
+
+    #[test]
+    fn runtime_plan_full_tunnel_routes_default_ipv4_cidr() {
+        let config = DaemonConfig {
+            route_mode: RouteMode::FullTunnel,
+            ..DaemonConfig::default()
+        };
+
+        let plan = LinuxRuntimePlan::from_config(&config).expect("full tunnel config should plan");
+
+        assert_eq!(plan.protected_cidr, "0.0.0.0/0");
+        assert!(plan
+            .network
+            .commands
+            .iter()
+            .any(|command| command == "ip route add 0.0.0.0/0 dev qlink0 table 51820"));
+        assert!(plan
+            .nftables
+            .rules
+            .iter()
+            .any(|rule| rule.contains("ip daddr 0.0.0.0/0")));
+    }
+
+    #[test]
+    fn runtime_plan_protected_prefixes_only_routes_overlay_cidr() {
+        let config = DaemonConfig {
+            route_mode: RouteMode::ProtectedPrefixesOnly,
+            ..DaemonConfig::default()
+        };
+
+        let plan = LinuxRuntimePlan::from_config(&config)
+            .expect("protected-prefixes-only config should plan");
+
+        assert_eq!(plan.protected_cidr, "100.64.0.0/10");
+        assert!(plan
+            .network
+            .commands
+            .iter()
+            .any(|command| command == "ip route add 100.64.0.0/10 dev qlink0 table 51820"));
+        assert!(plan
+            .nftables
+            .rules
+            .iter()
+            .any(|rule| rule.contains("ip daddr 100.64.0.0/10")));
+    }
+
+    #[test]
+    fn runtime_plan_rejects_invalid_config_before_building_plan() {
+        let config = DaemonConfig {
+            interface_name: String::new(),
+            ..DaemonConfig::default()
+        };
+
+        let error = LinuxRuntimePlan::from_config(&config).unwrap_err();
+
+        assert!(matches!(error, NetworkPlanError::InvalidConfig(_)));
+        assert!(error.to_string().contains("invalid interfaceName"));
+    }
 
     #[test]
     fn routing_plan_uses_dedicated_table_and_mark() {
@@ -356,6 +511,24 @@ mod tests {
     }
 
     #[test]
+    fn nftables_plan_marks_in_route_chain_and_drops_in_filter_chain() {
+        let plan = NftablesPlan::fail_closed("qlink0", "100.64.0.0/10");
+
+        assert!(plan.rules.iter().any(|rule| {
+            rule == "add chain inet qlink route_output { type route hook output priority 0; policy accept; }"
+        }));
+        assert!(plan.rules.iter().any(|rule| {
+            rule == "add rule inet qlink route_output ip daddr 100.64.0.0/10 meta mark set 0x514c"
+        }));
+        assert!(plan.rules.iter().any(|rule| {
+            rule == "add chain inet qlink filter_output { type filter hook output priority 0; policy accept; }"
+        }));
+        assert!(plan.rules.iter().any(|rule| {
+            rule == "add rule inet qlink filter_output ip daddr 100.64.0.0/10 oifname != \"qlink0\" drop"
+        }));
+    }
+
+    #[test]
     fn nftables_plan_preserves_exact_rule_order() {
         let plan = NftablesPlan::fail_closed("qlink0", "100.64.0.0/10");
 
@@ -363,9 +536,10 @@ mod tests {
             plan.rules,
             vec![
                 "add table inet qlink",
-                "add chain inet qlink output { type filter hook output priority 0; policy accept; }",
-                "add rule inet qlink output ip daddr 100.64.0.0/10 meta mark set 0x514c",
-                "add rule inet qlink output ip daddr 100.64.0.0/10 oifname != \"qlink0\" drop",
+                "add chain inet qlink route_output { type route hook output priority 0; policy accept; }",
+                "add chain inet qlink filter_output { type filter hook output priority 0; policy accept; }",
+                "add rule inet qlink route_output ip daddr 100.64.0.0/10 meta mark set 0x514c",
+                "add rule inet qlink filter_output ip daddr 100.64.0.0/10 oifname != \"qlink0\" drop",
             ]
         );
     }
@@ -375,7 +549,9 @@ mod tests {
         let plan = NftablesPlan::fail_closed("qlink0", "100.64.0.0/10");
 
         assert!(plan.rules.iter().any(|rule| {
-            rule.contains("ip daddr 100.64.0.0/10") && rule.contains("meta mark set 0x514c")
+            rule.contains("route_output")
+                && rule.contains("ip daddr 100.64.0.0/10")
+                && rule.contains("meta mark set 0x514c")
         }));
     }
 
@@ -468,7 +644,16 @@ mod tests {
                 NftablesOperation::AddChain {
                     family: "inet".to_string(),
                     table: "qlink".to_string(),
-                    chain: "output".to_string(),
+                    chain: "route_output".to_string(),
+                    chain_type: "route".to_string(),
+                    hook: "output".to_string(),
+                    priority: 0,
+                    policy: "accept".to_string()
+                },
+                NftablesOperation::AddChain {
+                    family: "inet".to_string(),
+                    table: "qlink".to_string(),
+                    chain: "filter_output".to_string(),
                     chain_type: "filter".to_string(),
                     hook: "output".to_string(),
                     priority: 0,
@@ -477,14 +662,14 @@ mod tests {
                 NftablesOperation::MarkTraffic {
                     family: "inet".to_string(),
                     table: "qlink".to_string(),
-                    chain: "output".to_string(),
+                    chain: "route_output".to_string(),
                     cidr: "100.64.0.0/10".to_string(),
                     mark: 0x514c
                 },
                 NftablesOperation::DropOutsideInterface {
                     family: "inet".to_string(),
                     table: "qlink".to_string(),
-                    chain: "output".to_string(),
+                    chain: "filter_output".to_string(),
                     cidr: "100.64.0.0/10".to_string(),
                     interface: "qlink0".to_string()
                 },
@@ -506,36 +691,49 @@ mod tests {
             NftablesOperation::AddChain {
                 family: "inet".to_string(),
                 table: "qlink".to_string(),
-                chain: "output".to_string(),
+                chain: "route_output".to_string(),
+                chain_type: "route".to_string(),
+                hook: "output".to_string(),
+                priority: 0,
+                policy: "accept".to_string(),
+            }
+            .to_rule(),
+            "add chain inet qlink route_output { type route hook output priority 0; policy accept; }"
+        );
+        assert_eq!(
+            NftablesOperation::AddChain {
+                family: "inet".to_string(),
+                table: "qlink".to_string(),
+                chain: "filter_output".to_string(),
                 chain_type: "filter".to_string(),
                 hook: "output".to_string(),
                 priority: 0,
                 policy: "accept".to_string(),
             }
             .to_rule(),
-            "add chain inet qlink output { type filter hook output priority 0; policy accept; }"
+            "add chain inet qlink filter_output { type filter hook output priority 0; policy accept; }"
         );
         assert_eq!(
             NftablesOperation::MarkTraffic {
                 family: "inet".to_string(),
                 table: "qlink".to_string(),
-                chain: "output".to_string(),
+                chain: "route_output".to_string(),
                 cidr: "100.64.0.0/10".to_string(),
                 mark: 0x514c
             }
             .to_rule(),
-            "add rule inet qlink output ip daddr 100.64.0.0/10 meta mark set 0x514c"
+            "add rule inet qlink route_output ip daddr 100.64.0.0/10 meta mark set 0x514c"
         );
         assert_eq!(
             NftablesOperation::DropOutsideInterface {
                 family: "inet".to_string(),
                 table: "qlink".to_string(),
-                chain: "output".to_string(),
+                chain: "filter_output".to_string(),
                 cidr: "100.64.0.0/10".to_string(),
                 interface: "qlink0".to_string()
             }
             .to_rule(),
-            "add rule inet qlink output ip daddr 100.64.0.0/10 oifname != \"qlink0\" drop"
+            "add rule inet qlink filter_output ip daddr 100.64.0.0/10 oifname != \"qlink0\" drop"
         );
     }
 

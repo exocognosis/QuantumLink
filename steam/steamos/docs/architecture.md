@@ -39,6 +39,12 @@ QuantumLink on SteamOS is a Linux daemon deployment inside the Steam silo. The p
 - Keep voice chat usable unless a profile explicitly restricts it.
 - Treat root filesystem updates as potentially removing `/usr/local` binaries or custom units; the installer is safe to re-run.
 
+## Dry-Run Network Planning
+
+The current daemon builds and reports a dry-run Linux network plan during startup. It validates the daemon config, renders the intended `ip` and `nftables` operations, and exposes those commands through `qlinkctl status`. It does not apply TUN, route, or nftables changes yet.
+
+Full-tunnel planning currently renders `0.0.0.0/0` as the protected CIDR so the intended route shape is visible in status output. A future privileged executor must add explicit underlay exemptions for rendezvous, relay, and local control traffic before enabling real full-tunnel application; otherwise fail-closed rules could block the daemon's own control-plane path.
+
 ## Boundaries
 
 The SteamOS silo contains the daemon, CLI, Linux network planning helpers, systemd unit, installer assets, and game profile helpers. The shared protocol core remains in `rust/qlink-core`. Production readiness still requires complete TUN packet integration in `qlinkd`, hardened nftables rollback, public rendezvous/relay hardening, signed release packaging, and broader game compatibility testing.

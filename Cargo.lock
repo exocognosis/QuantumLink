@@ -1324,6 +1324,7 @@ name = "qlinkctl"
 version = "0.1.0"
 dependencies = [
  "qlink-proto",
+ "serde",
  "serde_json",
  "thiserror 1.0.69",
 ]

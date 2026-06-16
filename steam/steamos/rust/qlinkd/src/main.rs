@@ -10,12 +10,19 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let engine = DaemonEngine::new(config, paths);
+    let engine = match DaemonEngine::try_new(config, paths) {
+        Ok(engine) => engine,
+        Err(error) => {
+            eprintln!("qlinkd startup error: {error}");
+            std::process::exit(1);
+        }
+    };
     match mode {
         RuntimeMode::CheckConfig => {
             println!(
-                "qlinkd phase={:?} socket={}",
+                "qlinkd phase={:?} network={:?} socket={}",
                 engine.status().phase,
+                engine.status().network.state,
                 engine.paths().socket.display()
             );
         }
