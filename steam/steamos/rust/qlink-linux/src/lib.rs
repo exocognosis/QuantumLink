@@ -42,6 +42,76 @@ impl LinuxRuntimePlan {
     pub fn protected_cidr(&self) -> &str {
         &self.protected_cidr
     }
+
+    pub fn apply_with_rollback<N, T>(
+        &self,
+        network_executor: &mut N,
+        nftables_executor: &mut T,
+    ) -> Result<(), NetworkApplyError>
+    where
+        N: NetworkExecutor,
+        T: NftablesExecutor,
+    {
+        let mut completed_network = Vec::new();
+        let mut completed_nftables = Vec::new();
+
+        for operation in &self.network.operations {
+            if let Err(error) = network_executor.apply(operation) {
+                return Err(self.rollback_error(
+                    format!("network apply failed: {error}"),
+                    &completed_network,
+                    &completed_nftables,
+                    network_executor,
+                    nftables_executor,
+                ));
+            }
+            completed_network.push(operation.clone());
+        }
+
+        for operation in &self.nftables.operations {
+            if let Err(error) = nftables_executor.apply_nftables(operation) {
+                return Err(self.rollback_error(
+                    format!("nftables apply failed: {error}"),
+                    &completed_network,
+                    &completed_nftables,
+                    network_executor,
+                    nftables_executor,
+                ));
+            }
+            completed_nftables.push(operation.clone());
+        }
+
+        Ok(())
+    }
+
+    fn rollback_error<N, T>(
+        &self,
+        original: String,
+        completed_network: &[NetworkOperation],
+        completed_nftables: &[NftablesOperation],
+        network_executor: &mut N,
+        nftables_executor: &mut T,
+    ) -> NetworkApplyError
+    where
+        N: NetworkExecutor,
+        T: NftablesExecutor,
+    {
+        let mut message = format!("runtime apply failed: {original}");
+
+        if let Err(error) =
+            NftablesPlan::revert_operations_with(nftables_executor, completed_nftables)
+        {
+            message.push_str(&format!("; rollback nftables revert failed: {error}"));
+        }
+
+        if let Err(error) =
+            LinuxNetworkPlan::revert_operations_with(network_executor, completed_network)
+        {
+            message.push_str(&format!("; rollback network revert failed: {error}"));
+        }
+
+        NetworkApplyError::new(message)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,6 +225,18 @@ pub enum NetworkOperation {
         interface: String,
         table: u32,
     },
+    RemoveRoute {
+        cidr: String,
+        interface: String,
+        table: u32,
+    },
+    RemoveRule {
+        fwmark: u32,
+        table: u32,
+    },
+    DeleteTun {
+        name: String,
+    },
 }
 
 impl NetworkOperation {
@@ -175,6 +257,15 @@ impl NetworkOperation {
                 interface,
                 table,
             } => format!("ip route add {cidr} dev {interface} table {table}"),
+            Self::RemoveRoute {
+                cidr,
+                interface,
+                table,
+            } => format!("ip route del {cidr} dev {interface} table {table}"),
+            Self::RemoveRule { fwmark, table } => {
+                format!("ip rule del fwmark {} table {table}", format_mark(*fwmark))
+            }
+            Self::DeleteTun { name } => format!("ip link delete dev {name}"),
         }
     }
 
@@ -240,6 +331,42 @@ impl NetworkOperation {
                     table.to_string(),
                 ],
             ),
+            Self::RemoveRoute {
+                cidr,
+                interface,
+                table,
+            } => SystemCommand::new(
+                IP_COMMAND,
+                vec![
+                    "route".to_string(),
+                    "del".to_string(),
+                    cidr.clone(),
+                    "dev".to_string(),
+                    interface.clone(),
+                    "table".to_string(),
+                    table.to_string(),
+                ],
+            ),
+            Self::RemoveRule { fwmark, table } => SystemCommand::new(
+                IP_COMMAND,
+                vec![
+                    "rule".to_string(),
+                    "del".to_string(),
+                    "fwmark".to_string(),
+                    format_mark(*fwmark),
+                    "table".to_string(),
+                    table.to_string(),
+                ],
+            ),
+            Self::DeleteTun { name } => SystemCommand::new(
+                IP_COMMAND,
+                vec![
+                    "link".to_string(),
+                    "delete".to_string(),
+                    "dev".to_string(),
+                    name.clone(),
+                ],
+            ),
         }
     }
 }
@@ -291,6 +418,70 @@ impl LinuxNetworkPlan {
         for operation in &self.operations {
             executor.apply(operation)?;
         }
+        Ok(())
+    }
+
+    pub fn revert_operations(&self) -> Vec<NetworkOperation> {
+        Self::revert_operations_for(&self.operations)
+    }
+
+    fn revert_operations_for(operations: &[NetworkOperation]) -> Vec<NetworkOperation> {
+        operations
+            .iter()
+            .rev()
+            .filter_map(|operation| match operation {
+                NetworkOperation::AddRoute {
+                    cidr,
+                    interface,
+                    table,
+                } => Some(NetworkOperation::RemoveRoute {
+                    cidr: cidr.clone(),
+                    interface: interface.clone(),
+                    table: *table,
+                }),
+                NetworkOperation::AddRule { fwmark, table } => Some(NetworkOperation::RemoveRule {
+                    fwmark: *fwmark,
+                    table: *table,
+                }),
+                NetworkOperation::CreateTun { name } => {
+                    Some(NetworkOperation::DeleteTun { name: name.clone() })
+                }
+                NetworkOperation::AddAddress { .. }
+                | NetworkOperation::SetLinkUp { .. }
+                | NetworkOperation::RemoveRoute { .. }
+                | NetworkOperation::RemoveRule { .. }
+                | NetworkOperation::DeleteTun { .. } => None,
+            })
+            .collect()
+    }
+
+    pub fn revert_commands(&self) -> Vec<String> {
+        self.revert_operations()
+            .iter()
+            .map(NetworkOperation::to_command)
+            .collect()
+    }
+
+    pub fn revert<E: NetworkExecutor>(&self, executor: &mut E) -> Result<(), NetworkApplyError> {
+        Self::revert_operations_with(executor, &self.operations)
+    }
+
+    fn revert_operations_with<E: NetworkExecutor>(
+        executor: &mut E,
+        operations: &[NetworkOperation],
+    ) -> Result<(), NetworkApplyError> {
+        let mut errors = Vec::new();
+
+        for operation in Self::revert_operations_for(operations) {
+            if let Err(error) = executor.apply(&operation) {
+                errors.push(error.to_string());
+            }
+        }
+
+        if !errors.is_empty() {
+            return Err(NetworkApplyError::new(errors.join("; ")));
+        }
+
         Ok(())
     }
 }
@@ -412,6 +603,10 @@ pub enum NftablesOperation {
         cidr: String,
         interface: String,
     },
+    DeleteTable {
+        family: String,
+        table: String,
+    },
 }
 
 impl NftablesOperation {
@@ -448,6 +643,7 @@ impl NftablesOperation {
             } => format!(
                 "add rule {family} {table} {chain} ip daddr {cidr} oifname != \"{interface}\" drop"
             ),
+            Self::DeleteTable { family, table } => format!("delete table {family} {table}"),
         }
     }
 
@@ -536,6 +732,15 @@ impl NftablesOperation {
                     "!=".to_string(),
                     interface.clone(),
                     "drop".to_string(),
+                ],
+            ),
+            Self::DeleteTable { family, table } => SystemCommand::new(
+                NFT_COMMAND,
+                vec![
+                    "delete".to_string(),
+                    "table".to_string(),
+                    family.clone(),
+                    table.clone(),
                 ],
             ),
         }
@@ -639,6 +844,59 @@ impl NftablesPlan {
         for operation in &self.operations {
             executor.apply_nftables(operation)?;
         }
+        Ok(())
+    }
+
+    pub fn revert_operations(&self) -> Vec<NftablesOperation> {
+        Self::revert_operations_for(&self.operations)
+    }
+
+    fn revert_operations_for(operations: &[NftablesOperation]) -> Vec<NftablesOperation> {
+        operations
+            .iter()
+            .rev()
+            .filter_map(|operation| match operation {
+                NftablesOperation::AddTable { family, table } => {
+                    Some(NftablesOperation::DeleteTable {
+                        family: family.clone(),
+                        table: table.clone(),
+                    })
+                }
+                NftablesOperation::AddChain { .. }
+                | NftablesOperation::MarkTraffic { .. }
+                | NftablesOperation::DropOutsideInterface { .. }
+                | NftablesOperation::DeleteTable { .. } => None,
+            })
+            .collect()
+    }
+
+    pub fn revert_rules(&self) -> Vec<String> {
+        self.revert_operations()
+            .iter()
+            .map(NftablesOperation::to_rule)
+            .collect()
+    }
+
+    pub fn revert<E: NftablesExecutor>(&self, executor: &mut E) -> Result<(), NetworkApplyError> {
+        Self::revert_operations_with(executor, &self.operations)
+    }
+
+    fn revert_operations_with<E: NftablesExecutor>(
+        executor: &mut E,
+        operations: &[NftablesOperation],
+    ) -> Result<(), NetworkApplyError> {
+        let mut errors = Vec::new();
+
+        for operation in Self::revert_operations_for(operations) {
+            if let Err(error) = executor.apply_nftables(&operation) {
+                errors.push(error.to_string());
+            }
+        }
+
+        if !errors.is_empty() {
+            return Err(NetworkApplyError::new(errors.join("; ")));
+        }
+
         Ok(())
     }
 }
@@ -1081,6 +1339,79 @@ mod tests {
     }
 
     #[test]
+    fn network_revert_uses_reverse_dependency_order() {
+        let plan = LinuxNetworkPlan::for_interface("qlink0", "100.64.10.2/32", "100.64.0.0/10");
+
+        assert_eq!(
+            plan.revert_operations(),
+            vec![
+                NetworkOperation::RemoveRoute {
+                    cidr: "100.64.0.0/10".to_string(),
+                    interface: "qlink0".to_string(),
+                    table: 51820,
+                },
+                NetworkOperation::RemoveRule {
+                    fwmark: 0x514c,
+                    table: 51820,
+                },
+                NetworkOperation::DeleteTun {
+                    name: "qlink0".to_string(),
+                },
+            ]
+        );
+        assert_eq!(
+            plan.revert_commands(),
+            vec![
+                "ip route del 100.64.0.0/10 dev qlink0 table 51820",
+                "ip rule del fwmark 0x514c table 51820",
+                "ip link delete dev qlink0",
+            ]
+        );
+    }
+
+    #[test]
+    fn network_revert_operations_render_to_exact_system_commands() {
+        assert_eq!(
+            NetworkOperation::RemoveRoute {
+                cidr: "100.64.0.0/10".to_string(),
+                interface: "qlink0".to_string(),
+                table: 51820,
+            }
+            .to_system_command(),
+            system_command(
+                IP_COMMAND,
+                &[
+                    "route",
+                    "del",
+                    "100.64.0.0/10",
+                    "dev",
+                    "qlink0",
+                    "table",
+                    "51820",
+                ],
+            )
+        );
+        assert_eq!(
+            NetworkOperation::RemoveRule {
+                fwmark: 0x514c,
+                table: 51820,
+            }
+            .to_system_command(),
+            system_command(
+                IP_COMMAND,
+                &["rule", "del", "fwmark", "0x514c", "table", "51820"]
+            )
+        );
+        assert_eq!(
+            NetworkOperation::DeleteTun {
+                name: "qlink0".to_string(),
+            }
+            .to_system_command(),
+            system_command(IP_COMMAND, &["link", "delete", "dev", "qlink0"])
+        );
+    }
+
+    #[test]
     fn nftables_operations_render_to_exact_system_commands() {
         assert_eq!(
             NftablesOperation::AddTable {
@@ -1177,6 +1508,32 @@ mod tests {
                     "drop",
                 ],
             )
+        );
+    }
+
+    #[test]
+    fn nftables_revert_deletes_quantumlink_table() {
+        let plan = NftablesPlan::fail_closed("qlink0", "100.64.0.0/10");
+
+        assert_eq!(
+            plan.revert_operations(),
+            vec![NftablesOperation::DeleteTable {
+                family: "inet".to_string(),
+                table: "qlink".to_string(),
+            }]
+        );
+        assert_eq!(plan.revert_rules(), vec!["delete table inet qlink"]);
+    }
+
+    #[test]
+    fn nftables_revert_operations_render_to_exact_system_commands() {
+        assert_eq!(
+            NftablesOperation::DeleteTable {
+                family: "inet".to_string(),
+                table: "qlink".to_string(),
+            }
+            .to_system_command(),
+            system_command(NFT_COMMAND, &["delete", "table", "inet", "qlink"])
         );
     }
 
@@ -1464,6 +1821,184 @@ mod tests {
     }
 
     #[test]
+    fn dry_run_executor_records_rendered_revert_operations() {
+        let network = LinuxNetworkPlan::for_interface("qlink0", "100.64.10.2/32", "100.64.0.0/10");
+        let nftables = NftablesPlan::fail_closed("qlink0", "100.64.0.0/10");
+        let mut executor = DryRunExecutor::new();
+
+        nftables
+            .revert(&mut executor)
+            .expect("dry-run nftables revert should record");
+        network
+            .revert(&mut executor)
+            .expect("dry-run network revert should record");
+
+        assert_eq!(
+            executor.recorded_commands(),
+            &[
+                "delete table inet qlink",
+                "ip route del 100.64.0.0/10 dev qlink0 table 51820",
+                "ip rule del fwmark 0x514c table 51820",
+                "ip link delete dev qlink0",
+            ]
+        );
+    }
+
+    #[test]
+    fn runtime_apply_succeeds_without_rollback() {
+        let plan = LinuxRuntimePlan::from_config(&DaemonConfig::default()).expect("valid plan");
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut network = RecordingNetworkExecutor::new(events.clone());
+        let mut nftables = RecordingNftablesExecutor::new(events.clone());
+
+        plan.apply_with_rollback(&mut network, &mut nftables)
+            .expect("runtime apply should succeed");
+
+        assert_eq!(
+            events.borrow().as_slice(),
+            &[
+                "network:ip tuntap add dev qlink0 mode tun",
+                "network:ip addr add 100.64.10.2/32 dev qlink0",
+                "network:ip link set dev qlink0 mtu 1280 up",
+                "network:ip rule add fwmark 0x514c table 51820",
+                "network:ip route add 100.64.0.0/10 dev qlink0 table 51820",
+                "nftables:add table inet qlink",
+                "nftables:add chain inet qlink route_output { type route hook output priority 0; policy accept; }",
+                "nftables:add chain inet qlink filter_output { type filter hook output priority 0; policy accept; }",
+                "nftables:add rule inet qlink route_output ip daddr 100.64.0.0/10 meta mark set 0x514c",
+                "nftables:add rule inet qlink filter_output ip daddr 100.64.0.0/10 oifname != \"qlink0\" drop",
+            ]
+        );
+    }
+
+    #[test]
+    fn runtime_apply_rolls_back_only_completed_network_operations_when_network_apply_fails() {
+        let plan = LinuxRuntimePlan::from_config(&DaemonConfig::default()).expect("valid plan");
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut network = RecordingNetworkExecutor::new(events.clone()).fail_on_apply(2);
+        let mut nftables = RecordingNftablesExecutor::new(events.clone());
+
+        let error = plan
+            .apply_with_rollback(&mut network, &mut nftables)
+            .unwrap_err();
+
+        assert!(error
+            .message()
+            .contains("runtime apply failed: network apply failed"));
+        assert!(error.message().contains("network apply failed at 2"));
+        assert_eq!(
+            events.borrow().as_slice(),
+            &[
+                "network:ip tuntap add dev qlink0 mode tun",
+                "network:ip addr add 100.64.10.2/32 dev qlink0",
+                "network:ip link delete dev qlink0",
+            ]
+        );
+    }
+
+    #[test]
+    fn runtime_apply_rolls_back_network_only_when_first_nftables_apply_fails() {
+        let plan = LinuxRuntimePlan::from_config(&DaemonConfig::default()).expect("valid plan");
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut network = RecordingNetworkExecutor::new(events.clone());
+        let mut nftables = RecordingNftablesExecutor::new(events.clone()).fail_on_apply(1);
+
+        let error = plan
+            .apply_with_rollback(&mut network, &mut nftables)
+            .unwrap_err();
+
+        assert!(error
+            .message()
+            .contains("runtime apply failed: nftables apply failed"));
+        assert!(error.message().contains("nftables apply failed at 1"));
+        assert_eq!(
+            events.borrow().as_slice(),
+            &[
+                "network:ip tuntap add dev qlink0 mode tun",
+                "network:ip addr add 100.64.10.2/32 dev qlink0",
+                "network:ip link set dev qlink0 mtu 1280 up",
+                "network:ip rule add fwmark 0x514c table 51820",
+                "network:ip route add 100.64.0.0/10 dev qlink0 table 51820",
+                "nftables:add table inet qlink",
+                "network:ip route del 100.64.0.0/10 dev qlink0 table 51820",
+                "network:ip rule del fwmark 0x514c table 51820",
+                "network:ip link delete dev qlink0",
+            ]
+        );
+    }
+
+    #[test]
+    fn runtime_apply_rolls_back_nftables_table_when_table_add_succeeded() {
+        let plan = LinuxRuntimePlan::from_config(&DaemonConfig::default()).expect("valid plan");
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut network = RecordingNetworkExecutor::new(events.clone());
+        let mut nftables = RecordingNftablesExecutor::new(events.clone()).fail_on_apply(2);
+
+        let error = plan
+            .apply_with_rollback(&mut network, &mut nftables)
+            .unwrap_err();
+
+        assert!(error
+            .message()
+            .contains("runtime apply failed: nftables apply failed"));
+        assert!(error.message().contains("nftables apply failed at 2"));
+        assert_eq!(
+            events.borrow().as_slice(),
+            &[
+                "network:ip tuntap add dev qlink0 mode tun",
+                "network:ip addr add 100.64.10.2/32 dev qlink0",
+                "network:ip link set dev qlink0 mtu 1280 up",
+                "network:ip rule add fwmark 0x514c table 51820",
+                "network:ip route add 100.64.0.0/10 dev qlink0 table 51820",
+                "nftables:add table inet qlink",
+                "nftables:add chain inet qlink route_output { type route hook output priority 0; policy accept; }",
+                "nftables:delete table inet qlink",
+                "network:ip route del 100.64.0.0/10 dev qlink0 table 51820",
+                "network:ip rule del fwmark 0x514c table 51820",
+                "network:ip link delete dev qlink0",
+            ]
+        );
+    }
+
+    #[test]
+    fn runtime_apply_reports_rollback_failures_with_original_failure() {
+        let plan = LinuxRuntimePlan::from_config(&DaemonConfig::default()).expect("valid plan");
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut network = RecordingNetworkExecutor::new(events.clone()).fail_on_revert(2);
+        let mut nftables = RecordingNftablesExecutor::new(events.clone())
+            .fail_on_apply(2)
+            .fail_on_revert(1);
+
+        let error = plan
+            .apply_with_rollback(&mut network, &mut nftables)
+            .unwrap_err();
+
+        assert!(error.message().contains("nftables apply failed at 2"));
+        assert!(error
+            .message()
+            .contains("rollback nftables revert failed: nftables revert failed at 1"));
+        assert!(error
+            .message()
+            .contains("rollback network revert failed: network revert failed at 2"));
+        assert_eq!(
+            events.borrow().as_slice(),
+            &[
+                "network:ip tuntap add dev qlink0 mode tun",
+                "network:ip addr add 100.64.10.2/32 dev qlink0",
+                "network:ip link set dev qlink0 mtu 1280 up",
+                "network:ip rule add fwmark 0x514c table 51820",
+                "network:ip route add 100.64.0.0/10 dev qlink0 table 51820",
+                "nftables:add table inet qlink",
+                "nftables:add chain inet qlink route_output { type route hook output priority 0; policy accept; }",
+                "nftables:delete table inet qlink",
+                "network:ip route del 100.64.0.0/10 dev qlink0 table 51820",
+                "network:ip rule del fwmark 0x514c table 51820",
+                "network:ip link delete dev qlink0",
+            ]
+        );
+    }
+
+    #[test]
     fn network_apply_propagates_executor_failures_and_stops() {
         #[derive(Default)]
         struct FailingNetworkExecutor {
@@ -1539,6 +2074,134 @@ mod tests {
             self.commands.push(command.clone());
             if self.fail_on == Some(self.commands.len()) {
                 return Err(NetworkApplyError::new("runner failed"));
+            }
+            Ok(())
+        }
+    }
+
+    type SharedEvents = std::rc::Rc<std::cell::RefCell<Vec<String>>>;
+
+    struct RecordingNetworkExecutor {
+        events: SharedEvents,
+        applied: usize,
+        reverted: usize,
+        fail_apply_on: Option<usize>,
+        fail_revert_on: Option<usize>,
+    }
+
+    impl RecordingNetworkExecutor {
+        fn new(events: SharedEvents) -> Self {
+            Self {
+                events,
+                applied: 0,
+                reverted: 0,
+                fail_apply_on: None,
+                fail_revert_on: None,
+            }
+        }
+
+        fn fail_on_apply(mut self, operation_index: usize) -> Self {
+            self.fail_apply_on = Some(operation_index);
+            self
+        }
+
+        fn fail_on_revert(mut self, operation_index: usize) -> Self {
+            self.fail_revert_on = Some(operation_index);
+            self
+        }
+    }
+
+    impl NetworkExecutor for RecordingNetworkExecutor {
+        fn apply(&mut self, operation: &NetworkOperation) -> Result<(), NetworkApplyError> {
+            if matches!(
+                operation,
+                NetworkOperation::RemoveRoute { .. }
+                    | NetworkOperation::RemoveRule { .. }
+                    | NetworkOperation::DeleteTun { .. }
+            ) {
+                self.reverted += 1;
+                self.events
+                    .borrow_mut()
+                    .push(format!("network:{}", operation.to_command()));
+                if self.fail_revert_on == Some(self.reverted) {
+                    return Err(NetworkApplyError::new(format!(
+                        "network revert failed at {}",
+                        self.reverted
+                    )));
+                }
+            } else {
+                self.applied += 1;
+                self.events
+                    .borrow_mut()
+                    .push(format!("network:{}", operation.to_command()));
+                if self.fail_apply_on == Some(self.applied) {
+                    return Err(NetworkApplyError::new(format!(
+                        "network apply failed at {}",
+                        self.applied
+                    )));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    struct RecordingNftablesExecutor {
+        events: SharedEvents,
+        applied: usize,
+        reverted: usize,
+        fail_apply_on: Option<usize>,
+        fail_revert_on: Option<usize>,
+    }
+
+    impl RecordingNftablesExecutor {
+        fn new(events: SharedEvents) -> Self {
+            Self {
+                events,
+                applied: 0,
+                reverted: 0,
+                fail_apply_on: None,
+                fail_revert_on: None,
+            }
+        }
+
+        fn fail_on_apply(mut self, operation_index: usize) -> Self {
+            self.fail_apply_on = Some(operation_index);
+            self
+        }
+
+        fn fail_on_revert(mut self, operation_index: usize) -> Self {
+            self.fail_revert_on = Some(operation_index);
+            self
+        }
+    }
+
+    impl NftablesExecutor for RecordingNftablesExecutor {
+        fn apply_nftables(
+            &mut self,
+            operation: &NftablesOperation,
+        ) -> Result<(), NetworkApplyError> {
+            if matches!(operation, NftablesOperation::DeleteTable { .. }) {
+                self.reverted += 1;
+                self.events
+                    .borrow_mut()
+                    .push(format!("nftables:{}", operation.to_rule()));
+                if self.fail_revert_on == Some(self.reverted) {
+                    return Err(NetworkApplyError::new(format!(
+                        "nftables revert failed at {}",
+                        self.reverted
+                    )));
+                }
+            } else {
+                self.applied += 1;
+                self.events
+                    .borrow_mut()
+                    .push(format!("nftables:{}", operation.to_rule()));
+                if self.fail_apply_on == Some(self.applied) {
+                    return Err(NetworkApplyError::new(format!(
+                        "nftables apply failed at {}",
+                        self.applied
+                    )));
+                }
             }
             Ok(())
         }

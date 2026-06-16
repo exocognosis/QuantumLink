@@ -1,7 +1,14 @@
+use qlink_linux::{StdCommandRunner, SystemNetworkExecutor, SystemNftablesExecutor};
 use qlinkd::{load_config_or_default, run_resident, DaemonEngine, DaemonPaths, RuntimeMode};
 
 fn main() {
-    let mode = RuntimeMode::from_args(std::env::args().skip(1));
+    let mode = match RuntimeMode::from_args(std::env::args().skip(1)) {
+        Ok(mode) => mode,
+        Err(error) => {
+            eprintln!("qlinkd argument error: {error}");
+            std::process::exit(2);
+        }
+    };
     let paths = DaemonPaths::default();
     let config = match load_config_or_default(&paths) {
         Ok(config) => config,
@@ -10,7 +17,7 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let engine = match DaemonEngine::try_new(config, paths) {
+    let mut engine = match DaemonEngine::try_new(config, paths) {
         Ok(engine) => engine,
         Err(error) => {
             eprintln!("qlinkd startup error: {error}");
@@ -26,7 +33,18 @@ fn main() {
                 engine.paths().socket.display()
             );
         }
-        RuntimeMode::RunResident => {
+        RuntimeMode::RunResident { activate_network } => {
+            if activate_network {
+                let mut network_executor = SystemNetworkExecutor::new(StdCommandRunner);
+                let mut nftables_executor = SystemNftablesExecutor::new(StdCommandRunner);
+                if let Err(error) =
+                    engine.activate_network_with(&mut network_executor, &mut nftables_executor)
+                {
+                    eprintln!("qlinkd network activation failed: {error}");
+                    std::process::exit(1);
+                }
+            }
+
             if let Err(error) = run_resident(engine) {
                 eprintln!("qlinkd failed: {error}");
                 std::process::exit(1);

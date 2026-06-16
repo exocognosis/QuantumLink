@@ -6,6 +6,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# Default packaged mode is dry-run planning-only. It validates and publishes the
+# intended network plan but does not apply TUN, route, or nftables changes.
+# Use a systemd drop-in that overrides ExecStart with
+# /usr/local/bin/qlinkd --activate-network for real network application.
 ExecStart=/usr/local/bin/qlinkd
 Restart=on-failure
 RestartSec=2s
@@ -15,8 +19,8 @@ ConfigurationDirectory=quantumlink
 UMask=0077
 NoNewPrivileges=no
 
-# qlinkd currently needs elevated networking privileges for TUN, routes, and nftables.
-# Keep the service root-owned until the daemon has a split privileged setup path.
+# Keep the service root-owned while activated networking, state, and the local
+# control socket still use the privileged SteamOS packaging path.
 
 [Install]
 WantedBy=multi-user.target

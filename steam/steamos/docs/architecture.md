@@ -4,7 +4,7 @@ QuantumLink on SteamOS is a Linux daemon deployment inside the Steam silo. The p
 
 ## Components
 
-- `qlinkd` lives in `steam/steamos/rust/qlinkd`, loads `/etc/quantumlink/config.json`, keeps state in `/var/lib/quantumlink`, exposes a local control socket at `/run/quantumlink/qlinkd.sock`, manages profiles, and owns the active mesh session.
+- `qlinkd` lives in `steam/steamos/rust/qlinkd`, loads `/etc/quantumlink/config.json`, keeps state in `/var/lib/quantumlink`, exposes a local control socket at `/run/quantumlink/qlinkd.sock`, manages profiles, and owns the active mesh session. The default resident mode is dry-run planning-only unless the operator starts it with `--activate-network`.
 - `qlinkctl` talks to the daemon for status, enrollment, invites, profile selection, diagnostics, and development service checks. The current scaffold uses a root-owned daemon socket, so status checks use `sudo qlinkctl status` until a non-root control model lands.
 - `qlink-devctl` remains the shared-core protocol-development smoke CLI for rendezvous, relay, QUIC, and mesh loopback checks.
 - `qlink0` is the intended Linux TUN interface for protected overlay packets.
@@ -14,6 +14,8 @@ QuantumLink on SteamOS is a Linux daemon deployment inside the Steam silo. The p
 - Game profiles decide which title, party, route, or LAN-discovery traffic is protected.
 
 ## Packet Flow
+
+This is the intended activated packet flow. The packaged systemd service does not enter this network-apply path by default.
 
 1. A game sends traffic matching an active profile or overlay route.
 2. Linux policy routing sends protected destinations to `qlink0`.
@@ -41,9 +43,11 @@ QuantumLink on SteamOS is a Linux daemon deployment inside the Steam silo. The p
 
 ## Dry-Run Network Planning
 
-The current daemon builds and reports a dry-run Linux network plan during startup. It validates the daemon config, renders the intended `ip` and `nftables` operations, and exposes those commands through `qlinkctl status`. It does not apply TUN, route, or nftables changes during normal startup or `--check`.
+The default resident daemon builds and reports a dry-run Linux network plan during startup. It validates the daemon config, renders the intended `ip` and `nftables` operations, and exposes those commands through `qlinkctl status`. It does not apply TUN, route, or nftables changes when launched by the packaged systemd unit or during `--check`.
 
-`qlink-linux` now separates human-readable plan rendering from privileged execution. Dry-run status still renders operator-friendly `ip` and `nftables` strings, while the execution boundary uses typed argv commands, trusted SteamOS tool paths (`/usr/bin/ip`, `/usr/bin/nft`), and injectable command runners. `qlinkd` has an explicit injected-executor API that can mark network state as `applied` or `applyFailed`, but no CLI, socket request, systemd path, or startup mode calls it yet.
+`qlinkd --check` is validation/status only and exits without mutating networking. `qlinkd --activate-network` is the explicit operator opt-in for real TUN, route, and nftables application. `qlinkd --check --activate-network` is invalid because validation-only mode and activation mode are mutually exclusive.
+
+`qlink-linux` separates human-readable plan rendering from privileged execution. Dry-run status still renders operator-friendly `ip` and `nftables` strings, while the execution boundary uses typed argv commands, trusted SteamOS tool paths (`/usr/bin/ip`, `/usr/bin/nft`), and injectable command runners. When activation is explicitly requested, `qlinkd` can mark network state as `applied` or `applyFailed` in status. The packaged unit remains `ExecStart=/usr/local/bin/qlinkd`, so SteamOS installs stay dry-run until an operator adds a systemd drop-in that overrides `ExecStart` with `qlinkd --activate-network`.
 
 Full-tunnel planning currently renders `0.0.0.0/0` as the protected CIDR so the intended route shape is visible in status output. A future privileged executor must add explicit underlay exemptions for rendezvous, relay, and local control traffic before enabling real full-tunnel application; otherwise fail-closed rules could block the daemon's own control-plane path.
 

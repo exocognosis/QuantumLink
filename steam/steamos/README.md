@@ -37,6 +37,8 @@ sudo PREFIX=/opt/quantumlink ./steam/steamos/scripts/install-steamos.sh
 
 The installer copies binaries to `/usr/local/bin` by default, creates `/etc/quantumlink` and `/var/lib/quantumlink`, installs `steam/steamos/packaging/systemd/qlinkd.service`, reloads systemd, and prints the next commands.
 
+The packaged `qlinkd.service` starts the resident daemon in dry-run planning mode. It validates configuration, builds the intended Linux network plan, and exposes that plan through status, but it does not create TUN devices, change routes, or apply nftables rules by default.
+
 Typical next steps:
 
 ```sh
@@ -45,13 +47,43 @@ sudo systemctl enable --now qlinkd
 sudo qlinkctl status
 ```
 
+## Runtime Modes
+
+- `qlinkd` starts the resident daemon in dry-run planning mode and does not mutate networking.
+- `qlinkd --check` validates configuration/status only and exits; it is not a network activation path.
+- `qlinkd --activate-network` is the explicit operator opt-in for real TUN, route, and nftables application.
+- `qlinkd --check --activate-network` is invalid because validation-only mode and activation mode are mutually exclusive.
+
+To run the packaged service with real network application, create a controlled systemd drop-in instead of editing the installed unit directly:
+
+```sh
+sudo systemctl edit qlinkd
+```
+
+Use this override for the default install path:
+
+```ini
+[Service]
+ExecStart=
+ExecStart=/usr/local/bin/qlinkd --activate-network
+```
+
+Then reload and restart the service:
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl restart qlinkd
+```
+
+If the installer was run with a custom `BINDIR`, use that installed `qlinkd` path in the override. Remove the drop-in to return the packaged service to dry-run planning mode.
+
 SteamOS may remount the root filesystem read-only after system updates. Re-run the installer after an OS image refresh if `/usr/local/bin/qlinkd`, `/usr/local/bin/qlinkctl`, or the systemd unit disappears.
 
 ## Runtime Model
 
 - Linux creates a dedicated TUN interface, currently documented as `qlink0`.
 - Protected game/party routes use the overlay range `100.64.0.0/10`.
-- `qlinkd` owns route setup, nftables fail-closed policy, peer state, and profile application.
+- `qlinkd` owns route setup, nftables fail-closed policy, peer state, and profile application; the packaged service plans those changes until explicitly started with `--activate-network`.
 - Rendezvous services publish and look up short-lived signed peer records.
 - Peers attempt direct QUIC paths first, with optional ICE/STUN helpers as the traversal layer matures.
 - Relay services are fallback paths for hostile NAT or intentionally hidden paths.

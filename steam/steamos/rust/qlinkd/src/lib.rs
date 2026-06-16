@@ -218,12 +218,27 @@ impl DaemonEngine {
         NE: NetworkExecutor,
         NF: NftablesExecutor,
     {
+        self.activate_network_with(network_executor, nftables_executor)
+    }
+
+    pub fn activate_network_with<NE, NF>(
+        &mut self,
+        network_executor: &mut NE,
+        nftables_executor: &mut NF,
+    ) -> Result<(), NetworkApplyError>
+    where
+        NE: NetworkExecutor,
+        NF: NftablesExecutor,
+    {
         let plan = LinuxRuntimePlan::from_config(&self.config).map_err(|error| {
             NetworkApplyError::new(format!("failed to plan SteamOS networking: {error}"))
         })?;
         let runtime_plan = NetworkRuntimePlan::from_plan(&self.config, &plan);
 
-        if let Err(error) = plan.network.apply(network_executor) {
+        if self.config.route_mode == RouteMode::FullTunnel {
+            let error = NetworkApplyError::new(
+                "full-tunnel activation requires underlay exemptions before real apply",
+            );
             self.runtime.network = NetworkRuntimeState::ApplyFailed {
                 plan: runtime_plan,
                 error: error.message().to_string(),
@@ -231,35 +246,68 @@ impl DaemonEngine {
             return Err(error);
         }
 
-        if let Err(error) = plan.nftables.apply(nftables_executor) {
-            self.runtime.network = NetworkRuntimeState::ApplyFailed {
-                plan: runtime_plan,
-                error: error.message().to_string(),
-            };
-            return Err(error);
+        match plan.apply_with_rollback(network_executor, nftables_executor) {
+            Ok(()) => {
+                self.runtime.network = NetworkRuntimeState::Applied(runtime_plan);
+                Ok(())
+            }
+            Err(error) => {
+                self.runtime.network = NetworkRuntimeState::ApplyFailed {
+                    plan: runtime_plan,
+                    error: error.message().to_string(),
+                };
+                Err(error)
+            }
         }
-
-        self.runtime.network = NetworkRuntimeState::Applied(runtime_plan);
-        Ok(())
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeMode {
-    RunResident,
+    RunResident { activate_network: bool },
     CheckConfig,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeModeError {
+    ConflictingFlags,
+}
+
+impl std::fmt::Display for RuntimeModeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ConflictingFlags => {
+                write!(f, "cannot combine --check with --activate-network")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RuntimeModeError {}
+
 impl RuntimeMode {
-    pub fn from_args<I, S>(args: I) -> Self
+    pub fn from_args<I, S>(args: I) -> Result<Self, RuntimeModeError>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        if args.into_iter().any(|arg| arg.as_ref() == "--check") {
-            Self::CheckConfig
+        let mut check_config = false;
+        let mut activate_network = false;
+
+        for arg in args {
+            match arg.as_ref() {
+                "--check" => check_config = true,
+                "--activate-network" => activate_network = true,
+                _ => {}
+            }
+        }
+
+        if check_config && activate_network {
+            Err(RuntimeModeError::ConflictingFlags)
+        } else if check_config {
+            Ok(Self::CheckConfig)
         } else {
-            Self::RunResident
+            Ok(Self::RunResident { activate_network })
         }
     }
 }
@@ -501,14 +549,14 @@ mod tests {
     }
 
     #[test]
-    fn apply_network_with_fake_executors_marks_applied() {
+    fn activate_network_with_fake_executors_marks_applied() {
         let mut engine = DaemonEngine::try_new(DaemonConfig::default(), DaemonPaths::default())
             .expect("default config should produce a dry-run network plan");
         let mut network_executor = RecordingNetworkExecutor::default();
         let mut nftables_executor = RecordingNftablesExecutor::default();
 
         engine
-            .apply_network_with(&mut network_executor, &mut nftables_executor)
+            .activate_network_with(&mut network_executor, &mut nftables_executor)
             .expect("fake executors should apply");
         let status = engine.status();
 
@@ -525,7 +573,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_network_stops_on_network_failure_and_marks_apply_failed() {
+    fn activate_network_rolls_back_network_failure_and_marks_apply_failed() {
         let mut engine = DaemonEngine::try_new(DaemonConfig::default(), DaemonPaths::default())
             .expect("default config should produce a dry-run network plan");
         let mut network_executor = RecordingNetworkExecutor {
@@ -535,23 +583,32 @@ mod tests {
         let mut nftables_executor = RecordingNftablesExecutor::default();
 
         let error = engine
-            .apply_network_with(&mut network_executor, &mut nftables_executor)
+            .activate_network_with(&mut network_executor, &mut nftables_executor)
             .unwrap_err();
         let status = engine.status();
 
-        assert_eq!(error.message(), "network apply failed");
+        assert!(error
+            .message()
+            .contains("runtime apply failed: network apply failed"));
         assert_eq!(network_executor.operations.len(), 1);
         assert!(nftables_executor.operations.is_empty());
         assert_eq!(status.network.state, NetworkPlanState::ApplyFailed);
         assert!(!status.network.dry_run);
-        assert_eq!(
-            status.network.error.as_deref(),
-            Some("network apply failed")
-        );
+        assert!(status
+            .network
+            .error
+            .as_deref()
+            .expect("activation failure should be recorded")
+            .contains("runtime apply failed: network apply failed"));
+        assert!(status
+            .network
+            .commands
+            .iter()
+            .any(|command| command == "ip tuntap add dev qlink0 mode tun"));
     }
 
     #[test]
-    fn apply_network_stops_on_nftables_failure_and_marks_apply_failed() {
+    fn activate_network_rolls_back_completed_network_when_nftables_fails() {
         let mut engine = DaemonEngine::try_new(DaemonConfig::default(), DaemonPaths::default())
             .expect("default config should produce a dry-run network plan");
         let mut network_executor = RecordingNetworkExecutor::default();
@@ -561,19 +618,83 @@ mod tests {
         };
 
         let error = engine
-            .apply_network_with(&mut network_executor, &mut nftables_executor)
+            .activate_network_with(&mut network_executor, &mut nftables_executor)
             .unwrap_err();
         let status = engine.status();
 
-        assert_eq!(error.message(), "nftables apply failed");
-        assert_eq!(network_executor.operations.len(), 5);
+        assert!(error
+            .message()
+            .contains("runtime apply failed: nftables apply failed"));
+        assert_eq!(network_executor.operations.len(), 8);
+        assert!(network_executor.operations.iter().any(|operation| matches!(
+            operation,
+            NetworkOperation::RemoveRule {
+                fwmark: 0x514c,
+                table: 51820
+            }
+        )));
+        assert!(network_executor.operations.iter().any(|operation| matches!(
+            operation,
+            NetworkOperation::DeleteTun { name } if name == "qlink0"
+        )));
         assert_eq!(nftables_executor.operations.len(), 1);
         assert_eq!(status.network.state, NetworkPlanState::ApplyFailed);
         assert!(!status.network.dry_run);
-        assert_eq!(
-            status.network.error.as_deref(),
-            Some("nftables apply failed")
-        );
+        assert!(status
+            .network
+            .error
+            .as_deref()
+            .expect("activation failure should be recorded")
+            .contains("runtime apply failed: nftables apply failed"));
+    }
+
+    #[test]
+    fn activate_network_blocks_full_tunnel_before_executor_calls() {
+        let config = DaemonConfig {
+            route_mode: RouteMode::FullTunnel,
+            ..DaemonConfig::default()
+        };
+        let mut engine = DaemonEngine::try_new(config, DaemonPaths::default())
+            .expect("full tunnel remains valid for dry-run planning");
+        let mut network_executor = RecordingNetworkExecutor::default();
+        let mut nftables_executor = RecordingNftablesExecutor::default();
+
+        let error = engine
+            .activate_network_with(&mut network_executor, &mut nftables_executor)
+            .unwrap_err();
+        let status = engine.status();
+
+        assert!(error.message().contains("full-tunnel activation"));
+        assert!(network_executor.operations.is_empty());
+        assert!(nftables_executor.operations.is_empty());
+        assert_eq!(status.network.state, NetworkPlanState::ApplyFailed);
+        assert_eq!(status.network.route_mode, Some(RouteMode::FullTunnel));
+        assert_eq!(status.network.protected_cidr.as_deref(), Some("0.0.0.0/0"));
+        assert!(!status.network.commands.is_empty());
+        assert!(!status.network.dry_run);
+        assert!(status
+            .network
+            .error
+            .as_deref()
+            .expect("activation failure should be recorded")
+            .contains("full-tunnel activation"));
+    }
+
+    #[test]
+    fn try_new_full_tunnel_still_plans_dry_run_without_activation() {
+        let config = DaemonConfig {
+            route_mode: RouteMode::FullTunnel,
+            ..DaemonConfig::default()
+        };
+
+        let engine = DaemonEngine::try_new(config, DaemonPaths::default())
+            .expect("full tunnel remains valid for dry-run planning");
+        let status = engine.status();
+
+        assert_eq!(status.network.state, NetworkPlanState::Planned);
+        assert_eq!(status.network.route_mode, Some(RouteMode::FullTunnel));
+        assert_eq!(status.network.protected_cidr.as_deref(), Some("0.0.0.0/0"));
+        assert!(status.network.dry_run);
     }
 
     #[test]
@@ -637,13 +758,37 @@ mod tests {
     #[test]
     fn default_runtime_mode_is_resident_daemon() {
         assert_eq!(
-            RuntimeMode::from_args(std::iter::empty::<&str>()),
-            RuntimeMode::RunResident
+            RuntimeMode::from_args(std::iter::empty::<&str>()).unwrap(),
+            RuntimeMode::RunResident {
+                activate_network: false
+            }
         );
+    }
+
+    #[test]
+    fn runtime_mode_parses_explicit_network_activation() {
         assert_eq!(
-            RuntimeMode::from_args(["--check"]),
+            RuntimeMode::from_args(["--activate-network"]).unwrap(),
+            RuntimeMode::RunResident {
+                activate_network: true
+            }
+        );
+    }
+
+    #[test]
+    fn runtime_mode_parses_check_config() {
+        assert_eq!(
+            RuntimeMode::from_args(["--check"]).unwrap(),
             RuntimeMode::CheckConfig
         );
+    }
+
+    #[test]
+    fn runtime_mode_rejects_check_with_network_activation() {
+        let error = RuntimeMode::from_args(["--check", "--activate-network"]).unwrap_err();
+
+        assert_eq!(error, RuntimeModeError::ConflictingFlags);
+        assert!(error.to_string().contains("cannot combine"));
     }
 
     #[test]
