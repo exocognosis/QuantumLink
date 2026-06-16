@@ -1,0 +1,22 @@
+[Unit]
+Description=QuantumLink gaming mesh VPN daemon
+Documentation=https://github.com/exocognosis/QuantumLink
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/qlinkd
+Restart=on-failure
+RestartSec=2s
+RuntimeDirectory=quantumlink
+StateDirectory=quantumlink
+ConfigurationDirectory=quantumlink
+UMask=0077
+NoNewPrivileges=no
+
+# qlinkd currently needs elevated networking privileges for TUN, routes, and nftables.
+# Keep the service root-owned until the daemon has a split privileged setup path.
+
+[Install]
+WantedBy=multi-user.target

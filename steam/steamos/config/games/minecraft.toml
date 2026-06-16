@@ -1,0 +1,7 @@
+id = "minecraft"
+display_name = "Minecraft"
+executables = ["java", "minecraft-launcher"]
+udp_ports = [19132, 25565]
+lan_discovery = true
+voice_chat_safe = true
+low_latency = true
