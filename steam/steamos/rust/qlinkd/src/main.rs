@@ -1,6 +1,6 @@
-use qlinkd::{load_config_or_default, DaemonEngine, DaemonPaths, RuntimeMode};
 #[cfg(unix)]
 use qlinkd::run_resident;
+use qlinkd::{load_config_or_default, DaemonEngine, DaemonPaths, RuntimeMode};
 
 fn main() {
     let mode = RuntimeMode::from_args(std::env::args().skip(1));

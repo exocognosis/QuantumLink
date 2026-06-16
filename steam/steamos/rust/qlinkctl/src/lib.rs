@@ -1,11 +1,10 @@
 use qlink_proto::DaemonStatus;
+#[cfg(unix)]
 use std::{
     io::{BufRead, BufReader, Write},
+    os::unix::net::UnixStream,
     path::Path,
 };
-
-#[cfg(unix)]
-use std::os::unix::net::UnixStream;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ControlError {
@@ -42,6 +41,7 @@ pub fn format_status(status: &DaemonStatus) -> Result<String, serde_json::Error>
     serde_json::to_string_pretty(status)
 }
 
+#[cfg(any(unix, test))]
 fn parse_status_response(line: &str) -> Result<DaemonStatus, ControlError> {
     let value = serde_json::from_str::<serde_json::Value>(line)?;
     if value.get("type").and_then(serde_json::Value::as_str) == Some("error") {
@@ -59,9 +59,11 @@ fn parse_status_response(line: &str) -> Result<DaemonStatus, ControlError> {
 mod tests {
     use super::*;
     use qlink_proto::{NetworkPlanState, NetworkStatus, RouteMode};
+    #[cfg(unix)]
     use std::path::PathBuf;
 
     #[test]
+    #[cfg(unix)]
     fn status_reports_daemon_unavailable_when_socket_is_missing() {
         let missing = PathBuf::from("/tmp/qlinkctl-missing-test.sock");
         let error = status_from_daemon(&missing).unwrap_err();
