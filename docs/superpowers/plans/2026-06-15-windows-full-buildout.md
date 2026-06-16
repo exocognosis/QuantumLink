@@ -22,6 +22,12 @@
 
 ## Task 1: Windows Release Pipeline
 
+Status update 2026-06-16: the Windows release workflow, build script,
+release-input docs, Wintun provenance checks, signing gate, artifact staging,
+and local verification contracts are implemented. Tag releases still require
+Authenticode signing, and release publication still requires external/manual
+validation evidence before publication.
+
 **Files:**
 - Create: `.github/workflows/windows-release.yml`
 - Modify: `windows/scripts/build-windows.ps1`
@@ -29,7 +35,7 @@
 - Modify: `windows/docs/beta-runbook-windows.md`
 - Modify: `windows/version.md`
 
-- [ ] **Step 1: Add workflow-dispatch and tag release workflow**
+- [x] **Step 1: Add workflow-dispatch and tag release workflow**
 
 Create `.github/workflows/windows-release.yml` with a Windows job that checks out the repo, installs Rust and .NET 8, runs the Windows Rust checks, publishes the WinUI app, downloads Wintun from pinned `WINTUN_DOWNLOAD_URL` and `WINTUN_SHA256` repository variables, verifies the archive before extraction, retains the upstream Wintun license, invokes `windows/scripts/build-windows.ps1 -Msi`, signs when signing secrets are present, computes SHA256 sums, uploads artifacts, and attaches tag artifacts to GitHub Releases only when signing is configured and succeeds.
 
@@ -41,7 +47,7 @@ gh workflow view windows-release.yml --repo exocognosis/QuantumLink
 
 Expected: before merge this may fail if the workflow is not on the default branch; local YAML parsing should still succeed through `ruby -e 'require "yaml"; YAML.load_file(".github/workflows/windows-release.yml")'` or an equivalent parser.
 
-- [ ] **Step 2: Make the packaging script release-friendly**
+- [x] **Step 2: Make the packaging script release-friendly**
 
 Modify `windows/scripts/build-windows.ps1` to accept:
 
@@ -64,7 +70,7 @@ pwsh -NoProfile -Command "[scriptblock]::Create((Get-Content -Raw 'windows/scrip
 
 Expected: command exits 0 on hosts with PowerShell.
 
-- [ ] **Step 3: Document release inputs and validation gates**
+- [x] **Step 3: Document release inputs and validation gates**
 
 Update Windows installer and beta docs to distinguish:
 
@@ -80,7 +86,7 @@ rg -n "Windows release|Authenticode|SmartScreen|Wintun|SHA256" windows/installer
 
 Expected: each release requirement appears in the docs.
 
-- [ ] **Step 4: Verify the first workstream**
+- [x] **Step 4: Verify the first workstream**
 
 Run:
 
@@ -94,22 +100,43 @@ Expected: all commands exit 0. On non-Windows hosts, do not claim MSI, WinUI, or
 
 ## Task 2: Installer Lifecycle Validation
 
+Status update 2026-06-16: `windows/scripts/validate-install.ps1` exists with
+install, service, state directory, UI binary, network snapshot, cleanup, and
+JSON report evidence checks. The release workflow has an explicit manual
+`run_install_validation` gate that uploads
+`windows/build/validation/install-validation-report.json`. `-SkipNetworkChecks`
+only waives adapter, route, and WFP evidence on constrained runners; clean
+Windows 10/11 VM, physical-host, leak-test, two-machine, and macOS interop
+validation remain manual beta gates.
+
 **Files:**
-- Create: `windows/scripts/validate-msi-install.ps1`
+- Create: `windows/scripts/validate-install.ps1`
+- Create: `windows/scripts/validate_install_contract_test.rb`
+- Create: `windows/scripts/windows_release_workflow_contract_test.rb`
+- Modify: `.github/workflows/windows-release.yml`
 - Modify: `windows/docs/beta-runbook-windows.md`
 - Modify: `windows/installer/README.md`
 
-- [ ] **Step 1: Add install validation script**
+- [x] **Step 1: Add install validation script**
 
 Create a PowerShell script that accepts an MSI path, installs it silently, checks `QuantumLinkService`, verifies `C:\ProgramData\QuantumLink`, confirms the UI binary exists, uninstalls the product, and verifies the service is removed.
 
-- [ ] **Step 2: Add cleanup checks**
+- [x] **Step 2: Add cleanup checks**
 
 Extend the script to check routes, adapter presence, and WFP sublayer state before and after uninstall.
 
-- [ ] **Step 3: Record validation evidence**
+- [x] **Step 3: Record validation evidence**
 
 Emit a JSON report containing host OS, MSI SHA256, install result, service status, state directory ACL result, uninstall result, and residual-state findings.
+
+- [x] **Step 4: Wire manual release workflow validation**
+
+Add `workflow_dispatch` inputs for `run_install_validation` and
+`skip_validation_network_checks`, run `.\windows\scripts\validate-install.ps1`
+against `.\windows\QuantumLink.msi`, write
+`.\windows\build\validation\install-validation-report.json`, and upload that
+report as `QuantumLink-Windows-InstallValidation-<run-number>` with `always()`
+when the manual validation gate is enabled.
 
 ## Task 3: Service Hardening
 

@@ -5,6 +5,15 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      run_install_validation:
+        description: "Installs/uninstalls the generated MSI on the GitHub Windows runner and uploads JSON evidence."
+        type: boolean
+        default: false
+      skip_validation_network_checks:
+        description: "Skips adapter/route/WFP evidence inside validate-install.ps1 if a runner cannot collect network evidence."
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -213,6 +222,35 @@ jobs:
           } finally {
             Remove-Item -Path $certPath -Force -ErrorAction SilentlyContinue
           }
+
+      - name: Validate MSI install and uninstall
+        if: github.event_name == 'workflow_dispatch' && inputs.run_install_validation
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          New-Item -ItemType Directory -Path ".\windows\build\validation" -Force | Out-Null
+
+          $arguments = @(
+            "-MsiPath",
+            ".\windows\QuantumLink.msi",
+            "-ReportPath",
+            ".\windows\build\validation\install-validation-report.json"
+          )
+
+          if ("${{ inputs.skip_validation_network_checks }}" -eq "true") {
+            $arguments += "-SkipNetworkChecks"
+          }
+
+          & .\windows\scripts\validate-install.ps1 @arguments
+
+      - name: Upload install validation report
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.run_install_validation
+        uses: actions/upload-artifact@v4
+        with:
+          name: QuantumLink-Windows-InstallValidation-${{ github.run_number }}
+          path: windows/build/validation/install-validation-report.json
+          if-no-files-found: warn
 
       - name: Stage release artifacts and checksums
         shell: pwsh

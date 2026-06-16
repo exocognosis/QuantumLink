@@ -43,9 +43,17 @@ The workflow downloads the archive to runner temp, verifies `WINTUN_SHA256`
 before extraction, stages `bin/amd64/wintun.dll` at
 `.\wintun\bin\amd64\wintun.dll`, verifies the staged DLL before packaging, and
 copies the upstream Wintun license text into the release artifact set.
-Tagged releases still require the Authenticode signing secrets; manual
-workflow builds may upload unsigned internal artifacts when signing is not
-configured.
+Tagged releases still require the Authenticode signing secrets and
+external/manual validation evidence before publication; manual workflow builds
+may upload unsigned internal artifacts when signing is not configured.
+
+Manual workflow runs can also set `run_install_validation` to run
+`.\windows\scripts\validate-install.ps1` against the generated MSI on
+`windows-latest` and upload
+`windows/build/validation/install-validation-report.json` as JSON evidence.
+Set `skip_validation_network_checks` only when the runner cannot collect
+adapter, route, or WFP evidence; that option does not replace full beta
+validation on clean Windows hosts.
 
 ## Build steps
 
@@ -83,6 +91,9 @@ signtool sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 windows\Qu
 # 6. Verify signature and publish checksum
 Get-AuthenticodeSignature .\windows\QuantumLink.msi
 Get-FileHash .\windows\QuantumLink.msi -Algorithm SHA256 | Format-List > .\windows\QuantumLink.msi.sha256
+
+# 7. Generate install/uninstall validation evidence
+.\windows\scripts\validate-install.ps1 -MsiPath .\windows\QuantumLink.msi -ReportPath .\windows\build\validation\install-validation-report.json
 ```
 
 ## Release operator checklist
@@ -115,12 +126,16 @@ command passes, release Rust artifacts build, and the WinUI 3 app builds.
 The Windows release workflow sources Wintun from the pinned URL/checksum, builds
 the WiX MSI, optionally Authenticode-signs manual artifacts, requires signing
 for tag releases, creates checksums, and uploads the Wintun license text with
-the artifacts.
+the artifacts. For manual runs with `run_install_validation` enabled, it also
+installs and uninstalls the generated MSI on `windows-latest` by running
+`.\windows\scripts\validate-install.ps1`, then uploads
+`windows/build/validation/install-validation-report.json` as
+`QuantumLink-Windows-InstallValidation-<run-number>`.
 
-CI does not currently install or uninstall the product, verify
-SmartScreen/publisher behavior, exercise Wintun/WFP on real networking stacks,
-or run two-machine mesh and macOS interop validation. Those remain manual beta
-gates on clean Windows hardware or VMs.
+CI and the optional manual workflow evidence do not verify SmartScreen/publisher
+behavior, exercise real networking and leak-test scenarios, or run two-machine
+mesh and macOS interop validation. Those remain manual beta gates on clean
+Windows hardware or VMs.
 
 ## What install does
 

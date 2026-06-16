@@ -17,6 +17,12 @@ Current CI proves:
   invariants.
 - Release Rust artifacts build for `quantumlink-service` and `qlink-core`.
 - The WinUI 3 app builds in Release configuration.
+- The manual Windows release workflow can run `validate-install.ps1` on
+  `windows-latest` when `run_install_validation` is enabled, then upload
+  `windows/build/validation/install-validation-report.json` as JSON evidence.
+  Tag releases are not forced to run this GitHub-hosted check, but tagged
+  publication still requires external/manual validation evidence before
+  publication.
 
 Manual Windows validation must still prove:
 
@@ -25,7 +31,8 @@ Manual Windows validation must still prove:
   and has a published SHA-256 checksum.
 - Clean install, first run, Wintun adapter creation, WFP kill-switch behavior,
   routing, service lifecycle, upgrade, uninstall, diagnostics, two-machine
-  mesh, and macOS interop pass on real Windows VMs or hardware.
+  mesh, and macOS interop pass on clean Windows 10/11 VMs and physical
+  Windows hardware.
 
 ## Release operator checklist
 
@@ -41,6 +48,10 @@ Manual Windows validation must still prove:
 - [ ] Authenticode-sign and timestamp `QuantumLink.msi`; verify the expected
       publisher is shown by `Get-AuthenticodeSignature`.
 - [ ] Generate and publish the MSI SHA-256 checksum.
+- [ ] Collect manual install validation evidence from either the release
+      workflow artifact `QuantumLink-Windows-InstallValidation-<run-number>`
+      or a local `.\windows\build\validation\install-validation-report.json`
+      report generated with `.\windows\scripts\validate-install.ps1`.
 - [ ] Run every beta gate below on clean Windows 10 22H2 and Windows 11 x64
       VMs plus at least one physical x64 Windows machine.
 - [ ] Block beta publication for any signing, checksum, install, Wintun, WFP,
@@ -60,11 +71,31 @@ Manual Windows validation must still prove:
       publisher name.
 - [ ] MSI SHA-256 checksum is generated and matches the artifact selected for
       beta distribution.
+- [ ] Install/uninstall validation evidence is generated locally or by the
+      manual release workflow:
+
+      ```powershell
+      .\windows\scripts\validate-install.ps1 -MsiPath .\windows\QuantumLink.msi -ReportPath .\windows\build\validation\install-validation-report.json
+      ```
+
+      The workflow's `-SkipNetworkChecks` option only waives adapter, route,
+      and WFP evidence for constrained GitHub runners. It does not waive clean
+      Windows 10/11 VM, physical-host, leak-test, two-machine, or macOS interop
+      beta validation.
 
 ## 1. Install / first run
 
 - [ ] MSI installs without warnings; `QuantumLinkService` is running
       (`sc query QuantumLinkService`).
+- [ ] Capture local install/uninstall JSON evidence for the selected MSI:
+
+      ```powershell
+      .\windows\scripts\validate-install.ps1 -MsiPath .\windows\QuantumLink.msi -ReportPath .\windows\build\validation\install-validation-report.json
+      ```
+
+      Use `-SkipNetworkChecks` only when a constrained runner cannot collect
+      adapter, route, or WFP evidence; it is not acceptable as a substitute for
+      full beta validation on clean Windows hosts.
 - [ ] `C:\ProgramData\QuantumLink` exists; non-admin user cannot read
       `secrets\*.dpapi`.
 - [ ] UI launches unprivileged, completes the `hello` handshake, shows
