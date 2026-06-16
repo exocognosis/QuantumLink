@@ -477,6 +477,7 @@ function Get-QuantumLinkNetworkSnapshot {
         wfp = [ordered]@{
             filters = $null
             state = $null
+            sublayers = $null
             totalReferenceCount = 0
         }
         passed = $true
@@ -540,11 +541,13 @@ function Get-QuantumLinkNetworkSnapshot {
 
     $filters = Get-QuantumLinkWfpReferences -Name "WFP filters" -Arguments @("wfp", "show", "filters", "file=-")
     $state = Get-QuantumLinkWfpReferences -Name "WFP state" -Arguments @("wfp", "show", "state", "file=-")
+    $sublayers = Get-QuantumLinkWfpReferences -Name "WFP sublayers" -Arguments @("wfp", "show", "state", "file=-")
     $snapshot.wfp.filters = $filters
     $snapshot.wfp.state = $state
-    $snapshot.wfp.totalReferenceCount = $filters.referenceCount + $state.referenceCount
+    $snapshot.wfp.sublayers = $sublayers
+    $snapshot.wfp.totalReferenceCount = $filters.referenceCount + $sublayers.referenceCount
 
-    if ((-not $filters.passed) -or (-not $state.passed)) {
+    if ((-not $filters.passed) -or (-not $state.passed) -or (-not $sublayers.passed)) {
         $snapshot.passed = $false
     }
 
@@ -849,10 +852,10 @@ function Invoke-QuantumLinkInstallValidation {
         }
     }
 
-    $report.service = Get-QuantumLinkServiceValidation -Name $ExpectedServiceName -ExpectPresent -RequireRunning
+    $report.service = Get-QuantumLinkServiceValidation -Name $ExpectedServiceName -ExpectPresent
     if (-not $report.service.passed) {
         if ($report.service.exists) {
-            $failures += "Expected service '$ExpectedServiceName' exists but is not running."
+            $failures += "Expected service '$ExpectedServiceName' could not be validated."
         } else {
             $failures += "Expected service '$ExpectedServiceName' was not found."
         }

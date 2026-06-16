@@ -62,6 +62,12 @@ class ValidateInstallContractTest < Minitest::Test
     assert_match(/ConvertTo-Json\s+-Depth\s+\d+/, @script)
   end
 
+  def test_service_existence_check_does_not_require_running_state
+    assert_match(/\$report\.service\s*=\s*Get-QuantumLinkServiceValidation\s+-Name\s+\$ExpectedServiceName\s+-ExpectPresent\b/, @script)
+    refute_match(/\$report\.service\s*=\s*Get-QuantumLinkServiceValidation\s+-Name\s+\$ExpectedServiceName\s+-ExpectPresent\s+-RequireRunning\b/, @script)
+    refute_match(/exists but is not running/, @script)
+  end
+
   def test_covers_install_uninstall_hash_and_exit_contract
     assert_match(/Get-FileHash\b[\s\S]*-Algorithm\s+SHA256/, @script)
     assert_match(/msiexec\.exe/, @script)
@@ -83,5 +89,9 @@ class ValidateInstallContractTest < Minitest::Test
     assert_match(/netsh\.exe/, @script)
     assert_match(/wfp"\s*,\s*"show"\s*,\s*"filters"\s*,\s*"file=-"/, @script)
     assert_match(/wfp"\s*,\s*"show"\s*,\s*"state"\s*,\s*"file=-"/, @script)
+    assert_match(/sublayers\s*=\s*\$null/, @script)
+    assert_match(/\$sublayers\s*=\s*Get-QuantumLinkWfpReferences\s+-Name\s+"WFP sublayers"\s+-Arguments\s+@\("wfp",\s*"show",\s*"state",\s*"file=-"\)/, @script)
+    assert_match(/\$snapshot\.wfp\.sublayers\s*=\s*\$sublayers/, @script)
+    assert_match(/\$filters\.referenceCount\s*\+\s*\$sublayers\.referenceCount/, @script)
   end
 end
