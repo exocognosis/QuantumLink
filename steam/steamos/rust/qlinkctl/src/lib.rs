@@ -92,6 +92,46 @@ mod tests {
     }
 
     #[test]
+    fn format_status_includes_applied_network_state() {
+        let mut status = DaemonStatus::idle(true);
+        status.network = NetworkStatus {
+            state: NetworkPlanState::Applied,
+            interface_name: Some("qlink0".to_string()),
+            route_mode: Some(RouteMode::GameOnly),
+            protected_cidr: Some("100.64.0.0/10".to_string()),
+            dry_run: false,
+            commands: vec!["ip tuntap add dev qlink0 mode tun".to_string()],
+            nftables_rules: vec!["add table inet qlink".to_string()],
+            error: None,
+        };
+
+        let json = format_status(&status).unwrap();
+
+        assert!(json.contains("\"state\": \"applied\""));
+        assert!(json.contains("\"dryRun\": false"));
+    }
+
+    #[test]
+    fn format_status_includes_apply_failed_error() {
+        let mut status = DaemonStatus::idle(true);
+        status.network = NetworkStatus {
+            state: NetworkPlanState::ApplyFailed,
+            interface_name: Some("qlink0".to_string()),
+            route_mode: Some(RouteMode::GameOnly),
+            protected_cidr: Some("100.64.0.0/10".to_string()),
+            dry_run: false,
+            commands: vec!["ip tuntap add dev qlink0 mode tun".to_string()],
+            nftables_rules: vec!["add table inet qlink".to_string()],
+            error: Some("nftables apply failed".to_string()),
+        };
+
+        let json = format_status(&status).unwrap();
+
+        assert!(json.contains("\"state\": \"applyFailed\""));
+        assert!(json.contains("\"error\": \"nftables apply failed\""));
+    }
+
+    #[test]
     fn parse_status_response_reports_daemon_error_envelope() {
         let error = parse_status_response(r#"{"type":"error","message":"unsupported request"}"#)
             .unwrap_err();

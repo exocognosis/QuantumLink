@@ -1,4 +1,6 @@
-use qlink_linux::{LinuxRuntimePlan, NetworkPlanError};
+use qlink_linux::{
+    LinuxRuntimePlan, NetworkApplyError, NetworkExecutor, NetworkPlanError, NftablesExecutor,
+};
 use qlink_proto::{
     ConnectionPhase, DaemonConfig, DaemonStatus, NetworkPlanState, NetworkStatus, PeerStatus,
     RouteMode,
@@ -30,20 +32,17 @@ impl Default for DaemonPaths {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NetworkRuntimeState {
-    NotStarted,
-    Planned {
-        interface_name: String,
-        route_mode: RouteMode,
-        protected_cidr: String,
-        commands: Vec<String>,
-        nftables_rules: Vec<String>,
-    },
+pub struct NetworkRuntimePlan {
+    pub interface_name: String,
+    pub route_mode: RouteMode,
+    pub protected_cidr: String,
+    pub commands: Vec<String>,
+    pub nftables_rules: Vec<String>,
 }
 
-impl NetworkRuntimeState {
-    fn planned(config: &DaemonConfig, plan: &LinuxRuntimePlan) -> Self {
-        Self::Planned {
+impl NetworkRuntimePlan {
+    fn from_plan(config: &DaemonConfig, plan: &LinuxRuntimePlan) -> Self {
+        Self {
             interface_name: config.interface_name.clone(),
             route_mode: config.route_mode,
             protected_cidr: plan.protected_cidr().to_string(),
@@ -52,25 +51,49 @@ impl NetworkRuntimeState {
         }
     }
 
+    fn status(
+        &self,
+        state: NetworkPlanState,
+        dry_run: bool,
+        error: Option<String>,
+    ) -> NetworkStatus {
+        NetworkStatus {
+            state,
+            interface_name: Some(self.interface_name.clone()),
+            route_mode: Some(self.route_mode),
+            protected_cidr: Some(self.protected_cidr.clone()),
+            dry_run,
+            commands: self.commands.clone(),
+            nftables_rules: self.nftables_rules.clone(),
+            error,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NetworkRuntimeState {
+    NotStarted,
+    Planned(NetworkRuntimePlan),
+    Applied(NetworkRuntimePlan),
+    ApplyFailed {
+        plan: NetworkRuntimePlan,
+        error: String,
+    },
+}
+
+impl NetworkRuntimeState {
+    fn planned(config: &DaemonConfig, plan: &LinuxRuntimePlan) -> Self {
+        Self::Planned(NetworkRuntimePlan::from_plan(config, plan))
+    }
+
     fn status(&self) -> NetworkStatus {
         match self {
             Self::NotStarted => NetworkStatus::not_started(),
-            Self::Planned {
-                interface_name,
-                route_mode,
-                protected_cidr,
-                commands,
-                nftables_rules,
-            } => NetworkStatus {
-                state: NetworkPlanState::Planned,
-                interface_name: Some(interface_name.clone()),
-                route_mode: Some(*route_mode),
-                protected_cidr: Some(protected_cidr.clone()),
-                dry_run: true,
-                commands: commands.clone(),
-                nftables_rules: nftables_rules.clone(),
-                error: None,
-            },
+            Self::Planned(plan) => plan.status(NetworkPlanState::Planned, true, None),
+            Self::Applied(plan) => plan.status(NetworkPlanState::Applied, false, None),
+            Self::ApplyFailed { plan, error } => {
+                plan.status(NetworkPlanState::ApplyFailed, false, Some(error.clone()))
+            }
         }
     }
 }
@@ -184,6 +207,40 @@ impl DaemonEngine {
 
     pub fn mark_preparing(&mut self) {
         self.runtime.phase = ConnectionPhase::Preparing;
+    }
+
+    pub fn apply_network_with<NE, NF>(
+        &mut self,
+        network_executor: &mut NE,
+        nftables_executor: &mut NF,
+    ) -> Result<(), NetworkApplyError>
+    where
+        NE: NetworkExecutor,
+        NF: NftablesExecutor,
+    {
+        let plan = LinuxRuntimePlan::from_config(&self.config).map_err(|error| {
+            NetworkApplyError::new(format!("failed to plan SteamOS networking: {error}"))
+        })?;
+        let runtime_plan = NetworkRuntimePlan::from_plan(&self.config, &plan);
+
+        if let Err(error) = plan.network.apply(network_executor) {
+            self.runtime.network = NetworkRuntimeState::ApplyFailed {
+                plan: runtime_plan,
+                error: error.message().to_string(),
+            };
+            return Err(error);
+        }
+
+        if let Err(error) = plan.nftables.apply(nftables_executor) {
+            self.runtime.network = NetworkRuntimeState::ApplyFailed {
+                plan: runtime_plan,
+                error: error.message().to_string(),
+            };
+            return Err(error);
+        }
+
+        self.runtime.network = NetworkRuntimeState::Applied(runtime_plan);
+        Ok(())
     }
 }
 
@@ -325,6 +382,9 @@ fn validate_loaded_config(config: DaemonConfig, source: &str) -> std::io::Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    use qlink_linux::{
+        NetworkApplyError, NetworkExecutor, NetworkOperation, NftablesExecutor, NftablesOperation,
+    };
 
     #[test]
     fn daemon_paths_match_linux_service_layout() {
@@ -387,6 +447,133 @@ mod tests {
             .nftables_rules
             .iter()
             .any(|rule| rule.contains("ip daddr 100.64.0.0/10")));
+    }
+
+    #[derive(Default)]
+    struct RecordingNetworkExecutor {
+        operations: Vec<NetworkOperation>,
+        fail_on_call: Option<usize>,
+    }
+
+    impl NetworkExecutor for RecordingNetworkExecutor {
+        fn apply(&mut self, operation: &NetworkOperation) -> Result<(), NetworkApplyError> {
+            self.operations.push(operation.clone());
+            if self.fail_on_call == Some(self.operations.len()) {
+                return Err(NetworkApplyError::new("network apply failed"));
+            }
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingNftablesExecutor {
+        operations: Vec<NftablesOperation>,
+        fail_on_call: Option<usize>,
+    }
+
+    impl NftablesExecutor for RecordingNftablesExecutor {
+        fn apply_nftables(
+            &mut self,
+            operation: &NftablesOperation,
+        ) -> Result<(), NetworkApplyError> {
+            self.operations.push(operation.clone());
+            if self.fail_on_call == Some(self.operations.len()) {
+                return Err(NetworkApplyError::new("nftables apply failed"));
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn engine_try_new_still_only_plans_network() {
+        let network_executor = RecordingNetworkExecutor::default();
+        let nftables_executor = RecordingNftablesExecutor::default();
+
+        let engine = DaemonEngine::try_new(DaemonConfig::default(), DaemonPaths::default())
+            .expect("default config should produce a dry-run network plan");
+        let status = engine.status();
+
+        assert_eq!(status.network.state, NetworkPlanState::Planned);
+        assert!(status.network.dry_run);
+        assert!(network_executor.operations.is_empty());
+        assert!(nftables_executor.operations.is_empty());
+        assert!(status.network.error.is_none());
+    }
+
+    #[test]
+    fn apply_network_with_fake_executors_marks_applied() {
+        let mut engine = DaemonEngine::try_new(DaemonConfig::default(), DaemonPaths::default())
+            .expect("default config should produce a dry-run network plan");
+        let mut network_executor = RecordingNetworkExecutor::default();
+        let mut nftables_executor = RecordingNftablesExecutor::default();
+
+        engine
+            .apply_network_with(&mut network_executor, &mut nftables_executor)
+            .expect("fake executors should apply");
+        let status = engine.status();
+
+        assert_eq!(network_executor.operations.len(), 5);
+        assert_eq!(nftables_executor.operations.len(), 5);
+        assert_eq!(status.network.state, NetworkPlanState::Applied);
+        assert!(!status.network.dry_run);
+        assert!(status.network.error.is_none());
+        assert!(status
+            .network
+            .commands
+            .iter()
+            .any(|command| { command == "ip route add 100.64.0.0/10 dev qlink0 table 51820" }));
+    }
+
+    #[test]
+    fn apply_network_stops_on_network_failure_and_marks_apply_failed() {
+        let mut engine = DaemonEngine::try_new(DaemonConfig::default(), DaemonPaths::default())
+            .expect("default config should produce a dry-run network plan");
+        let mut network_executor = RecordingNetworkExecutor {
+            fail_on_call: Some(1),
+            ..RecordingNetworkExecutor::default()
+        };
+        let mut nftables_executor = RecordingNftablesExecutor::default();
+
+        let error = engine
+            .apply_network_with(&mut network_executor, &mut nftables_executor)
+            .unwrap_err();
+        let status = engine.status();
+
+        assert_eq!(error.message(), "network apply failed");
+        assert_eq!(network_executor.operations.len(), 1);
+        assert!(nftables_executor.operations.is_empty());
+        assert_eq!(status.network.state, NetworkPlanState::ApplyFailed);
+        assert!(!status.network.dry_run);
+        assert_eq!(
+            status.network.error.as_deref(),
+            Some("network apply failed")
+        );
+    }
+
+    #[test]
+    fn apply_network_stops_on_nftables_failure_and_marks_apply_failed() {
+        let mut engine = DaemonEngine::try_new(DaemonConfig::default(), DaemonPaths::default())
+            .expect("default config should produce a dry-run network plan");
+        let mut network_executor = RecordingNetworkExecutor::default();
+        let mut nftables_executor = RecordingNftablesExecutor {
+            fail_on_call: Some(1),
+            ..RecordingNftablesExecutor::default()
+        };
+
+        let error = engine
+            .apply_network_with(&mut network_executor, &mut nftables_executor)
+            .unwrap_err();
+        let status = engine.status();
+
+        assert_eq!(error.message(), "nftables apply failed");
+        assert_eq!(network_executor.operations.len(), 5);
+        assert_eq!(nftables_executor.operations.len(), 1);
+        assert_eq!(status.network.state, NetworkPlanState::ApplyFailed);
+        assert!(!status.network.dry_run);
+        assert_eq!(
+            status.network.error.as_deref(),
+            Some("nftables apply failed")
+        );
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, process::Command as ProcessCommand};
 
 use qlink_proto::{ConfigValidationError, DaemonConfig, RouteMode};
 
@@ -11,6 +11,8 @@ const NFT_OUTPUT_HOOK: &str = "output";
 const NFT_ROUTE_OUTPUT_CHAIN: &str = "route_output";
 const NFT_FILTER_OUTPUT_CHAIN: &str = "filter_output";
 const FULL_TUNNEL_CIDR: &str = "0.0.0.0/0";
+const IP_COMMAND: &str = "/usr/bin/ip";
+const NFT_COMMAND: &str = "/usr/bin/nft";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinuxRuntimePlan {
@@ -71,6 +73,67 @@ fn protected_cidr_for_route_mode(config: &DaemonConfig) -> &str {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SystemCommand {
+    pub program: String,
+    pub args: Vec<String>,
+}
+
+impl SystemCommand {
+    pub fn new<I, S>(program: impl Into<String>, args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            program: program.into(),
+            args: args.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    pub fn rendered(&self) -> String {
+        format!("{:?} {:?}", self.program, self.args)
+    }
+}
+
+pub trait CommandRunner {
+    fn run(&mut self, command: &SystemCommand) -> Result<(), NetworkApplyError>;
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StdCommandRunner;
+
+impl CommandRunner for StdCommandRunner {
+    fn run(&mut self, command: &SystemCommand) -> Result<(), NetworkApplyError> {
+        let output = ProcessCommand::new(&command.program)
+            .args(&command.args)
+            .output()
+            .map_err(|error| {
+                NetworkApplyError::new(format!("failed to spawn `{}`: {error}", command.rendered()))
+            })?;
+
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let detail = if !stderr.trim().is_empty() {
+            format!(": stderr: {}", stderr.trim())
+        } else if !stdout.trim().is_empty() {
+            format!(": stdout: {}", stdout.trim())
+        } else {
+            String::new()
+        };
+
+        Err(NetworkApplyError::new(format!(
+            "command `{}` exited with status {}{detail}",
+            command.rendered(),
+            output.status
+        )))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetworkOperation {
     CreateTun {
         name: String,
@@ -112,6 +175,71 @@ impl NetworkOperation {
                 interface,
                 table,
             } => format!("ip route add {cidr} dev {interface} table {table}"),
+        }
+    }
+
+    pub fn to_system_command(&self) -> SystemCommand {
+        match self {
+            Self::CreateTun { name } => SystemCommand::new(
+                IP_COMMAND,
+                vec![
+                    "tuntap".to_string(),
+                    "add".to_string(),
+                    "dev".to_string(),
+                    name.clone(),
+                    "mode".to_string(),
+                    "tun".to_string(),
+                ],
+            ),
+            Self::AddAddress { interface, address } => SystemCommand::new(
+                IP_COMMAND,
+                vec![
+                    "addr".to_string(),
+                    "add".to_string(),
+                    address.clone(),
+                    "dev".to_string(),
+                    interface.clone(),
+                ],
+            ),
+            Self::SetLinkUp { interface, mtu } => SystemCommand::new(
+                IP_COMMAND,
+                vec![
+                    "link".to_string(),
+                    "set".to_string(),
+                    "dev".to_string(),
+                    interface.clone(),
+                    "mtu".to_string(),
+                    mtu.to_string(),
+                    "up".to_string(),
+                ],
+            ),
+            Self::AddRule { fwmark, table } => SystemCommand::new(
+                IP_COMMAND,
+                vec![
+                    "rule".to_string(),
+                    "add".to_string(),
+                    "fwmark".to_string(),
+                    format_mark(*fwmark),
+                    "table".to_string(),
+                    table.to_string(),
+                ],
+            ),
+            Self::AddRoute {
+                cidr,
+                interface,
+                table,
+            } => SystemCommand::new(
+                IP_COMMAND,
+                vec![
+                    "route".to_string(),
+                    "add".to_string(),
+                    cidr.clone(),
+                    "dev".to_string(),
+                    interface.clone(),
+                    "table".to_string(),
+                    table.to_string(),
+                ],
+            ),
         }
     }
 }
@@ -169,6 +297,35 @@ impl LinuxNetworkPlan {
 
 pub trait NetworkExecutor {
     fn apply(&mut self, operation: &NetworkOperation) -> Result<(), NetworkApplyError>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SystemNetworkExecutor<R> {
+    runner: R,
+}
+
+impl<R> SystemNetworkExecutor<R> {
+    pub fn new(runner: R) -> Self {
+        Self { runner }
+    }
+
+    pub fn runner(&self) -> &R {
+        &self.runner
+    }
+
+    pub fn runner_mut(&mut self) -> &mut R {
+        &mut self.runner
+    }
+
+    pub fn into_runner(self) -> R {
+        self.runner
+    }
+}
+
+impl<R: CommandRunner> NetworkExecutor for SystemNetworkExecutor<R> {
+    fn apply(&mut self, operation: &NetworkOperation) -> Result<(), NetworkApplyError> {
+        self.runner.run(&operation.to_system_command())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -293,10 +450,129 @@ impl NftablesOperation {
             ),
         }
     }
+
+    pub fn to_system_command(&self) -> SystemCommand {
+        match self {
+            Self::AddTable { family, table } => SystemCommand::new(
+                NFT_COMMAND,
+                vec![
+                    "add".to_string(),
+                    "table".to_string(),
+                    family.clone(),
+                    table.clone(),
+                ],
+            ),
+            Self::AddChain {
+                family,
+                table,
+                chain,
+                chain_type,
+                hook,
+                priority,
+                policy,
+            } => SystemCommand::new(
+                NFT_COMMAND,
+                vec![
+                    "add".to_string(),
+                    "chain".to_string(),
+                    family.clone(),
+                    table.clone(),
+                    chain.clone(),
+                    "{".to_string(),
+                    "type".to_string(),
+                    chain_type.clone(),
+                    "hook".to_string(),
+                    hook.clone(),
+                    "priority".to_string(),
+                    priority.to_string(),
+                    ";".to_string(),
+                    "policy".to_string(),
+                    policy.clone(),
+                    ";".to_string(),
+                    "}".to_string(),
+                ],
+            ),
+            Self::MarkTraffic {
+                family,
+                table,
+                chain,
+                cidr,
+                mark,
+            } => SystemCommand::new(
+                NFT_COMMAND,
+                vec![
+                    "add".to_string(),
+                    "rule".to_string(),
+                    family.clone(),
+                    table.clone(),
+                    chain.clone(),
+                    "ip".to_string(),
+                    "daddr".to_string(),
+                    cidr.clone(),
+                    "meta".to_string(),
+                    "mark".to_string(),
+                    "set".to_string(),
+                    format_mark(*mark),
+                ],
+            ),
+            Self::DropOutsideInterface {
+                family,
+                table,
+                chain,
+                cidr,
+                interface,
+            } => SystemCommand::new(
+                NFT_COMMAND,
+                vec![
+                    "add".to_string(),
+                    "rule".to_string(),
+                    family.clone(),
+                    table.clone(),
+                    chain.clone(),
+                    "ip".to_string(),
+                    "daddr".to_string(),
+                    cidr.clone(),
+                    "oifname".to_string(),
+                    "!=".to_string(),
+                    interface.clone(),
+                    "drop".to_string(),
+                ],
+            ),
+        }
+    }
 }
 
 pub trait NftablesExecutor {
     fn apply_nftables(&mut self, operation: &NftablesOperation) -> Result<(), NetworkApplyError>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SystemNftablesExecutor<R> {
+    runner: R,
+}
+
+impl<R> SystemNftablesExecutor<R> {
+    pub fn new(runner: R) -> Self {
+        Self { runner }
+    }
+
+    pub fn runner(&self) -> &R {
+        &self.runner
+    }
+
+    pub fn runner_mut(&mut self) -> &mut R {
+        &mut self.runner
+    }
+
+    pub fn into_runner(self) -> R {
+        self.runner
+    }
+}
+
+impl<R: CommandRunner> NftablesExecutor for SystemNftablesExecutor<R> {
+    fn apply_nftables(&mut self, operation: &NftablesOperation) -> Result<(), NetworkApplyError> {
+        self.runner.run(&operation.to_system_command())
+    }
 }
 
 impl NftablesExecutor for DryRunExecutor {
@@ -738,6 +1014,434 @@ mod tests {
     }
 
     #[test]
+    fn network_operations_render_to_exact_system_commands() {
+        assert_eq!(
+            NetworkOperation::CreateTun {
+                name: "qlink0".to_string(),
+            }
+            .to_system_command(),
+            system_command(
+                IP_COMMAND,
+                &["tuntap", "add", "dev", "qlink0", "mode", "tun"]
+            )
+        );
+        assert_eq!(
+            NetworkOperation::AddAddress {
+                interface: "qlink0".to_string(),
+                address: "100.64.10.2/32".to_string(),
+            }
+            .to_system_command(),
+            system_command(
+                IP_COMMAND,
+                &["addr", "add", "100.64.10.2/32", "dev", "qlink0"]
+            )
+        );
+        assert_eq!(
+            NetworkOperation::SetLinkUp {
+                interface: "qlink0".to_string(),
+                mtu: 1280,
+            }
+            .to_system_command(),
+            system_command(
+                IP_COMMAND,
+                &["link", "set", "dev", "qlink0", "mtu", "1280", "up"]
+            )
+        );
+        assert_eq!(
+            NetworkOperation::AddRule {
+                fwmark: 0x514c,
+                table: 51820,
+            }
+            .to_system_command(),
+            system_command(
+                IP_COMMAND,
+                &["rule", "add", "fwmark", "0x514c", "table", "51820"]
+            )
+        );
+        assert_eq!(
+            NetworkOperation::AddRoute {
+                cidr: "100.64.0.0/10".to_string(),
+                interface: "qlink0".to_string(),
+                table: 51820,
+            }
+            .to_system_command(),
+            system_command(
+                IP_COMMAND,
+                &[
+                    "route",
+                    "add",
+                    "100.64.0.0/10",
+                    "dev",
+                    "qlink0",
+                    "table",
+                    "51820",
+                ],
+            )
+        );
+    }
+
+    #[test]
+    fn nftables_operations_render_to_exact_system_commands() {
+        assert_eq!(
+            NftablesOperation::AddTable {
+                family: "inet".to_string(),
+                table: "qlink".to_string(),
+            }
+            .to_system_command(),
+            system_command(NFT_COMMAND, &["add", "table", "inet", "qlink"])
+        );
+        assert_eq!(
+            NftablesOperation::AddChain {
+                family: "inet".to_string(),
+                table: "qlink".to_string(),
+                chain: "route_output".to_string(),
+                chain_type: "route".to_string(),
+                hook: "output".to_string(),
+                priority: 0,
+                policy: "accept".to_string(),
+            }
+            .to_system_command(),
+            system_command(
+                NFT_COMMAND,
+                &[
+                    "add",
+                    "chain",
+                    "inet",
+                    "qlink",
+                    "route_output",
+                    "{",
+                    "type",
+                    "route",
+                    "hook",
+                    "output",
+                    "priority",
+                    "0",
+                    ";",
+                    "policy",
+                    "accept",
+                    ";",
+                    "}",
+                ],
+            )
+        );
+        assert_eq!(
+            NftablesOperation::MarkTraffic {
+                family: "inet".to_string(),
+                table: "qlink".to_string(),
+                chain: "route_output".to_string(),
+                cidr: "100.64.0.0/10".to_string(),
+                mark: 0x514c,
+            }
+            .to_system_command(),
+            system_command(
+                NFT_COMMAND,
+                &[
+                    "add",
+                    "rule",
+                    "inet",
+                    "qlink",
+                    "route_output",
+                    "ip",
+                    "daddr",
+                    "100.64.0.0/10",
+                    "meta",
+                    "mark",
+                    "set",
+                    "0x514c",
+                ],
+            )
+        );
+        assert_eq!(
+            NftablesOperation::DropOutsideInterface {
+                family: "inet".to_string(),
+                table: "qlink".to_string(),
+                chain: "filter_output".to_string(),
+                cidr: "100.64.0.0/10".to_string(),
+                interface: "qlink0".to_string(),
+            }
+            .to_system_command(),
+            system_command(
+                NFT_COMMAND,
+                &[
+                    "add",
+                    "rule",
+                    "inet",
+                    "qlink",
+                    "filter_output",
+                    "ip",
+                    "daddr",
+                    "100.64.0.0/10",
+                    "oifname",
+                    "!=",
+                    "qlink0",
+                    "drop",
+                ],
+            )
+        );
+    }
+
+    #[test]
+    fn network_system_commands_use_trusted_ip_binary() {
+        let command = NetworkOperation::CreateTun {
+            name: "qlink0".to_string(),
+        }
+        .to_system_command();
+
+        assert_eq!(command.program, "/usr/bin/ip");
+        assert_eq!(
+            command.args,
+            vec!["tuntap", "add", "dev", "qlink0", "mode", "tun"]
+        );
+    }
+
+    #[test]
+    fn nftables_system_commands_use_trusted_nft_binary() {
+        let command = NftablesOperation::AddTable {
+            family: "inet".to_string(),
+            table: "qlink".to_string(),
+        }
+        .to_system_command();
+
+        assert_eq!(command.program, "/usr/bin/nft");
+        assert_eq!(command.args, vec!["add", "table", "inet", "qlink"]);
+    }
+
+    #[test]
+    fn rendered_system_command_preserves_argument_boundaries() {
+        let command = SystemCommand::new("/bin/echo", ["two words", "semi;colon"]);
+
+        assert_eq!(
+            command.rendered(),
+            r#""/bin/echo" ["two words", "semi;colon"]"#
+        );
+    }
+
+    #[test]
+    fn system_network_executor_runs_exact_argv_in_order() {
+        let plan = LinuxNetworkPlan::for_interface("qlink0", "100.64.10.2/32", "100.64.0.0/10");
+        let mut executor = SystemNetworkExecutor::new(FakeRunner::default());
+
+        plan.apply(&mut executor).expect("fake runner should apply");
+
+        assert_eq!(
+            executor.runner().commands,
+            vec![
+                system_command(
+                    IP_COMMAND,
+                    &["tuntap", "add", "dev", "qlink0", "mode", "tun"]
+                ),
+                system_command(
+                    IP_COMMAND,
+                    &["addr", "add", "100.64.10.2/32", "dev", "qlink0"]
+                ),
+                system_command(
+                    IP_COMMAND,
+                    &["link", "set", "dev", "qlink0", "mtu", "1280", "up"]
+                ),
+                system_command(
+                    IP_COMMAND,
+                    &["rule", "add", "fwmark", "0x514c", "table", "51820"]
+                ),
+                system_command(
+                    IP_COMMAND,
+                    &[
+                        "route",
+                        "add",
+                        "100.64.0.0/10",
+                        "dev",
+                        "qlink0",
+                        "table",
+                        "51820",
+                    ],
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn system_nftables_executor_runs_exact_argv_in_order() {
+        let plan = NftablesPlan::fail_closed("qlink0", "100.64.0.0/10");
+        let mut executor = SystemNftablesExecutor::new(FakeRunner::default());
+
+        plan.apply(&mut executor).expect("fake runner should apply");
+
+        assert_eq!(
+            executor.runner().commands,
+            vec![
+                system_command(NFT_COMMAND, &["add", "table", "inet", "qlink"]),
+                system_command(
+                    NFT_COMMAND,
+                    &[
+                        "add",
+                        "chain",
+                        "inet",
+                        "qlink",
+                        "route_output",
+                        "{",
+                        "type",
+                        "route",
+                        "hook",
+                        "output",
+                        "priority",
+                        "0",
+                        ";",
+                        "policy",
+                        "accept",
+                        ";",
+                        "}",
+                    ],
+                ),
+                system_command(
+                    NFT_COMMAND,
+                    &[
+                        "add",
+                        "chain",
+                        "inet",
+                        "qlink",
+                        "filter_output",
+                        "{",
+                        "type",
+                        "filter",
+                        "hook",
+                        "output",
+                        "priority",
+                        "0",
+                        ";",
+                        "policy",
+                        "accept",
+                        ";",
+                        "}",
+                    ],
+                ),
+                system_command(
+                    NFT_COMMAND,
+                    &[
+                        "add",
+                        "rule",
+                        "inet",
+                        "qlink",
+                        "route_output",
+                        "ip",
+                        "daddr",
+                        "100.64.0.0/10",
+                        "meta",
+                        "mark",
+                        "set",
+                        "0x514c",
+                    ],
+                ),
+                system_command(
+                    NFT_COMMAND,
+                    &[
+                        "add",
+                        "rule",
+                        "inet",
+                        "qlink",
+                        "filter_output",
+                        "ip",
+                        "daddr",
+                        "100.64.0.0/10",
+                        "oifname",
+                        "!=",
+                        "qlink0",
+                        "drop",
+                    ],
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn system_network_executor_stops_on_first_runner_failure() {
+        let plan = LinuxNetworkPlan::for_interface("qlink0", "100.64.10.2/32", "100.64.0.0/10");
+        let mut executor = SystemNetworkExecutor::new(FakeRunner::fail_on(2));
+
+        let error = plan.apply(&mut executor).unwrap_err();
+
+        assert_eq!(error.message(), "runner failed");
+        assert_eq!(
+            executor.runner().commands,
+            vec![
+                system_command(
+                    IP_COMMAND,
+                    &["tuntap", "add", "dev", "qlink0", "mode", "tun"]
+                ),
+                system_command(
+                    IP_COMMAND,
+                    &["addr", "add", "100.64.10.2/32", "dev", "qlink0"]
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn system_nftables_executor_stops_on_first_runner_failure() {
+        let plan = NftablesPlan::fail_closed("qlink0", "100.64.0.0/10");
+        let mut executor = SystemNftablesExecutor::new(FakeRunner::fail_on(2));
+
+        let error = plan.apply(&mut executor).unwrap_err();
+
+        assert_eq!(error.message(), "runner failed");
+        assert_eq!(
+            executor.runner().commands,
+            vec![
+                system_command(NFT_COMMAND, &["add", "table", "inet", "qlink"]),
+                system_command(
+                    NFT_COMMAND,
+                    &[
+                        "add",
+                        "chain",
+                        "inet",
+                        "qlink",
+                        "route_output",
+                        "{",
+                        "type",
+                        "route",
+                        "hook",
+                        "output",
+                        "priority",
+                        "0",
+                        ";",
+                        "policy",
+                        "accept",
+                        ";",
+                        "}",
+                    ],
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn std_command_runner_reports_spawn_failure_with_command_context() {
+        let mut runner = StdCommandRunner;
+        let command = system_command("/definitely/not/a/qlink-test-command", &["--nope"]);
+
+        let error = runner.run(&command).unwrap_err();
+
+        assert!(error.message().contains("failed to spawn"));
+        assert!(error
+            .message()
+            .contains("\"/definitely/not/a/qlink-test-command\" [\"--nope\"]"));
+    }
+
+    #[test]
+    fn std_command_runner_reports_non_zero_exit_with_command_context() {
+        let false_program = if std::path::Path::new("/usr/bin/false").exists() {
+            "/usr/bin/false"
+        } else {
+            "/bin/false"
+        };
+        let mut runner = StdCommandRunner;
+        let command = system_command(false_program, &[]);
+
+        let error = runner.run(&command).unwrap_err();
+
+        assert!(error.message().contains("exited with status"));
+        assert!(error.message().contains(false_program));
+    }
+
+    #[test]
     fn dry_run_executor_records_rendered_network_operations() {
         let plan = LinuxNetworkPlan::for_interface("qlink0", "100.64.10.2/32", "100.64.0.0/10");
         let mut executor = DryRunExecutor::default();
@@ -806,5 +1510,37 @@ mod tests {
 
         assert_eq!(error.message(), "nftables executor failed");
         assert_eq!(executor.applied, 1);
+    }
+
+    fn system_command(program: &str, args: &[&str]) -> SystemCommand {
+        SystemCommand {
+            program: program.to_string(),
+            args: args.iter().map(|arg| arg.to_string()).collect(),
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeRunner {
+        commands: Vec<SystemCommand>,
+        fail_on: Option<usize>,
+    }
+
+    impl FakeRunner {
+        fn fail_on(command_index: usize) -> Self {
+            Self {
+                commands: Vec::new(),
+                fail_on: Some(command_index),
+            }
+        }
+    }
+
+    impl CommandRunner for FakeRunner {
+        fn run(&mut self, command: &SystemCommand) -> Result<(), NetworkApplyError> {
+            self.commands.push(command.clone());
+            if self.fail_on == Some(self.commands.len()) {
+                return Err(NetworkApplyError::new("runner failed"));
+            }
+            Ok(())
+        }
     }
 }

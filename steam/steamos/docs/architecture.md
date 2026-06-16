@@ -41,7 +41,9 @@ QuantumLink on SteamOS is a Linux daemon deployment inside the Steam silo. The p
 
 ## Dry-Run Network Planning
 
-The current daemon builds and reports a dry-run Linux network plan during startup. It validates the daemon config, renders the intended `ip` and `nftables` operations, and exposes those commands through `qlinkctl status`. It does not apply TUN, route, or nftables changes yet.
+The current daemon builds and reports a dry-run Linux network plan during startup. It validates the daemon config, renders the intended `ip` and `nftables` operations, and exposes those commands through `qlinkctl status`. It does not apply TUN, route, or nftables changes during normal startup or `--check`.
+
+`qlink-linux` now separates human-readable plan rendering from privileged execution. Dry-run status still renders operator-friendly `ip` and `nftables` strings, while the execution boundary uses typed argv commands, trusted SteamOS tool paths (`/usr/bin/ip`, `/usr/bin/nft`), and injectable command runners. `qlinkd` has an explicit injected-executor API that can mark network state as `applied` or `applyFailed`, but no CLI, socket request, systemd path, or startup mode calls it yet.
 
 Full-tunnel planning currently renders `0.0.0.0/0` as the protected CIDR so the intended route shape is visible in status output. A future privileged executor must add explicit underlay exemptions for rendezvous, relay, and local control traffic before enabling real full-tunnel application; otherwise fail-closed rules could block the daemon's own control-plane path.
 

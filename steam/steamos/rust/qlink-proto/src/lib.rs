@@ -543,6 +543,32 @@ mod tests {
     }
 
     #[test]
+    fn network_status_serializes_applied_and_apply_failed_states() {
+        let mut status = DaemonStatus::idle(true);
+        status.network = NetworkStatus {
+            state: NetworkPlanState::Applied,
+            interface_name: Some("qlink0".to_string()),
+            route_mode: Some(RouteMode::GameOnly),
+            protected_cidr: Some("100.64.0.0/10".to_string()),
+            dry_run: false,
+            commands: vec!["ip tuntap add dev qlink0 mode tun".to_string()],
+            nftables_rules: vec!["add table inet qlink".to_string()],
+            error: None,
+        };
+
+        let applied_json = serde_json::to_string(&status).unwrap();
+        assert!(applied_json.contains(r#""state":"applied""#));
+        assert!(applied_json.contains(r#""dryRun":false"#));
+
+        status.network.state = NetworkPlanState::ApplyFailed;
+        status.network.error = Some("nftables apply failed".to_string());
+
+        let failed_json = serde_json::to_string(&status).unwrap();
+        assert!(failed_json.contains(r#""state":"applyFailed""#));
+        assert!(failed_json.contains(r#""error":"nftables apply failed""#));
+    }
+
+    #[test]
     fn invite_codes_round_trip_without_real_ip_requirement() {
         let invite = InviteCode {
             mesh_id: "mesh-game".to_string(),
