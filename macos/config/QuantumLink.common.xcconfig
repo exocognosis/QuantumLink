@@ -11,4 +11,5 @@ CODE_SIGN_ENTITLEMENTS = macos/entitlements/QuantumLink.entitlements
 QLINK_APP_BUNDLE_ID = com.quantumlink.macos
 QLINK_TUNNEL_BUNDLE_ID = com.quantumlink.macos.PacketTunnel
 QLINK_APP_GROUP = group.com.quantumlink.macos
-
+QLINK_APP_PROVISIONING_PROFILE_SPECIFIER =
+QLINK_TUNNEL_PROVISIONING_PROFILE_SPECIFIER =

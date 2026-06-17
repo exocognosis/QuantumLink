@@ -13,8 +13,8 @@ notary credentials, and the Network Extension entitlement are available.
   `QLINK_TUNNEL_PROVISIONING_PROFILE_SPECIFIER`,
   `QLINK_SPARKLE_FEED_URL`, and `QLINK_SPARKLE_PUBLIC_ED_KEY`.
 - Confirm the CI/release secrets: Developer ID certificate P12, certificate
-  password, notary API key, notary key ID, notary issuer ID, and Sparkle EdDSA
-  private key.
+  password, notary API key, notary key ID, notary issuer ID, app and tunnel
+  provisioning profile payloads, and Sparkle EdDSA private key.
 - Confirm none of the signed release values use placeholder IDs:
   `com.quantumlink.macos`, `com.quantumlink.macos.PacketTunnel`, or
   `group.com.quantumlink.macos`.
@@ -23,15 +23,15 @@ notary credentials, and the Network Extension entitlement are available.
 - Confirm app and tunnel provisioning profiles match their bundle IDs and team.
 - Confirm Sparkle feed URL and EdDSA public key are set for signed release
   packaging.
-- Run `./scripts/preapple-check.sh`.
-- Run `./scripts/macos-release-readiness.sh --require-signing-env`.
+- Run `./macos/scripts/preapple-check.sh`.
+- Run `./macos/scripts/macos-release-readiness.sh --require-signing-env`.
 - For PKG releases, run
-  `./scripts/macos-release-readiness.sh --require-pkg-signing-env`.
+  `./macos/scripts/macos-release-readiness.sh --require-pkg-signing-env`.
 
 ## Build And Sign
 
 ```sh
-./scripts/package-macos.sh --pkg
+./macos/scripts/package-macos.sh --pkg
 ```
 
 Record:

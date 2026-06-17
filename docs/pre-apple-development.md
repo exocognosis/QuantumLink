@@ -66,20 +66,20 @@ target/release/qlinkctl relay-loopback
 Validate macOS release signing and entitlement wiring without Apple credentials:
 
 ```sh
-./scripts/macos-release-readiness.sh
+./macos/scripts/macos-release-readiness.sh
 ```
 
 Before a real signed release, require the Developer ID, notary, bundle ID, app
 group, provisioning profile, and Sparkle update environment:
 
 ```sh
-./scripts/macos-release-readiness.sh --require-signing-env
+./macos/scripts/macos-release-readiness.sh --require-signing-env
 ```
 
 Before building a signed PKG release, include the installer identity check:
 
 ```sh
-./scripts/macos-release-readiness.sh --require-pkg-signing-env
+./macos/scripts/macos-release-readiness.sh --require-pkg-signing-env
 ```
 
 The readiness check validates project configuration and packaging workflow
@@ -93,7 +93,7 @@ Use the beta tester and release operator checklists before distributing builds:
 - `docs/beta-tester-onboarding.md`
 - `docs/release-operator-checklist.md`
 
-`./scripts/preapple-check.sh` requires XcodeGen for package-readiness lanes. Set
+`./macos/scripts/preapple-check.sh` requires XcodeGen for package-readiness lanes. Set
 `QLINK_ALLOW_SKIP_XCODEGEN=true` only for CI jobs that intentionally skip
 unsigned Xcode archive and package validation.
 
@@ -228,8 +228,8 @@ does not contain those files; confirm this again on the signed release machine.
 For a signed release, export the required signing environment and run:
 
 ```sh
-./scripts/macos-release-readiness.sh --require-signing-env
-./scripts/package-macos.sh --pkg
+./macos/scripts/macos-release-readiness.sh --require-signing-env
+./macos/scripts/package-macos.sh --pkg
 ```
 
 Required signed-release environment:
@@ -252,7 +252,7 @@ Required signed-release environment:
 ./macos/scripts/package-dev-artifacts.sh
 ```
 
-The package is written to `build/dist/QuantumLink-dev.tar.gz` and includes local CLI tools, the Rust dylib, example config, and a short runbook. It is not signed or notarized.
+The package is written to `macos/build/dist/QuantumLink-dev.tar.gz` with a sibling `.sha256` file. It includes local CLI tools, the Rust dylib, example config, a manifest, and a short runbook. It is not signed or notarized.
 
 ## Apple-Blocked Work
 
@@ -304,7 +304,7 @@ export QLINK_SPARKLE_PUBLIC_ED_KEY="BASE64-SPARKLE-PUBLIC-KEY"
 ```
 
 7. Run `./macos/scripts/package-macos.sh --pkg` locally and verify `codesign`, `notarytool`, `stapler`, and PKG generation.
-8. Configure GitHub release secrets and variables:
+8. Configure GitHub release secrets:
 
 ```text
 APPLE_DEVELOPER_ID_CERT_P12_BASE64
@@ -312,10 +312,20 @@ APPLE_DEVELOPER_ID_CERT_PASSWORD
 APPLE_NOTARY_API_KEY_BASE64
 APPLE_NOTARY_API_KEY_ID
 APPLE_NOTARY_API_KEY_ISSUER_ID
+QLINK_APP_PROVISIONING_PROFILE_BASE64
+QLINK_TUNNEL_PROVISIONING_PROFILE_BASE64
 SPARKLE_EDDSA_PRIVATE_KEY
+```
+
+Configure GitHub release variables:
+
+```text
+QLINK_DEVELOPMENT_TEAM
+QLINK_APP_BUNDLE_ID
+QLINK_TUNNEL_BUNDLE_ID
+QLINK_APP_GROUP
 QLINK_SPARKLE_FEED_URL
 QLINK_SPARKLE_PUBLIC_ED_KEY
-QLINK_APP_GROUP
 QLINK_APP_PROVISIONING_PROFILE_SPECIFIER
 QLINK_TUNNEL_PROVISIONING_PROFILE_SPECIFIER
 ```
