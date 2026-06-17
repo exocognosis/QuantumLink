@@ -31,7 +31,7 @@ hmac = "0.12"
 mdns-sd = { version = "0.13", default-features = false, features = ["async"] }
 ml-dsa = { version = "0.1.0-rc.8", features = ["zeroize"] }
 ml-kem = { version = "0.3.0-rc.2", features = ["getrandom", "zeroize"] }
-quinn = { version = "0.11.9", default-features = true }
+quinn = { version = "0.11.9", default-features = false, features = ["bloom", "log", "platform-verifier", "runtime-tokio", "rustls-aws-lc-rs"] }
 rand_core_06 = { package = "rand_core", version = "0.6", features = ["getrandom"] }
 rcgen = "0.14.7"
 rustls = "0.23"

@@ -1324,7 +1324,6 @@ name = "qlinkctl"
 version = "0.1.0"
 dependencies = [
  "qlink-proto",
- "serde",
  "serde_json",
  "thiserror 1.0.69",
 ]
@@ -1365,6 +1364,7 @@ version = "0.11.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "434b42fec591c96ef50e21e886936e66d3cc3f737104fdb9b737c40ffb94c098"
 dependencies = [
+ "aws-lc-rs",
  "bytes",
  "fastbloom",
  "getrandom 0.3.4",
@@ -1555,7 +1555,6 @@ dependencies = [
  "aws-lc-rs",
  "log",
  "once_cell",
- "ring",
  "rustls-pki-types",
  "rustls-webpki",
  "subtle",
