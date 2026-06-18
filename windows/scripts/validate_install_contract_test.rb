@@ -20,23 +20,44 @@ class ValidateInstallContractTest < Minitest::Test
     SettleTimeoutSeconds
     SettleIntervalSeconds
     IncludeHostIdentifiers
+    UpgradeFromMsiPath
+    ValidateRollback
+    RollbackToMsiPath
+    RollbackMode
   ].freeze
 
   REQUIRED_REPORT_KEYS = %w[
     schemaVersion
     generatedAt
+    scenario
     host
     msi
+    upgradeFromMsi
+    rollbackToMsi
     elevation
     install
     service
     stateDirectory
     uiBinary
     networkBeforeUninstall
+    upgrade
+    rollback
     uninstall
     networkAfterUninstall
     residualFindings
+    warnings
+    failures
     passed
+  ].freeze
+
+  REQUIRED_MSI_SNAPSHOT_KEYS = %w[
+    productName
+    manufacturer
+    productVersion
+    productCode
+    upgradeCode
+    packageCode
+    metadataError
   ].freeze
 
   def setup
@@ -56,6 +77,7 @@ class ValidateInstallContractTest < Minitest::Test
     assert_match(/\$ExpectedServiceName\s*=\s*"QuantumLinkService"/, @script)
     assert_match(/\$ExpectedStatePath\s*=\s*"C:\\ProgramData\\QuantumLink"/, @script)
     assert_match(/\$ExpectedUiExe\s*=\s*"C:\\Program Files\\QuantumLink\\QuantumLink\.Windows\.exe"/, @script)
+    assert_match(/\[ValidateSet\("UninstallReinstall",\s*"DirectDowngrade"\)\]\s*\[string\]\$RollbackMode\s*=\s*"UninstallReinstall"/, @script)
     assert_match(/quantumlink-install-validation-report\.json/, @script)
     assert_match(/\$ContractOnly\b/, @script, "expected an explicit contract/dry mode")
   end
@@ -65,7 +87,129 @@ class ValidateInstallContractTest < Minitest::Test
       assert_match(/#{Regexp.escape(key)}/, @script, "missing report key #{key}")
     end
 
-    assert_match(/ConvertTo-Json\s+-Depth\s+\d+/, @script)
+    assert_match(/\$script:SchemaVersion\s*=\s*"1\.1"/, @script)
+    assert_match(/ConvertTo-Json\s+-Depth\s+16\b/, @script)
+  end
+
+  def test_msi_snapshots_include_bounded_installer_metadata
+    REQUIRED_MSI_SNAPSHOT_KEYS.each do |key|
+      assert_match(/#{Regexp.escape(key)}/, @script, "missing MSI snapshot key #{key}")
+    end
+
+    assert_match(/WindowsInstaller\.Installer/, @script)
+    assert_match(/ProductCode/, @script)
+    assert_match(/UpgradeCode/, @script)
+    assert_match(/PackageCode/, @script)
+    assert_match(/metadataError/, @script)
+  end
+
+  def test_upgrade_and_rollback_report_sections_cover_required_evidence
+    upgrade_keys = %w[
+      skipped
+      passed
+      baselineInstall
+      baselineInstallWait
+      baselineInstalledProduct
+      networkBeforeUpgrade
+      upgradeInstall
+      upgradeWait
+      upgradeInstalledProduct
+      baselineProductAbsent
+      networkAfterUpgrade
+      footprintContinuity
+      failures
+    ]
+    rollback_keys = %w[
+      skipped
+      passed
+      mode
+      uninstallBeforeRollback
+      cleanupWait
+      rollbackInstall
+      rollbackWait
+      rollbackInstalledProduct
+      upgradedProductAbsent
+      networkAfterRollback
+      footprintContinuity
+      failures
+    ]
+
+    upgrade_keys.each do |key|
+      assert_match(/#{Regexp.escape(key)}/, @script, "missing upgrade evidence key #{key}")
+    end
+    rollback_keys.each do |key|
+      assert_match(/#{Regexp.escape(key)}/, @script, "missing rollback evidence key #{key}")
+    end
+  end
+
+  def test_upgrade_and_rollback_static_sequencing_is_opt_in
+    assert_match(/if\s*\(\[string\]::IsNullOrWhiteSpace\(\$UpgradeFromMsiPath\)\)/, @script)
+    assert_match(/Invoke-QuantumLinkUpgradeValidation/, @script)
+    assert_match(/Invoke-QuantumLinkRollbackValidation/, @script)
+    assert_match(/\$rollbackTargetPath\s*=\s*\$RollbackToMsiPath/, @script)
+    assert_match(/\$rollbackTargetPath\s*=\s*\$UpgradeFromMsiPath/, @script)
+    assert_match(/switch\s*\(\$RollbackMode\)/, @script)
+    assert_match(/"UninstallReinstall"/, @script)
+    assert_match(/"DirectDowngrade"/, @script)
+    report_ref = /\$(?:report|Report)/
+    assert_match(/Invoke-QuantumLinkMsiExec\s+-Action\s+Install\s+-Path\s+#{report_ref}\.upgradeFromMsi\.resolvedPath[\s\S]*Invoke-QuantumLinkMsiExec\s+-Action\s+Install\s+-Path\s+#{report_ref}\.msi\.resolvedPath/, @script)
+    assert_match(/Invoke-QuantumLinkMsiExec\s+-Action\s+Uninstall[\s\S]*Invoke-QuantumLinkMsiExec\s+-Action\s+Install\s+-Path\s+#{report_ref}\.rollbackToMsi\.resolvedPath/, @script)
+  end
+
+  def test_candidate_upgrade_requires_baseline_install_and_footprint_success
+    assert_match(/\$baselineReadyForUpgrade\s*=\s*\(\$upgrade\.baselineInstall\.passed\s+-and\s+\$upgrade\.baselineInstallWait\.passed\s+-and\s+\$upgrade\.baselineInstalledProduct\.passed\)/, @script)
+    assert_match(/if\s*\(\$baselineReadyForUpgrade\)\s*\{[\s\S]*Invoke-QuantumLinkMsiExec\s+-Action\s+Install\s+-Path\s+\$Report\.msi\.resolvedPath/, @script)
+    refute_match(/if\s*\(\$upgrade\.baselineInstallWait\.passed\)\s*\{[\s\S]*Invoke-QuantumLinkMsiExec\s+-Action\s+Install\s+-Path\s+\$Report\.msi\.resolvedPath/, @script)
+  end
+
+  def test_upgrade_and_rollback_validate_installed_product_identity
+    assert_match(/function Get-QuantumLinkInstalledProductIdentity\b/, @script)
+    assert_match(/ProductState/, @script)
+    assert_match(/ProductInfo/, @script)
+    assert_match(/VersionString/, @script)
+    assert_match(/productStateInstalled/, @script)
+    assert_match(/installed product version does not match the expected MSI ProductVersion/, @script)
+    assert_match(/\$upgrade\.baselineInstalledProduct\s*=\s*Get-QuantumLinkInstalledProductIdentity\s+`[\s\S]*-ExpectedMsi\s+\$Report\.upgradeFromMsi/, @script)
+    assert_match(/\$upgrade\.upgradeInstalledProduct\s*=\s*Get-QuantumLinkInstalledProductIdentity\s+`[\s\S]*-ExpectedMsi\s+\$Report\.msi/, @script)
+    assert_match(/\$rollback\.rollbackInstalledProduct\s*=\s*Get-QuantumLinkInstalledProductIdentity\s+`[\s\S]*-ExpectedMsi\s+\$Report\.rollbackToMsi/, @script)
+  end
+
+  def test_upgrade_and_rollback_validate_replaced_product_absence
+    assert_match(/function Get-QuantumLinkInstalledProductAbsence\b/, @script)
+    assert_match(/replaced-product absence is not applicable/, @script)
+    assert_match(/replaced product is still installed/, @script)
+    assert_match(/\$upgrade\.baselineProductAbsent\s*=\s*Get-QuantumLinkInstalledProductAbsence\s+`[\s\S]*-ExpectedAbsentMsi\s+\$Report\.upgradeFromMsi\s+`[\s\S]*-ExpectedInstalledMsi\s+\$Report\.msi/, @script)
+    assert_match(/\$rollback\.upgradedProductAbsent\s*=\s*Get-QuantumLinkInstalledProductAbsence\s+`[\s\S]*-ExpectedAbsentMsi\s+\$Report\.msi\s+`[\s\S]*-ExpectedInstalledMsi\s+\$Report\.rollbackToMsi/, @script)
+  end
+
+  def test_continuity_report_uses_honest_footprint_naming
+    assert_match(/New-QuantumLinkFootprintContinuityReport/, @script)
+    assert_match(/footprintContinuity/, @script)
+    refute_match(/stateContinuity/, @script)
+    refute_match(/StateContinuity/, @script)
+  end
+
+  def test_rollback_promotion_requires_a_real_rollback_attempt
+    assert_match(/\$rollbackAttempted\s*=\s*\(\$ValidateRollback\s+-and\s+\$report\.upgrade\.passed\s+-and\s+\(-not\s+\$report\.upgrade\.skipped\)\)/, @script)
+    assert_match(/if\s*\(\$rollbackAttempted\)\s*\{[\s\S]*Invoke-QuantumLinkRollbackValidation/, @script)
+    assert_match(/if\s*\(-not\s+\$report\.rollback\.skipped\)\s*\{[\s\S]*\$report\.install\s*=\s*\$report\.rollback\.rollbackInstall/, @script)
+  end
+
+  def test_final_cleanup_can_skip_msi_uninstall_when_current_product_known_absent
+    assert_match(/\[switch\]\$CurrentProductKnownAbsent/, @script)
+    assert_match(/if\s*\(\$CurrentProductKnownAbsent\)\s*\{[\s\S]*No product is currently installed[\s\S]*New-SkippedValidationSection/, @script)
+    assert_match(/-CurrentProductKnownAbsent:\$currentProductKnownAbsent/, @script)
+  end
+
+  def test_upgrade_and_rollback_results_track_last_attempted_install_msi
+    assert_match(/LastAttemptedInstallMsiPath\s*=\s*\$lastAttemptedInstallMsiPath/, @script)
+    assert_match(/\$lastAttemptedInstallMsiPath\s*=\s*\$Report\.upgradeFromMsi\.resolvedPath[\s\S]*\$upgrade\.baselineInstall\s*=\s*Invoke-QuantumLinkMsiExec\s+-Action\s+Install\s+-Path\s+\$Report\.upgradeFromMsi\.resolvedPath/, @script)
+    assert_match(/\$lastAttemptedInstallMsiPath\s*=\s*\$Report\.rollbackToMsi\.resolvedPath[\s\S]*\$rollback\.rollbackInstall\s*=\s*Invoke-QuantumLinkMsiExec\s+-Action\s+Install\s+-Path\s+\$Report\.rollbackToMsi\.resolvedPath/, @script)
+    assert_match(/\$finalCleanupMsiPath\s*=\s*\$currentInstalledMsiPath[\s\S]*\$finalCleanupMsiPath\s*=\s*\$lastAttemptedInstallMsiPath[\s\S]*-InstalledMsiPath\s+\$finalCleanupMsiPath/, @script)
+  end
+
+  def test_rollback_install_attempt_makes_current_absence_unknown
+    assert_match(/\$currentProductKnownAbsent\s*=\s*\$true[\s\S]*\$lastAttemptedInstallMsiPath\s*=\s*\$Report\.rollbackToMsi\.resolvedPath[\s\S]*\$currentProductKnownAbsent\s*=\s*\$false[\s\S]*\$rollback\.rollbackInstall\s*=\s*Invoke-QuantumLinkMsiExec\s+-Action\s+Install\s+-Path\s+\$Report\.rollbackToMsi\.resolvedPath/, @script)
   end
 
   def test_service_existence_check_does_not_require_running_state
@@ -145,11 +289,17 @@ class ValidateInstallContractTest < Minitest::Test
         assert report.key?(key), "missing report key #{key}"
       end
 
-      assert_equal "1.0", report.fetch("schemaVersion")
+      assert_equal "1.1", report.fetch("schemaVersion")
       assert_equal true, report.fetch("passed")
       assert_kind_of Hash, report.fetch("host")
       assert_kind_of Hash, report.fetch("elevation")
+      assert_kind_of Hash, report.fetch("upgrade")
+      assert_kind_of Hash, report.fetch("rollback")
       assert_kind_of Hash, report.fetch("residualFindings")
+      assert_equal "cleanInstall", report.fetch("scenario")
+      assert_equal true, report.fetch("upgrade").fetch("skipped")
+      assert_equal true, report.fetch("rollback").fetch("skipped")
+      assert_kind_of Array, report.fetch("warnings")
       assert_kind_of Array, report.fetch("failures")
     end
   end

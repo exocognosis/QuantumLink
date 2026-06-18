@@ -14,6 +14,41 @@ on:
         description: "Skips adapter/route/WFP evidence inside validate-install.ps1 if a runner cannot collect network evidence."
         type: boolean
         default: false
+      expected_publisher_subject:
+        description: "Optional exact Authenticode publisher subject expected on the staged MSI."
+        type: string
+        default: ""
+      expected_publisher_thumbprint:
+        description: "Optional Authenticode publisher certificate thumbprint expected on the staged MSI."
+        type: string
+        default: ""
+      upgrade_from_msi_url:
+        description: "Optional older MSI URL to install before validating upgrade to the generated MSI."
+        type: string
+        default: ""
+      upgrade_from_msi_sha256:
+        description: "Required SHA-256 when upgrade_from_msi_url is supplied."
+        type: string
+        default: ""
+      validate_rollback:
+        description: "Validate rollback after a successful upgrade validation."
+        type: boolean
+        default: false
+      rollback_to_msi_url:
+        description: "Optional rollback target MSI URL. Defaults to upgrade_from_msi_url when omitted."
+        type: string
+        default: ""
+      rollback_to_msi_sha256:
+        description: "Required SHA-256 when rollback_to_msi_url is supplied."
+        type: string
+        default: ""
+      rollback_mode:
+        description: "Rollback validation strategy used by validate-install.ps1."
+        type: choice
+        default: UninstallReinstall
+        options:
+          - UninstallReinstall
+          - DirectDowngrade
 
 permissions:
   contents: write
@@ -226,10 +261,99 @@ jobs:
       - name: Validate MSI install and uninstall
         if: github.event_name == 'workflow_dispatch' && inputs.run_install_validation
         shell: pwsh
+        env:
+          SKIP_VALIDATION_NETWORK_CHECKS: ${{ inputs.skip_validation_network_checks }}
+          UPGRADE_FROM_MSI_URL: ${{ inputs.upgrade_from_msi_url }}
+          UPGRADE_FROM_MSI_SHA256: ${{ inputs.upgrade_from_msi_sha256 }}
+          VALIDATE_ROLLBACK: ${{ inputs.validate_rollback }}
+          ROLLBACK_TO_MSI_URL: ${{ inputs.rollback_to_msi_url }}
+          ROLLBACK_TO_MSI_SHA256: ${{ inputs.rollback_to_msi_sha256 }}
+          ROLLBACK_MODE: ${{ inputs.rollback_mode }}
         run: |
           $ErrorActionPreference = "Stop"
 
-          New-Item -ItemType Directory -Path ".\windows\build\validation" -Force | Out-Null
+          function Get-WorkflowInput {
+            param([AllowNull()][string]$Value)
+
+            if ([string]::IsNullOrWhiteSpace($Value)) {
+              return ""
+            }
+
+            return $Value.Trim()
+          }
+
+          function Assert-Sha256Input {
+            param(
+              [string]$Name,
+              [string]$Value
+            )
+
+            if (-not [string]::IsNullOrWhiteSpace($Value) -and $Value -notmatch '^[0-9a-fA-F]{64}$') {
+              Write-Error "$Name must be a 64-character hex SHA-256 checksum."
+              exit 1
+            }
+          }
+
+          function Save-VerifiedMsi {
+            param(
+              [string]$Url,
+              [string]$ExpectedSha256,
+              [string]$DestinationPath,
+              [string]$Description
+            )
+
+            Write-Host "Downloading $Description MSI from $Url"
+            Invoke-WebRequest -Uri $Url -OutFile $DestinationPath
+
+            if ((Get-Item $DestinationPath).Length -eq 0) {
+              Write-Error "Downloaded $Description MSI is empty."
+              exit 1
+            }
+
+            $expectedHash = $ExpectedSha256.ToLowerInvariant()
+            $actualHash = (Get-FileHash -Algorithm SHA256 -Path $DestinationPath).Hash.ToLowerInvariant()
+            if ($actualHash -ne $expectedHash) {
+              Write-Error "$Description MSI SHA-256 mismatch. Expected $expectedHash but got $actualHash."
+              exit 1
+            }
+          }
+
+          $validationDir = ".\windows\build\validation"
+          New-Item -ItemType Directory -Path $validationDir -Force | Out-Null
+
+          $upgradeUrl = Get-WorkflowInput -Value $env:UPGRADE_FROM_MSI_URL
+          $upgradeSha256 = Get-WorkflowInput -Value $env:UPGRADE_FROM_MSI_SHA256
+          $rollbackUrl = Get-WorkflowInput -Value $env:ROLLBACK_TO_MSI_URL
+          $rollbackSha256 = Get-WorkflowInput -Value $env:ROLLBACK_TO_MSI_SHA256
+          $validateRollback = ($env:VALIDATE_ROLLBACK -eq "true")
+
+          if ($upgradeUrl -ne "" -and $upgradeSha256 -eq "") {
+            Write-Error "upgrade_from_msi_sha256 is required when upgrade_from_msi_url is supplied."
+            exit 1
+          }
+          if ($upgradeUrl -eq "" -and $upgradeSha256 -ne "") {
+            Write-Error "upgrade_from_msi_url is required when upgrade_from_msi_sha256 is supplied."
+            exit 1
+          }
+          if ($validateRollback -and $upgradeUrl -eq "") {
+            Write-Error "validate_rollback requires upgrade_from_msi_url."
+            exit 1
+          }
+          if ($rollbackUrl -ne "" -and -not $validateRollback) {
+            Write-Error "rollback_to_msi_url requires validate_rollback."
+            exit 1
+          }
+          if ($rollbackUrl -ne "" -and $rollbackSha256 -eq "") {
+            Write-Error "rollback_to_msi_sha256 is required when rollback_to_msi_url is supplied."
+            exit 1
+          }
+          if ($rollbackUrl -eq "" -and $rollbackSha256 -ne "") {
+            Write-Error "rollback_to_msi_url is required when rollback_to_msi_sha256 is supplied."
+            exit 1
+          }
+
+          Assert-Sha256Input -Name "upgrade_from_msi_sha256" -Value $upgradeSha256
+          Assert-Sha256Input -Name "rollback_to_msi_sha256" -Value $rollbackSha256
 
           $arguments = @(
             "-MsiPath",
@@ -238,8 +362,34 @@ jobs:
             ".\windows\build\validation\install-validation-report.json"
           )
 
-          if ("${{ inputs.skip_validation_network_checks }}" -eq "true") {
+          if ($env:SKIP_VALIDATION_NETWORK_CHECKS -eq "true") {
             $arguments += "-SkipNetworkChecks"
+          }
+
+          if ($upgradeUrl -ne "") {
+            $upgradeMsiPath = Join-Path $validationDir "upgrade-from.msi"
+            Save-VerifiedMsi -Url $upgradeUrl `
+              -ExpectedSha256 $upgradeSha256 `
+              -DestinationPath $upgradeMsiPath `
+              -Description "upgrade_from_msi_url"
+            $arguments += "-UpgradeFromMsiPath"
+            $arguments += $upgradeMsiPath
+          }
+
+          if ($validateRollback) {
+            $arguments += "-ValidateRollback"
+            $arguments += "-RollbackMode"
+            $arguments += $env:ROLLBACK_MODE
+          }
+
+          if ($rollbackUrl -ne "") {
+            $rollbackMsiPath = Join-Path $validationDir "rollback-to.msi"
+            Save-VerifiedMsi -Url $rollbackUrl `
+              -ExpectedSha256 $rollbackSha256 `
+              -DestinationPath $rollbackMsiPath `
+              -Description "rollback_to_msi_url"
+            $arguments += "-RollbackToMsiPath"
+            $arguments += $rollbackMsiPath
           }
 
           & .\windows\scripts\validate-install.ps1 @arguments
@@ -288,6 +438,65 @@ jobs:
 
           Get-Content $checksumsPath
 
+      - name: Verify Windows release evidence
+        shell: pwsh
+        env:
+          SIGNING_AVAILABLE: ${{ steps.signing.outputs.available }}
+          RUN_INSTALL_VALIDATION: ${{ github.event_name == 'workflow_dispatch' && inputs.run_install_validation }}
+          EXPECTED_PUBLISHER_SUBJECT: ${{ inputs.expected_publisher_subject }}
+          EXPECTED_PUBLISHER_THUMBPRINT: ${{ inputs.expected_publisher_thumbprint }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $releaseDir = ".\windows\build\release"
+          $stagedMsi = @(
+            Get-ChildItem -Path $releaseDir -File -Filter "QuantumLink-*-windows-x64.msi" |
+              Sort-Object Name
+          )
+
+          if ($stagedMsi.Count -ne 1) {
+            Write-Error "Expected exactly one staged Windows MSI in $releaseDir but found $($stagedMsi.Count)."
+            exit 1
+          }
+
+          $arguments = @(
+            "-ArtifactDirectory",
+            ".\windows\build\release",
+            "-MsiPath",
+            $stagedMsi[0].FullName,
+            "-ChecksumsPath",
+            ".\windows\build\release\SHA256SUMS.txt",
+            "-WintunLicensePath",
+            ".\windows\build\release\WINTUN-LICENSE.txt",
+            "-WintunDllPath",
+            ".\wintun\bin\amd64\wintun.dll",
+            "-EvidencePath",
+            ".\windows\build\release\windows-release-evidence.json"
+          )
+
+          if ($env:SIGNING_AVAILABLE -eq "true" -or $env:GITHUB_REF -like "refs/tags/v*") {
+            $arguments += "-RequireValidSignature"
+            $arguments += "-RequireTimestamp"
+          }
+
+          if (-not [string]::IsNullOrWhiteSpace($env:EXPECTED_PUBLISHER_SUBJECT)) {
+            $arguments += "-ExpectedPublisherSubject"
+            $arguments += $env:EXPECTED_PUBLISHER_SUBJECT.Trim()
+          }
+
+          if (-not [string]::IsNullOrWhiteSpace($env:EXPECTED_PUBLISHER_THUMBPRINT)) {
+            $arguments += "-ExpectedPublisherThumbprint"
+            $arguments += $env:EXPECTED_PUBLISHER_THUMBPRINT.Trim()
+          }
+
+          if ($env:RUN_INSTALL_VALIDATION -eq "true") {
+            $arguments += "-InstallValidationReportPath"
+            $arguments += ".\windows\build\validation\install-validation-report.json"
+            $arguments += "-RequireInstallValidation"
+          }
+
+          & .\windows\scripts\verify-windows-release.ps1 @arguments
+
       - name: Upload release artifacts
         uses: actions/upload-artifact@v7
         with:
@@ -296,6 +505,7 @@ jobs:
             windows/build/release/*.msi
             windows/build/release/WINTUN-LICENSE.txt
             windows/build/release/SHA256SUMS.txt
+            windows/build/release/windows-release-evidence.json
           if-no-files-found: error
 
       - name: Attach to GitHub Release
@@ -306,4 +516,5 @@ jobs:
             windows/build/release/*.msi
             windows/build/release/WINTUN-LICENSE.txt
             windows/build/release/SHA256SUMS.txt
+            windows/build/release/windows-release-evidence.json
           fail_on_unmatched_files: true

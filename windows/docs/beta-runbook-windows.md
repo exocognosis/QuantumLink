@@ -20,6 +20,11 @@ Current CI proves:
 - The manual Windows release workflow can run `validate-install.ps1` on
   `windows-latest` when `run_install_validation` is enabled, then upload
   `windows/build/validation/install-validation-report.json` as JSON evidence.
+  The release workflow also runs `verify-windows-release.ps1` before artifact
+  upload and writes `windows/build/release/windows-release-evidence.json`,
+  binding the selected MSI, `SHA256SUMS.txt`, Wintun DLL/license evidence,
+  publisher signature evidence, and any install-validation report into one
+  release evidence file.
   Tag releases are not forced to run this GitHub-hosted check, but tagged
   publication still requires external/manual validation evidence before
   publication.
@@ -47,11 +52,18 @@ Manual Windows validation must still prove:
       artifact.
 - [ ] Authenticode-sign and timestamp `QuantumLink.msi`; verify the expected
       publisher is shown by `Get-AuthenticodeSignature`.
+- [ ] For manual release workflow runs, set `expected_publisher_subject` and/or
+      `expected_publisher_thumbprint` when the publisher identity should be
+      enforced by `windows-release-evidence.json`.
 - [ ] Generate and publish the MSI SHA-256 checksum.
 - [ ] Collect manual install validation evidence from either the release
       workflow artifact `QuantumLink-Windows-InstallValidation-<run-number>`
       or a local `.\windows\build\validation\install-validation-report.json`
       report generated with `.\windows\scripts\validate-install.ps1`.
+- [ ] Confirm `windows/build/release/windows-release-evidence.json` is present
+      next to the MSI, `SHA256SUMS.txt`, and `WINTUN-LICENSE.txt`; if install
+      validation ran, confirm it required and matched
+      `install-validation-report.json` for the selected MSI SHA-256.
 - [ ] Run every beta gate below on clean Windows 10 22H2 and Windows 11 x64
       VMs plus at least one physical x64 Windows machine.
 - [ ] Block beta publication for any signing, checksum, install, Wintun, WFP,
@@ -82,6 +94,23 @@ Manual Windows validation must still prove:
       and WFP evidence for constrained GitHub runners. It does not waive clean
       Windows 10/11 VM, physical-host, leak-test, two-machine, or macOS interop
       beta validation.
+- [ ] Optional workflow upgrade validation is configured only with complete
+      URL/SHA pairs: `upgrade_from_msi_url` plus
+      `upgrade_from_msi_sha256`. To validate rollback, set
+      `validate_rollback`, keep the upgrade source configured, and choose
+      `rollback_mode` (`UninstallReinstall` or `DirectDowngrade`). If using a
+      rollback target other than the upgrade source, set `rollback_to_msi_url`
+      plus `rollback_to_msi_sha256`.
+- [ ] Release evidence is generated before upload:
+
+      ```powershell
+      .\windows\scripts\verify-windows-release.ps1 -ArtifactDirectory .\windows\build\release -MsiPath <staged-msi> -ChecksumsPath .\windows\build\release\SHA256SUMS.txt -WintunLicensePath .\windows\build\release\WINTUN-LICENSE.txt -WintunDllPath .\wintun\bin\amd64\wintun.dll -EvidencePath .\windows\build\release\windows-release-evidence.json
+      ```
+
+      Signed/tagged releases require valid MSI signature and timestamp
+      evidence. When `run_install_validation` is enabled, the verifier also
+      requires `.\windows\build\validation\install-validation-report.json` and
+      checks that its MSI SHA-256 matches the staged release MSI.
 
 ## 1. Install / first run
 
