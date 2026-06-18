@@ -3,9 +3,9 @@ import XCTest
 
 final class PQCAlgorithmTests: XCTestCase {
     func testFIPSAlgorithmsMapToSuiteIdentifiers() {
-        XCTAssertEqual(PQCAlgorithm.fips203.suiteIdentifier, "QLINK-FIPS203-MLKEM768-HKDFSHA256-v1")
-        XCTAssertEqual(PQCAlgorithm.fips204.suiteIdentifier, "QLINK-FIPS204-MLDSA65-HKDFSHA256-v1")
-        XCTAssertEqual(PQCAlgorithm.fips205.suiteIdentifier, "QLINK-FIPS205-SLHDSA-SHA2-128S-HKDFSHA256-v1")
+        XCTAssertEqual(PQCAlgorithm.fips203.suiteIdentifier, "QLINK-FIPS203-MLKEM768-SHAKE256-v1")
+        XCTAssertEqual(PQCAlgorithm.fips204.suiteIdentifier, "QLINK-FIPS204-MLDSA65-SHAKE256-v1")
+        XCTAssertEqual(PQCAlgorithm.fips205.suiteIdentifier, "QLINK-FIPS205-SLHDSA-SHAKE128S-SHAKE256-v1")
     }
 
     func testCryptoPolicyUsesSelectedPQCAlgorithmSuite() {

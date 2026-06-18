@@ -7,7 +7,7 @@ open. Source references are to the QuantumLinkOS repository.
 
 | Source | Destination | Notes |
 |--------|-------------|-------|
-| `rust/qlink-core` (entire crate) | `rust/qlink-core` | Already Windows-clean: the only Unix-specific code (`peer_store.rs` file mode 0o600) is `#[cfg(unix)]`-gated; on Windows the peer store relies on the ProgramData ACL + ChaCha20-Poly1305 envelope instead. `cdylib`/`staticlib` crate types already produce `qlink_core.dll`/`.lib`. |
+| `rust/qlink-core` (entire crate) | `rust/qlink-core` | Already Windows-clean: the only Unix-specific code (`peer_store.rs` file mode 0o600) is `#[cfg(unix)]`-gated; on Windows the peer store relies on the ProgramData ACL + SHAKE256 v3 envelope instead. `cdylib`/`staticlib` crate types already produce `qlink_core.dll`/`.lib`. |
 | `config/mesh.example.json` | `config/` | Same configuration semantics. |
 
 ## Ported to Rust (shared logic, now testable everywhere)

@@ -12,7 +12,7 @@ final class RustCoreBridgeTests: XCTestCase {
         }
 
         let library = try RustCoreLibrary(path: path)
-        XCTAssertEqual(library.defaultSuite, "QLINK-FIPS203-MLKEM768-HKDFSHA256-v1")
+        XCTAssertEqual(library.defaultSuite, "QLINK-FIPS203-MLKEM768-SHAKE256-v1")
 
         let adapter = try RustTunnelCoreAdapter(configuration: .defaultDevelopment, library: library)
         let packet = ipv4Packet(destination: [100, 127, 0, 10])

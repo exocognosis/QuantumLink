@@ -4,7 +4,6 @@ use crate::{
     error::{QlinkError, Result},
     packet_core::{FfiRouteMode, PacketTunnelCore, PacketTunnelCoreConfig},
     quic_transport::QuicEndpoint,
-    relay::{spawn_dev_relay, RelayClient},
     rendezvous::{spawn_dev_rendezvous, RendezvousClient},
     traversal::{relay_candidate, PathSelector},
 };
@@ -135,51 +134,9 @@ pub async fn run_local_mesh_loopback() -> Result<MeshLoopbackResult> {
 }
 
 pub async fn run_relay_loopback() -> Result<RelayLoopbackResult> {
-    let relay = spawn_dev_relay().await?;
-    let relay_addr = relay.local_addr();
-
-    let alice_key = DeviceKeypair::generate()?;
-    let bob_key = DeviceKeypair::generate()?;
-    let source_peer_id = alice_key.public_key().peer_id();
-    let destination_peer_id = bob_key.public_key().peer_id();
-
-    let mut alice = RelayClient::connect(&relay_addr.to_string(), source_peer_id.clone()).await?;
-    let mut bob =
-        RelayClient::connect(&relay_addr.to_string(), destination_peer_id.clone()).await?;
-
-    let mut sender = dev_packet_core()?;
-    let mut receiver = dev_packet_core()?;
-    let packet = test_ipv4_packet([100, 127, 0, 10]);
-    sender.submit_tunnel_packet(2, &packet)?;
-    let frame = sender
-        .pop_transport_frame()
-        .ok_or_else(|| QlinkError::Protocol("packet core produced no transport frame".into()))?;
-
-    alice.send_datagram(&destination_peer_id, &frame).await?;
-    let (relay_source, received_frame) =
-        tokio::time::timeout(Duration::from_secs(5), bob.receive_datagram())
-            .await
-            .map_err(|_| QlinkError::Protocol("relay loopback timed out".into()))??
-            .ok_or_else(|| QlinkError::Protocol("relay closed before delivering packet".into()))?;
-    if relay_source != source_peer_id {
-        return Err(QlinkError::Protocol(
-            "relay datagram source mismatch".into(),
-        ));
-    }
-
-    receiver.accept_transport_frame(&received_frame)?;
-    let restored = receiver
-        .pop_tunnel_packet()
-        .ok_or_else(|| QlinkError::Protocol("receiver produced no tunnel packet".into()))?;
-
-    Ok(RelayLoopbackResult {
-        relay_addr,
-        source_peer_id,
-        destination_peer_id,
-        protocol_family: restored.protocol_family,
-        packet_bytes: restored.bytes.len(),
-        packet_round_trip: normalized_packet_matches(&restored.bytes, &packet),
-    })
+    Err(QlinkError::Protocol(
+        "relay loopback is disabled until relay has an end-to-end PQC session".into(),
+    ))
 }
 
 fn signed_dev_record(
@@ -265,10 +222,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relay_loopback_moves_packet_frame() {
-        let result = run_relay_loopback().await.unwrap();
-        assert_eq!(result.protocol_family, 2);
-        assert_eq!(result.packet_bytes, 20);
-        assert!(result.packet_round_trip);
+    async fn relay_loopback_fails_closed_without_pqc_session() {
+        let error = run_relay_loopback().await.unwrap_err();
+        assert!(error.to_string().contains("relay loopback is disabled"));
     }
 }

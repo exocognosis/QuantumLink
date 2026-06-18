@@ -4,12 +4,12 @@ use qlink_core::{
     discovery::{CandidateEndpoint, CandidateType, PeerRecord, UnsignedPeerRecord},
     dytallix_identity::MeshTrustPolicy,
     ice::{perform_ice_check, spawn_dev_ice_responder, IceCheckRequest, IceCredentials},
-    local_loopback::{run_local_mesh_loopback, run_relay_loopback},
+    local_loopback::run_local_mesh_loopback,
     mesh_connection::{ConnectionOutcome, MeshConnector, MeshConnectorConfig, PathKind},
     mesh_transport::{MeshTransportConfig, MeshTransportHandle},
     packet_core::{FfiRouteMode, PacketTunnelCore, PacketTunnelCoreConfig},
     quic_transport::QuicEndpoint,
-    relay::{run_relay, spawn_dev_relay, RelayClient},
+    relay::{run_relay, spawn_dev_relay},
     rendezvous::{run_rendezvous, spawn_dev_rendezvous, RendezvousClient},
     stun::spawn_dev_stun,
     traversal::gather_local_candidates,
@@ -245,29 +245,14 @@ async fn main() -> qlink_core::Result<()> {
             println!("packet_round_trip={}", result.packet_round_trip);
         }
         Command::RelayLoopback => {
-            let result = run_relay_loopback().await?;
-            println!("transport=relay_datagram");
-            println!("relay_addr={}", result.relay_addr);
-            println!("source_peer_id={}", result.source_peer_id);
-            println!("destination_peer_id={}", result.destination_peer_id);
-            println!("packet_bytes={}", result.packet_bytes);
-            println!("protocol_family={}", result.protocol_family);
-            println!("packet_round_trip={}", result.packet_round_trip);
+            return Err(qlink_core::QlinkError::Protocol(
+                "relay-loopback is disabled until relay has an end-to-end PQC session".into(),
+            ));
         }
-        Command::RelaySmoke { server } => {
-            let mut alice = RelayClient::connect(&server, "alice").await?;
-            let mut bob = RelayClient::connect(&server, "bob").await?;
-            alice.send_datagram("bob", b"hello via relay").await?;
-            let received = tokio::time::timeout(Duration::from_secs(5), bob.receive_datagram())
-                .await
-                .map_err(|_| qlink_core::QlinkError::Protocol("relay smoke timed out".into()))??
-                .ok_or_else(|| {
-                    qlink_core::QlinkError::Protocol("relay closed before response".into())
-                })?;
-
-            println!("relay_server={server}");
-            println!("source={}", received.0);
-            println!("payload={}", String::from_utf8_lossy(&received.1));
+        Command::RelaySmoke { .. } => {
+            return Err(qlink_core::QlinkError::Protocol(
+                "relay-smoke is disabled until relay has an end-to-end PQC session".into(),
+            ));
         }
         Command::RendezvousSmoke { server } => {
             let keypair = DeviceKeypair::generate()?;

@@ -31,10 +31,10 @@ public struct MeshTransportConfiguration: Codable, Equatable, Sendable {
     /// connector's in-memory-only store. The parent directory must
     /// exist before tunnel start.
     public let peerStorePath: String?
-    /// Optional 32-byte ChaCha20-Poly1305 key, base64-encoded
+    /// Optional 32-byte SHAKE256 envelope key, base64-encoded
     /// (standard alphabet, with padding). Mirrors the Rust
     /// `peer_store_key_b64`. When set together with `peerStorePath`,
-    /// the on-disk cache file is written in the v2 encrypted
+    /// the on-disk cache file is written in the v3 protected
     /// envelope; without it the file is plaintext JSON. Mint via
     /// `PeerStoreKey.loadOrGenerateBase64()`.
     public let peerStoreKeyB64: String?
@@ -653,7 +653,7 @@ public enum TunnelTransportFactory {
             // directory, so ensure it exists before pointing at it.
             try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
             peerStorePath = dir.appendingPathComponent("peers.json").path
-            // Encryption is best-effort: if the Keychain isn't
+            // At-rest protection is best-effort: if the Keychain isn't
             // available (SPM smoke), silently ship with plaintext
             // on disk rather than failing the whole launch. The
             // file is still mode 0o600 in either case.

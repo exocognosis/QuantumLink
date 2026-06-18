@@ -114,7 +114,7 @@ public sealed record PacketPumpMetrics
 
 public sealed record CryptoPolicy
 {
-    [JsonPropertyName("suite")] public string Suite { get; init; } = "QLINK-FIPS203-MLKEM768-HKDFSHA256-v1";
+    [JsonPropertyName("suite")] public string Suite { get; init; } = "QLINK-FIPS203-MLKEM768-SHAKE256-v1";
     [JsonPropertyName("rekeyAfterSeconds")] public double RekeyAfterSeconds { get; init; } = 3600;
     [JsonPropertyName("rekeyAfterBytes")] public ulong RekeyAfterBytes { get; init; } = 1_073_741_824;
 }

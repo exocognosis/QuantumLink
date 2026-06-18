@@ -14,7 +14,6 @@ use crate::{
     pqc_frame::PqcFrameProtector,
     pqc_session_wire::run_pqc_session_initiator,
     quic_transport::{QuicCertificate, QuicDatagramSession, QuicEndpoint},
-    relay::RelayClient,
     rendezvous::RendezvousClient,
     session_crypto::PqcSessionContext,
     traversal::{candidate_socket_addr, HOST_PRIORITY},
@@ -291,72 +290,61 @@ pub struct DirectLink {
     frame_protector: PqcFrameProtector,
 }
 
-pub struct RelayLink {
-    pub remote_peer_id: String,
-    pub client: RelayClient,
+pub struct MeshLink {
+    inner: MeshLinkInner,
 }
 
-pub enum MeshLink {
+enum MeshLinkInner {
     Direct(DirectLink),
-    Relay(RelayLink),
 }
 
 impl std::fmt::Debug for MeshLink {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            MeshLink::Direct(link) => f
+            MeshLink {
+                inner: MeshLinkInner::Direct(link),
+            } => f
                 .debug_struct("MeshLink::Direct")
                 .field("remote_addr", &link.remote_addr)
-                .finish(),
-            MeshLink::Relay(link) => f
-                .debug_struct("MeshLink::Relay")
-                .field("remote_peer_id", &link.remote_peer_id)
                 .finish(),
         }
     }
 }
 
 impl MeshLink {
+    fn direct(link: DirectLink) -> Self {
+        Self {
+            inner: MeshLinkInner::Direct(link),
+        }
+    }
+
     pub fn path_kind(&self) -> PathKind {
-        match self {
-            MeshLink::Direct(_) => PathKind::Direct,
-            MeshLink::Relay(_) => PathKind::Relay,
+        match &self.inner {
+            MeshLinkInner::Direct(_) => PathKind::Direct,
         }
     }
 
     pub async fn send_frame(&mut self, frame: Vec<u8>) -> Result<()> {
-        match self {
-            MeshLink::Direct(link) => {
+        match &mut self.inner {
+            MeshLinkInner::Direct(link) => {
                 let protected = link.frame_protector.protect(&frame)?;
                 link.session.send_frame(protected).await
-            }
-            MeshLink::Relay(link) => {
-                link.client
-                    .send_datagram(&link.remote_peer_id, &frame)
-                    .await
             }
         }
     }
 
     pub async fn receive_frame(&mut self) -> Result<Vec<u8>> {
-        match self {
-            MeshLink::Direct(link) => {
+        match &mut self.inner {
+            MeshLinkInner::Direct(link) => {
                 let protected = link.session.receive_frame().await?;
                 link.frame_protector.open(&protected)
             }
-            MeshLink::Relay(link) => match link.client.receive_datagram().await? {
-                Some((_source, payload)) => Ok(payload),
-                None => Err(QlinkError::Protocol(
-                    "relay closed before delivering frame".into(),
-                )),
-            },
         }
     }
 
     pub fn close(&self, reason: &[u8]) {
-        if let MeshLink::Direct(link) = self {
-            link.session.close(reason);
-        }
+        let MeshLinkInner::Direct(link) = &self.inner;
+        link.session.close(reason);
     }
 }
 
@@ -840,7 +828,7 @@ impl MeshConnector {
                     registry_decision,
                     peer_record_source,
                 };
-                let link = MeshLink::Direct(DirectLink {
+                let link = MeshLink::direct(DirectLink {
                     remote_addr: address,
                     session,
                     frame_protector: PqcFrameProtector::new(session_keys),

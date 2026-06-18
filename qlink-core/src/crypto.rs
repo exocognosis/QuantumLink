@@ -1,5 +1,4 @@
 use crate::error::{QlinkError, Result};
-use hkdf::Hkdf;
 use ml_dsa::{
     signature::{Keypair as MlDsaKeypair, Signer as MlDsaSigner, Verifier as MlDsaVerifier},
     EncodedSignature, EncodedVerifyingKey, KeyGen, MlDsa65, Signature as MlDsaSignature,
@@ -11,16 +10,19 @@ use ml_kem::{
     MlKem768,
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha3::{
+    digest::{ExtendableOutput, Update},
+    Shake256,
+};
 use slh_dsa::{
     signature::rand_core::{Infallible as SlhInfallible, TryCryptoRng as SlhTryCryptoRng},
-    Sha2_128s, Signature as SlhSignature, SigningKey as SlhSigningKey,
+    Shake128s, Signature as SlhSignature, SigningKey as SlhSigningKey,
     VerifyingKey as SlhVerifyingKey,
 };
 
-pub const SUITE_FIPS203: &str = "QLINK-FIPS203-MLKEM768-HKDFSHA256-v1";
-pub const SUITE_FIPS204: &str = "QLINK-FIPS204-MLDSA65-HKDFSHA256-v1";
-pub const SUITE_FIPS205: &str = "QLINK-FIPS205-SLHDSA-SHA2-128S-HKDFSHA256-v1";
+pub const SUITE_FIPS203: &str = "QLINK-FIPS203-MLKEM768-SHAKE256-v1";
+pub const SUITE_FIPS204: &str = "QLINK-FIPS204-MLDSA65-SHAKE256-v1";
+pub const SUITE_FIPS205: &str = "QLINK-FIPS205-SLHDSA-SHAKE128S-SHAKE256-v1";
 pub const PROTOCOL_VERSION: u8 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,7 +43,7 @@ impl QlinkCryptoSuite {
 
     fn device_signature_algorithm(self) -> DeviceSignatureAlgorithm {
         match self {
-            Self::Fips205SlhDsa => DeviceSignatureAlgorithm::SlhDsaSha2_128s,
+            Self::Fips205SlhDsa => DeviceSignatureAlgorithm::SlhDsaShake128s,
             Self::Fips203MlKem | Self::Fips204MlDsa => DeviceSignatureAlgorithm::MlDsa65,
         }
     }
@@ -247,13 +249,13 @@ impl std::fmt::Debug for DeviceKeypair {
 
 enum DeviceSigningKey {
     MlDsa(ml_dsa::SigningKey<MlDsa65>),
-    SlhDsa(SlhSigningKey<Sha2_128s>),
+    SlhDsa(SlhSigningKey<Shake128s>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DeviceSignatureAlgorithm {
     MlDsa65,
-    SlhDsaSha2_128s,
+    SlhDsaShake128s,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -271,10 +273,10 @@ impl DeviceKeypair {
         let suite = suite_from_identifier(suite)?;
         match suite.device_signature_algorithm() {
             DeviceSignatureAlgorithm::MlDsa65 => Self::generate_ml_dsa(),
-            DeviceSignatureAlgorithm::SlhDsaSha2_128s => {
+            DeviceSignatureAlgorithm::SlhDsaShake128s => {
                 let mut rng = SlhOsRng;
                 Ok(Self {
-                    signing_key: DeviceSigningKey::SlhDsa(SlhSigningKey::<Sha2_128s>::new(
+                    signing_key: DeviceSigningKey::SlhDsa(SlhSigningKey::<Shake128s>::new(
                         &mut rng,
                     )),
                     // SLH-DSA's KeyGen API doesn't surface a stable
@@ -320,7 +322,7 @@ impl DeviceKeypair {
                 bytes: signing_key.verifying_key().encode().as_slice().to_vec(),
             },
             DeviceSigningKey::SlhDsa(signing_key) => DevicePublicKey {
-                algorithm: "SLH-DSA-SHA2-128S".to_string(),
+                algorithm: "SLH-DSA-SHAKE-128S".to_string(),
                 bytes: signing_key.as_ref().to_bytes().as_slice().to_vec(),
             },
         }
@@ -333,7 +335,7 @@ impl DeviceKeypair {
                 signature.encode().as_slice().to_vec()
             }
             DeviceSigningKey::SlhDsa(signing_key) => {
-                let signature: SlhSignature<Sha2_128s> = signing_key
+                let signature: SlhSignature<Shake128s> = signing_key
                     .try_sign_with_context(message, &[], None)
                     .expect("SLH-DSA signing failed");
                 signature.to_bytes().as_slice().to_vec()
@@ -344,9 +346,12 @@ impl DeviceKeypair {
 
 impl DevicePublicKey {
     pub fn peer_id(&self) -> String {
-        let digest = Sha256::digest(&self.bytes);
+        let digest = shake256_xof::<16>(
+            b"QuantumLink device peer id v1",
+            &[self.algorithm.as_bytes(), self.bytes.as_slice()],
+        );
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-        format!("qlink_{}", URL_SAFE_NO_PAD.encode(&digest[..16]))
+        format!("qlink_{}", URL_SAFE_NO_PAD.encode(digest))
     }
 
     pub fn verify(&self, message: &[u8], signature: &[u8]) -> Result<()> {
@@ -368,13 +373,13 @@ impl DevicePublicKey {
                     .verify(message, &signature)
                     .map_err(|_| QlinkError::SignatureVerification)
             }
-            "SLH-DSA-SHA2-128S" => {
-                let verifying_key = SlhVerifyingKey::<Sha2_128s>::try_from(self.bytes.as_slice())
+            "SLH-DSA-SHAKE-128S" => {
+                let verifying_key = SlhVerifyingKey::<Shake128s>::try_from(self.bytes.as_slice())
                     .map_err(|_| {
-                    QlinkError::InvalidKey("invalid SLH-DSA-SHA2-128S public key size".into())
+                    QlinkError::InvalidKey("invalid SLH-DSA-SHAKE-128S public key size".into())
                 })?;
-                let signature = SlhSignature::<Sha2_128s>::try_from(signature).map_err(|_| {
-                    QlinkError::InvalidKey("invalid SLH-DSA-SHA2-128S signature size".into())
+                let signature = SlhSignature::<Shake128s>::try_from(signature).map_err(|_| {
+                    QlinkError::InvalidKey("invalid SLH-DSA-SHAKE-128S signature size".into())
                 })?;
 
                 verifying_key
@@ -435,16 +440,32 @@ fn validate_suite(version: u8, suite: &str) -> Result<QlinkCryptoSuite> {
     suite_from_identifier(suite)
 }
 
+pub(crate) fn shake256_xof<const N: usize>(domain: &[u8], chunks: &[&[u8]]) -> [u8; N] {
+    let mut hasher = Shake256::default();
+    hasher.update(b"QuantumLink SHAKE256 XOF v1");
+    absorb_len_prefixed(&mut hasher, domain);
+    hasher.update(&(N as u64).to_be_bytes());
+    for chunk in chunks {
+        absorb_len_prefixed(&mut hasher, chunk);
+    }
+
+    let mut output = [0_u8; N];
+    hasher.finalize_xof_into(&mut output);
+    output
+}
+
+fn absorb_len_prefixed(hasher: &mut Shake256, chunk: &[u8]) {
+    hasher.update(&(chunk.len() as u64).to_be_bytes());
+    hasher.update(chunk);
+}
+
 fn hash_transcript(initiator: &InitiatorHello, responder: &ResponderHello) -> Result<[u8; 32]> {
     let initiator = serde_json::to_vec(initiator)?;
     let responder = serde_json::to_vec(responder)?;
-    let mut hasher = Sha256::new();
-    hasher.update(b"QuantumLink transcript v1");
-    hasher.update((initiator.len() as u64).to_be_bytes());
-    hasher.update(initiator);
-    hasher.update((responder.len() as u64).to_be_bytes());
-    hasher.update(responder);
-    Ok(hasher.finalize().into())
+    Ok(shake256_xof::<32>(
+        b"QuantumLink transcript hash v1",
+        &[initiator.as_slice(), responder.as_slice()],
+    ))
 }
 
 enum Direction {
@@ -458,22 +479,14 @@ fn derive_directional_keys(
     suite: &str,
     direction: Direction,
 ) -> Result<([u8; 32], [u8; 32])> {
-    let mut ikm = Vec::with_capacity(mlkem_shared.len() + transcript_hash.len());
-    ikm.extend_from_slice(mlkem_shared);
-    ikm.extend_from_slice(transcript_hash);
-
-    let hkdf = Hkdf::<Sha256>::new(Some(transcript_hash), &ikm);
-    let mut okm = [0_u8; 64];
-    let mut info = Vec::with_capacity(b"QuantumLink ML-KEM session keys v1".len() + suite.len());
-    info.extend_from_slice(b"QuantumLink ML-KEM session keys v1");
-    info.extend_from_slice(suite.as_bytes());
-    hkdf.expand(&info, &mut okm)
-        .map_err(|_| QlinkError::Crypto("HKDF expand failed".into()))?;
-
-    let mut i2r = [0_u8; 32];
-    let mut r2i = [0_u8; 32];
-    i2r.copy_from_slice(&okm[..32]);
-    r2i.copy_from_slice(&okm[32..]);
+    let i2r = shake256_xof::<32>(
+        b"QuantumLink ML-KEM session key initiator-to-responder v1",
+        &[suite.as_bytes(), mlkem_shared, transcript_hash],
+    );
+    let r2i = shake256_xof::<32>(
+        b"QuantumLink ML-KEM session key responder-to-initiator v1",
+        &[suite.as_bytes(), mlkem_shared, transcript_hash],
+    );
 
     Ok(match direction {
         Direction::Initiator => (i2r, r2i),
@@ -488,6 +501,29 @@ mod tests {
     #[test]
     fn legacy_hybrid_suite_is_rejected() {
         assert!(validate_suite_name("QLINK-HYBRID-X25519-MLKEM768-HKDFSHA256-v1").is_err());
+    }
+
+    #[test]
+    fn nist_suite_identifiers_use_shake_family() {
+        assert_eq!(SUITE_FIPS203, "QLINK-FIPS203-MLKEM768-SHAKE256-v1");
+        assert_eq!(SUITE_FIPS204, "QLINK-FIPS204-MLDSA65-SHAKE256-v1");
+        assert_eq!(SUITE_FIPS205, "QLINK-FIPS205-SLHDSA-SHAKE128S-SHAKE256-v1");
+
+        for suite in [SUITE_FIPS203, SUITE_FIPS204, SUITE_FIPS205] {
+            assert!(!suite.contains("HKDFSHA256"));
+            assert!(!suite.contains("SHA2-128S"));
+        }
+    }
+
+    #[test]
+    fn legacy_hkdf_and_slh_dsa_sha2_suites_are_rejected() {
+        for suite in [
+            "QLINK-FIPS203-MLKEM768-HKDFSHA256-v1",
+            "QLINK-FIPS204-MLDSA65-HKDFSHA256-v1",
+            "QLINK-FIPS205-SLHDSA-SHA2-128S-HKDFSHA256-v1",
+        ] {
+            assert!(validate_suite_name(suite).is_err());
+        }
     }
 
     #[test]
@@ -569,7 +605,7 @@ mod tests {
         for (suite, algorithm) in [
             (SUITE_FIPS203, "ML-DSA-65"),
             (SUITE_FIPS204, "ML-DSA-65"),
-            (SUITE_FIPS205, "SLH-DSA-SHA2-128S"),
+            (SUITE_FIPS205, "SLH-DSA-SHAKE-128S"),
         ] {
             let keypair = DeviceKeypair::generate_for_suite(suite).unwrap();
             let public = keypair.public_key();

@@ -214,7 +214,7 @@ pub struct CryptoPolicy {
 impl Default for CryptoPolicy {
     fn default() -> Self {
         Self {
-            suite: "QLINK-FIPS203-MLKEM768-HKDFSHA256-v1".to_string(),
+            suite: "QLINK-FIPS203-MLKEM768-SHAKE256-v1".to_string(),
             rekey_after_seconds: 3600.0,
             rekey_after_bytes: 1_073_741_824,
         }

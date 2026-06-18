@@ -16,7 +16,7 @@
 //!    device private key — the same key whose public half is in Alice's
 //!    signed rendezvous record.
 //! 3. Receiving peer (Bob) calls [`InboundIdentityAssertion::verify`]:
-//!    - peer_id must match SHA-256-derived hash of `device_public_key`
+//!    - peer_id must match SHAKE256-derived hash of `device_public_key`
 //!    - mesh_id must match what Bob expects
 //!    - timestamp must be within `max_age` of now (replay window)
 //!    - signature must verify against `device_public_key`
@@ -380,7 +380,7 @@ mod tests {
     fn peer_id_must_match_public_key() {
         // Substitute a different peer_id while keeping the original
         // public key. Verification should reject before even checking
-        // the signature, because the binding `peer_id == sha256(pubkey)`
+        // the signature, because the binding `peer_id == shake256(pubkey)`
         // is the foundation of identity.
         let keypair = fresh_keypair();
         let mut assertion = InboundIdentityAssertion::sign(&keypair, "devmesh").unwrap();

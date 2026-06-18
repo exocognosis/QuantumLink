@@ -1,10 +1,9 @@
 use crate::{
-    crypto::{DeviceKeypair, DevicePublicKey},
+    crypto::{shake256_xof, DeviceKeypair, DevicePublicKey},
     error::{QlinkError, Result},
     ice::IceCredentials,
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -183,7 +182,10 @@ impl PeerRecord {
 
     pub fn record_hash(&self) -> Result<[u8; 32]> {
         let bytes = serde_json::to_vec(self)?;
-        Ok(Sha256::digest(bytes).into())
+        Ok(shake256_xof::<32>(
+            b"QuantumLink peer record hash v1",
+            &[bytes.as_slice()],
+        ))
     }
 }
 
@@ -195,11 +197,12 @@ pub fn now_unix() -> u64 {
 }
 
 fn privacy_preserving_alias(peer_id: &str, sequence: u64) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(peer_id.as_bytes());
-    hasher.update(sequence.to_be_bytes());
-    let digest = hasher.finalize();
-    let suffix = digest[..6]
+    let sequence_bytes = sequence.to_be_bytes();
+    let digest = shake256_xof::<6>(
+        b"QuantumLink privacy preserving alias v1",
+        &[peer_id.as_bytes(), &sequence_bytes],
+    );
+    let suffix = digest
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
@@ -361,5 +364,13 @@ mod tests {
         );
 
         assert_ne!(first.alias, second.alias);
+    }
+
+    #[test]
+    fn privacy_alias_uses_shake256_vector() {
+        assert_eq!(
+            privacy_preserving_alias("qlink_test-peer-id", 42),
+            "peer-7f2f547a3b0f"
+        );
     }
 }

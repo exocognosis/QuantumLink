@@ -454,8 +454,8 @@ pub struct MeshTransportConfig {
     #[serde(default)]
     pub peer_store_path: Option<String>,
     /// Optional base64 (standard alphabet, with padding) of a
-    /// 32-byte ChaCha20-Poly1305 key. When set together with
-    /// `peer_store_path`, the on-disk file is encrypted in the v2
+    /// 32-byte SHAKE256 envelope key. When set together with
+    /// `peer_store_path`, the on-disk file is protected in the v3
     /// envelope; without it the file is plaintext JSON. The host
     /// (Swift app) is expected to mint + persist this key in the
     /// macOS Keychain. `qlinkctl` deployments without a Keychain
@@ -690,8 +690,8 @@ impl MeshTransportHandle {
         // unreadable file) are surfaced up — we'd rather refuse to
         // start than silently degrade to ephemeral storage when the
         // operator asked for persistence. When `peer_store_key_b64`
-        // is set, the file is wrapped in the v2 ChaCha20-Poly1305
-        // envelope; the key MUST decode to exactly 32 bytes.
+        // is set, the file is wrapped in the v3 SHAKE256 envelope;
+        // the key MUST decode to exactly 32 bytes.
         let peer_store: Arc<dyn PeerStore> = match config.peer_store_path.as_deref() {
             None => Arc::new(InMemoryPeerStore::new()),
             Some(path) => match config.peer_store_key_b64.as_deref() {

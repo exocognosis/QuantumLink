@@ -1,20 +1,22 @@
-use crate::error::{QlinkError, Result};
+#[cfg(test)]
+use crate::error::QlinkError;
+use crate::error::Result;
+#[cfg(test)]
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+#[cfg(test)]
+use tokio::net::tcp::OwnedReadHalf;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::{
-        tcp::{OwnedReadHalf, OwnedWriteHalf},
-        TcpListener, TcpStream,
-    },
+    net::{tcp::OwnedWriteHalf, TcpListener, TcpStream},
     sync::Mutex,
     task::JoinHandle,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum RelayMessage {
+enum RelayMessage {
     Register {
         peer_id: String,
     },
@@ -84,14 +86,16 @@ pub async fn spawn_dev_relay() -> Result<DevRelayServer> {
     Ok(DevRelayServer { local_addr, task })
 }
 
-pub struct RelayClient {
+#[cfg(test)]
+struct RelayClient {
     peer_id: String,
     reader: BufReader<OwnedReadHalf>,
     writer: OwnedWriteHalf,
 }
 
+#[cfg(test)]
 impl RelayClient {
-    pub async fn connect(server: &str, peer_id: impl Into<String>) -> Result<Self> {
+    async fn connect(server: &str, peer_id: impl Into<String>) -> Result<Self> {
         let stream = TcpStream::connect(server).await?;
         let (reader, mut writer) = stream.into_split();
         let peer_id = peer_id.into();
@@ -124,11 +128,7 @@ impl RelayClient {
         })
     }
 
-    pub fn peer_id(&self) -> &str {
-        &self.peer_id
-    }
-
-    pub async fn send_datagram(&mut self, destination: &str, payload: &[u8]) -> Result<()> {
+    async fn send_datagram(&mut self, destination: &str, payload: &[u8]) -> Result<()> {
         let message = RelayMessage::Datagram {
             source: self.peer_id.clone(),
             destination: destination.to_string(),
@@ -141,7 +141,7 @@ impl RelayClient {
         Ok(())
     }
 
-    pub async fn receive_datagram(&mut self) -> Result<Option<(String, Vec<u8>)>> {
+    async fn receive_datagram(&mut self) -> Result<Option<(String, Vec<u8>)>> {
         let mut line = String::new();
         if self.reader.read_line(&mut line).await? == 0 {
             return Ok(None);
