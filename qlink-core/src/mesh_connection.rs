@@ -11,6 +11,7 @@ use crate::{
     mdns_discovery::{compute_public_key_fingerprint, MdnsPeerObservation},
     peer_acl::PeerAcl,
     peer_store::{InMemoryPeerStore, PeerStore},
+    pqc_frame::PqcFrameProtector,
     pqc_session_wire::run_pqc_session_initiator,
     quic_transport::{QuicCertificate, QuicDatagramSession, QuicEndpoint},
     relay::RelayClient,
@@ -286,8 +287,8 @@ impl PeerRecordSource {
 
 pub struct DirectLink {
     pub remote_addr: SocketAddr,
-    pub session: QuicDatagramSession,
-    pub session_keys: SessionKeys,
+    session: QuicDatagramSession,
+    frame_protector: PqcFrameProtector,
 }
 
 pub struct RelayLink {
@@ -325,7 +326,10 @@ impl MeshLink {
 
     pub async fn send_frame(&mut self, frame: Vec<u8>) -> Result<()> {
         match self {
-            MeshLink::Direct(link) => link.session.send_frame(frame).await,
+            MeshLink::Direct(link) => {
+                let protected = link.frame_protector.protect(&frame)?;
+                link.session.send_frame(protected).await
+            }
             MeshLink::Relay(link) => {
                 link.client
                     .send_datagram(&link.remote_peer_id, &frame)
@@ -336,7 +340,10 @@ impl MeshLink {
 
     pub async fn receive_frame(&mut self) -> Result<Vec<u8>> {
         match self {
-            MeshLink::Direct(link) => link.session.receive_frame().await,
+            MeshLink::Direct(link) => {
+                let protected = link.session.receive_frame().await?;
+                link.frame_protector.open(&protected)
+            }
             MeshLink::Relay(link) => match link.client.receive_datagram().await? {
                 Some((_source, payload)) => Ok(payload),
                 None => Err(QlinkError::Protocol(
@@ -836,7 +843,7 @@ impl MeshConnector {
                 let link = MeshLink::Direct(DirectLink {
                     remote_addr: address,
                     session,
-                    session_keys,
+                    frame_protector: PqcFrameProtector::new(session_keys),
                 });
                 Ok((link, outcome))
             }
@@ -959,12 +966,15 @@ impl MeshConnector {
                 }
 
                 let probe_started = Instant::now();
-                let effective_quic_timeout = probe_timeout.min(
-                    overall_deadline
-                        .checked_sub(started.elapsed())
-                        .unwrap_or(Duration::ZERO),
-                );
-                if effective_quic_timeout.is_zero() {
+                if remaining_probe_budget(
+                    Instant::now(),
+                    started,
+                    probe_started,
+                    probe_timeout,
+                    overall_deadline,
+                )
+                .is_zero()
+                {
                     return ProbeOutcomeRecord::from_parts(
                         candidate_type,
                         Some(address),
@@ -1013,7 +1023,31 @@ impl MeshConnector {
                         use_candidate: true,
                     };
 
-                    match perform_ice_check(&socket, address, request, ice_check_timeout).await {
+                    let remaining = remaining_probe_budget(
+                        Instant::now(),
+                        started,
+                        probe_started,
+                        probe_timeout,
+                        overall_deadline,
+                    );
+                    let bounded_ice_timeout = ice_check_timeout.min(remaining);
+                    if bounded_ice_timeout.is_zero() {
+                        return ProbeOutcomeRecord {
+                            candidate_type,
+                            address: Some(address),
+                            launched: true,
+                            elapsed: probe_started.elapsed(),
+                            outcome: ProbeOutcome::TimedOut,
+                            quic_connect_elapsed: None,
+                            identity_assertion_elapsed: None,
+                            ice_round_trip: None,
+                            peer_reflexive_address: None,
+                            session: None,
+                            session_keys: None,
+                        };
+                    }
+
+                    match perform_ice_check(&socket, address, request, bounded_ice_timeout).await {
                         Ok(result) => {
                             ice_round_trip = Some(result.round_trip);
                             peer_reflexive_address = result.mapped_address;
@@ -1038,10 +1072,12 @@ impl MeshConnector {
 
                 // Either ICE passed or it was disabled; now run the QUIC
                 // handshake to establish the data path.
-                let remaining_quic_timeout = probe_timeout.min(
-                    overall_deadline
-                        .checked_sub(started.elapsed())
-                        .unwrap_or(Duration::ZERO),
+                let remaining_quic_timeout = remaining_probe_budget(
+                    Instant::now(),
+                    started,
+                    probe_started,
+                    probe_timeout,
+                    overall_deadline,
                 );
                 if remaining_quic_timeout.is_zero() {
                     return ProbeOutcomeRecord {
@@ -1073,22 +1109,21 @@ impl MeshConnector {
                         // assertion, then complete the authenticated PQC
                         // session before the link can be considered direct.
                         let assertion_started = Instant::now();
-                        if let Err(error) = send_inbound_assertion(
-                            &session,
-                            local_keypair.as_ref(),
-                            &mesh_id_for_task,
-                        )
-                        .await
-                        {
-                            session.close(b"assertion send failed");
+                        let assertion_remaining = remaining_probe_budget(
+                            Instant::now(),
+                            started,
+                            probe_started,
+                            probe_timeout,
+                            overall_deadline,
+                        );
+                        if assertion_remaining.is_zero() {
+                            session.close(b"assertion send timed out");
                             return ProbeOutcomeRecord {
                                 candidate_type,
                                 address: Some(address),
                                 launched: true,
                                 elapsed: probe_started.elapsed(),
-                                outcome: ProbeOutcome::Failed(format!(
-                                    "inbound assertion send failed: {error}"
-                                )),
+                                outcome: ProbeOutcome::TimedOut,
                                 quic_connect_elapsed: Some(quic_connect_elapsed),
                                 identity_assertion_elapsed: Some(assertion_started.elapsed()),
                                 ice_round_trip,
@@ -1097,12 +1132,60 @@ impl MeshConnector {
                                 session_keys: None,
                             };
                         }
+                        let assertion_result = tokio::time::timeout(
+                            assertion_remaining,
+                            send_inbound_assertion(
+                                &session,
+                                local_keypair.as_ref(),
+                                &mesh_id_for_task,
+                            ),
+                        )
+                        .await;
+                        match assertion_result {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => {
+                                session.close(b"assertion send failed");
+                                return ProbeOutcomeRecord {
+                                    candidate_type,
+                                    address: Some(address),
+                                    launched: true,
+                                    elapsed: probe_started.elapsed(),
+                                    outcome: ProbeOutcome::Failed(format!(
+                                        "inbound assertion send failed: {error}"
+                                    )),
+                                    quic_connect_elapsed: Some(quic_connect_elapsed),
+                                    identity_assertion_elapsed: Some(assertion_started.elapsed()),
+                                    ice_round_trip,
+                                    peer_reflexive_address,
+                                    session: None,
+                                    session_keys: None,
+                                };
+                            }
+                            Err(_) => {
+                                session.close(b"assertion send timed out");
+                                return ProbeOutcomeRecord {
+                                    candidate_type,
+                                    address: Some(address),
+                                    launched: true,
+                                    elapsed: probe_started.elapsed(),
+                                    outcome: ProbeOutcome::TimedOut,
+                                    quic_connect_elapsed: Some(quic_connect_elapsed),
+                                    identity_assertion_elapsed: Some(assertion_started.elapsed()),
+                                    ice_round_trip,
+                                    peer_reflexive_address,
+                                    session: None,
+                                    session_keys: None,
+                                };
+                            }
+                        }
                         let identity_assertion_elapsed = Some(assertion_started.elapsed());
 
-                        let pqc_remaining = probe_timeout.min(
-                            overall_deadline
-                                .checked_sub(started.elapsed())
-                                .unwrap_or(Duration::ZERO),
+                        let pqc_remaining = remaining_probe_budget(
+                            Instant::now(),
+                            started,
+                            probe_started,
+                            probe_timeout,
+                            overall_deadline,
                         );
                         if pqc_remaining.is_zero() {
                             session.close(b"pqc session timed out");
@@ -1390,6 +1473,24 @@ fn direct_keypair_required_attempts(candidates: &[CandidateEndpoint]) -> Vec<Pro
         .collect()
 }
 
+fn remaining_probe_budget(
+    now: Instant,
+    connect_started: Instant,
+    probe_started: Instant,
+    direct_probe_timeout: Duration,
+    overall_deadline: Duration,
+) -> Duration {
+    let candidate_elapsed = now.duration_since(probe_started);
+    let overall_elapsed = now.duration_since(connect_started);
+    let candidate_remaining = direct_probe_timeout
+        .checked_sub(candidate_elapsed)
+        .unwrap_or(Duration::ZERO);
+    let overall_remaining = overall_deadline
+        .checked_sub(overall_elapsed)
+        .unwrap_or(Duration::ZERO);
+    candidate_remaining.min(overall_remaining)
+}
+
 fn latest_probe_failure_summary(attempts: &[ProbeAttempt]) -> Option<String> {
     attempts
         .iter()
@@ -1541,6 +1642,87 @@ mod tests {
         assert!(!outcome.used_cached_path);
 
         assert_eq!(connector.cache().lookup(&remote_peer_id), Some(server_addr));
+    }
+
+    #[tokio::test]
+    async fn direct_probe_caps_identity_and_pqc_with_candidate_timeout() {
+        let rendezvous = spawn_dev_rendezvous().await.unwrap();
+        let rendezvous_client = RendezvousClient::new(rendezvous.local_addr().to_string());
+
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let local_key = Arc::new(DeviceKeypair::generate().unwrap());
+        let remote_key = Arc::new(DeviceKeypair::generate().unwrap());
+        let remote_peer_id = remote_key.public_key().peer_id();
+        let (server_endpoint, server_cert) = QuicEndpoint::server(bind).unwrap();
+        let server_addr = server_endpoint.local_addr().unwrap();
+        let server_cert_der = server_cert.as_der().to_vec();
+        let client_endpoint = QuicEndpoint::client(bind, &[server_cert]).unwrap();
+        let _stalled_server = tokio::spawn(async move {
+            let Ok(_session) = server_endpoint.accept_one().await else {
+                return;
+            };
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let remote_record = signed_record_with_cert(
+            remote_key.as_ref(),
+            vec![CandidateEndpoint {
+                candidate_type: CandidateType::Host,
+                address: server_addr.ip().to_string(),
+                port: server_addr.port(),
+                priority: 120,
+            }],
+            1,
+            server_cert_der,
+        );
+        rendezvous_client
+            .publish(MESH_ID, remote_record)
+            .await
+            .unwrap();
+
+        let direct_timeout = Duration::from_millis(100);
+        let connector = MeshConnector::new(
+            MeshConnectorConfig::new(MESH_ID, local_key.public_key().peer_id())
+                .with_direct_probe_timeout(direct_timeout)
+                .with_overall_deadline(Duration::from_millis(900))
+                .with_local_device_keypair(local_key),
+            rendezvous_client,
+            client_endpoint,
+        );
+
+        let started = Instant::now();
+        let err = connector.connect(&remote_peer_id).await.unwrap_err();
+        let elapsed = started.elapsed();
+
+        assert!(
+            err.to_string().contains("no direct candidate"),
+            "expected direct probing to fail, got {err}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "identity/PQC must consume the same direct probe timeout; elapsed={elapsed:?}, direct_timeout={direct_timeout:?}"
+        );
+    }
+
+    #[test]
+    fn remaining_probe_budget_is_bounded_by_candidate_deadline() {
+        let now = Instant::now();
+        let connect_started = now
+            .checked_sub(Duration::from_millis(100))
+            .expect("test instant subtraction");
+        let probe_started = now
+            .checked_sub(Duration::from_millis(80))
+            .expect("test instant subtraction");
+
+        let remaining = remaining_probe_budget(
+            now,
+            connect_started,
+            probe_started,
+            Duration::from_millis(100),
+            Duration::from_millis(900),
+        );
+
+        assert_eq!(remaining, Duration::from_millis(20));
     }
 
     #[tokio::test]
@@ -2938,8 +3120,8 @@ mod tests {
 
         let connector = MeshConnector::new(
             MeshConnectorConfig::new(MESH_ID, local_key.public_key().peer_id())
-                .with_direct_probe_timeout(Duration::from_millis(500))
-                .with_overall_deadline(Duration::from_secs(2))
+                .with_direct_probe_timeout(Duration::from_secs(2))
+                .with_overall_deadline(Duration::from_secs(5))
                 .with_local_device_keypair(local_key.clone()),
             rendezvous_client,
             client_endpoint,

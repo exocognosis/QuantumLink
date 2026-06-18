@@ -45,6 +45,7 @@ use crate::{
     peer_store::{
         open_file_peer_store, open_file_peer_store_with_key, InMemoryPeerStore, PeerStore,
     },
+    pqc_frame::PqcFrameProtector,
     pqc_session_wire::run_pqc_session_responder,
     quic_transport::QuicEndpoint,
     rendezvous::RendezvousClient,
@@ -573,10 +574,8 @@ impl MeshTransportHandle {
         Self::new(config)
     }
 
-    pub fn new(_config: MeshTransportConfig) -> Result<Self> {
-        Err(QlinkError::Protocol(
-            "MeshTransportHandle::new cannot satisfy PQC transport: use new_with_keypair with a local_device_keypair".into(),
-        ))
+    pub fn new(config: MeshTransportConfig) -> Result<Self> {
+        Self::new_with_keypair(config, None)
     }
 
     /// Variant of `new` that also installs a local device keypair on
@@ -596,18 +595,28 @@ impl MeshTransportHandle {
         config: MeshTransportConfig,
         local_device_keypair: Option<Arc<DeviceKeypair>>,
     ) -> Result<Self> {
-        let local_device_keypair = local_device_keypair.ok_or_else(|| {
-            QlinkError::Protocol(
-                "MeshTransportHandle requires local_device_keypair for PQC transport".into(),
-            )
-        })?;
-        let keypair_peer_id = local_device_keypair.public_key().peer_id();
-        if keypair_peer_id != config.local_peer_id {
-            return Err(QlinkError::Protocol(format!(
-                "MeshTransportHandle local_device_keypair peer_id {keypair_peer_id} \
-                 does not match config.local_peer_id {}",
-                config.local_peer_id
-            )));
+        if let Some(local_device_keypair) = local_device_keypair.as_ref() {
+            let keypair_peer_id = local_device_keypair.public_key().peer_id();
+            if keypair_peer_id != config.local_peer_id {
+                return Err(QlinkError::Protocol(format!(
+                    "MeshTransportHandle local_device_keypair peer_id {keypair_peer_id} \
+                     does not match config.local_peer_id {}",
+                    config.local_peer_id
+                )));
+            }
+        } else {
+            if config.relay_url.is_none() {
+                return Err(QlinkError::Protocol(
+                    "MeshTransportHandle direct transport requires local_device_keypair for PQC"
+                        .into(),
+                ));
+            }
+            if !config.disable_inbound_responder {
+                return Err(QlinkError::Protocol(
+                    "MeshTransportHandle inbound responder requires local_device_keypair for PQC"
+                        .into(),
+                ));
+            }
         }
 
         let runtime = Runtime::new().map_err(|err| {
@@ -668,7 +677,9 @@ impl MeshTransportHandle {
         if config.enable_ice {
             connector_config = connector_config.with_local_ice_credentials(local_credentials);
         }
-        connector_config = connector_config.with_local_device_keypair(local_device_keypair.clone());
+        if let Some(local_device_keypair) = local_device_keypair.clone() {
+            connector_config = connector_config.with_local_device_keypair(local_device_keypair);
+        }
         if let Some(registry_config) = config.dytallix_identity.clone() {
             let registry = DytallixIdentityRegistry::from_lookup_config(registry_config)?;
             connector_config = connector_config.with_identity_registry_lookup(Arc::new(registry));
@@ -749,7 +760,9 @@ impl MeshTransportHandle {
                 let inbound_acl = config.inbound_acl.clone().map(Arc::new);
                 let mesh_id = config.mesh_id.clone();
                 let local_peer_id = config.local_peer_id.clone();
-                let local_keypair = local_device_keypair.clone();
+                let local_keypair = local_device_keypair
+                    .clone()
+                    .expect("inbound responder requires a local device keypair");
                 let server_cert_der = server_certificate_der
                     .clone()
                     .expect("server certificate DER must exist when responder is enabled");
@@ -1303,18 +1316,46 @@ async fn run_responder_loop(
                         local_peer_id,
                         carrier_binding,
                     );
-                    if run_pqc_session_responder(
-                        &session,
-                        pqc_context,
-                        local_device_keypair.as_ref(),
+                    let handshake_timeout = pqc_responder_handshake_timeout();
+                    let session_keys = match tokio::time::timeout(
+                        handshake_timeout,
+                        run_pqc_session_responder(
+                            &session,
+                            pqc_context,
+                            local_device_keypair.as_ref(),
+                        ),
                     )
                     .await
-                    .is_err()
                     {
-                        session.close(b"");
-                        return;
-                    }
-                    while let Ok(frame) = session.receive_frame().await {
+                        Ok(Ok(session_keys)) => session_keys,
+                        Ok(Err(error)) => {
+                            tracing::warn!(
+                                ?error,
+                                peer_id = %peer_id,
+                                "inbound PQC session failed"
+                            );
+                            session.close(b"");
+                            return;
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                timeout_ms = handshake_timeout.as_millis() as u64,
+                                peer_id = %peer_id,
+                                "inbound PQC session timed out"
+                            );
+                            session.close(b"");
+                            return;
+                        }
+                    };
+                    let frame_protector = PqcFrameProtector::new(session_keys);
+                    while let Ok(protected_frame) = session.receive_frame().await {
+                        let frame = match frame_protector.open(&protected_frame) {
+                            Ok(frame) => frame,
+                            Err(_) => {
+                                session.close(b"");
+                                return;
+                            }
+                        };
                         let inbound_frame = InboundFrame {
                             peer_id: peer_id.clone(),
                             frame,
@@ -1337,6 +1378,16 @@ async fn run_responder_loop(
             }
         });
     }
+}
+
+#[cfg(test)]
+fn pqc_responder_handshake_timeout() -> Duration {
+    Duration::from_millis(500)
+}
+
+#[cfg(not(test))]
+fn pqc_responder_handshake_timeout() -> Duration {
+    Duration::from_secs(5)
 }
 
 fn mesh_transport_snapshot(
@@ -1736,23 +1787,37 @@ mod tests {
                                 responder_keypair.public_key().peer_id(),
                                 server_cert_der,
                             );
-                            if run_pqc_session_responder(
+                            let session_keys = match run_pqc_session_responder(
                                 &session,
                                 context,
                                 responder_keypair.as_ref(),
                             )
                             .await
-                            .is_err()
                             {
-                                session.close(b"");
-                                return;
-                            }
+                                Ok(session_keys) => session_keys,
+                                Err(_) => {
+                                    session.close(b"");
+                                    return;
+                                }
+                            };
+                            let mut frame_protector = PqcFrameProtector::new(session_keys);
 
-                            while let Ok(frame) = session.receive_frame().await {
+                            while let Ok(protected_frame) = session.receive_frame().await {
+                                let frame = match frame_protector.open(&protected_frame) {
+                                    Ok(frame) => frame,
+                                    Err(_) => {
+                                        session.close(b"");
+                                        return;
+                                    }
+                                };
                                 if let Some(prefix) = echo_prefix {
                                     let mut out = prefix.to_vec();
                                     out.extend_from_slice(&frame);
-                                    let _ = session.send_frame(out).await;
+                                    let Ok(protected_out) = frame_protector.protect(&out) else {
+                                        session.close(b"");
+                                        return;
+                                    };
+                                    let _ = session.send_frame(protected_out).await;
                                 }
                             }
                         });
@@ -1769,7 +1834,7 @@ mod tests {
         mesh_id: &str,
         initiator_keypair: &DeviceKeypair,
         responder_peer_id: String,
-    ) {
+    ) -> crate::crypto::SessionKeys {
         let cert_der = handle
             .server_certificate_der()
             .expect("responder must be enabled")
@@ -1782,7 +1847,7 @@ mod tests {
         );
         run_pqc_session_initiator(session, context, initiator_keypair)
             .await
-            .expect("PQC initiator session against responder must succeed");
+            .expect("PQC initiator session against responder must succeed")
     }
 
     #[test]
@@ -1969,9 +2034,11 @@ mod tests {
 
     #[test]
     fn mesh_transport_config_decodes_registry_and_wires_connector() {
+        let local_key = Arc::new(DeviceKeypair::generate().unwrap());
+        let local_peer_id = local_key.public_key().peer_id();
         let config: MeshTransportConfig = serde_json::from_value(serde_json::json!({
             "meshId": "public-mesh",
-            "localPeerId": "qlink_local",
+            "localPeerId": local_peer_id,
             "remotePeerId": "qlink_remote",
             "rendezvousUrl": "127.0.0.1:1",
             "bindAddr": "127.0.0.1:0",
@@ -2005,7 +2072,7 @@ mod tests {
             vec!["https://dytallix.example".to_string()]
         );
 
-        let handle = MeshTransportHandle::new(config).unwrap();
+        let handle = MeshTransportHandle::new_with_keypair(config, Some(local_key)).unwrap();
 
         assert_eq!(
             handle.connector.config().mesh_trust_policy,
@@ -2033,6 +2100,65 @@ mod tests {
         .unwrap_err();
 
         assert!(err.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn keyless_constructor_allows_relay_only_when_responder_disabled() {
+        let handle = MeshTransportHandle::new(MeshTransportConfig {
+            mesh_id: MESH_ID.to_string(),
+            local_peer_id: "qlink_keyless-local".to_string(),
+            remote_peer_id: "qlink_keyless-remote".to_string(),
+            rendezvous_url: "127.0.0.1:9".to_string(),
+            relay_url: Some("127.0.0.1:9".to_string()),
+            bind_addr: "127.0.0.1:0".to_string(),
+            overall_deadline_ms: 100,
+            direct_probe_timeout_ms: 50,
+            probe_pacing_ms: 10,
+            enable_ice: false,
+            reconnect_initial_backoff_ms: 60_000,
+            reconnect_max_backoff_ms: 60_000,
+            metrics_endpoint_bind_addr: None,
+            inbound_acl: None,
+            disable_inbound_responder: true,
+            peer_store_path: None,
+            peer_store_key_b64: None,
+            mesh_trust_policy: MeshTrustPolicy::DevelopmentOptional,
+            dytallix_identity: None,
+        })
+        .expect("relay-only keyless construction must remain available");
+
+        assert!(handle.server_certificate_der().is_none());
+        assert!(handle.responder_local_addr().is_none());
+    }
+
+    #[test]
+    fn keyless_constructor_rejects_direct_only_transport() {
+        let err = match MeshTransportHandle::new(MeshTransportConfig {
+            mesh_id: MESH_ID.to_string(),
+            local_peer_id: "qlink_keyless-local".to_string(),
+            remote_peer_id: "qlink_keyless-remote".to_string(),
+            rendezvous_url: "127.0.0.1:9".to_string(),
+            relay_url: None,
+            bind_addr: "127.0.0.1:0".to_string(),
+            overall_deadline_ms: 100,
+            direct_probe_timeout_ms: 50,
+            probe_pacing_ms: 10,
+            enable_ice: false,
+            reconnect_initial_backoff_ms: 60_000,
+            reconnect_max_backoff_ms: 60_000,
+            metrics_endpoint_bind_addr: None,
+            inbound_acl: None,
+            disable_inbound_responder: true,
+            peer_store_path: None,
+            peer_store_key_b64: None,
+            mesh_trust_policy: MeshTrustPolicy::DevelopmentOptional,
+            dytallix_identity: None,
+        }) {
+            Ok(_) => panic!("direct keyless construction must still be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("local_device_keypair"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2996,7 +3122,7 @@ mod tests {
         send_inbound_assertion(&session, &dialer_key, "devmesh")
             .await
             .unwrap();
-        run_initiator_pqc_against_responder(
+        let session_keys = run_initiator_pqc_against_responder(
             &handle,
             &session,
             "devmesh",
@@ -3004,7 +3130,9 @@ mod tests {
             local_peer_id,
         )
         .await;
-        session.send_frame(b"hello mesh".to_vec()).await.unwrap();
+        let mut frame_protector = PqcFrameProtector::new(session_keys);
+        let protected = frame_protector.protect(b"hello mesh").unwrap();
+        session.send_frame(protected).await.unwrap();
 
         // Poll the inbound queue until the frame surfaces. 2s ceiling
         // so the test fails loudly rather than hanging.
@@ -3048,11 +3176,49 @@ mod tests {
             .unwrap();
         session.send_frame(b"missing pqc".to_vec()).await.unwrap();
 
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        let receive_result =
+            tokio::time::timeout(Duration::from_millis(1_000), session.receive_frame()).await;
+        assert!(
+            matches!(receive_result, Ok(Err(_))),
+            "responder must close identity-only sessions that never complete PQC"
+        );
         assert!(
             handle.try_receive_frame_from_any().is_none(),
             "valid identity alone must not surface frames before PQC session completion"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn responder_closes_connection_when_pqc_session_stalls() {
+        let rendezvous = spawn_dev_rendezvous().await.unwrap();
+
+        let dialer_key = DeviceKeypair::generate().unwrap();
+        let dialer_peer_id = dialer_key.public_key().peer_id();
+        let local_key = Arc::new(DeviceKeypair::generate().unwrap());
+        let local_peer_id = local_key.public_key().peer_id();
+
+        let acl = PeerAcl::new().with_allow([dialer_peer_id]);
+        let handle = build_handle_with_responder(
+            rendezvous.local_addr().to_string(),
+            local_peer_id,
+            "devmesh",
+            Some(acl),
+            Some(local_key.clone()),
+        )
+        .await;
+
+        let session = dial_responder(&handle).await;
+        send_inbound_assertion(&session, &dialer_key, "devmesh")
+            .await
+            .unwrap();
+
+        let receive_result =
+            tokio::time::timeout(Duration::from_millis(1_000), session.receive_frame()).await;
+        match receive_result {
+            Ok(Err(_)) => {}
+            Ok(Ok(frame)) => panic!("stalled PQC session must not receive a frame: {frame:?}"),
+            Err(_) => panic!("responder did not close stalled PQC session within timeout"),
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
