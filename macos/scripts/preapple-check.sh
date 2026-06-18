@@ -14,6 +14,14 @@ run() {
   "$@"
 }
 
+expect_fail() {
+  log "expect failure: $*"
+  if "$@"; then
+    echo "command unexpectedly succeeded"
+    return 1
+  fi
+}
+
 log "Toolchain"
 swift --version
 rustc --version
@@ -35,20 +43,21 @@ DYLIB="$REPO_ROOT/target/release/libqlink_core.dylib"
 
 log "Swift dylib-backed integration tests"
 QLINK_CORE_DYLIB="$DYLIB" swift test --filter RustCoreBridgeTests
-QLINK_CORE_DYLIB="$DYLIB" swift test --filter TunnelTransportTests/testRustDevQuicLoopbackTransportWhenDylibIsConfigured
-QLINK_CORE_DYLIB="$DYLIB" swift test --filter TunnelTransportTests/testTransportSmokeRunnerWhenDylibIsConfigured
+QLINK_CORE_DYLIB="$DYLIB" swift test --filter TunnelTransportTests/testRustDevQuicLoopbackTransportIsDisabled
+QLINK_CORE_DYLIB="$DYLIB" swift test --filter TunnelTransportTests/testTransportSmokeRunnerDisablesDevQuicLoopbackWhenDylibIsConfigured
 
 run swift run QuantumLinkSmoke validate-config --config "$REPO_ROOT/config/mesh.example.json"
-run swift run QuantumLinkSmoke preflight \
+expect_fail swift run QuantumLinkSmoke preflight \
   --config "$REPO_ROOT/config/mesh.example.json" \
   --transport \
   --mode dev-quic-loopback \
   --dylib "$DYLIB"
 
 run "$REPO_ROOT/target/release/qlinkctl" simulate-handshake
-run "$REPO_ROOT/target/release/qlinkctl" quic-loopback
-run "$REPO_ROOT/target/release/qlinkctl" mesh-loopback
-run "$REPO_ROOT/target/release/qlinkctl" relay-loopback
+expect_fail "$REPO_ROOT/target/release/qlinkctl" quic-loopback
+expect_fail "$REPO_ROOT/target/release/qlinkctl" mesh-loopback
+expect_fail "$REPO_ROOT/target/release/qlinkctl" relay-loopback
+expect_fail "$REPO_ROOT/target/release/qlinkctl" relay-smoke
 
 run "$ROOT/scripts/build-rust-xcframework.sh"
 run "$ROOT/scripts/package-dev-artifacts.sh"

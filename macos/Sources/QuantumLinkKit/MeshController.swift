@@ -417,7 +417,7 @@ public final class SimulatedMeshController: ObservableObject, MeshControlling {
            ProcessInfo.processInfo.environment["QLINK_CORE_DYLIB"]?.isEmpty ?? true {
             return (
                 DevelopmentDropTransportSender(
-                    reason: "Set QLINK_CORE_DYLIB and QLINK_TRANSPORT_MODE=dev-quic-loopback to run the local transport smoke path"
+                    reason: "Local transport smoke is disabled in the strict PQC profile; use production mesh integration checks with a mesh transport config"
                 ).metrics,
                 nil
             )

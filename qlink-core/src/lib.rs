@@ -39,15 +39,21 @@ mod pqc_policy_tests {
         let manifest = include_str!("../Cargo.toml");
         for forbidden in [
             "aes =",
+            "aes=\"",
             "aes-gcm",
             "aes-gcm-siv",
             "aes_gcm",
             "chacha20 =",
+            "chacha20=\"",
             "chacha20poly1305",
             "hkdf =",
+            "hkdf=\"",
             "hmac =",
+            "hmac=\"",
             "sha1 =",
+            "sha1=\"",
             "sha2 =",
+            "sha2=\"",
         ] {
             assert!(
                 !manifest.contains(forbidden),

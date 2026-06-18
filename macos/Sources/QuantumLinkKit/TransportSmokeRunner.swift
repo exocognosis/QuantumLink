@@ -114,13 +114,13 @@ public enum TransportSmokeRunner {
 
     private static func makeTransport(
         mode: TransportSmokeMode,
-        library: RustCoreLibrary
+        library _: RustCoreLibrary
     ) -> TunnelTransporting {
         switch mode {
         case .developmentDrop:
-            DevelopmentDropTransportSender(reason: "Development drop transport selected")
+            return DevelopmentDropTransportSender(reason: "Development drop transport selected")
         case .devQuicLoopback:
-            RustDevQuicLoopbackTransport(library: library)
+            return RustDevQuicLoopbackTransport()
         }
     }
 

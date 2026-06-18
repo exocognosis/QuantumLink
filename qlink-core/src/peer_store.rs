@@ -237,10 +237,9 @@ const LEGACY_PROTECTED_FORMAT_VERSION: u32 = 2;
 const ENCRYPTED_FORMAT_VERSION: u32 = 3;
 const PEER_STORE_NONCE_LEN: usize = 24;
 const PEER_STORE_TAG_LEN: usize = 32;
-/// Constant 16-byte AAD prefix that ties the ciphertext to the
-/// store's identity. Prevents a swapped envelope from authenticating
-/// against a different file's key (e.g. someone copies a
-/// `peers.json` to another machine).
+/// Constant AAD for peer-store envelope domain separation. This binds
+/// tags to the peer-store purpose, not to a specific file or machine;
+/// copying an envelope with the same key preserves authenticity.
 const ENCRYPTION_AAD: &[u8] = b"qlink-peer-store";
 const PEER_STORE_STREAM_LABEL: &[u8] = b"QuantumLink peer-store SHAKE256 stream v3";
 const PEER_STORE_TAG_LABEL: &[u8] = b"QuantumLink peer-store SHAKE256 tag v3";

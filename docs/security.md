@@ -55,6 +55,15 @@ Party Mesh invite boundary:
   but they can reveal a party mesh name, host overlay address, and discovery
   endpoints to anyone who receives the code.
 
+Migration note: peer IDs now derive from SHAKE256 over the device public
+key material. Devices enrolled under earlier SHA-256-derived peer IDs
+must be re-enrolled, republished to rendezvous, and updated in remote
+peer configs, ACLs, and registry records. Treat existing peer-store
+caches as cold data during this migration: stale signed records keyed by
+old peer IDs should fail verification against the new
+`DevicePublicKey::peer_id()` value, and operators should purge or
+regenerate `peers.json` after rolling the new build.
+
 Not yet production-complete:
 
 - Replacing Quinn/rustls carrier transport with an ML-KEM-only transport. Current Quinn/rustls carrier setup still configures `X25519MLKEM768`.

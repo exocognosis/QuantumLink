@@ -5,7 +5,7 @@ import QuantumLinkKit
 enum QuantumLinkSmoke {
     static func main() -> Int32 {
         let arguments = Array(CommandLine.arguments.dropFirst())
-        let command = arguments.first ?? "transport-loopback"
+        let command = arguments.first ?? "validate-config"
 
         switch command {
         case "transport-loopback":
@@ -108,12 +108,15 @@ enum QuantumLinkSmoke {
         print(
             """
             Usage:
+              swift run QuantumLinkSmoke validate-config --config ../config/mesh.example.json
+              swift run QuantumLinkSmoke preflight --config ../config/mesh.example.json
+
+            Fail-closed transport checks:
               swift run QuantumLinkSmoke transport-loopback --mode dev-quic-loopback --dylib /path/to/libqlink_core.dylib
-              swift run QuantumLinkSmoke validate-config --config config/mesh.example.json
-              swift run QuantumLinkSmoke preflight --config config/mesh.example.json --transport --mode dev-quic-loopback --dylib /path/to/libqlink_core.dylib
+              swift run QuantumLinkSmoke preflight --config ../config/mesh.example.json --transport --mode dev-quic-loopback --dylib /path/to/libqlink_core.dylib
 
             Options:
-              --mode development-drop|dev-quic-loopback
+              --mode development-drop|dev-quic-loopback (strict PQC fail-closed only)
               --dylib /path/to/libqlink_core.dylib
               --config /path/to/mesh.json
               --transport
@@ -126,7 +129,7 @@ struct ConfigOptions {
     let configURL: URL
 
     init(arguments: [String]) throws {
-        var configPath = "config/mesh.example.json"
+        var configPath = defaultMeshConfigPath()
         var index = 0
 
         while index < arguments.count {
@@ -157,7 +160,7 @@ struct PreflightOptions {
     let dylibPath: String?
 
     init(arguments: [String]) throws {
-        var configPath = "config/mesh.example.json"
+        var configPath = defaultMeshConfigPath()
         var runTransport = false
         var mode = TransportSmokeMode()
         var dylibPath = ProcessInfo.processInfo.environment["QLINK_CORE_DYLIB"]
@@ -176,7 +179,7 @@ struct PreflightOptions {
             case "--mode":
                 index += 1
                 guard index < arguments.count, let parsed = TransportSmokeMode(rawValue: arguments[index]) else {
-                    throw SmokeArgumentError("Expected --mode development-drop|dev-quic-loopback")
+                    throw SmokeArgumentError("Expected --mode development-drop|dev-quic-loopback (strict PQC fail-closed only)")
                 }
                 mode = parsed
             case "--dylib":
@@ -215,7 +218,7 @@ struct TransportLoopbackOptions {
             case "--mode":
                 index += 1
                 guard index < arguments.count, let parsed = TransportSmokeMode(rawValue: arguments[index]) else {
-                    throw SmokeArgumentError("Expected --mode development-drop|dev-quic-loopback")
+                    throw SmokeArgumentError("Expected --mode development-drop|dev-quic-loopback (strict PQC fail-closed only)")
                 }
                 mode = parsed
             case "--dylib":
@@ -236,6 +239,14 @@ struct TransportLoopbackOptions {
         self.mode = mode
         self.dylibPath = dylibPath
     }
+}
+
+private func defaultMeshConfigPath() -> String {
+    let localPath = "config/mesh.example.json"
+    if FileManager.default.fileExists(atPath: localPath) {
+        return localPath
+    }
+    return "../config/mesh.example.json"
 }
 
 struct SmokeArgumentError: LocalizedError {

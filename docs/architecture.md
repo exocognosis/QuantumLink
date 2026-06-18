@@ -4,7 +4,7 @@ QuantumLink is split into three runtime surfaces.
 
 1. `QuantumLinkApp` is the SwiftUI desktop surface. It owns user-visible state, enrollment UX, diagnostics, and profile installation.
 2. `QuantumLinkTunnel` is the `NEPacketTunnelProvider` extension. It configures the `utun` interface, applies routes and DNS, and owns packet ingress/egress.
-3. `qlink-core` is the Rust protocol core. It owns crypto orchestration, signed peer records, replay protection, route validation, rendezvous, relay development services, and the development QUIC/ICE data-plane scaffolding.
+3. `qlink-core` is the Rust protocol core. It owns crypto orchestration, signed peer records, replay protection, route validation, rendezvous, relay development services, the Quinn carrier wrapper, and ICE data-plane scaffolding.
 
 The current source tree is intentionally source-first instead of Xcode-project-first. The unsigned XcodeGen project can be generated locally, but a production Mac release still needs Apple-granted Network Extension entitlement approval, Developer ID signing, and notarization.
 

@@ -5,17 +5,13 @@ use crate::{
         MeshTransportConfig, MeshTransportHandle, MeshTransportState, PeerTrustStatusRaw,
     },
     packet_core::{PacketDisposition, PacketTunnelCore},
-    quic_transport::{QuicDatagramSession, QuicEndpoint},
     tracing_bridge,
 };
 use std::{
-    net::{IpAddr, Ipv4Addr, SocketAddr},
     os::raw::c_char,
     ptr, slice, str,
     sync::{Arc, Mutex},
-    time::Duration,
 };
-use tokio::runtime::Runtime;
 
 static VERSION: &[u8] = b"0.1.0\0";
 static SUITE: &[u8] = b"QLINK-FIPS203-MLKEM768-SHAKE256-v1\0";
@@ -25,15 +21,11 @@ pub struct QlinkTunnelCoreHandle {
 }
 
 pub struct QlinkDevQuicTransportHandle {
-    _client_endpoint: QuicEndpoint,
-    _server_endpoint: QuicEndpoint,
-    client_session: QuicDatagramSession,
-    server_session: QuicDatagramSession,
     metrics: QlinkTransportMetrics,
-    runtime: Runtime,
 }
 
 #[repr(C)]
+#[derive(Default)]
 pub struct QlinkOwnedBuffer {
     pub ptr: *mut u8,
     pub len: usize,
@@ -259,10 +251,7 @@ pub unsafe extern "C" fn qlink_tunnel_core_metrics(
 
 #[no_mangle]
 pub extern "C" fn qlink_dev_quic_transport_create() -> *mut QlinkDevQuicTransportHandle {
-    match create_dev_quic_transport() {
-        Ok(handle) => Box::into_raw(Box::new(handle)),
-        Err(_) => ptr::null_mut(),
-    }
+    ptr::null_mut()
 }
 
 #[no_mangle]
@@ -283,25 +272,12 @@ pub unsafe extern "C" fn qlink_dev_quic_transport_send_frame(
     let Some(handle) = handle.as_mut() else {
         return -1;
     };
-    let Some(frame) = borrowed_slice(frame, frame_len) else {
+    if borrowed_slice(frame, frame_len).is_none() {
         handle.metrics.send_failures += 1;
         return -1;
-    };
-
-    match handle
-        .runtime
-        .block_on(async { handle.client_session.send_frame(frame.to_vec()).await })
-    {
-        Ok(()) => {
-            handle.metrics.frames_sent += 1;
-            handle.metrics.bytes_sent += frame_len as u64;
-            0
-        }
-        Err(_) => {
-            handle.metrics.send_failures += 1;
-            -1
-        }
     }
+    handle.metrics.send_failures += 1;
+    -1
 }
 
 #[no_mangle]
@@ -316,26 +292,9 @@ pub unsafe extern "C" fn qlink_dev_quic_transport_receive_frame(
         handle.metrics.receive_failures += 1;
         return false;
     };
-
-    match handle.runtime.block_on(async {
-        tokio::time::timeout(
-            Duration::from_millis(25),
-            handle.server_session.receive_frame(),
-        )
-        .await
-    }) {
-        Ok(Ok(frame)) => {
-            handle.metrics.frames_received += 1;
-            handle.metrics.bytes_received += frame.len() as u64;
-            *out = owned_buffer_from_vec(frame);
-            true
-        }
-        Ok(Err(_)) => {
-            handle.metrics.receive_failures += 1;
-            false
-        }
-        Err(_) => false,
-    }
+    *out = QlinkOwnedBuffer::default();
+    handle.metrics.receive_failures += 1;
+    false
 }
 
 #[no_mangle]
@@ -392,35 +351,6 @@ fn owned_buffer_from_vec(mut bytes: Vec<u8>) -> QlinkOwnedBuffer {
     };
     std::mem::forget(bytes);
     buffer
-}
-
-fn create_dev_quic_transport() -> crate::Result<QlinkDevQuicTransportHandle> {
-    let runtime = Runtime::new()
-        .map_err(|err| crate::QlinkError::Protocol(format!("failed to create runtime: {err}")))?;
-    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-    let _runtime_guard = runtime.enter();
-    let (server_endpoint, server_cert) = QuicEndpoint::server(bind)?;
-    let client_endpoint = QuicEndpoint::client(bind, &[server_cert])?;
-    let server_addr = server_endpoint.local_addr()?;
-    let (client_session, server_session) = runtime.block_on(async {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            tokio::join!(
-                client_endpoint.connect(server_addr),
-                server_endpoint.accept_one()
-            )
-        })
-        .await
-        .map_err(|_| crate::QlinkError::Protocol("dev QUIC transport timed out".into()))
-    })?;
-
-    Ok(QlinkDevQuicTransportHandle {
-        _client_endpoint: client_endpoint,
-        _server_endpoint: server_endpoint,
-        client_session: client_session?,
-        server_session: server_session?,
-        metrics: QlinkTransportMetrics::default(),
-        runtime,
-    })
 }
 
 // ===================================================================
@@ -1128,31 +1058,26 @@ mod tests {
     }
 
     #[test]
-    fn ffi_dev_quic_transport_round_trips_frame() {
+    fn ffi_dev_quic_transport_is_disabled() {
         let handle = qlink_dev_quic_transport_create();
-        assert!(!handle.is_null());
+        assert!(handle.is_null());
 
         let frame = b"qlink-frame";
         let sent =
             unsafe { qlink_dev_quic_transport_send_frame(handle, frame.as_ptr(), frame.len()) };
-        assert_eq!(sent, 0);
+        assert_eq!(sent, -1);
 
         let mut received = QlinkOwnedBuffer {
             ptr: ptr::null_mut(),
             len: 0,
             cap: 0,
         };
-        assert!(unsafe { qlink_dev_quic_transport_receive_frame(handle, &mut received) });
-        let bytes = unsafe { slice::from_raw_parts(received.ptr, received.len).to_vec() };
-        assert_eq!(bytes, frame);
-        unsafe { qlink_owned_buffer_free(received) };
+        assert!(!unsafe { qlink_dev_quic_transport_receive_frame(handle, &mut received) });
+        assert!(received.ptr.is_null());
+        assert_eq!(received.len, 0);
 
         let mut metrics = QlinkTransportMetrics::default();
-        assert!(unsafe { qlink_dev_quic_transport_metrics(handle, &mut metrics) });
-        assert_eq!(metrics.frames_sent, 1);
-        assert_eq!(metrics.frames_received, 1);
-
-        unsafe { qlink_dev_quic_transport_destroy(handle) };
+        assert!(!unsafe { qlink_dev_quic_transport_metrics(handle, &mut metrics) });
     }
 
     fn test_ipv4_packet(destination: [u8; 4]) -> Vec<u8> {
