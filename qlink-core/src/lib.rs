@@ -13,6 +13,7 @@ pub mod metrics_endpoint;
 pub mod packet_core;
 pub mod peer_acl;
 pub mod peer_store;
+pub mod pqc_session_wire;
 pub mod quic_transport;
 pub mod relay;
 pub mod rendezvous;
