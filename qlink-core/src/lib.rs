@@ -37,7 +37,18 @@ mod pqc_policy_tests {
     #[test]
     fn qlink_core_has_no_direct_retired_crypto_dependencies() {
         let manifest = include_str!("../Cargo.toml");
-        for forbidden in ["chacha20poly1305", "hkdf =", "hmac =", "sha1 =", "sha2 ="] {
+        for forbidden in [
+            "aes =",
+            "aes-gcm",
+            "aes-gcm-siv",
+            "aes_gcm",
+            "chacha20 =",
+            "chacha20poly1305",
+            "hkdf =",
+            "hmac =",
+            "sha1 =",
+            "sha2 =",
+        ] {
             assert!(
                 !manifest.contains(forbidden),
                 "qlink-core Cargo.toml must not directly depend on {forbidden}"
@@ -76,6 +87,10 @@ mod pqc_policy_tests {
             "SHA2-128S",
             "X25519",
             "AES",
+            "Aes",
+            "aes::",
+            "aes_gcm",
+            "aes-gcm",
         ];
 
         for (name, source) in files {

@@ -4,162 +4,276 @@
 [![Windows CI](https://github.com/exocognosis/QuantumLink/actions/workflows/windows-ci.yml/badge.svg)](https://github.com/exocognosis/QuantumLink/actions/workflows/windows-ci.yml)
 [![Release](https://github.com/exocognosis/QuantumLink/actions/workflows/release.yml/badge.svg)](https://github.com/exocognosis/QuantumLink/actions/workflows/release.yml)
 
-**QuantumLink is a post-quantum, peer-to-peer mesh VPN** with a
-server-minimized control plane: peers exchange traffic directly when
-possible, use rendezvous for discovery, and fall back to relay paths
-only in hostile NAT — no centralized VPN concentrator in the steady
-state.
+QuantumLink is a cross-platform, post-quantum mesh VPN product built
+around a shared Rust protocol core and native platform silos for macOS,
+Windows, and the Steam/SteamOS gamer track. It is designed to minimize
+central infrastructure: peers discover each other through short-lived
+signed records, connect directly when possible, fall back to relay when
+necessary, and preserve a fail-closed L3 overlay on each supported OS.
 
-It ships as **three platform editions built on one shared Rust core.**
-The reusable asset, [`qlink-core`](qlink-core), *is* the product; each
-edition wraps it with a native tunnel, UI, and packaging:
+The repository is not a macOS-only proof of concept. It is a product monorepo:
+`qlink-core` owns the mesh protocol, cryptography, packet framing,
+rendezvous, relay, ICE/STUN helpers, peer stores, identity assertions,
+metrics, tracing, and smoke tooling; each platform silo wraps that core
+with the OS-specific tunnel, UI, privilege boundary, packaging, and
+release mechanics.
 
-- **[QuantumLink for macOS](macos)** — the reference edition.
-- **[QuantumLink for Windows](windows)** — the Windows-native port.
-- **[QuantumLink for Steam](steam)** — the Steam-safe gamer edition.
+## Product Pillars
 
-Every edition links the **same** `qlink-core` crate — there is no
-per-edition copy of the protocol, so the security-critical handshake,
-packet core, transport, and peer store are written, audited, and tested
-once. The Cargo workspace at the repo root ties `qlink-core` together
-with the Windows edition's Rust crates; the macOS edition consumes the
-same crate as an XCFramework.
+- **Post-quantum data plane** - ML-KEM-768 session establishment,
+  ML-DSA-65 and SLH-DSA-SHAKE device credentials, SHAKE256 transcript
+  binding and directional key derivation, app-layer PQC frame
+  protection, replay windows, and protocol downgrade rejection.
+- **Server-minimized mesh control plane** - signed and expiring peer
+  records, rendezvous discovery, relay fallback, peer-store caching,
+  mDNS/local discovery support, and synthetic WAN test harnesses.
+- **On-chain identity and trust** - [Dytallix](https://github.com/DytallixHQ)-backed registry flows,
+  wallet/contract-aware enrollment settings, registry lookup policy,
+  verified peer decisions, identity assertions, ACL/denylist handling,
+  blocked-peer history, and support-bundle diagnostics that explain
+  trust failures without leaking raw peer identifiers by default.
+- **Native platform silos** - macOS uses SwiftUI, Network Extension,
+  Keychain, XcodeGen, MDM payloads, and Apple packaging; Windows uses a
+  privileged Rust service, Wintun, WFP kill switch, DPAPI, named-pipe
+  IPC, WinUI 3, and WiX packaging; Steam/SteamOS is tracked as a gamer
+  edition with Steam-safe routing policy and low-latency game traffic
+  goals.
+- **Fail-closed posture** - protected-route filtering, kill-switch
+  watchdogs, packet-pump drop accounting, route/DNS policy, diagnostics
+  redaction, and explicit production gates for signing, notarization,
+  certificates, and real-hardware validation.
 
-## Editions
+## Platform Silos
 
-| Edition | Path | Status | Stack |
-|---------|------|--------|-------|
-| **macOS** | [`macos/`](macos) | Implemented baseline | SwiftUI + Network Extension |
-| **Windows** | [`windows/`](windows) | Alpha scaffold | WinUI 3 + LocalSystem service |
-| **Steam** | [`steam/`](steam) | Planning scaffold (docs) | Steam-safe gamer edition |
+| Silo | Path | Status | What it contains |
+|------|------|--------|------------------|
+| **Shared core** | [`qlink-core/`](qlink-core) | Active | Rust mesh engine, PQC crypto, signed peer records, packet core, QUIC transport, rendezvous, relay, ICE/STUN, peer store, metrics, tracing bridge, FFI, and `qlinkctl` loopback/smoke tooling. |
+| **macOS** | [`macos/`](macos) | Implemented baseline | SwiftUI app, `NEPacketTunnelProvider`, `QuantumLinkKit`, Rust FFI bridge, transport smoke runner, Dytallix enrollment UI/models, MDM payload templates, XcodeGen project, entitlements, Sparkle/appcast scripts, and unsigned/package build flows. |
+| **Windows** | [`windows/`](windows) | Alpha implementation | Privileged Rust tunnel service, Wintun adapter path, WFP kill switch, DPAPI secret storage, named-pipe IPC schema, WinUI 3 dashboard, WiX MSI packaging, beta runbook, and Windows CI smoke coverage. |
+| **Steam / SteamOS** | [`steam/`](steam) | Product track / planning baseline | Steam-safe gamer edition notes for desktop and companion surfaces: game-aware routing, SDR awareness, account/store traffic bypass policy, latency-sensitive mode, streamer/privacy modes, and future SteamOS packaging direction. |
 
-### QuantumLink for macOS — implemented baseline
+All platform work is built around the same `qlink-core` crate. There is
+no separate macOS protocol, Windows protocol, or Steam protocol. The
+root Cargo workspace ties together the shared core and Windows Rust
+crates; the macOS silo consumes the same core through a generated
+XCFramework; the Steam track is expected to depend on the same service
+and policy layers rather than fork the mesh engine.
 
-A SwiftUI app plus a `NEPacketTunnelProvider` Network Extension, built on
-`QuantumLinkKit` (the Swift bridge that loads `qlink-core` as an
-XCFramework). Ships with an XcodeGen project, entitlements, and
-Sparkle / DMG / PKG packaging. This is the most mature edition and the
-behavioral reference the others port from.
-→ [`macos/`](macos)
-
-### QuantumLink for Windows — alpha scaffold
-
-An unprivileged **WinUI 3** dashboard that talks over a newline-delimited
-JSON **named pipe** to a **LocalSystem Windows service** owning the data
-plane: a Wintun L3 adapter, a WFP kill switch (route ownership), a DPAPI
-secret store, route/DNS programming, and an IP Helper path observer.
-`qlink-core` is linked natively into the service — no FFI hop on the data
-path. Packaged as a WiX MSI.
-→ [`windows/`](windows) · [`windows/README.md`](windows/README.md)
-
-### QuantumLink for Steam — planning scaffold
-
-A Steam-safe, low-latency **gamer edition** (a desktop client plus a
-mobile companion) that layers game-aware routing and Steam-compliance
-policy on top of the Windows service: per-game (PID/app) routing,
-Steam Datagram Relay–aware bypass, game-server ping matching, and
-streamer-privacy / DDoS-shielding modes — while Steam account, store,
-wallet, launcher, and embedded-browser traffic bypass the tunnel by
-default. Currently documentation only; first implementation step is a
-`quantumlink-steam-policy` crate encoding the Steam-safe rules.
-→ [`steam/`](steam) · [`steam/README.md`](steam/README.md)
-
-## Shared core — `qlink-core`
-
-The protocol lives once in [`qlink-core`](qlink-core) and is identical
-across editions:
-
-- Protocol version `1`. Cipher suites:
-  - `QLINK-FIPS203-MLKEM768-HKDFSHA256-v1`
-  - `QLINK-FIPS204-MLDSA65-HKDFSHA256-v1`
-  - `QLINK-FIPS205-SLHDSA-SHA2-128S-HKDFSHA256-v1`
-- ML-KEM-768 session establishment; transcript hashed with SHA-256 and
-  bound into HKDF-SHA-256 directional key derivation. No X25519 fallback
-  (the legacy hybrid identifier is rejected).
-- ML-DSA-65 default device credentials (SLH-DSA-SHA2-128S for FIPS 205);
-  v1 persistence is ML-DSA-seed based.
-- Signed peer records bind peer ID, device key, routes, endpoint
-  candidates, ICE creds, QUIC cert material, expiration, and sequence.
-- `PacketTunnelCore` accepts only protected IPv4 routes and wraps
-  transport frames with ChaCha20-Poly1305 under suite-bound HKDF keys;
-  replay protection uses a monotonic packet-number window.
-- QUIC/ICE transport, rendezvous + relay fallback, and the `qlinkctl`
-  developer CLI.
-
-Repo-level spec and feature inventory: [`SPEC.md`](SPEC.md),
-[`FEATURES.md`](FEATURES.md).
-
-## Repository layout
+## Repository Layout
 
 ```text
-qlink-core/                     Shared Rust mesh core + qlinkctl CLI
-macos/                          QuantumLink for macOS
+qlink-core/                         Shared Rust mesh protocol core
+  src/crypto.rs                     ML-KEM/ML-DSA/SLH-DSA orchestration
+  src/packet_core.rs                Protected-route packet framing
+  src/mesh_transport.rs             Multi-peer transport/session manager
+  src/rendezvous.rs, relay.rs       Development control-plane services
+  src/inbound_identity.rs           Authenticated inbound identity checks
+  src/peer_acl.rs                   Peer allow/deny policy
+  include/qlink_core.h              Swift/C FFI surface
+
+macos/
   Package.swift, Sources/, Tests/   SwiftPM app, QuantumLinkKit, tunnel
-  project.yml, *.xcodeproj           XcodeGen spec + generated project
-  entitlements/, Info/, mdm/         Apple packaging
-  scripts/                           Build / xcframework / sign / package
-windows/                        QuantumLink for Windows
-  rust/quantumlink-proto             Shared models + named-pipe IPC schema
-  rust/quantumlink-service           Privileged tunnel service
-  ui/QuantumLink.Windows             WinUI 3 app
-  installer/                         WiX MSI
-  docs/                              Architecture, porting notes, runbook
-steam/                          QuantumLink for Steam (planning scaffold)
-config/                         Example mesh configuration (shared)
-docs/                           Cross-cutting architecture / security / perf
-Cargo.toml                      Root Cargo workspace
+  project.yml                       XcodeGen spec; generate project locally
+  entitlements/, Info/, mdm/        Apple signing and managed deployment
+  scripts/                          XCFramework, Xcode, package, release
+
+windows/
+  rust/quantumlink-proto            Shared models and IPC schema
+  rust/quantumlink-service          Privileged tunnel service
+  ui/QuantumLink.Windows            WinUI 3 app
+  installer/                        WiX MSI packaging
+  docs/                             Architecture, porting notes, beta runbook
+
+steam/
+  README.md, version.md             Steam gamer edition product direction
+  docs/version-mobile.md            Mobile companion direction
+
+config/                             Shared example mesh configuration
+docs/                               Architecture, security, beta, perf notes
+Cargo.toml                          Root Cargo workspace
 ```
 
-## Build
+## Identity And Trust
 
-Shared core and all cross-platform Rust (runs on any host):
+QuantumLink treats peer identity as part of the mesh, not as an
+afterthought bolted onto transport setup.
+
+- Device credentials are post-quantum signing keys, with ML-DSA-65 as
+  the default and SLH-DSA-SHAKE-128S support for the FIPS 205 path.
+- Peer records are signed, expiring, sequence-numbered documents that
+  bind peer ID, device public key, routes, endpoint candidates, ICE
+  credentials, QUIC certificate material, and discovery metadata.
+- Dytallix registry configuration supports lookup-only trust decisions,
+  contract/network allowlists, wallet-aware enrollment outputs, and
+  operator-visible trust status in the app and support bundles. The
+  external Dytallix project publishes the public SDK/CLI, PQC primitive
+  crate, documentation, node, faucet, explorer surface map, and on-chain
+  WASM contract repositories under
+  [`DytallixHQ`](https://github.com/DytallixHQ).
+- The mesh transport records registry failures and ACL rejections so a
+  peer can surface "why this connection was blocked" without requiring
+  payload traffic from that peer first.
+- Diagnostics redact raw `qlink_*` peer identifiers and network
+  addresses by default; raw support-bundle export is an explicit opt-in.
+
+## Cryptographic Core
+
+The protocol lives once in [`qlink-core`](qlink-core) and is shared
+across platform silos.
+
+Supported suite identifiers:
+
+- `QLINK-FIPS203-MLKEM768-SHAKE256-v1`
+- `QLINK-FIPS204-MLDSA65-SHAKE256-v1`
+- `QLINK-FIPS205-SLHDSA-SHAKE128S-SHAKE256-v1`
+
+Implemented behavior includes ML-KEM-768 session establishment,
+SHAKE256 transcript binding, SHAKE256 directional derivation, signed
+peer records, app-layer PQC frame protection with replay rejection,
+protected IPv4 route enforcement, selected metadata normalization,
+native UDP carrier session-wire coverage, optional dev-only QUIC
+DATAGRAM carrier transport behind `dev-quic-carrier`, fail-closed raw
+relay fallback, rendezvous lookup/publish, QuantumLink-only SHAKE-based
+ICE helpers, SHAKE256 v3 peer-store protection, tracing export, and
+metrics surfaces.
+
+The legacy hybrid X25519/ML-KEM app-layer suite identifier is
+intentionally rejected. QuantumLink's v1 app-layer cryptographic
+direction is post-quantum session establishment without a classical
+key-exchange fallback.
+
+Known blockers for a strict "zero classical in the full stack" profile:
+
+- The default `qlink-core` build excludes the dev Quinn/rustls/rcgen
+  carrier dependencies. The legacy Quinn/rustls carrier is still present
+  only behind `--features dev-quic-carrier`, where it configures the
+  hybrid `X25519MLKEM768` group for development comparison smokes.
+  Default live mesh dialing now fails closed until rendezvous publication
+  and direct probing are wired to the native UDP carrier.
+- macOS and Windows privacy-redaction helpers still use SHA-256-derived
+  stable aliases outside the packet/session boundary.
+- macOS CMS/profile signing still requests platform SHA-256, and tests
+  document platform AES behavior. That is OS distribution/signing
+  plumbing, not the mesh transport boundary, but it is not a zero-
+  classical stack.
+- Optional dev-carrier builds still pull transitive rustls/aws-lc/ring
+  classical algorithms through Quinn. The default core graph should not,
+  but lockfile contents and dev tooling are not a full zero-classical
+  stack claim.
+
+## Build And Validate
+
+Shared Rust workspace:
 
 ```sh
 cargo test --workspace
-cargo run -p qlink-core --bin qlinkctl -- quic-loopback
+cargo run -p qlink-core --bin qlinkctl -- rendezvous
 ```
 
-Per edition:
+`quic-loopback`, `mesh-loopback`, `relay-loopback`, and `relay-smoke`
+are disabled in the strict PQC profile because they bypass or lack the
+app-layer PQC frame session.
 
-- **macOS** — `cd macos && swift test`; full validation
-  `macos/scripts/preapple-check.sh`; Xcode scaffold
-  `macos/scripts/build-rust-xcframework.sh && macos/scripts/generate-xcode-project.sh`
-  (XcodeGen + Apple toolchain required).
-- **Windows** — `windows/scripts/build-windows.ps1` (Rust msvc + .NET 8
-  SDK; `-Msi` for the installer). Data-plane check:
-  `cargo run -p quantumlink-service -- smoke`. See
-  [`windows/README.md`](windows/README.md).
-- **Steam** — planning only; see [`steam/README.md`](steam/README.md).
+Legacy dev-carrier mesh publication is explicit opt-in:
 
-## Status & production boundaries
+```sh
+cargo run -p qlink-core --no-default-features --features dev-quic-carrier --bin qlinkctl -- publish-self --once
+```
 
-A v1 implementation baseline, not a signed/notarized production bundle.
-macOS needs Apple signing + Network Extension entitlements + notarization
-before the tunnel extension can run on real Macs; Windows needs an
-Authenticode certificate and real-hardware validation of the Wintun/WFP
-data path. CI covers the Rust workspace, Swift tests, transport smokes,
-XCFramework generation, unsigned Xcode builds, and the Windows
-build/test/smoke + cross-target check.
+macOS:
 
-Design boundaries that hold across every edition:
+```sh
+cd macos
+swift test
+./scripts/build-rust-xcframework.sh
+./scripts/generate-xcode-project.sh
+```
+
+The macOS source tree is source-first. `macos/project.yml` is the
+tracked XcodeGen source of truth; `QuantumLink.xcodeproj` is generated
+locally and is not part of the public source boundary.
+
+Windows:
+
+```powershell
+cargo test --workspace
+cargo run -p quantumlink-service -- smoke
+windows\scripts\build-windows.ps1
+```
+
+Steam / SteamOS:
+
+- Current source is product and policy planning, not a compiled client.
+- See [`steam/README.md`](steam/README.md), [`steam/version.md`](steam/version.md),
+  and [`steam/docs/version-mobile.md`](steam/docs/version-mobile.md).
+
+## Open Source Status
+
+QuantumLink is published as a full-source product monorepo for the
+shared Rust core, the native macOS client, the native Windows client,
+and the Steam/SteamOS product track. The repository is licensed under
+Apache-2.0; see [`LICENSE`](LICENSE), [`NOTICE`](NOTICE), and
+[`docs/open-source-boundaries.md`](docs/open-source-boundaries.md).
+
+Official macOS and Windows production binaries are signed release
+artifacts. Local source builds, unsigned packages, and CI uploads are
+development or validation artifacts only and should not be treated as
+production distributions.
+
+The public repository includes:
+
+- source code for `qlink-core`, macOS, Windows, and Steam/SteamOS
+  planning surfaces
+- reproducible local build and validation scripts
+- public documentation, examples, tests, and CI definitions
+- release packaging source for macOS and Windows
+
+The public repository does not include production signing keys,
+certificates, app-store accounts, hosted rendezvous or relay operations,
+telemetry infrastructure, support data, customer data, production
+environment secrets, or private release infrastructure.
+
+CI covers the Rust workspace, Rust formatting, QUIC/mesh/relay smokes,
+Swift tests, Swift transport smoke, XCFramework generation, unsigned
+Xcode generation/build checks, Windows Rust tests, Windows service
+smoke, and WinUI build checks.
+
+## Production Boundaries
 
 - No mandatory centralized VPN concentrator in the steady-state data
-  plane; optional rendezvous/STUN/ICE/relay only for bootstrap and
-  hostile NAT.
-- L3 overlay per platform (macOS `NEPacketTunnelProvider`/`utun`,
-  Windows Wintun); no kernel extension / custom driver in v1.
-- ML-KEM-768 session establishment with no classical fallback;
-  ML-DSA-65 default credentials.
-- Signed, expiring rendezvous records and authenticated inbound identity
-  assertions.
-- Suite-bound ChaCha20-Poly1305 packet-frame protection.
-- Local-first diagnostics with opt-in export.
+  plane; rendezvous, STUN/ICE, and relay exist for discovery,
+  reachability, and fallback.
+- L3 overlay per platform: macOS `NEPacketTunnelProvider`/`utun`,
+  Windows Wintun/WFP, and a Steam/SteamOS track intended to layer
+  game-aware policy over the same core.
+- No kernel extension or custom driver in v1 beyond platform-approved
+  tunnel mechanisms.
+- Public relay and rendezvous services in this repo are development
+  tools until hardened for internet exposure.
+- Local-first diagnostics are redacted by default; raw export is
+  operator-controlled.
 
-## Contributing and support
+## More Detail
+
+- Product feature inventory: [`FEATURES.md`](FEATURES.md)
+- Protocol and runtime spec: [`SPEC.md`](SPEC.md)
+- Security notes: [`docs/security.md`](docs/security.md)
+- macOS pre-Apple checklist: [`docs/pre-apple-development.md`](docs/pre-apple-development.md)
+- Windows architecture: [`windows/docs/architecture-windows.md`](windows/docs/architecture-windows.md)
+- Windows beta runbook: [`windows/docs/beta-runbook-windows.md`](windows/docs/beta-runbook-windows.md)
+- Steam product track: [`steam/README.md`](steam/README.md)
+- Dytallix organization: [`DytallixHQ`](https://github.com/DytallixHQ)
+- Dytallix SDK/CLI: [`DytallixHQ/dytallix-sdk`](https://github.com/DytallixHQ/dytallix-sdk)
+- Dytallix PQC primitives: [`DytallixHQ/dytallix-pqc`](https://github.com/DytallixHQ/dytallix-pqc)
+- Dytallix node: [`DytallixHQ/dytallix-node`](https://github.com/DytallixHQ/dytallix-node)
+- Dytallix faucet: [`DytallixHQ/dytallix-faucet`](https://github.com/DytallixHQ/dytallix-faucet)
+- Dytallix explorer surface: [`DytallixHQ/dytallix-explorer`](https://github.com/DytallixHQ/dytallix-explorer)
+- Dytallix contracts: [`DytallixHQ/dytallix-contracts`](https://github.com/DytallixHQ/dytallix-contracts)
+- Dytallix docs: [`DytallixHQ/dytallix-docs`](https://github.com/DytallixHQ/dytallix-docs)
+
+## Contributing And Support
 
 - Contribution workflow: [`CONTRIBUTING.md`](CONTRIBUTING.md)
-- Threat model: [`THREAT_MODEL.md`](THREAT_MODEL.md)
-- Quantum-specific threats: [`QUANTUM_THREATS.md`](QUANTUM_THREATS.md)
 - Security reporting: [`SECURITY.md`](SECURITY.md)
 - Support expectations: [`SUPPORT.md`](SUPPORT.md)
 - Community expectations: [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md)

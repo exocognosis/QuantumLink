@@ -4,10 +4,8 @@ use qlink_core::{
     discovery::{CandidateEndpoint, CandidateType, PeerRecord, UnsignedPeerRecord},
     dytallix_identity::MeshTrustPolicy,
     ice::{perform_ice_check, spawn_dev_ice_responder, IceCheckRequest, IceCredentials},
-    local_loopback::run_local_mesh_loopback,
     mesh_connection::{ConnectionOutcome, MeshConnector, MeshConnectorConfig, PathKind},
     mesh_transport::{MeshTransportConfig, MeshTransportHandle},
-    packet_core::{FfiRouteMode, PacketTunnelCore, PacketTunnelCoreConfig},
     quic_transport::QuicEndpoint,
     relay::{run_relay, spawn_dev_relay},
     rendezvous::{run_rendezvous, spawn_dev_rendezvous, RendezvousClient},
@@ -193,56 +191,14 @@ async fn main() -> qlink_core::Result<()> {
             run_relay(&listen).await?;
         }
         Command::QuicLoopback => {
-            let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-            let (server_endpoint, server_cert) = QuicEndpoint::server(bind)?;
-            let client_endpoint = QuicEndpoint::client(bind, &[server_cert])?;
-            let server_addr = server_endpoint.local_addr()?;
-
-            let (client_session, server_session) =
-                tokio::time::timeout(Duration::from_secs(5), async {
-                    tokio::join!(
-                        client_endpoint.connect(server_addr),
-                        server_endpoint.accept_one()
-                    )
-                })
-                .await
-                .map_err(|_| qlink_core::QlinkError::Protocol("QUIC loopback timed out".into()))?;
-            let client_session = client_session?;
-            let server_session = server_session?;
-
-            let mut sender = dev_packet_core()?;
-            let mut receiver = dev_packet_core()?;
-            let packet = test_ipv4_packet([100, 127, 0, 10]);
-            sender.submit_tunnel_packet(2, &packet)?;
-            let frame = sender.pop_transport_frame().ok_or_else(|| {
-                qlink_core::QlinkError::Protocol("packet core produced no frame".into())
-            })?;
-
-            client_session.send_frame(frame).await?;
-            let received_frame = server_session.receive_frame().await?;
-            receiver.accept_transport_frame(&received_frame)?;
-            let restored = receiver.pop_tunnel_packet().ok_or_else(|| {
-                qlink_core::QlinkError::Protocol("receiver produced no tunnel packet".into())
-            })?;
-
-            println!("transport=quic_datagram");
-            println!("server_addr={server_addr}");
-            println!("packet_bytes={}", restored.bytes.len());
-            println!("protocol_family={}", restored.protocol_family);
-            println!("packet_round_trip={}", restored.bytes == packet);
+            return Err(qlink_core::QlinkError::Protocol(
+                "quic-loopback is disabled because raw Quinn DATAGRAM bypasses the app-layer PQC frame session".into(),
+            ));
         }
         Command::MeshLoopback => {
-            let result = run_local_mesh_loopback().await?;
-            println!("transport=quic_datagram");
-            println!("rendezvous_addr={}", result.rendezvous_addr);
-            println!("quic_server_addr={}", result.quic_server_addr);
-            println!("local_peer_id={}", result.local_peer_id);
-            println!("remote_peer_id={}", result.remote_peer_id);
-            println!("selected_path_type={:?}", result.selected_path_type);
-            println!("selected_path_score={}", result.selected_path_score);
-            println!("packet_bytes={}", result.packet_bytes);
-            println!("protocol_family={}", result.protocol_family);
-            println!("packet_round_trip={}", result.packet_round_trip);
+            return Err(qlink_core::QlinkError::Protocol(
+                "mesh-loopback is disabled because the legacy local loopback bypasses the app-layer PQC frame session; use direct-send or mesh-transport tests".into(),
+            ));
         }
         Command::RelayLoopback => {
             return Err(qlink_core::QlinkError::Protocol(
@@ -353,6 +309,7 @@ async fn main() -> qlink_core::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 async fn run_direct_send(
     rendezvous_url: &str,
     mesh_id: &str,
@@ -847,28 +804,6 @@ async fn run_stun_gather_demo() -> qlink_core::Result<()> {
         println!("  failed[{server}]: {error}");
     }
     Ok(())
-}
-
-fn dev_packet_core() -> qlink_core::Result<PacketTunnelCore> {
-    PacketTunnelCore::new(PacketTunnelCoreConfig {
-        protected_routes: vec!["100.127.0.0/16".to_string()],
-        excluded_routes: vec![],
-        route_mode: FfiRouteMode::SplitTunnel,
-        mtu: 1280,
-        crypto: None,
-    })
-}
-
-fn test_ipv4_packet(destination: [u8; 4]) -> Vec<u8> {
-    let mut packet = vec![0_u8; 20];
-    packet[0] = 0x45;
-    packet[2] = 0;
-    packet[3] = 20;
-    packet[8] = 64;
-    packet[9] = 17;
-    packet[12..16].copy_from_slice(&[100, 127, 0, 2]);
-    packet[16..20].copy_from_slice(&destination);
-    packet
 }
 
 #[cfg(test)]
