@@ -18,6 +18,7 @@ pub mod relay;
 pub mod rendezvous;
 pub mod replay;
 pub mod routing;
+pub mod session_crypto;
 pub mod stun;
 pub mod synthetic_wan;
 pub mod tracing_bridge;
