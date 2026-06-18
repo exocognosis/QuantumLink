@@ -173,6 +173,17 @@ sanitize_app_bundle() {
     xattr -cr "${bundle_path}" 2>/dev/null || true
 }
 
+write_release_checksums() {
+    local checksum_path="${out_dir}/SHA256SUMS.txt"
+    local artifacts=("${dmg_path}")
+    if [[ "${build_pkg}" == "true" ]]; then
+        artifacts+=("${pkg_path}")
+    fi
+
+    echo "==> Writing release checksums to ${checksum_path}"
+    shasum -a 256 "${artifacts[@]}" > "${checksum_path}"
+}
+
 xcode_settings=(
     "QLINK_APP_BUNDLE_ID=${QLINK_APP_BUNDLE_ID:-com.quantumlink.macos}"
     "QLINK_TUNNEL_BUNDLE_ID=${QLINK_TUNNEL_BUNDLE_ID:-com.quantumlink.macos.PacketTunnel}"
@@ -245,6 +256,14 @@ cp -R "${app_path}" "${export_path}/QuantumLink.app"
 app_path="${export_path}/QuantumLink.app"
 sanitize_app_bundle "${app_path}"
 
+helper_path="${app_path}/Contents/MacOS/qlinkctl"
+echo "==> Bundling qlinkctl helper at ${helper_path}"
+install -m 755 "${QLINKCTL_SOURCE_PATH}" "${helper_path}"
+if [[ ! -x "${helper_path}" ]]; then
+    echo "Missing bundled qlinkctl helper at ${helper_path}" >&2
+    exit 1
+fi
+
 if [[ "${skip_sign}" == "true" ]]; then
     echo "==> Skipping codesign / notarization (--skip-sign)"
 else
@@ -255,16 +274,10 @@ else
     sed 's|$(QLINK_APP_GROUP)|'"${QLINK_APP_GROUP}"'|g' \
         entitlements/QuantumLinkTunnel.entitlements > "${resolved_tunnel_entitlements}"
 
-    helper_path="${app_path}/Contents/MacOS/qlinkctl"
-    if [[ -x "${helper_path}" ]]; then
-        echo "==> Codesigning qlinkctl helper"
-        codesign --force --options runtime --timestamp \
-            --sign "${APPLE_DEVELOPER_ID_APPLICATION}" \
-            "${helper_path}"
-    else
-        echo "Missing bundled qlinkctl helper at ${helper_path}" >&2
-        exit 1
-    fi
+    echo "==> Codesigning qlinkctl helper"
+    codesign --force --options runtime --timestamp \
+        --sign "${APPLE_DEVELOPER_ID_APPLICATION}" \
+        "${helper_path}"
 
     echo "==> Re-signing nested frameworks and dylibs"
     while IFS= read -r -d '' nested; do
@@ -319,6 +332,7 @@ hdiutil create \
     -ov \
     -format UDZO \
     "${dmg_path}"
+hdiutil verify "${dmg_path}"
 
 if [[ "${skip_sign}" == "false" ]]; then
     echo "==> Codesigning DMG"
@@ -351,6 +365,8 @@ if [[ "${build_pkg}" == "true" ]]; then
         xcrun stapler staple "${pkg_path}"
     fi
 fi
+
+write_release_checksums
 
 echo "==> Release artifacts under ${out_dir}:"
 ls -lh "${out_dir}"

@@ -38,9 +38,9 @@ QLINK_CORE_DYLIB="$DYLIB" swift test --filter RustCoreBridgeTests
 QLINK_CORE_DYLIB="$DYLIB" swift test --filter TunnelTransportTests/testRustDevQuicLoopbackTransportWhenDylibIsConfigured
 QLINK_CORE_DYLIB="$DYLIB" swift test --filter TunnelTransportTests/testTransportSmokeRunnerWhenDylibIsConfigured
 
-run swift run QuantumLinkSmoke validate-config --config "$ROOT/config/mesh.example.json"
+run swift run QuantumLinkSmoke validate-config --config "$REPO_ROOT/config/mesh.example.json"
 run swift run QuantumLinkSmoke preflight \
-  --config "$ROOT/config/mesh.example.json" \
+  --config "$REPO_ROOT/config/mesh.example.json" \
   --transport \
   --mode dev-quic-loopback \
   --dylib "$DYLIB"
