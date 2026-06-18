@@ -1,18 +1,29 @@
 use qlink_linux::{
-    LinuxRuntimePlan, NetworkApplyError, NetworkExecutor, NetworkPlanError, NftablesExecutor,
+    LinuxNetworkPlan, LinuxRuntimePlan, NetworkApplyError, NetworkExecutor, NetworkOperation,
+    NetworkPlanError, NftablesExecutor, NftablesOperation, NftablesPlan,
 };
 use qlink_proto::{
     ConnectionPhase, DaemonConfig, DaemonStatus, NetworkPlanState, NetworkStatus, PeerStatus,
     RouteMode,
 };
+use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const MAX_CONTROL_REQUEST_BYTES: usize = 1024;
 const CONTROL_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(2);
+const NETWORK_OWNERSHIP_FILE: &str = "network-ownership.json";
+const NETWORK_OWNERSHIP_SCHEMA_VERSION: u8 = 1;
+const QLINK_FWMARK: u32 = 0x514c;
+const QLINK_ROUTE_TABLE: u32 = 51820;
+const NFT_FAMILY: &str = "inet";
+const NFT_TABLE: &str = "qlink";
+const FULL_TUNNEL_CIDR: &str = "0.0.0.0/0";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonPaths {
@@ -55,6 +66,7 @@ impl NetworkRuntimePlan {
         &self,
         state: NetworkPlanState,
         dry_run: bool,
+        ownership_record_present: bool,
         error: Option<String>,
     ) -> NetworkStatus {
         NetworkStatus {
@@ -63,6 +75,7 @@ impl NetworkRuntimePlan {
             route_mode: Some(self.route_mode),
             protected_cidr: Some(self.protected_cidr.clone()),
             dry_run,
+            ownership_record_present,
             commands: self.commands.clone(),
             nftables_rules: self.nftables_rules.clone(),
             error,
@@ -86,16 +99,97 @@ impl NetworkRuntimeState {
         Self::Planned(NetworkRuntimePlan::from_plan(config, plan))
     }
 
-    fn status(&self) -> NetworkStatus {
+    fn status(&self, ownership_record_present: bool) -> NetworkStatus {
         match self {
             Self::NotStarted => NetworkStatus::not_started(),
-            Self::Planned(plan) => plan.status(NetworkPlanState::Planned, true, None),
-            Self::Applied(plan) => plan.status(NetworkPlanState::Applied, false, None),
-            Self::ApplyFailed { plan, error } => {
-                plan.status(NetworkPlanState::ApplyFailed, false, Some(error.clone()))
-            }
+            Self::Planned(plan) => plan.status(
+                NetworkPlanState::Planned,
+                true,
+                ownership_record_present,
+                None,
+            ),
+            Self::Applied(plan) => plan.status(
+                NetworkPlanState::Applied,
+                false,
+                ownership_record_present,
+                None,
+            ),
+            Self::ApplyFailed { plan, error } => plan.status(
+                NetworkPlanState::ApplyFailed,
+                false,
+                ownership_record_present,
+                Some(error.clone()),
+            ),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkOwnershipRecord {
+    pub schema_version: u8,
+    pub interface_name: String,
+    pub route_mode: RouteMode,
+    pub protected_cidr: String,
+    pub fwmark: u32,
+    pub route_table: u32,
+    pub nft_family: String,
+    pub nft_table: String,
+    pub activated_at_unix_seconds: u64,
+}
+
+impl NetworkOwnershipRecord {
+    pub fn from_config(config: &DaemonConfig) -> Self {
+        Self {
+            schema_version: NETWORK_OWNERSHIP_SCHEMA_VERSION,
+            interface_name: config.interface_name.clone(),
+            route_mode: config.route_mode,
+            protected_cidr: protected_cidr_for_record(config).to_string(),
+            fwmark: QLINK_FWMARK,
+            route_table: QLINK_ROUTE_TABLE,
+            nft_family: NFT_FAMILY.to_string(),
+            nft_table: NFT_TABLE.to_string(),
+            activated_at_unix_seconds: current_unix_seconds(),
+        }
+    }
+
+    fn runtime_plan(&self) -> LinuxRuntimePlan {
+        LinuxRuntimePlan {
+            network: LinuxNetworkPlan::from_operations(vec![
+                NetworkOperation::CreateTun {
+                    name: self.interface_name.clone(),
+                },
+                NetworkOperation::AddRule {
+                    fwmark: self.fwmark,
+                    table: self.route_table,
+                },
+                NetworkOperation::AddRoute {
+                    cidr: self.protected_cidr.clone(),
+                    interface: self.interface_name.clone(),
+                    table: self.route_table,
+                },
+            ]),
+            nftables: NftablesPlan::from_operations(vec![NftablesOperation::AddTable {
+                family: self.nft_family.clone(),
+                table: self.nft_table.clone(),
+            }]),
+            protected_cidr: self.protected_cidr.clone(),
+        }
+    }
+}
+
+fn protected_cidr_for_record(config: &DaemonConfig) -> &str {
+    match config.route_mode {
+        RouteMode::GameOnly | RouteMode::ProtectedPrefixesOnly => &config.overlay_cidr,
+        RouteMode::FullTunnel => FULL_TUNNEL_CIDR,
+    }
+}
+
+fn current_unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
 }
 
 #[derive(Debug)]
@@ -145,13 +239,13 @@ impl DaemonRuntimeState {
         }
     }
 
-    pub fn status(&self) -> DaemonStatus {
+    pub fn status(&self, ownership_record_present: bool) -> DaemonStatus {
         DaemonStatus {
             phase: self.phase,
             active_party: self.active_party.clone(),
             peers: self.peers.clone(),
             kill_switch: self.kill_switch,
-            network: self.network.status(),
+            network: self.network.status(ownership_record_present),
         }
     }
 }
@@ -190,7 +284,10 @@ impl DaemonEngine {
     }
 
     pub fn status(&self) -> DaemonStatus {
-        self.runtime.status()
+        let ownership_record_present = load_network_ownership(&self.paths)
+            .map(|record| record.is_some())
+            .unwrap_or(false);
+        self.runtime.status(ownership_record_present)
     }
 
     pub fn runtime_state(&self) -> &DaemonRuntimeState {
@@ -246,8 +343,36 @@ impl DaemonEngine {
             return Err(error);
         }
 
+        if let Err(error) = prepare_network_ownership_storage(&self.paths) {
+            let error = NetworkApplyError::new(format!(
+                "failed to prepare network ownership storage: {error}"
+            ));
+            self.runtime.network = NetworkRuntimeState::ApplyFailed {
+                plan: runtime_plan,
+                error: error.message().to_string(),
+            };
+            return Err(error);
+        }
+
         match plan.apply_with_rollback(network_executor, nftables_executor) {
             Ok(()) => {
+                if let Err(error) = store_network_ownership(
+                    &self.paths,
+                    &NetworkOwnershipRecord::from_config(&self.config),
+                ) {
+                    let mut message = format!("failed to persist network ownership: {error}");
+                    if let Err(rollback_error) =
+                        plan.deactivate(network_executor, nftables_executor)
+                    {
+                        message.push_str(&format!("; rollback failed: {rollback_error}"));
+                    }
+                    let error = NetworkApplyError::new(message);
+                    self.runtime.network = NetworkRuntimeState::ApplyFailed {
+                        plan: runtime_plan,
+                        error: error.message().to_string(),
+                    };
+                    return Err(error);
+                }
                 self.runtime.network = NetworkRuntimeState::Applied(runtime_plan);
                 Ok(())
             }
@@ -265,6 +390,7 @@ impl DaemonEngine {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeMode {
     RunResident { activate_network: bool },
+    DeactivateNetwork,
     CheckConfig,
 }
 
@@ -277,7 +403,10 @@ impl std::fmt::Display for RuntimeModeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ConflictingFlags => {
-                write!(f, "cannot combine --check with --activate-network")
+                write!(
+                    f,
+                    "cannot combine --check, --activate-network, or --deactivate-network"
+                )
             }
         }
     }
@@ -293,23 +422,224 @@ impl RuntimeMode {
     {
         let mut check_config = false;
         let mut activate_network = false;
+        let mut deactivate_network = false;
 
         for arg in args {
             match arg.as_ref() {
                 "--check" => check_config = true,
                 "--activate-network" => activate_network = true,
+                "--deactivate-network" => deactivate_network = true,
                 _ => {}
             }
         }
 
-        if check_config && activate_network {
+        let selected_modes = [check_config, activate_network, deactivate_network]
+            .into_iter()
+            .filter(|selected| *selected)
+            .count();
+
+        if selected_modes > 1 {
             Err(RuntimeModeError::ConflictingFlags)
+        } else if deactivate_network {
+            Ok(Self::DeactivateNetwork)
         } else if check_config {
             Ok(Self::CheckConfig)
         } else {
             Ok(Self::RunResident { activate_network })
         }
     }
+}
+
+pub fn network_ownership_path(paths: &DaemonPaths) -> PathBuf {
+    paths.state_dir.join(NETWORK_OWNERSHIP_FILE)
+}
+
+pub fn load_network_ownership(
+    paths: &DaemonPaths,
+) -> std::io::Result<Option<NetworkOwnershipRecord>> {
+    match read_network_ownership_bytes(paths) {
+        Ok(Some(bytes)) => serde_json::from_slice(&bytes).map(Some).map_err(|error| {
+            std::io::Error::new(
+                ErrorKind::InvalidData,
+                format!("failed to parse network ownership record: {error}"),
+            )
+        }),
+        Ok(None) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+pub fn store_network_ownership(
+    paths: &DaemonPaths,
+    record: &NetworkOwnershipRecord,
+) -> std::io::Result<()> {
+    prepare_network_ownership_storage(paths)?;
+    let bytes = serde_json::to_vec_pretty(record).map_err(|error| {
+        std::io::Error::new(
+            ErrorKind::InvalidData,
+            format!("failed to serialize network ownership record: {error}"),
+        )
+    })?;
+    write_network_ownership_atomically(paths, &bytes)
+}
+
+fn prepare_network_ownership_storage(paths: &DaemonPaths) -> std::io::Result<()> {
+    std::fs::create_dir_all(&paths.state_dir)?;
+    let ownership_path = network_ownership_path(paths);
+    match std::fs::symlink_metadata(&ownership_path) {
+        Ok(metadata) => {
+            if !metadata.is_file() {
+                return Err(std::io::Error::new(
+                    ErrorKind::AlreadyExists,
+                    format!(
+                        "network ownership path {} is not a regular file",
+                        ownership_path.display()
+                    ),
+                ));
+            }
+            open_ownership_file_for_update(&ownership_path)?;
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            let probe_path = paths.state_dir.join(format!(
+                ".{NETWORK_OWNERSHIP_FILE}.probe.{}",
+                std::process::id()
+            ));
+            let mut probe = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&probe_path)?;
+            probe.write_all(b"ownership preflight")?;
+            drop(probe);
+            std::fs::remove_file(probe_path)?;
+        }
+        Err(error) => return Err(error),
+    }
+    Ok(())
+}
+
+fn read_network_ownership_bytes(paths: &DaemonPaths) -> std::io::Result<Option<Vec<u8>>> {
+    let ownership_path = network_ownership_path(paths);
+    match std::fs::symlink_metadata(&ownership_path) {
+        Ok(metadata) => {
+            if !metadata.is_file() {
+                return Err(std::io::Error::new(
+                    ErrorKind::AlreadyExists,
+                    format!(
+                        "network ownership path {} is not a regular file",
+                        ownership_path.display()
+                    ),
+                ));
+            }
+            let mut file = open_ownership_file_for_read(&ownership_path)?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            Ok(Some(bytes))
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn open_ownership_file_for_read(path: &PathBuf) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    open_ownership_file_no_follow(&mut options, path)
+}
+
+fn open_ownership_file_for_update(path: &PathBuf) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true);
+    open_ownership_file_no_follow(&mut options, path)
+}
+
+fn write_network_ownership_atomically(paths: &DaemonPaths, bytes: &[u8]) -> std::io::Result<()> {
+    let ownership_path = network_ownership_path(paths);
+    let temp_path = network_ownership_temp_path(paths);
+
+    let write_result = (|| {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        let mut file = open_ownership_file_no_follow(&mut options, &temp_path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+
+        std::fs::rename(&temp_path, &ownership_path)?;
+        Ok(())
+    })();
+
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+
+    write_result
+}
+
+fn network_ownership_temp_path(paths: &DaemonPaths) -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    paths.state_dir.join(format!(
+        ".{NETWORK_OWNERSHIP_FILE}.{}.{}.tmp",
+        std::process::id(),
+        nonce
+    ))
+}
+
+#[cfg(unix)]
+fn open_ownership_file_no_follow(
+    options: &mut std::fs::OpenOptions,
+    path: &PathBuf,
+) -> std::io::Result<std::fs::File> {
+    options.custom_flags(libc::O_NOFOLLOW).open(path)
+}
+
+#[cfg(not(unix))]
+fn open_ownership_file_no_follow(
+    options: &mut std::fs::OpenOptions,
+    path: &PathBuf,
+) -> std::io::Result<std::fs::File> {
+    options.open(path)
+}
+
+fn remove_network_ownership(paths: &DaemonPaths) -> std::io::Result<()> {
+    match std::fs::remove_file(network_ownership_path(paths)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+pub fn deactivate_network_with<NE, NF>(
+    paths: &DaemonPaths,
+    network_executor: &mut NE,
+    nftables_executor: &mut NF,
+) -> Result<(), NetworkApplyError>
+where
+    NE: NetworkExecutor,
+    NF: NftablesExecutor,
+{
+    let Some(record) = load_network_ownership(paths).map_err(|error| {
+        NetworkApplyError::new(format!("failed to load network ownership: {error}"))
+    })?
+    else {
+        return Ok(());
+    };
+
+    if record.schema_version != NETWORK_OWNERSHIP_SCHEMA_VERSION {
+        return Err(NetworkApplyError::new(format!(
+            "unsupported network ownership schema {}; expected {}",
+            record.schema_version, NETWORK_OWNERSHIP_SCHEMA_VERSION
+        )));
+    }
+
+    record
+        .runtime_plan()
+        .deactivate(network_executor, nftables_executor)?;
+    remove_network_ownership(paths).map_err(|error| {
+        NetworkApplyError::new(format!("failed to remove network ownership: {error}"))
+    })
 }
 
 #[cfg(unix)]
@@ -511,6 +841,14 @@ mod tests {
             }
             Ok(())
         }
+
+        fn revert(&mut self, operation: &NetworkOperation) -> Result<(), NetworkApplyError> {
+            self.operations.push(operation.clone());
+            if self.fail_on_call == Some(self.operations.len()) {
+                return Err(NetworkApplyError::new("network cleanup failed"));
+            }
+            Ok(())
+        }
     }
 
     #[derive(Default)]
@@ -529,6 +867,79 @@ mod tests {
                 return Err(NetworkApplyError::new("nftables apply failed"));
             }
             Ok(())
+        }
+
+        fn revert_nftables(
+            &mut self,
+            operation: &NftablesOperation,
+        ) -> Result<(), NetworkApplyError> {
+            self.operations.push(operation.clone());
+            if self.fail_on_call == Some(self.operations.len()) {
+                return Err(NetworkApplyError::new("nftables cleanup failed"));
+            }
+            Ok(())
+        }
+    }
+
+    struct ReadOnlyStateAfterNftablesApply {
+        operations: Vec<NftablesOperation>,
+        state_dir: PathBuf,
+        expected_apply_calls: usize,
+        original_permissions: Option<std::fs::Permissions>,
+    }
+
+    impl ReadOnlyStateAfterNftablesApply {
+        fn new(state_dir: PathBuf, expected_apply_calls: usize) -> Self {
+            Self {
+                operations: Vec::new(),
+                state_dir,
+                expected_apply_calls,
+                original_permissions: None,
+            }
+        }
+
+        fn restore_permissions(&mut self) {
+            if let Some(permissions) = self.original_permissions.take() {
+                std::fs::set_permissions(&self.state_dir, permissions).unwrap();
+            }
+        }
+    }
+
+    impl Drop for ReadOnlyStateAfterNftablesApply {
+        fn drop(&mut self) {
+            self.restore_permissions();
+        }
+    }
+
+    impl NftablesExecutor for ReadOnlyStateAfterNftablesApply {
+        fn apply_nftables(
+            &mut self,
+            operation: &NftablesOperation,
+        ) -> Result<(), NetworkApplyError> {
+            self.operations.push(operation.clone());
+            if self.operations.len() == self.expected_apply_calls {
+                let mut permissions = std::fs::metadata(&self.state_dir).unwrap().permissions();
+                self.original_permissions = Some(permissions.clone());
+                permissions.set_readonly(true);
+                std::fs::set_permissions(&self.state_dir, permissions).unwrap();
+            }
+            Ok(())
+        }
+
+        fn revert_nftables(
+            &mut self,
+            operation: &NftablesOperation,
+        ) -> Result<(), NetworkApplyError> {
+            self.operations.push(operation.clone());
+            Ok(())
+        }
+    }
+
+    fn test_paths(temp: &tempfile::TempDir) -> DaemonPaths {
+        DaemonPaths {
+            config_file: temp.path().join("config.json"),
+            state_dir: temp.path().join("state"),
+            socket: temp.path().join("qlinkd.sock"),
         }
     }
 
@@ -550,7 +961,9 @@ mod tests {
 
     #[test]
     fn activate_network_with_fake_executors_marks_applied() {
-        let mut engine = DaemonEngine::try_new(DaemonConfig::default(), DaemonPaths::default())
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(&temp);
+        let mut engine = DaemonEngine::try_new(DaemonConfig::default(), paths)
             .expect("default config should produce a dry-run network plan");
         let mut network_executor = RecordingNetworkExecutor::default();
         let mut nftables_executor = RecordingNftablesExecutor::default();
@@ -573,8 +986,344 @@ mod tests {
     }
 
     #[test]
+    fn ownership_path_uses_state_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(&temp);
+
+        assert_eq!(
+            network_ownership_path(&paths),
+            temp.path().join("state").join("network-ownership.json")
+        );
+    }
+
+    #[test]
+    fn activate_network_writes_ownership_record_after_success() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(&temp);
+        let mut engine = DaemonEngine::try_new(DaemonConfig::default(), paths.clone())
+            .expect("default config should produce a dry-run network plan");
+        let mut network_executor = RecordingNetworkExecutor::default();
+        let mut nftables_executor = RecordingNftablesExecutor::default();
+
+        engine
+            .activate_network_with(&mut network_executor, &mut nftables_executor)
+            .expect("fake executors should apply");
+        let record = load_network_ownership(&paths)
+            .expect("ownership read should succeed")
+            .expect("successful activation should persist ownership");
+        let status = engine.status();
+
+        assert_eq!(record.schema_version, 1);
+        assert_eq!(record.interface_name, "qlink0");
+        assert_eq!(record.route_mode, RouteMode::GameOnly);
+        assert_eq!(record.protected_cidr, "100.64.0.0/10");
+        assert_eq!(record.fwmark, 0x514c);
+        assert_eq!(record.route_table, 51820);
+        assert_eq!(record.nft_family, "inet");
+        assert_eq!(record.nft_table, "qlink");
+        assert!(status.network.ownership_record_present);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn activation_rolls_back_when_post_apply_ownership_storage_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(&temp);
+        let mut engine = DaemonEngine::try_new(DaemonConfig::default(), paths.clone())
+            .expect("default config should produce a dry-run network plan");
+        let mut network_executor = RecordingNetworkExecutor::default();
+        let mut nftables_executor =
+            ReadOnlyStateAfterNftablesApply::new(paths.state_dir.clone(), 5);
+
+        let error = engine
+            .activate_network_with(&mut network_executor, &mut nftables_executor)
+            .unwrap_err();
+
+        nftables_executor.restore_permissions();
+        assert!(error
+            .message()
+            .contains("failed to persist network ownership"));
+        assert!(nftables_executor.operations.len() > 5);
+        assert!(nftables_executor
+            .operations
+            .iter()
+            .any(|operation| matches!(
+                operation,
+                NftablesOperation::DeleteTable { family, table }
+                    if family == "inet" && table == "qlink"
+            )));
+        assert!(network_executor.operations.len() > 5);
+        assert!(network_executor.operations.iter().any(|operation| matches!(
+            operation,
+            NetworkOperation::DeleteTun { name } if name == "qlink0"
+        )));
+        assert!(load_network_ownership(&paths).unwrap().is_none());
+        assert_eq!(engine.status().network.state, NetworkPlanState::ApplyFailed);
+    }
+
+    #[test]
+    fn failed_activation_does_not_write_ownership_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(&temp);
+        let mut engine = DaemonEngine::try_new(DaemonConfig::default(), paths.clone())
+            .expect("default config should produce a dry-run network plan");
+        let mut network_executor = RecordingNetworkExecutor {
+            fail_on_call: Some(1),
+            ..RecordingNetworkExecutor::default()
+        };
+        let mut nftables_executor = RecordingNftablesExecutor::default();
+
+        let _ = engine
+            .activate_network_with(&mut network_executor, &mut nftables_executor)
+            .unwrap_err();
+
+        assert!(load_network_ownership(&paths).unwrap().is_none());
+        assert!(!engine.status().network.ownership_record_present);
+    }
+
+    #[test]
+    fn full_tunnel_activation_block_does_not_write_ownership_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(&temp);
+        let config = DaemonConfig {
+            route_mode: RouteMode::FullTunnel,
+            ..DaemonConfig::default()
+        };
+        let mut engine = DaemonEngine::try_new(config, paths.clone())
+            .expect("full tunnel remains valid for dry-run planning");
+        let mut network_executor = RecordingNetworkExecutor::default();
+        let mut nftables_executor = RecordingNftablesExecutor::default();
+
+        let _ = engine
+            .activate_network_with(&mut network_executor, &mut nftables_executor)
+            .unwrap_err();
+
+        assert!(load_network_ownership(&paths).unwrap().is_none());
+        assert!(!engine.status().network.ownership_record_present);
+    }
+
+    #[test]
+    fn activation_does_not_apply_when_ownership_state_cannot_be_prepared() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = DaemonPaths {
+            config_file: temp.path().join("config.json"),
+            state_dir: temp.path().join("state-file"),
+            socket: temp.path().join("qlinkd.sock"),
+        };
+        std::fs::write(&paths.state_dir, b"not a directory").unwrap();
+        let mut engine = DaemonEngine::try_new(DaemonConfig::default(), paths)
+            .expect("default config should produce a dry-run network plan");
+        let mut network_executor = RecordingNetworkExecutor::default();
+        let mut nftables_executor = RecordingNftablesExecutor::default();
+
+        let error = engine
+            .activate_network_with(&mut network_executor, &mut nftables_executor)
+            .unwrap_err();
+
+        assert!(error.message().contains("network ownership"));
+        assert!(network_executor.operations.is_empty());
+        assert!(nftables_executor.operations.is_empty());
+        assert_eq!(engine.status().network.state, NetworkPlanState::ApplyFailed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn activation_rejects_symlinked_ownership_path_before_apply() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(&temp);
+        std::fs::create_dir_all(&paths.state_dir).unwrap();
+        let target_path = temp.path().join("outside-ownership-target.json");
+        std::fs::write(&target_path, b"do not modify").unwrap();
+        std::os::unix::fs::symlink(&target_path, network_ownership_path(&paths)).unwrap();
+        let mut engine = DaemonEngine::try_new(DaemonConfig::default(), paths)
+            .expect("default config should produce a dry-run network plan");
+        let mut network_executor = RecordingNetworkExecutor::default();
+        let mut nftables_executor = RecordingNftablesExecutor::default();
+
+        let error = engine
+            .activate_network_with(&mut network_executor, &mut nftables_executor)
+            .unwrap_err();
+
+        assert!(error.message().contains("network ownership"));
+        assert!(network_executor.operations.is_empty());
+        assert!(nftables_executor.operations.is_empty());
+        assert_eq!(
+            std::fs::read(&target_path).unwrap(),
+            b"do not modify".to_vec()
+        );
+    }
+
+    #[test]
+    fn activation_does_not_apply_when_ownership_file_path_is_unwritable() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(&temp);
+        std::fs::create_dir_all(network_ownership_path(&paths)).unwrap();
+        let mut engine = DaemonEngine::try_new(DaemonConfig::default(), paths)
+            .expect("default config should produce a dry-run network plan");
+        let mut network_executor = RecordingNetworkExecutor::default();
+        let mut nftables_executor = RecordingNftablesExecutor::default();
+
+        let error = engine
+            .activate_network_with(&mut network_executor, &mut nftables_executor)
+            .unwrap_err();
+
+        assert!(error.message().contains("network ownership"));
+        assert!(network_executor.operations.is_empty());
+        assert!(nftables_executor.operations.is_empty());
+        assert_eq!(engine.status().network.state, NetworkPlanState::ApplyFailed);
+    }
+
+    #[test]
+    fn activation_does_not_apply_when_existing_ownership_file_is_readonly() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(&temp);
+        std::fs::create_dir_all(&paths.state_dir).unwrap();
+        let ownership_path = network_ownership_path(&paths);
+        std::fs::write(&ownership_path, b"{}").unwrap();
+        let original_permissions = std::fs::metadata(&ownership_path).unwrap().permissions();
+        let mut permissions = original_permissions.clone();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&ownership_path, permissions).unwrap();
+
+        let mut engine = DaemonEngine::try_new(DaemonConfig::default(), paths)
+            .expect("default config should produce a dry-run network plan");
+        let mut network_executor = RecordingNetworkExecutor::default();
+        let mut nftables_executor = RecordingNftablesExecutor::default();
+
+        let error = engine
+            .activate_network_with(&mut network_executor, &mut nftables_executor)
+            .unwrap_err();
+
+        std::fs::set_permissions(&ownership_path, original_permissions).unwrap();
+        assert!(error.message().contains("network ownership"));
+        assert!(network_executor.operations.is_empty());
+        assert!(nftables_executor.operations.is_empty());
+        assert_eq!(engine.status().network.state, NetworkPlanState::ApplyFailed);
+    }
+
+    #[test]
+    fn deactivate_network_with_no_record_skips_executor_calls() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(&temp);
+        let mut network_executor = RecordingNetworkExecutor::default();
+        let mut nftables_executor = RecordingNftablesExecutor::default();
+
+        deactivate_network_with(&paths, &mut network_executor, &mut nftables_executor)
+            .expect("missing ownership should be idempotent");
+
+        assert!(network_executor.operations.is_empty());
+        assert!(nftables_executor.operations.is_empty());
+    }
+
+    #[test]
+    fn deactivate_network_uses_record_and_removes_it_on_success() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(&temp);
+        store_network_ownership(
+            &paths,
+            &NetworkOwnershipRecord::from_config(&DaemonConfig {
+                interface_name: "qltest0".to_string(),
+                overlay_ipv4_address: "100.64.10.9".to_string(),
+                ..DaemonConfig::default()
+            }),
+        )
+        .unwrap();
+        let mut network_executor = RecordingNetworkExecutor::default();
+        let mut nftables_executor = RecordingNftablesExecutor::default();
+
+        deactivate_network_with(&paths, &mut network_executor, &mut nftables_executor)
+            .expect("cleanup should succeed");
+
+        assert_eq!(nftables_executor.operations.len(), 1);
+        assert!(matches!(
+            nftables_executor.operations[0],
+            NftablesOperation::DeleteTable { ref family, ref table }
+                if family == "inet" && table == "qlink"
+        ));
+        assert_eq!(network_executor.operations.len(), 3);
+        assert!(matches!(
+            network_executor.operations[0],
+            NetworkOperation::RemoveRoute { ref cidr, ref interface, table }
+                if cidr == "100.64.0.0/10" && interface == "qltest0" && table == 51820
+        ));
+        assert!(load_network_ownership(&paths).unwrap().is_none());
+    }
+
+    #[test]
+    fn deactivate_network_failure_leaves_record_for_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(&temp);
+        store_network_ownership(
+            &paths,
+            &NetworkOwnershipRecord::from_config(&DaemonConfig::default()),
+        )
+        .unwrap();
+        let mut network_executor = RecordingNetworkExecutor::default();
+        let mut nftables_executor = RecordingNftablesExecutor {
+            fail_on_call: Some(1),
+            ..RecordingNftablesExecutor::default()
+        };
+
+        let error = deactivate_network_with(&paths, &mut network_executor, &mut nftables_executor)
+            .unwrap_err();
+
+        assert!(error.message().contains("runtime deactivate failed"));
+        assert!(load_network_ownership(&paths).unwrap().is_some());
+    }
+
+    #[test]
+    fn deactivate_network_rejects_unsupported_ownership_schema_without_executor_calls() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(&temp);
+        std::fs::create_dir_all(&paths.state_dir).unwrap();
+        let mut record = NetworkOwnershipRecord::from_config(&DaemonConfig::default());
+        record.schema_version = NETWORK_OWNERSHIP_SCHEMA_VERSION + 1;
+        std::fs::write(
+            network_ownership_path(&paths),
+            serde_json::to_vec_pretty(&record).unwrap(),
+        )
+        .unwrap();
+        let mut network_executor = RecordingNetworkExecutor::default();
+        let mut nftables_executor = RecordingNftablesExecutor::default();
+
+        let error = deactivate_network_with(&paths, &mut network_executor, &mut nftables_executor)
+            .unwrap_err();
+
+        assert!(error
+            .message()
+            .contains("unsupported network ownership schema"));
+        assert!(network_executor.operations.is_empty());
+        assert!(nftables_executor.operations.is_empty());
+        assert!(network_ownership_path(&paths).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deactivate_network_rejects_symlinked_ownership_path_without_executor_calls() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(&temp);
+        std::fs::create_dir_all(&paths.state_dir).unwrap();
+        let record = NetworkOwnershipRecord::from_config(&DaemonConfig::default());
+        let target_path = temp.path().join("outside-ownership-target.json");
+        std::fs::write(&target_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target_path, network_ownership_path(&paths)).unwrap();
+        let mut network_executor = RecordingNetworkExecutor::default();
+        let mut nftables_executor = RecordingNftablesExecutor::default();
+
+        let error = deactivate_network_with(&paths, &mut network_executor, &mut nftables_executor)
+            .unwrap_err();
+
+        assert!(error.message().contains("network ownership"));
+        assert!(network_executor.operations.is_empty());
+        assert!(nftables_executor.operations.is_empty());
+        assert!(network_ownership_path(&paths).exists());
+    }
+
+    #[test]
     fn activate_network_rolls_back_network_failure_and_marks_apply_failed() {
-        let mut engine = DaemonEngine::try_new(DaemonConfig::default(), DaemonPaths::default())
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(&temp);
+        let mut engine = DaemonEngine::try_new(DaemonConfig::default(), paths)
             .expect("default config should produce a dry-run network plan");
         let mut network_executor = RecordingNetworkExecutor {
             fail_on_call: Some(1),
@@ -609,7 +1358,9 @@ mod tests {
 
     #[test]
     fn activate_network_rolls_back_completed_network_when_nftables_fails() {
-        let mut engine = DaemonEngine::try_new(DaemonConfig::default(), DaemonPaths::default())
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(&temp);
+        let mut engine = DaemonEngine::try_new(DaemonConfig::default(), paths)
             .expect("default config should produce a dry-run network plan");
         let mut network_executor = RecordingNetworkExecutor::default();
         let mut nftables_executor = RecordingNftablesExecutor {
@@ -776,6 +1527,14 @@ mod tests {
     }
 
     #[test]
+    fn runtime_mode_parses_explicit_network_deactivation() {
+        assert_eq!(
+            RuntimeMode::from_args(["--deactivate-network"]).unwrap(),
+            RuntimeMode::DeactivateNetwork
+        );
+    }
+
+    #[test]
     fn runtime_mode_parses_check_config() {
         assert_eq!(
             RuntimeMode::from_args(["--check"]).unwrap(),
@@ -789,6 +1548,18 @@ mod tests {
 
         assert_eq!(error, RuntimeModeError::ConflictingFlags);
         assert!(error.to_string().contains("cannot combine"));
+    }
+
+    #[test]
+    fn runtime_mode_rejects_deactivate_conflicts() {
+        assert_eq!(
+            RuntimeMode::from_args(["--check", "--deactivate-network"]).unwrap_err(),
+            RuntimeModeError::ConflictingFlags
+        );
+        assert_eq!(
+            RuntimeMode::from_args(["--activate-network", "--deactivate-network"]).unwrap_err(),
+            RuntimeModeError::ConflictingFlags
+        );
     }
 
     #[test]

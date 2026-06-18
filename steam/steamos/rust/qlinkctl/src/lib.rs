@@ -78,6 +78,7 @@ mod tests {
             route_mode: Some(RouteMode::GameOnly),
             protected_cidr: Some("100.64.0.0/10".to_string()),
             dry_run: true,
+            ownership_record_present: false,
             commands: vec!["ip tuntap add dev qlink0 mode tun".to_string()],
             nftables_rules: vec!["add table inet qlink".to_string()],
             error: None,
@@ -100,6 +101,7 @@ mod tests {
             route_mode: Some(RouteMode::GameOnly),
             protected_cidr: Some("100.64.0.0/10".to_string()),
             dry_run: false,
+            ownership_record_present: true,
             commands: vec!["ip tuntap add dev qlink0 mode tun".to_string()],
             nftables_rules: vec!["add table inet qlink".to_string()],
             error: None,
@@ -109,6 +111,7 @@ mod tests {
 
         assert!(json.contains("\"state\": \"applied\""));
         assert!(json.contains("\"dryRun\": false"));
+        assert!(json.contains("\"ownershipRecordPresent\": true"));
     }
 
     #[test]
@@ -120,6 +123,7 @@ mod tests {
             route_mode: Some(RouteMode::GameOnly),
             protected_cidr: Some("100.64.0.0/10".to_string()),
             dry_run: false,
+            ownership_record_present: true,
             commands: vec!["ip tuntap add dev qlink0 mode tun".to_string()],
             nftables_rules: vec!["add table inet qlink".to_string()],
             error: Some("nftables apply failed".to_string()),

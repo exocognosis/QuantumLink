@@ -1,5 +1,8 @@
 use qlink_linux::{StdCommandRunner, SystemNetworkExecutor, SystemNftablesExecutor};
-use qlinkd::{load_config_or_default, run_resident, DaemonEngine, DaemonPaths, RuntimeMode};
+use qlinkd::{
+    deactivate_network_with, load_config_or_default, run_resident, DaemonEngine, DaemonPaths,
+    RuntimeMode,
+};
 
 fn main() {
     let mode = match RuntimeMode::from_args(std::env::args().skip(1)) {
@@ -10,6 +13,18 @@ fn main() {
         }
     };
     let paths = DaemonPaths::default();
+    if mode == RuntimeMode::DeactivateNetwork {
+        let mut network_executor = SystemNetworkExecutor::new(StdCommandRunner);
+        let mut nftables_executor = SystemNftablesExecutor::new(StdCommandRunner);
+        if let Err(error) =
+            deactivate_network_with(&paths, &mut network_executor, &mut nftables_executor)
+        {
+            eprintln!("qlinkd network deactivation failed: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     let config = match load_config_or_default(&paths) {
         Ok(config) => config,
         Err(error) => {
@@ -33,6 +48,7 @@ fn main() {
                 engine.paths().socket.display()
             );
         }
+        RuntimeMode::DeactivateNetwork => unreachable!("deactivation exits before config loading"),
         RuntimeMode::RunResident { activate_network } => {
             if activate_network {
                 let mut network_executor = SystemNetworkExecutor::new(StdCommandRunner);

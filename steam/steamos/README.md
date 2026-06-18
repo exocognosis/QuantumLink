@@ -39,6 +39,8 @@ The installer copies binaries to `/usr/local/bin` by default, creates `/etc/quan
 
 The packaged `qlinkd.service` starts the resident daemon in dry-run planning mode. It validates configuration, builds the intended Linux network plan, and exposes that plan through status, but it does not create TUN devices, change routes, or apply nftables rules by default.
 
+The installed service also runs `qlinkd --deactivate-network` during stop. That stop command is idempotent: dry-run service starts have no ownership record and therefore no teardown work, while successful activated starts write `/var/lib/quantumlink/network-ownership.json` so stop removes only QuantumLink-owned TUN, route, and nftables state.
+
 Typical next steps:
 
 ```sh
@@ -52,7 +54,8 @@ sudo qlinkctl status
 - `qlinkd` starts the resident daemon in dry-run planning mode and does not mutate networking.
 - `qlinkd --check` validates configuration/status only and exits; it is not a network activation path.
 - `qlinkd --activate-network` is the explicit operator opt-in for real TUN, route, and nftables application.
-- `qlinkd --check --activate-network` is invalid because validation-only mode and activation mode are mutually exclusive.
+- `qlinkd --deactivate-network` removes qlink-owned network state from the persisted ownership record and exits; it is safe when no ownership record exists.
+- `qlinkd --check`, `qlinkd --activate-network`, and `qlinkd --deactivate-network` are mutually exclusive runtime modes.
 
 To run the packaged service with real network application, create a controlled systemd drop-in instead of editing the installed unit directly:
 
@@ -75,7 +78,7 @@ sudo systemctl daemon-reload
 sudo systemctl restart qlinkd
 ```
 
-If the installer was run with a custom `BINDIR`, use that installed `qlinkd` path in the override. Remove the drop-in to return the packaged service to dry-run planning mode.
+If the installer was run with a custom `BINDIR`, use that installed `qlinkd` path in the override. The installed `ExecStop` line is rewritten to the same `BINDIR` by the installer, so activated service stops use the matching `qlinkd --deactivate-network` binary. Remove the drop-in to return the packaged service to dry-run planning mode.
 
 SteamOS may remount the root filesystem read-only after system updates. Re-run the installer after an OS image refresh if `/usr/local/bin/qlinkd`, `/usr/local/bin/qlinkctl`, or the systemd unit disappears.
 
@@ -83,7 +86,7 @@ SteamOS may remount the root filesystem read-only after system updates. Re-run t
 
 - Linux creates a dedicated TUN interface, currently documented as `qlink0`.
 - Protected game/party routes use the overlay range `100.64.0.0/10`.
-- `qlinkd` owns route setup, nftables fail-closed policy, peer state, and profile application; the packaged service plans those changes until explicitly started with `--activate-network`.
+- `qlinkd` owns route setup, nftables fail-closed policy, peer state, and profile application; the packaged service plans those changes until explicitly started with `--activate-network`, then records ownership for `--deactivate-network` cleanup.
 - Rendezvous services publish and look up short-lived signed peer records.
 - Peers attempt direct QUIC paths first, with optional ICE/STUN helpers as the traversal layer matures.
 - Relay services are fallback paths for hostile NAT or intentionally hidden paths.

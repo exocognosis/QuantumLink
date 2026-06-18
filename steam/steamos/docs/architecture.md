@@ -41,13 +41,15 @@ This is the intended activated packet flow. The packaged systemd service does no
 - Keep voice chat usable unless a profile explicitly restricts it.
 - Treat root filesystem updates as potentially removing `/usr/local` binaries or custom units; the installer is safe to re-run.
 
-## Dry-Run Network Planning
+## Network Lifecycle
 
 The default resident daemon builds and reports a dry-run Linux network plan during startup. It validates the daemon config, renders the intended `ip` and `nftables` operations, and exposes those commands through `qlinkctl status`. It does not apply TUN, route, or nftables changes when launched by the packaged systemd unit or during `--check`.
 
-`qlinkd --check` is validation/status only and exits without mutating networking. `qlinkd --activate-network` is the explicit operator opt-in for real TUN, route, and nftables application. `qlinkd --check --activate-network` is invalid because validation-only mode and activation mode are mutually exclusive.
+`qlinkd --check` is validation/status only and exits without mutating networking. `qlinkd --activate-network` is the explicit operator opt-in for real TUN, route, and nftables application. `qlinkd --deactivate-network` is a one-shot teardown path that reads `/var/lib/quantumlink/network-ownership.json`, removes only QuantumLink-owned network state, and exits. These runtime modes are mutually exclusive.
 
 `qlink-linux` separates human-readable plan rendering from privileged execution. Dry-run status still renders operator-friendly `ip` and `nftables` strings, while the execution boundary uses typed argv commands, trusted SteamOS tool paths (`/usr/bin/ip`, `/usr/bin/nft`), and injectable command runners. When activation is explicitly requested, `qlinkd` can mark network state as `applied` or `applyFailed` in status. The packaged unit remains `ExecStart=/usr/local/bin/qlinkd`, so SteamOS installs stay dry-run until an operator adds a systemd drop-in that overrides `ExecStart` with `qlinkd --activate-network`.
+
+Successful activated starts persist a small ownership record under the daemon state directory with the interface, route mode, protected CIDR, fwmark, route table, nftables family/table, schema version, and activation timestamp. Deactivation reconstructs the owned Linux runtime plan from that record, tears down nftables before network objects, removes the record only after successful cleanup, and leaves it in place when cleanup fails so the operator can retry. If no record exists, deactivation is a no-op. The packaged systemd unit wires this through `ExecStop=/usr/local/bin/qlinkd --deactivate-network`, which is harmless for dry-run starts and required for activated service stops.
 
 Full-tunnel planning currently renders `0.0.0.0/0` as the protected CIDR so the intended route shape is visible in status output. A future privileged executor must add explicit underlay exemptions for rendezvous, relay, and local control traffic before enabling real full-tunnel application; otherwise fail-closed rules could block the daemon's own control-plane path.
 

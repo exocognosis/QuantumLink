@@ -94,7 +94,10 @@ Default service behavior:
   qlinkd.service runs dry-run planning only and does not apply TUN, route, or
   nftables changes. For real network application, use a systemd drop-in that
   overrides ExecStart with: $BINDIR/qlinkd --activate-network
-  Do not combine --check with --activate-network.
+  The installed unit runs ExecStop=$BINDIR/qlinkd --deactivate-network, which is
+  a no-op for dry-run service starts and removes only qlink-owned network state
+  recorded by successful activated starts. Do not combine --check with
+  --activate-network or --deactivate-network.
 
 If this SteamOS image update removes files under /usr/local or custom systemd
 units, re-run this installer after the update.

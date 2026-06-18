@@ -11,6 +11,9 @@ Type=simple
 # Use a systemd drop-in that overrides ExecStart with
 # /usr/local/bin/qlinkd --activate-network for real network application.
 ExecStart=/usr/local/bin/qlinkd
+# Stop is record-backed and idempotent. It is a no-op for the default dry-run
+# service and tears down only qlink-owned network state after activated runs.
+ExecStop=/usr/local/bin/qlinkd --deactivate-network
 Restart=on-failure
 RestartSec=2s
 RuntimeDirectory=quantumlink
