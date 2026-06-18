@@ -1,6 +1,7 @@
 use crate::{
     crypto::SessionKeys,
     error::{QlinkError, Result},
+    replay::ReplayWindow,
 };
 use sha3::{
     digest::{ExtendableOutput, Update, XofReader},
@@ -12,12 +13,13 @@ const FRAME_VERSION: u8 = 1;
 const FRAME_HEADER_LEN: usize = 6 + 1 + 8 + 4;
 const FRAME_TAG_LEN: usize = 32;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct PqcFrameProtector {
     suite: String,
     tx_key: [u8; 32],
     rx_key: [u8; 32],
     next_tx_counter: u64,
+    rx_window: ReplayWindow,
 }
 
 impl PqcFrameProtector {
@@ -27,6 +29,7 @@ impl PqcFrameProtector {
             tx_key: keys.tx_key,
             rx_key: keys.rx_key,
             next_tx_counter: 1,
+            rx_window: ReplayWindow::new(),
         }
     }
 
@@ -40,7 +43,7 @@ impl PqcFrameProtector {
         protect_with_key(&self.suite, &self.tx_key, counter, frame)
     }
 
-    pub fn open(&self, protected: &[u8]) -> Result<Vec<u8>> {
+    pub fn open(&mut self, protected: &[u8]) -> Result<Vec<u8>> {
         if protected.len() < FRAME_HEADER_LEN + FRAME_TAG_LEN {
             return Err(QlinkError::Protocol("PQC frame too short".into()));
         }
@@ -57,6 +60,9 @@ impl PqcFrameProtector {
         let mut counter = [0_u8; 8];
         counter.copy_from_slice(&protected[7..15]);
         let counter = u64::from_be_bytes(counter);
+        if counter == 0 {
+            return Err(QlinkError::Protocol("invalid PQC frame counter".into()));
+        }
 
         let mut len = [0_u8; 4];
         len.copy_from_slice(&protected[15..19]);
@@ -74,6 +80,9 @@ impl PqcFrameProtector {
         let expected_tag = frame_tag(&self.suite, &self.rx_key, counter, header, ciphertext);
         if !constant_time_eq(tag, &expected_tag) {
             return Err(QlinkError::Crypto("PQC frame authentication failed".into()));
+        }
+        if !self.rx_window.observe(counter) {
+            return Err(QlinkError::Protocol("PQC frame replay rejected".into()));
         }
 
         Ok(xor_stream(
@@ -191,7 +200,7 @@ mod tests {
     fn pqc_frame_protector_round_trips_directional_keys() {
         let (initiator_keys, responder_keys) = test_keys();
         let mut initiator = PqcFrameProtector::new(initiator_keys);
-        let responder = PqcFrameProtector::new(responder_keys);
+        let mut responder = PqcFrameProtector::new(responder_keys);
 
         let protected = initiator.protect(b"hello pqc").unwrap();
         assert!(!protected
@@ -206,12 +215,28 @@ mod tests {
     fn pqc_frame_protector_rejects_tampering() {
         let (initiator_keys, responder_keys) = test_keys();
         let mut initiator = PqcFrameProtector::new(initiator_keys);
-        let responder = PqcFrameProtector::new(responder_keys);
+        let mut responder = PqcFrameProtector::new(responder_keys);
 
         let mut protected = initiator.protect(b"hello pqc").unwrap();
         let last = protected.last_mut().unwrap();
         *last ^= 0x01;
 
         assert!(responder.open(&protected).is_err());
+    }
+
+    #[test]
+    fn pqc_frame_protector_rejects_replayed_counter() {
+        let (initiator_keys, responder_keys) = test_keys();
+        let mut initiator = PqcFrameProtector::new(initiator_keys);
+        let mut responder = PqcFrameProtector::new(responder_keys);
+
+        let protected = initiator.protect(b"hello pqc").unwrap();
+        assert_eq!(responder.open(&protected).unwrap(), b"hello pqc");
+
+        let replay = responder.open(&protected).unwrap_err();
+        assert!(
+            replay.to_string().contains("replay"),
+            "replayed frame should be rejected as replay, got {replay}"
+        );
     }
 }

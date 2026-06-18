@@ -1347,7 +1347,7 @@ async fn run_responder_loop(
                             return;
                         }
                     };
-                    let frame_protector = PqcFrameProtector::new(session_keys);
+                    let mut frame_protector = PqcFrameProtector::new(session_keys);
                     while let Ok(protected_frame) = session.receive_frame().await {
                         let frame = match frame_protector.open(&protected_frame) {
                             Ok(frame) => frame,

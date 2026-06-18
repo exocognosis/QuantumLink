@@ -852,32 +852,19 @@ impl MeshConnector {
                     self.cache.invalidate(remote_peer_id);
                 }
 
+                let detail = latest_probe_failure_summary(&attempts)
+                    .map(|summary| format!("; last direct failure: {summary}"))
+                    .unwrap_or_default();
                 let Some(server) = self.config.relay_server.as_ref() else {
-                    let detail = latest_probe_failure_summary(&attempts)
-                        .map(|summary| format!("; last direct failure: {summary}"))
-                        .unwrap_or_default();
                     return Err(QlinkError::Protocol(format!(
                         "no direct candidate for peer {remote_peer_id} succeeded{detail} and no relay server is configured"
                     )));
                 };
 
-                let client =
-                    RelayClient::connect(server, self.config.local_peer_id.clone()).await?;
-                let outcome = ConnectionOutcome {
-                    remote_peer_id: remote_peer_id.to_string(),
-                    path_kind: PathKind::Relay,
-                    remote_addr: None,
-                    attempts,
-                    total_elapsed: started.elapsed(),
-                    used_cached_path: false,
-                    registry_decision,
-                    peer_record_source,
-                };
-                let link = MeshLink::Relay(RelayLink {
-                    remote_peer_id: remote_peer_id.to_string(),
-                    client,
-                });
-                Ok((link, outcome))
+                Err(QlinkError::Protocol(format!(
+                    "relay PQC session is required for peer {remote_peer_id}; \
+                     raw relay fallback via {server} is disabled{detail}"
+                )))
             }
         }
     }
@@ -1592,8 +1579,7 @@ mod tests {
         let rendezvous_client = RendezvousClient::new(rendezvous.local_addr().to_string());
 
         let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-        let local_key = DeviceKeypair::generate().unwrap();
-        let local_key = Arc::new(local_key);
+        let local_key = Arc::new(DeviceKeypair::generate().unwrap());
         let remote_key = Arc::new(DeviceKeypair::generate().unwrap());
         let remote_peer_id = remote_key.public_key().peer_id();
         let (server_endpoint, server_cert) = QuicEndpoint::server(bind).unwrap();
@@ -1726,7 +1712,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_failure_falls_back_to_relay() {
+    async fn direct_failure_rejects_raw_relay_fallback() {
         let rendezvous = spawn_dev_rendezvous().await.unwrap();
         let rendezvous_client = RendezvousClient::new(rendezvous.local_addr().to_string());
 
@@ -1739,7 +1725,7 @@ mod tests {
         drop(server_endpoint);
         let client_endpoint = QuicEndpoint::client(bind, &[server_cert]).unwrap();
 
-        let local_key = DeviceKeypair::generate().unwrap();
+        let local_key = Arc::new(DeviceKeypair::generate().unwrap());
         let remote_key = DeviceKeypair::generate().unwrap();
         let remote_peer_id = remote_key.public_key().peer_id();
 
@@ -1764,23 +1750,63 @@ mod tests {
             MeshConnectorConfig::new(MESH_ID, local_key.public_key().peer_id())
                 .with_direct_probe_timeout(Duration::from_millis(150))
                 .with_overall_deadline(Duration::from_millis(500))
-                .with_relay_server(relay_addr.to_string()),
+                .with_relay_server(relay_addr.to_string())
+                .with_local_device_keypair(local_key),
             rendezvous_client,
             client_endpoint,
         );
 
-        let (link, outcome) = connector.connect(&remote_peer_id).await.unwrap();
-        assert_eq!(link.path_kind(), PathKind::Relay);
-        assert_eq!(outcome.path_kind, PathKind::Relay);
-        assert_eq!(outcome.remote_addr, None);
-        assert!(!outcome.attempts.is_empty());
-        assert!(outcome.attempts.iter().all(|attempt| {
-            matches!(
-                attempt.outcome,
-                ProbeOutcome::TimedOut | ProbeOutcome::Failed(_)
-            )
-        }));
+        let error = connector.connect(&remote_peer_id).await.unwrap_err();
+        assert!(
+            error.to_string().contains("relay PQC session"),
+            "raw relay fallback must fail closed: {error}"
+        );
         assert!(connector.cache().lookup(&remote_peer_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn relay_fallback_is_rejected_without_pqc_session() {
+        let rendezvous = spawn_dev_rendezvous().await.unwrap();
+        let rendezvous_client = RendezvousClient::new(rendezvous.local_addr().to_string());
+        let relay = spawn_dev_relay().await.unwrap();
+
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let (_server_endpoint, server_cert) = QuicEndpoint::server(bind).unwrap();
+        let client_endpoint = QuicEndpoint::client(bind, &[server_cert]).unwrap();
+
+        let local_key = Arc::new(DeviceKeypair::generate().unwrap());
+        let remote_key = DeviceKeypair::generate().unwrap();
+        let remote_peer_id = remote_key.public_key().peer_id();
+        let remote_record = signed_record(
+            &remote_key,
+            vec![CandidateEndpoint {
+                candidate_type: CandidateType::Host,
+                address: "127.0.0.1".to_string(),
+                port: 1,
+                priority: 120,
+            }],
+            1,
+        );
+        rendezvous_client
+            .publish(MESH_ID, remote_record)
+            .await
+            .unwrap();
+
+        let connector = MeshConnector::new(
+            MeshConnectorConfig::new(MESH_ID, local_key.public_key().peer_id())
+                .with_direct_probe_timeout(Duration::from_millis(150))
+                .with_overall_deadline(Duration::from_millis(500))
+                .with_relay_server(relay.local_addr().to_string())
+                .with_local_device_keypair(local_key),
+            rendezvous_client,
+            client_endpoint,
+        );
+
+        let error = connector.connect(&remote_peer_id).await.unwrap_err();
+        assert!(
+            error.to_string().contains("relay PQC session"),
+            "relay fallback must fail closed until it has an end-to-end PQC session: {error}"
+        );
     }
 
     #[tokio::test]
@@ -1792,7 +1818,7 @@ mod tests {
         let (_unused_server, throwaway_cert) = QuicEndpoint::server(bind).unwrap();
         let client_endpoint = QuicEndpoint::client(bind, &[throwaway_cert]).unwrap();
 
-        let local_key = DeviceKeypair::generate().unwrap();
+        let local_key = Arc::new(DeviceKeypair::generate().unwrap());
         let connector = MeshConnector::new(
             MeshConnectorConfig::new(MESH_ID, local_key.public_key().peer_id()),
             rendezvous_client,
@@ -2003,9 +2029,10 @@ mod tests {
         // we can verify that the ICE attempt was recorded.
         let _ = connector.connect(&remote_peer_id).await; // priming run is allowed to fail
 
-        // Add a relay for fallback so the connector returns a successful
-        // outcome whose ProbeAttempts capture both the ICE success and the
-        // post-ICE QUIC failure.
+        // Add a relay for fallback so the connector would previously return
+        // a successful relay outcome. Relay is now fail-closed until it has
+        // an end-to-end PQC session, but the error keeps the direct failure
+        // summary so operators can still diagnose the post-ICE QUIC failure.
         let relay = spawn_dev_relay().await.unwrap();
         let connector_with_relay = MeshConnector::new(
             MeshConnectorConfig::new(MESH_ID, local_key.public_key().peer_id())
@@ -2019,33 +2046,18 @@ mod tests {
             QuicEndpoint::client(bind, &[QuicEndpoint::server(bind).unwrap().1]).unwrap(),
         );
 
-        let (_link, outcome) = connector_with_relay.connect(&remote_peer_id).await.unwrap();
-        assert_eq!(outcome.path_kind, PathKind::Relay);
-
-        // The recorded ProbeAttempt must show ICE round-trip captured (proves
-        // ICE ran), with the QUIC handshake then failing (since the responder
-        // does not speak QUIC).
-        let attempt = outcome
-            .attempts
-            .iter()
-            .find(|a| a.address == responder_addr)
-            .expect("probe attempt for the responder must be recorded");
+        let error = connector_with_relay
+            .connect(&remote_peer_id)
+            .await
+            .unwrap_err();
         assert!(
-            attempt.ice_round_trip.is_some(),
-            "ICE round-trip should be captured: {attempt:?}"
+            error.to_string().contains("relay PQC session"),
+            "relay path must fail closed without PQC: {error}"
         );
-        // The responder doesn't speak QUIC, so the post-ICE handshake must
-        // fail. That can surface either as a structured QUIC error
-        // (Failed(_)) or as a timeout — both are acceptable evidence that
-        // ICE ran first and QUIC ran second. The crucial property is that
-        // ICE recorded a round-trip BEFORE the QUIC outcome was decided.
         assert!(
-            matches!(
-                attempt.outcome,
-                ProbeOutcome::Failed(_) | ProbeOutcome::TimedOut
-            ),
-            "QUIC handshake must fail (or time out) because the responder is not a Quinn server: {:?}",
-            attempt.outcome
+            error.to_string().contains("timed out")
+                || error.to_string().contains("failed to establish"),
+            "error should retain direct failure context: {error}"
         );
     }
 
@@ -2600,7 +2612,7 @@ mod tests {
         let client_endpoint = QuicEndpoint::client(bind, &[throwaway_cert]).unwrap();
         let rendezvous_client = RendezvousClient::new("127.0.0.1:1".to_string());
 
-        let local_key = DeviceKeypair::generate().unwrap();
+        let local_key = Arc::new(DeviceKeypair::generate().unwrap());
         let banned_peer_id = "qlink_banned-peer";
         let connector = MeshConnector::new(
             MeshConnectorConfig::new(MESH_ID, local_key.public_key().peer_id())
@@ -2626,7 +2638,7 @@ mod tests {
         let client_endpoint = QuicEndpoint::client(bind, &[throwaway_cert]).unwrap();
         let rendezvous_client = RendezvousClient::new("127.0.0.1:1".to_string());
 
-        let local_key = DeviceKeypair::generate().unwrap();
+        let local_key = Arc::new(DeviceKeypair::generate().unwrap());
         let connector = MeshConnector::new(
             MeshConnectorConfig::new(MESH_ID, local_key.public_key().peer_id())
                 .with_peer_acl(PeerAcl::new().with_allow(["qlink_friend"])),
@@ -2656,7 +2668,7 @@ mod tests {
         let (_unused_server, throwaway_cert) = QuicEndpoint::server(bind).unwrap();
         let client_endpoint = QuicEndpoint::client(bind, &[throwaway_cert]).unwrap();
 
-        let local_key = DeviceKeypair::generate().unwrap();
+        let local_key = Arc::new(DeviceKeypair::generate().unwrap());
         let permitted_peer_id = "qlink_friend";
         let connector = MeshConnector::new(
             MeshConnectorConfig::new(MESH_ID, local_key.public_key().peer_id())
@@ -2678,12 +2690,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wrong_cert_in_record_fails_quic_handshake_and_falls_back_to_relay() {
+    async fn wrong_cert_in_record_fails_quic_handshake_and_rejects_raw_relay() {
         // Two QUIC servers exist: peer A is the "real" server we want to
         // reach. Peer B's cert is the one we MIS-publish in A's record.
         // The connector trusts B's cert per the (signed) record; A presents
         // its own cert; rustls verification fails; the probe records a
-        // failure; relay fallback engages.
+        // failure; raw relay fallback is refused.
         let rendezvous = spawn_dev_rendezvous().await.unwrap();
         let rendezvous_client = RendezvousClient::new(rendezvous.local_addr().to_string());
         let relay = spawn_dev_relay().await.unwrap();
@@ -2706,7 +2718,7 @@ mod tests {
 
         let client_endpoint = QuicEndpoint::client(bind, &[]).unwrap();
 
-        let local_key = DeviceKeypair::generate().unwrap();
+        let local_key = Arc::new(DeviceKeypair::generate().unwrap());
         let remote_key = DeviceKeypair::generate().unwrap();
         let remote_peer_id = remote_key.public_key().peer_id();
 
@@ -2731,34 +2743,31 @@ mod tests {
             MeshConnectorConfig::new(MESH_ID, local_key.public_key().peer_id())
                 .with_direct_probe_timeout(Duration::from_millis(500))
                 .with_overall_deadline(Duration::from_secs(2))
-                .with_relay_server(relay.local_addr().to_string()),
+                .with_relay_server(relay.local_addr().to_string())
+                .with_local_device_keypair(local_key.clone()),
             rendezvous_client,
             client_endpoint,
         );
 
-        let (link, outcome) = connector.connect(&remote_peer_id).await.unwrap();
+        let error = connector.connect(&remote_peer_id).await.unwrap_err();
+        let error = error.to_string();
         // The direct probe must have failed (TLS verification couldn't
         // match the server's real cert against the wrong one we trusted),
-        // and the connector must have fallen back to relay.
-        assert_eq!(link.path_kind(), PathKind::Relay);
-        assert_eq!(outcome.path_kind, PathKind::Relay);
-        let direct_attempt = outcome
-            .attempts
-            .iter()
-            .find(|a| a.address == real_server_addr)
-            .expect("direct probe attempt must be recorded");
+        // and raw relay fallback must be refused.
         assert!(
-            matches!(
-                direct_attempt.outcome,
-                ProbeOutcome::Failed(_) | ProbeOutcome::TimedOut
-            ),
-            "wrong cert must fail or time out the QUIC handshake: {:?}",
-            direct_attempt.outcome
+            error.contains("relay PQC session"),
+            "raw relay fallback must fail closed: {error}"
+        );
+        assert!(
+            error.contains("failed to establish")
+                || error.contains("invalid peer certificate")
+                || error.contains("timed out"),
+            "wrong cert failure should remain visible in the relay-disabled error: {error}"
         );
     }
 
     #[tokio::test]
-    async fn stale_certificate_after_rotation_fails_direct_and_falls_back_to_relay() {
+    async fn stale_certificate_after_rotation_fails_direct_and_rejects_raw_relay() {
         let rendezvous = spawn_dev_rendezvous().await.unwrap();
         let rendezvous_client = RendezvousClient::new(rendezvous.local_addr().to_string());
         let relay = spawn_dev_relay().await.unwrap();
@@ -2814,18 +2823,18 @@ mod tests {
             client_endpoint,
         );
 
-        let (_link, outcome) = connector.connect(&remote_peer_id).await.unwrap();
-        assert_eq!(outcome.path_kind, PathKind::Relay);
-        let attempt = outcome
-            .attempts
-            .iter()
-            .find(|attempt| attempt.address == rotated_addr)
-            .expect("rotated address should have been probed");
+        let error = connector.connect(&remote_peer_id).await.unwrap_err();
+        let error = error.to_string();
+        assert!(
+            error.contains("relay PQC session"),
+            "raw relay fallback must fail closed after cert rotation: {error}"
+        );
         assert!(matches!(
-            attempt.outcome,
-            ProbeOutcome::Failed(_) | ProbeOutcome::TimedOut
+            error.as_str(),
+            s if s.contains("failed to establish")
+                || s.contains("invalid peer certificate")
+                || s.contains("timed out")
         ));
-        assert!(attempt.quic_connect_elapsed.is_some());
     }
 
     #[tokio::test]
@@ -3245,8 +3254,8 @@ mod tests {
         // this peer_id; the lookup will return Ok(None).
         let connector = MeshConnector::new(
             MeshConnectorConfig::new(MESH_ID, local_key.public_key().peer_id())
-                .with_direct_probe_timeout(Duration::from_millis(500))
-                .with_overall_deadline(Duration::from_secs(2))
+                .with_direct_probe_timeout(Duration::from_secs(2))
+                .with_overall_deadline(Duration::from_secs(5))
                 .with_local_device_keypair(local_key.clone()),
             rendezvous_client,
             client_endpoint,
