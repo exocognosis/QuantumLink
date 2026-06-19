@@ -260,40 +260,35 @@ class WindowsReleaseWorkflowContractTest < Minitest::Test
     assert_equal "${{ inputs.expected_publisher_thumbprint }}", env.fetch("EXPECTED_PUBLISHER_THUMBPRINT")
     assert_includes run, VERIFY_SCRIPT_PATH
     assert_in_order run, [
-      '"-ArtifactDirectory"',
-      '".\windows\build\release"',
-      '"-MsiPath"',
-      '$stagedMsi[0].FullName',
-      '"-ChecksumsPath"',
-      '".\windows\build\release\SHA256SUMS.txt"',
-      '"-WintunLicensePath"',
-      '".\windows\build\release\WINTUN-LICENSE.txt"',
-      '"-WintunDllPath"',
-      '".\wintun\bin\amd64\wintun.dll"',
-      '"-EvidencePath"',
-      "\"#{EVIDENCE_PATH}\""
+      "$arguments = @{",
+      'ArtifactDirectory = ".\windows\build\release"',
+      "MsiPath = $stagedMsi[0].FullName",
+      'ChecksumsPath = ".\windows\build\release\SHA256SUMS.txt"',
+      'WintunDllPath = ".\wintun\bin\amd64\wintun.dll"',
+      'WintunLicensePath = ".\windows\build\release\WINTUN-LICENSE.txt"',
+      "EvidencePath = \"#{EVIDENCE_PATH}\"",
+      "}"
     ]
+    refute_includes run, '"-WintunDllPath"'
     assert_in_order run, [
       '$env:SIGNING_AVAILABLE -eq "true" -or $env:GITHUB_REF -like "refs/tags/v*"',
-      '$arguments += "-RequireValidSignature"',
-      '$arguments += "-RequireTimestamp"'
+      '$arguments.RequireValidSignature = $true',
+      '$arguments.RequireTimestamp = $true'
     ]
     assert_in_order run, [
       '$env:EXPECTED_PUBLISHER_SUBJECT',
-      '$arguments += "-ExpectedPublisherSubject"',
-      '$arguments += $env:EXPECTED_PUBLISHER_SUBJECT.Trim()'
+      '$arguments.ExpectedPublisherSubject = $env:EXPECTED_PUBLISHER_SUBJECT.Trim()'
     ]
     assert_in_order run, [
       '$env:EXPECTED_PUBLISHER_THUMBPRINT',
-      '$arguments += "-ExpectedPublisherThumbprint"',
-      '$arguments += $env:EXPECTED_PUBLISHER_THUMBPRINT.Trim()'
+      '$arguments.ExpectedPublisherThumbprint = $env:EXPECTED_PUBLISHER_THUMBPRINT.Trim()'
     ]
     assert_in_order run, [
       '$env:RUN_INSTALL_VALIDATION -eq "true"',
-      '$arguments += "-InstallValidationReportPath"',
-      "\"#{REPORT_PATH}\"",
-      '$arguments += "-RequireInstallValidation"'
+      "$arguments.InstallValidationReportPath = \"#{REPORT_PATH}\"",
+      '$arguments.RequireInstallValidation = $true'
     ]
+    assert_includes run, "& #{VERIFY_SCRIPT_PATH} @arguments"
   end
 
   def test_workflow_uploads_release_evidence_with_artifacts_and_github_release
