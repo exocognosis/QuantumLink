@@ -14,11 +14,17 @@ ExecStart=/usr/local/bin/qlinkd
 # Stop is record-backed and idempotent. It is a no-op for the default dry-run
 # service and tears down only qlink-owned network state after activated runs.
 ExecStop=/usr/local/bin/qlinkd --deactivate-network
+# Backstop cleanup for crashes and start failures; this is idempotent when no
+# activated ownership record exists.
+ExecStopPost=/usr/local/bin/qlinkd --deactivate-network
 Restart=on-failure
 RestartSec=2s
 RuntimeDirectory=quantumlink
+RuntimeDirectoryMode=0750
 StateDirectory=quantumlink
+StateDirectoryMode=0750
 ConfigurationDirectory=quantumlink
+ConfigurationDirectoryMode=0750
 UMask=0077
 NoNewPrivileges=no
 

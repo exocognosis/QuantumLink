@@ -35,11 +35,17 @@ Or install from a staged prefix containing `bin/qlinkd` and `bin/qlinkctl`:
 sudo PREFIX=/opt/quantumlink ./steam/steamos/scripts/install-steamos.sh
 ```
 
-The installer copies binaries to `/usr/local/bin` by default, creates `/etc/quantumlink` and `/var/lib/quantumlink`, installs `steam/steamos/packaging/systemd/qlinkd.service`, reloads systemd, and prints the next commands.
+For package tests or image assembly, stage into a destination root without root privileges:
+
+```sh
+PREFIX=/opt/quantumlink DESTDIR=/tmp/qlink-root ./steam/steamos/scripts/install-steamos.sh
+```
+
+The installer copies binaries to `/usr/local/bin` by default, creates `/etc/quantumlink` and `/var/lib/quantumlink`, installs `steam/steamos/packaging/systemd/qlinkd.service`, stages an activated-mode sample drop-in, validates the staged files, reloads systemd for live installs, and prints the next commands. Live installs without `DESTDIR` still require root.
 
 The packaged `qlinkd.service` starts the resident daemon in dry-run planning mode. It validates configuration, builds the intended Linux network plan, and exposes that plan through status, but it does not create TUN devices, change routes, or apply nftables rules by default.
 
-The installed service also runs `qlinkd --deactivate-network` during stop. That stop command is idempotent: dry-run service starts have no ownership record and therefore no teardown work, while successful activated starts write `/var/lib/quantumlink/network-ownership.json` so stop removes only QuantumLink-owned TUN, route, and nftables state.
+The installed service also runs `qlinkd --deactivate-network` during stop and stop-post cleanup. Those teardown commands are idempotent: dry-run service starts have no ownership record and therefore no teardown work, while successful activated starts write `/var/lib/quantumlink/network-ownership.json` so stop removes only QuantumLink-owned TUN, route, and nftables state.
 
 Typical next steps:
 
@@ -57,13 +63,15 @@ sudo qlinkctl status
 - `qlinkd --deactivate-network` removes qlink-owned network state from the persisted ownership record and exits; it is safe when no ownership record exists.
 - `qlinkd --check`, `qlinkd --activate-network`, and `qlinkd --deactivate-network` are mutually exclusive runtime modes.
 
-To run the packaged service with real network application, create a controlled systemd drop-in instead of editing the installed unit directly:
+To run the packaged service with real network application, install the packaged sample as a controlled systemd drop-in instead of editing the installed unit directly:
 
 ```sh
-sudo systemctl edit qlinkd
+sudo cp /etc/systemd/system/qlinkd.service.d/activate-network.conf.sample /etc/systemd/system/qlinkd.service.d/10-activate-network.conf
+sudo systemctl daemon-reload
+sudo systemctl restart qlinkd
 ```
 
-Use this override for the default install path:
+The sample contains this override for the default install path:
 
 ```ini
 [Service]
@@ -71,14 +79,17 @@ ExecStart=
 ExecStart=/usr/local/bin/qlinkd --activate-network
 ```
 
-Then reload and restart the service:
+Remove the live drop-in to return to dry-run planning mode:
 
 ```sh
+sudo rm -f /etc/systemd/system/qlinkd.service.d/10-activate-network.conf
 sudo systemctl daemon-reload
 sudo systemctl restart qlinkd
 ```
 
-If the installer was run with a custom `BINDIR`, use that installed `qlinkd` path in the override. The installed `ExecStop` line is rewritten to the same `BINDIR` by the installer, so activated service stops use the matching `qlinkd --deactivate-network` binary. Remove the drop-in to return the packaged service to dry-run planning mode.
+If the installer was run with a custom `BINDIR`, the installed service and sample are both rewritten to that installed `qlinkd` path. The installed `ExecStop` and `ExecStopPost` lines are rewritten to the same `BINDIR`, so activated service stops use the matching `qlinkd --deactivate-network` binary. Default reinstalls do not create or delete the live `10-activate-network.conf` operator drop-in.
+
+After copying files, the installer validates that `qlinkd` and `qlinkctl` are executable, the unit exists and contains the resolved dry-run `ExecStart` plus teardown `ExecStop`, and the activated-mode sample exists with the resolved activated `ExecStart`. Validation failures exit nonzero.
 
 SteamOS may remount the root filesystem read-only after system updates. Re-run the installer after an OS image refresh if `/usr/local/bin/qlinkd`, `/usr/local/bin/qlinkctl`, or the systemd unit disappears.
 
@@ -97,6 +108,7 @@ SteamOS may remount the root filesystem read-only after system updates. Re-run t
 ```sh
 cargo check -p qlinkd -p qlinkctl -p qlink-linux -p qlink-proto -p qlink-game
 cargo test -p qlink-game
+bash steam/steamos/tests/install-steamos-test.sh
 bash -n steam/steamos/scripts/install-steamos.sh
 ```
 

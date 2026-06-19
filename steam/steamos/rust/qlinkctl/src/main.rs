@@ -1,5 +1,5 @@
 use qlink_proto::InviteCode;
-use qlinkctl::{format_status, status_from_daemon};
+use qlinkctl::{format_doctor, format_status, status_from_daemon};
 use std::path::Path;
 
 fn main() {
@@ -7,6 +7,13 @@ fn main() {
     match args.next().as_deref() {
         Some("status") => match status_from_daemon(Path::new("/run/quantumlink/qlinkd.sock")) {
             Ok(status) => println!("{}", format_status(&status).expect("status serializes")),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        },
+        Some("doctor") => match status_from_daemon(Path::new("/run/quantumlink/qlinkd.sock")) {
+            Ok(status) => println!("{}", format_doctor(&status)),
             Err(error) => {
                 eprintln!("{error}");
                 std::process::exit(1);
@@ -35,7 +42,7 @@ fn main() {
             }
         },
         _ => {
-            eprintln!("usage: qlinkctl <status|invite decode>");
+            eprintln!("usage: qlinkctl <status|doctor|invite decode>");
             std::process::exit(2);
         }
     }
