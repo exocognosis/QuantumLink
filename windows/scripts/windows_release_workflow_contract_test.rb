@@ -94,8 +94,9 @@ class WindowsReleaseWorkflowContractTest < Minitest::Test
       '"-MsiPath"',
       "\"#{MSI_PATH}\"",
       '"-ReportPath"',
-      "\"#{REPORT_PATH}\""
+      "$reportPath"
     ]
+    assert_includes run, "$reportPath = \"#{REPORT_PATH}\""
     assert_in_order run, [
       "$env:SKIP_VALIDATION_NETWORK_CHECKS -eq \"true\"",
       '$arguments += "-SkipNetworkChecks"'
@@ -158,6 +159,36 @@ class WindowsReleaseWorkflowContractTest < Minitest::Test
       '$arguments += "-RollbackToMsiPath"',
       '$arguments += $rollbackMsiPath'
     ]
+  end
+
+  def test_workflow_writes_install_validation_report_for_bootstrap_failures
+    step = workflow_step("Validate MSI install and uninstall")
+    run = step.fetch("run")
+    upload_step = workflow_step("Upload install validation report")
+
+    assert_includes run, "function Write-WorkflowBootstrapFailureReport"
+    assert_includes run, "workflowBootstrapFailure = [ordered]@{"
+    assert_includes run, 'warnings = @("Windows release workflow failed before validate-install.ps1 completed.")'
+    assert_includes run, 'failures = @("Windows install validation workflow bootstrap error: $message")'
+    assert_includes run, "passed = $false"
+    assert_in_order run, [
+      "try {",
+      "Assert-Sha256Input -Name \"upgrade_from_msi_sha256\" -Value $upgradeSha256",
+      "& .\\windows\\scripts\\validate-install.ps1 @arguments",
+      "} catch {",
+      "Write-WorkflowBootstrapFailureReport -ErrorRecord $_ -Path $reportPath",
+      "exit 1"
+    ]
+    assert_in_order run, [
+      "throw \"upgrade_from_msi_sha256 is required when upgrade_from_msi_url is supplied.\"",
+      "throw \"upgrade_from_msi_url is required when upgrade_from_msi_sha256 is supplied.\"",
+      "throw \"validate_rollback requires upgrade_from_msi_url.\"",
+      "throw \"rollback_to_msi_url requires validate_rollback.\"",
+      "throw \"rollback_to_msi_sha256 is required when rollback_to_msi_url is supplied.\"",
+      "throw \"rollback_to_msi_url is required when rollback_to_msi_sha256 is supplied.\""
+    ]
+    refute_includes run, "exit 1\n          }\n          if ($upgradeUrl"
+    assert_equal "error", upload_step.fetch("with").fetch("if-no-files-found")
   end
 
   def test_workflow_uploads_install_validation_evidence_even_on_failure

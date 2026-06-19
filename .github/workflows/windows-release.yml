@@ -277,6 +277,85 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
+          $validationDir = ".\windows\build\validation"
+          $reportPath = ".\windows\build\validation\install-validation-report.json"
+
+          function Get-WorkflowValidationTimestamp {
+            return (Get-Date).ToUniversalTime().ToString("o")
+          }
+
+          function Get-WorkflowMsiSnapshot {
+            param([string]$Path)
+
+            $snapshot = [ordered]@{
+              path = $Path
+              resolvedPath = $null
+              exists = $false
+              sha256 = $null
+              lengthBytes = $null
+              error = $null
+            }
+
+            try {
+              $resolvedPath = (Resolve-Path -LiteralPath $Path -ErrorAction Stop).ProviderPath
+              $item = Get-Item -LiteralPath $resolvedPath -ErrorAction Stop
+              $snapshot.resolvedPath = $resolvedPath
+              $snapshot.exists = $true
+              $snapshot.lengthBytes = $item.Length
+              $snapshot.sha256 = (Get-FileHash -Algorithm SHA256 -Path $resolvedPath -ErrorAction Stop).Hash.ToLowerInvariant()
+            } catch {
+              $snapshot.error = $_.Exception.Message
+            }
+
+            return $snapshot
+          }
+
+          function Write-WorkflowBootstrapFailureReport {
+            param(
+              [Parameter(Mandatory = $true)]
+              [object]$ErrorRecord,
+
+              [Parameter(Mandatory = $true)]
+              [string]$Path
+            )
+
+            try {
+              $directory = Split-Path -Parent $Path
+              if (-not [string]::IsNullOrWhiteSpace($directory)) {
+                New-Item -ItemType Directory -Path $directory -Force | Out-Null
+              }
+
+              $message = if ($ErrorRecord.Exception) { $ErrorRecord.Exception.Message } else { [string]$ErrorRecord }
+              $exceptionType = if ($ErrorRecord.Exception) { $ErrorRecord.Exception.GetType().FullName } else { $ErrorRecord.GetType().FullName }
+              $report = [ordered]@{
+                schemaVersion = "1.1"
+                generatedAt = (Get-WorkflowValidationTimestamp)
+                scenario = "workflowBootstrap"
+                host = [ordered]@{
+                  os = [System.Environment]::OSVersion.ToString()
+                  machineName = $env:COMPUTERNAME
+                  runnerName = $env:RUNNER_NAME
+                }
+                msi = (Get-WorkflowMsiSnapshot -Path ".\windows\QuantumLink.msi")
+                warnings = @("Windows release workflow failed before validate-install.ps1 completed.")
+                failures = @("Windows install validation workflow bootstrap error: $message")
+                workflowBootstrapFailure = [ordered]@{
+                  message = $message
+                  type = $exceptionType
+                  category = [string]$ErrorRecord.CategoryInfo.Category
+                  fullyQualifiedErrorId = [string]$ErrorRecord.FullyQualifiedErrorId
+                  positionMessage = [string]$ErrorRecord.InvocationInfo.PositionMessage
+                  scriptStackTrace = [string]$ErrorRecord.ScriptStackTrace
+                }
+                passed = $false
+              }
+
+              $report | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $Path -Encoding UTF8
+            } catch {
+              Write-Error -Message "Failed to write workflow bootstrap install validation report: $($_.Exception.Message)" -ErrorAction Continue
+            }
+          }
+
           function Get-WorkflowInput {
             param([AllowNull()][string]$Value)
 
@@ -294,8 +373,7 @@ jobs:
             )
 
             if (-not [string]::IsNullOrWhiteSpace($Value) -and $Value -notmatch '^[0-9a-fA-F]{64}$') {
-              Write-Error "$Name must be a 64-character hex SHA-256 checksum."
-              exit 1
+              throw "$Name must be a 64-character hex SHA-256 checksum."
             }
           }
 
@@ -311,93 +389,90 @@ jobs:
             Invoke-WebRequest -Uri $Url -OutFile $DestinationPath
 
             if ((Get-Item $DestinationPath).Length -eq 0) {
-              Write-Error "Downloaded $Description MSI is empty."
-              exit 1
+              throw "Downloaded $Description MSI is empty."
             }
 
             $expectedHash = $ExpectedSha256.ToLowerInvariant()
             $actualHash = (Get-FileHash -Algorithm SHA256 -Path $DestinationPath).Hash.ToLowerInvariant()
             if ($actualHash -ne $expectedHash) {
-              Write-Error "$Description MSI SHA-256 mismatch. Expected $expectedHash but got $actualHash."
-              exit 1
+              throw "$Description MSI SHA-256 mismatch. Expected $expectedHash but got $actualHash."
             }
           }
 
-          $validationDir = ".\windows\build\validation"
           New-Item -ItemType Directory -Path $validationDir -Force | Out-Null
 
-          $upgradeUrl = Get-WorkflowInput -Value $env:UPGRADE_FROM_MSI_URL
-          $upgradeSha256 = Get-WorkflowInput -Value $env:UPGRADE_FROM_MSI_SHA256
-          $rollbackUrl = Get-WorkflowInput -Value $env:ROLLBACK_TO_MSI_URL
-          $rollbackSha256 = Get-WorkflowInput -Value $env:ROLLBACK_TO_MSI_SHA256
-          $validateRollback = ($env:VALIDATE_ROLLBACK -eq "true")
+          try {
+            $upgradeUrl = Get-WorkflowInput -Value $env:UPGRADE_FROM_MSI_URL
+            $upgradeSha256 = Get-WorkflowInput -Value $env:UPGRADE_FROM_MSI_SHA256
+            $rollbackUrl = Get-WorkflowInput -Value $env:ROLLBACK_TO_MSI_URL
+            $rollbackSha256 = Get-WorkflowInput -Value $env:ROLLBACK_TO_MSI_SHA256
+            $validateRollback = ($env:VALIDATE_ROLLBACK -eq "true")
 
-          if ($upgradeUrl -ne "" -and $upgradeSha256 -eq "") {
-            Write-Error "upgrade_from_msi_sha256 is required when upgrade_from_msi_url is supplied."
+            if ($upgradeUrl -ne "" -and $upgradeSha256 -eq "") {
+              throw "upgrade_from_msi_sha256 is required when upgrade_from_msi_url is supplied."
+            }
+            if ($upgradeUrl -eq "" -and $upgradeSha256 -ne "") {
+              throw "upgrade_from_msi_url is required when upgrade_from_msi_sha256 is supplied."
+            }
+            if ($validateRollback -and $upgradeUrl -eq "") {
+              throw "validate_rollback requires upgrade_from_msi_url."
+            }
+            if ($rollbackUrl -ne "" -and -not $validateRollback) {
+              throw "rollback_to_msi_url requires validate_rollback."
+            }
+            if ($rollbackUrl -ne "" -and $rollbackSha256 -eq "") {
+              throw "rollback_to_msi_sha256 is required when rollback_to_msi_url is supplied."
+            }
+            if ($rollbackUrl -eq "" -and $rollbackSha256 -ne "") {
+              throw "rollback_to_msi_url is required when rollback_to_msi_sha256 is supplied."
+            }
+
+            Assert-Sha256Input -Name "upgrade_from_msi_sha256" -Value $upgradeSha256
+            Assert-Sha256Input -Name "rollback_to_msi_sha256" -Value $rollbackSha256
+
+            $arguments = @(
+              "-MsiPath",
+              ".\windows\QuantumLink.msi",
+              "-ReportPath",
+              $reportPath
+            )
+
+            if ($env:SKIP_VALIDATION_NETWORK_CHECKS -eq "true") {
+              $arguments += "-SkipNetworkChecks"
+            }
+
+            if ($upgradeUrl -ne "") {
+              $upgradeMsiPath = Join-Path $validationDir "upgrade-from.msi"
+              Save-VerifiedMsi -Url $upgradeUrl `
+                -ExpectedSha256 $upgradeSha256 `
+                -DestinationPath $upgradeMsiPath `
+                -Description "upgrade_from_msi_url"
+              $arguments += "-UpgradeFromMsiPath"
+              $arguments += $upgradeMsiPath
+            }
+
+            if ($validateRollback) {
+              $arguments += "-ValidateRollback"
+              $arguments += "-RollbackMode"
+              $arguments += $env:ROLLBACK_MODE
+            }
+
+            if ($rollbackUrl -ne "") {
+              $rollbackMsiPath = Join-Path $validationDir "rollback-to.msi"
+              Save-VerifiedMsi -Url $rollbackUrl `
+                -ExpectedSha256 $rollbackSha256 `
+                -DestinationPath $rollbackMsiPath `
+                -Description "rollback_to_msi_url"
+              $arguments += "-RollbackToMsiPath"
+              $arguments += $rollbackMsiPath
+            }
+
+            & .\windows\scripts\validate-install.ps1 @arguments
+          } catch {
+            Write-WorkflowBootstrapFailureReport -ErrorRecord $_ -Path $reportPath
+            Write-Error -Message "Windows install validation workflow bootstrap failed: $($_.Exception.Message)" -ErrorAction Continue
             exit 1
           }
-          if ($upgradeUrl -eq "" -and $upgradeSha256 -ne "") {
-            Write-Error "upgrade_from_msi_url is required when upgrade_from_msi_sha256 is supplied."
-            exit 1
-          }
-          if ($validateRollback -and $upgradeUrl -eq "") {
-            Write-Error "validate_rollback requires upgrade_from_msi_url."
-            exit 1
-          }
-          if ($rollbackUrl -ne "" -and -not $validateRollback) {
-            Write-Error "rollback_to_msi_url requires validate_rollback."
-            exit 1
-          }
-          if ($rollbackUrl -ne "" -and $rollbackSha256 -eq "") {
-            Write-Error "rollback_to_msi_sha256 is required when rollback_to_msi_url is supplied."
-            exit 1
-          }
-          if ($rollbackUrl -eq "" -and $rollbackSha256 -ne "") {
-            Write-Error "rollback_to_msi_url is required when rollback_to_msi_sha256 is supplied."
-            exit 1
-          }
-
-          Assert-Sha256Input -Name "upgrade_from_msi_sha256" -Value $upgradeSha256
-          Assert-Sha256Input -Name "rollback_to_msi_sha256" -Value $rollbackSha256
-
-          $arguments = @(
-            "-MsiPath",
-            ".\windows\QuantumLink.msi",
-            "-ReportPath",
-            ".\windows\build\validation\install-validation-report.json"
-          )
-
-          if ($env:SKIP_VALIDATION_NETWORK_CHECKS -eq "true") {
-            $arguments += "-SkipNetworkChecks"
-          }
-
-          if ($upgradeUrl -ne "") {
-            $upgradeMsiPath = Join-Path $validationDir "upgrade-from.msi"
-            Save-VerifiedMsi -Url $upgradeUrl `
-              -ExpectedSha256 $upgradeSha256 `
-              -DestinationPath $upgradeMsiPath `
-              -Description "upgrade_from_msi_url"
-            $arguments += "-UpgradeFromMsiPath"
-            $arguments += $upgradeMsiPath
-          }
-
-          if ($validateRollback) {
-            $arguments += "-ValidateRollback"
-            $arguments += "-RollbackMode"
-            $arguments += $env:ROLLBACK_MODE
-          }
-
-          if ($rollbackUrl -ne "") {
-            $rollbackMsiPath = Join-Path $validationDir "rollback-to.msi"
-            Save-VerifiedMsi -Url $rollbackUrl `
-              -ExpectedSha256 $rollbackSha256 `
-              -DestinationPath $rollbackMsiPath `
-              -Description "rollback_to_msi_url"
-            $arguments += "-RollbackToMsiPath"
-            $arguments += $rollbackMsiPath
-          }
-
-          & .\windows\scripts\validate-install.ps1 @arguments
 
       - name: Upload install validation report
         if: always() && github.event_name == 'workflow_dispatch' && inputs.run_install_validation
@@ -405,7 +480,7 @@ jobs:
         with:
           name: QuantumLink-Windows-InstallValidation-${{ github.run_number }}
           path: windows/build/validation/install-validation-report.json
-          if-no-files-found: warn
+          if-no-files-found: error
 
       - name: Stage release artifacts and checksums
         shell: pwsh
