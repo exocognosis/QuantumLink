@@ -4,7 +4,7 @@ QuantumLink assumes passive observers, active on-path attackers, malicious rende
 
 Implemented baseline:
 
-- ML-KEM-768 session establishment without a classical key-exchange fallback.
+- App-layer ML-KEM-768 session establishment without a classical key-exchange fallback.
 - Transcript-bound SHAKE256 key derivation.
 - Anti-downgrade suite binding through versioned FIPS 203, FIPS 204, and FIPS 205 suite identifiers.
 - ML-DSA-65 and SLH-DSA-SHAKE-128S device credential signing and verification.
@@ -24,6 +24,7 @@ Implemented baseline:
 - Packet metadata normalization before packet-frame emission: DSCP/ECN is cleared, TTL is normalized, non-fragment IPv4 IDs are cleared, and IPv4 header checksums are recomputed.
 - Public peer-record minimization: clear aliases are replaced with sequence-rotating pseudonyms and rendezvous publication keeps relay candidates only by default.
 - Raw QUIC, raw relay, and legacy mesh loopback smoke paths fail closed unless an end-to-end app-layer PQC session exists.
+- Native UDP carrier seam with fragmented authenticated control-message support; current tests prove the PQC session wire establishes matching ML-KEM/SHAKE keys over this non-TLS carrier.
 
 Dytallix wallet and registry boundary:
 
@@ -66,7 +67,7 @@ regenerate `peers.json` after rolling the new build.
 
 Not yet production-complete:
 
-- Replacing Quinn/rustls carrier transport with an ML-KEM-only transport. Current Quinn/rustls carrier setup still configures `X25519MLKEM768`.
+- Switching rendezvous publication and direct mesh probing from Quinn/rustls to the native UDP carrier. Current Quinn/rustls carrier setup still configures `X25519MLKEM768`; the native carrier seam exists, but the live mesh dialer has not switched yet.
 - Full ICE/STUN/TURN candidate gathering and nomination beyond local host/STUN parser scaffolding.
 - Notarized Developer ID app and extension bundles.
 - Managed Device Attestation and SSO integration.

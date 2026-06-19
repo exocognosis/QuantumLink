@@ -48,6 +48,11 @@ tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-threa
 tracing = "0.1"
 zeroize = { version = "1", features = ["derive"] }
 
+[features]
+default = ["native-udp-carrier"]
+native-udp-carrier = []
+dev-quic-carrier = []
+
 [dev-dependencies]
 criterion = { version = "0.5", default-features = false, features = ["async_tokio", "html_reports"] }
 tempfile = "3"

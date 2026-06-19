@@ -1,7 +1,7 @@
 use crate::{
+    carrier_transport::CarrierSession,
     crypto::{DeviceKeypair, SessionKeys},
     error::{QlinkError, Result},
-    quic_transport::QuicDatagramSession,
     session_crypto::{
         answer_pqc_session, start_pqc_session, PqcInitiatorFinish, PqcInitiatorHello,
         PqcResponderHello, PqcSessionContext,
@@ -20,7 +20,7 @@ enum PqcSessionWireMessage {
 }
 
 pub async fn run_pqc_session_initiator(
-    session: &QuicDatagramSession,
+    session: &CarrierSession,
     context: PqcSessionContext,
     keypair: &DeviceKeypair,
 ) -> Result<SessionKeys> {
@@ -47,7 +47,7 @@ pub async fn run_pqc_session_initiator(
 }
 
 pub async fn run_pqc_session_responder(
-    session: &QuicDatagramSession,
+    session: &CarrierSession,
     context: PqcSessionContext,
     keypair: &DeviceKeypair,
 ) -> Result<SessionKeys> {
@@ -81,10 +81,7 @@ pub async fn run_pqc_session_responder(
     responder.finish(&finish)
 }
 
-async fn send_wire_message(
-    session: &QuicDatagramSession,
-    message: PqcSessionWireMessage,
-) -> Result<()> {
+async fn send_wire_message(session: &CarrierSession, message: PqcSessionWireMessage) -> Result<()> {
     let bytes = serde_json::to_vec(&message)?;
     if bytes.len() > PQC_SESSION_MAX_WIRE_SIZE {
         return Err(QlinkError::Protocol(format!(
@@ -96,7 +93,7 @@ async fn send_wire_message(
     session.send_authenticated_message(bytes).await
 }
 
-async fn receive_wire_message(session: &QuicDatagramSession) -> Result<PqcSessionWireMessage> {
+async fn receive_wire_message(session: &CarrierSession) -> Result<PqcSessionWireMessage> {
     let bytes = session
         .receive_authenticated_message(PQC_SESSION_MAX_WIRE_SIZE)
         .await?;
@@ -146,7 +143,7 @@ mod tests {
             server_cert_der.clone(),
         );
         let responder_task = tokio::spawn(async move {
-            let session = server.accept_one().await.unwrap();
+            let session = CarrierSession::from(server.accept_one().await.unwrap());
             run_pqc_session_responder(&session, responder_context, &responder_key)
                 .await
                 .unwrap()
@@ -157,6 +154,7 @@ mod tests {
             .connect_with_trusted_cert(server_addr, &trusted)
             .await
             .unwrap();
+        let session = CarrierSession::from(session);
         let initiator_context = PqcSessionContext::new(
             "wire-mesh",
             initiator_key.public_key().peer_id(),
@@ -166,6 +164,50 @@ mod tests {
         let initiator_keys = run_pqc_session_initiator(&session, initiator_context, &initiator_key)
             .await
             .unwrap();
+        let responder_keys = responder_task.await.unwrap();
+
+        assert_eq!(initiator_keys.suite, PQC_SESSION_SUITE);
+        assert_eq!(responder_keys.suite, PQC_SESSION_SUITE);
+        assert_eq!(initiator_keys.tx_key, responder_keys.rx_key);
+        assert_eq!(initiator_keys.rx_key, responder_keys.tx_key);
+        assert_eq!(initiator_keys.handshake_hash, responder_keys.handshake_hash);
+    }
+
+    #[tokio::test]
+    async fn pqc_session_wire_establishes_keys_over_native_udp_carrier() {
+        let initiator_key = DeviceKeypair::generate().unwrap();
+        let responder_key = DeviceKeypair::generate().unwrap();
+        let responder_peer_id = responder_key.public_key().peer_id();
+        let (initiator_session, responder_session) =
+            crate::carrier_transport::NativeUdpSession::loopback_pair()
+                .await
+                .unwrap();
+        let initiator_session = crate::carrier_transport::CarrierSession::from(initiator_session);
+        let responder_session = crate::carrier_transport::CarrierSession::from(responder_session);
+        let carrier_binding = b"native-udp-loopback-test".to_vec();
+
+        let responder_context = PqcSessionContext::new(
+            "native-wire-mesh",
+            initiator_key.public_key().peer_id(),
+            responder_peer_id.clone(),
+            carrier_binding.clone(),
+        );
+        let responder_task = tokio::spawn(async move {
+            run_pqc_session_responder(&responder_session, responder_context, &responder_key)
+                .await
+                .unwrap()
+        });
+
+        let initiator_context = PqcSessionContext::new(
+            "native-wire-mesh",
+            initiator_key.public_key().peer_id(),
+            responder_peer_id,
+            carrier_binding,
+        );
+        let initiator_keys =
+            run_pqc_session_initiator(&initiator_session, initiator_context, &initiator_key)
+                .await
+                .unwrap();
         let responder_keys = responder_task.await.unwrap();
 
         assert_eq!(initiator_keys.suite, PQC_SESSION_SUITE);

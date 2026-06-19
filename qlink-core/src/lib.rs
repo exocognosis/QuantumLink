@@ -1,3 +1,4 @@
+pub mod carrier_transport;
 pub mod crypto;
 pub mod discovery;
 pub mod dytallix_identity;
@@ -63,8 +64,26 @@ mod pqc_policy_tests {
     }
 
     #[test]
+    fn qlink_core_declares_native_udp_carrier_as_default_migration_direction() {
+        let manifest = include_str!("../Cargo.toml");
+        assert!(
+            manifest.contains("default = [\"native-udp-carrier\"]"),
+            "qlink-core default features must name native-udp-carrier as the migration direction"
+        );
+        assert!(
+            manifest.contains("native-udp-carrier = []"),
+            "qlink-core must declare the native-udp-carrier feature"
+        );
+        assert!(
+            manifest.contains("dev-quic-carrier = []"),
+            "qlink-core must track Quinn/rustls as a dev carrier until it is optional"
+        );
+    }
+
+    #[test]
     fn application_security_boundary_avoids_retired_primitives() {
         let files = [
+            ("carrier_transport.rs", include_str!("carrier_transport.rs")),
             ("crypto.rs", include_str!("crypto.rs")),
             ("discovery.rs", include_str!("discovery.rs")),
             ("ice.rs", include_str!("ice.rs")),

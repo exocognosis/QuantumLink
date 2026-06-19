@@ -26,6 +26,7 @@
 //! handle is dropped.
 
 use crate::{
+    carrier_transport::CarrierSession,
     crypto::DeviceKeypair,
     discovery::{now_unix, CandidateEndpoint, CandidateType, PeerRecord, UnsignedPeerRecord},
     dytallix_identity::{
@@ -1292,6 +1293,7 @@ async fn run_responder_loop(
             Ok(session) => session,
             Err(_) => break,
         };
+        let session = CarrierSession::from(session);
         let mesh_id = expected_mesh_id.clone();
         let local_peer_id = local_peer_id.clone();
         let local_device_keypair = local_device_keypair.clone();
@@ -1766,6 +1768,7 @@ mod tests {
             loop {
                 match server_endpoint.accept_one().await {
                     Ok(session) => {
+                        let session = CarrierSession::from(session);
                         let responder_keypair = responder_keypair.clone();
                         let server_cert_der = server_cert_der.clone();
                         tokio::spawn(async move {
@@ -1830,7 +1833,7 @@ mod tests {
 
     async fn run_initiator_pqc_against_responder(
         handle: &MeshTransportHandle,
-        session: &crate::quic_transport::QuicDatagramSession,
+        session: &CarrierSession,
         mesh_id: &str,
         initiator_keypair: &DeviceKeypair,
         responder_peer_id: String,
@@ -3080,9 +3083,7 @@ mod tests {
 
     /// Helper for the responder tests: build a dialer (client endpoint
     /// + connected QUIC session) targeting the handle's responder.
-    async fn dial_responder(
-        handle: &MeshTransportHandle,
-    ) -> crate::quic_transport::QuicDatagramSession {
+    async fn dial_responder(handle: &MeshTransportHandle) -> CarrierSession {
         let server_addr = handle
             .responder_local_addr()
             .expect("responder must be enabled");
@@ -3093,10 +3094,11 @@ mod tests {
         let trusted = QuicCertificate::from_der(cert_der);
         let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
         let client = QuicEndpoint::client(bind, &[]).unwrap();
-        client
+        let session = client
             .connect_with_trusted_cert(server_addr, &trusted)
             .await
-            .expect("dial against responder must succeed")
+            .expect("dial against responder must succeed");
+        CarrierSession::from(session)
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -1,4 +1,5 @@
 use crate::{
+    carrier_transport::CarrierSession,
     crypto::{DeviceKeypair, SessionKeys},
     discovery::{CandidateEndpoint, CandidateType},
     dytallix_identity::{
@@ -13,7 +14,7 @@ use crate::{
     peer_store::{InMemoryPeerStore, PeerStore},
     pqc_frame::PqcFrameProtector,
     pqc_session_wire::run_pqc_session_initiator,
-    quic_transport::{QuicCertificate, QuicDatagramSession, QuicEndpoint},
+    quic_transport::{QuicCertificate, QuicEndpoint},
     rendezvous::RendezvousClient,
     session_crypto::PqcSessionContext,
     traversal::{candidate_socket_addr, HOST_PRIORITY},
@@ -286,7 +287,7 @@ impl PeerRecordSource {
 
 pub struct DirectLink {
     pub remote_addr: SocketAddr,
-    session: QuicDatagramSession,
+    session: CarrierSession,
     frame_protector: PqcFrameProtector,
 }
 
@@ -1080,6 +1081,7 @@ impl MeshConnector {
 
                 match quic_result {
                     Ok(Ok(session)) => {
+                        let session = CarrierSession::from(session);
                         // QUIC handshake done. Send our inbound identity
                         // assertion, then complete the authenticated PQC
                         // session before the link can be considered direct.
@@ -1340,7 +1342,7 @@ impl MeshConnector {
 enum DirectProbeResult {
     Established {
         address: SocketAddr,
-        session: QuicDatagramSession,
+        session: CarrierSession,
         session_keys: SessionKeys,
         attempts: Vec<ProbeAttempt>,
     },
@@ -1359,7 +1361,7 @@ struct ProbeOutcomeRecord {
     identity_assertion_elapsed: Option<Duration>,
     ice_round_trip: Option<Duration>,
     peer_reflexive_address: Option<SocketAddr>,
-    session: Option<QuicDatagramSession>,
+    session: Option<CarrierSession>,
     session_keys: Option<SessionKeys>,
 }
 
@@ -1520,6 +1522,7 @@ mod tests {
             loop {
                 match server_endpoint.accept_one().await {
                     Ok(session) => {
+                        let session = CarrierSession::from(session);
                         let responder_keypair = responder_keypair.clone();
                         let server_cert_der = server_cert_der.clone();
                         tokio::spawn(async move {
