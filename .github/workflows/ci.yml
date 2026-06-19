@@ -10,7 +10,7 @@ jobs:
     name: Rust workspace (shared core + cross-platform silo code)
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Show toolchain
         run: |
           rustc --version
@@ -34,7 +34,7 @@ jobs:
     name: macOS silo (Swift + XCFramework)
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Show toolchain
         run: |
           swift --version
@@ -80,7 +80,7 @@ jobs:
     name: Unsigned Xcode project smoke
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install XcodeGen
         run: brew install xcodegen
       - name: Build Rust XCFramework
