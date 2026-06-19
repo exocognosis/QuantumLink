@@ -36,6 +36,11 @@ class WindowsReleaseWorkflowContractTest < Minitest::Test
     REXML::Document.new(@installer_wxs)
   end
 
+  def test_installer_state_directory_acl_uses_wix_supported_permissions
+    refute_match(/<CreateFolder\b[^>]*\bDisableInheritance=/, @installer_wxs)
+    assert_match(/<CreateFolder>\s*<util:PermissionEx User="SYSTEM" GenericAll="yes" \/>\s*<util:PermissionEx User="Administrators" GenericAll="yes" \/>\s*<\/CreateFolder>/m, @installer_wxs)
+  end
+
   def test_workflow_declares_manual_install_validation_inputs
     inputs = workflow_dispatch_inputs
 

@@ -74,7 +74,7 @@
     <StandardDirectory Id="CommonAppDataFolder">
       <Directory Id="StateFolder" Name="QuantumLink">
         <Component Id="StateDir" Guid="0c5be1d8-7a92-4f04-9e61-d3b8a25c70f1" KeyPath="yes">
-          <CreateFolder DisableInheritance="yes">
+          <CreateFolder>
             <util:PermissionEx User="SYSTEM" GenericAll="yes" />
             <util:PermissionEx User="Administrators" GenericAll="yes" />
           </CreateFolder>
