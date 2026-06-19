@@ -98,10 +98,12 @@ class WindowsReleaseWorkflowContractTest < Minitest::Test
     assert_equal "6.0.2", env.fetch("WIX_VERSION")
     assert_includes run, "dotnet tool install --global wix --version $env:WIX_VERSION"
     assert_includes run, 'wix extension add -g "$env:WIX_EXTENSION/$env:WIX_VERSION"'
+    assert_includes run, "wix extension list -g"
     assert_includes @build_script, '$wixUtilExtension = "WixToolset.Util.wixext/$wixVersion"'
     assert_includes @build_script, '$wixUtilExtension,'
     refute_includes run, "dotnet tool install --global wix\n"
     refute_includes run, "wix extension add -g $env:WIX_EXTENSION\n"
+    refute_includes run, "wix extension list\n"
   end
 
   def test_workflow_downloads_and_verifies_upgrade_and_rollback_validation_inputs

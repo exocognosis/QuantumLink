@@ -95,9 +95,13 @@ jobs:
           $env:PATH = "$dotnetTools;$env:PATH"
 
           dotnet tool install --global wix --version $env:WIX_VERSION
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           wix extension add -g "$env:WIX_EXTENSION/$env:WIX_VERSION"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           wix --version
-          wix extension list
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          wix extension list -g
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Stage Wintun DLL
         shell: pwsh
