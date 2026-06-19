@@ -416,7 +416,7 @@ public struct SupportBundleExporter: Sendable {
     private let isReleaseBuild: Bool
 
     public init(
-        now: @Sendable @escaping () -> Date = Date.init,
+        now: @Sendable @escaping () -> Date = { Date() },
         osVersion: String = SupportBundleExporter.currentOSVersion(),
         architecture: String = SupportBundleExporter.currentArchitecture(),
         appVersion: String = SupportBundleExporter.currentAppVersion(),

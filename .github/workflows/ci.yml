@@ -46,6 +46,9 @@ jobs:
       # library, so both Apple targets must be installed.
       - name: Install Apple Rust targets
         run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - name: macOS release readiness
+        working-directory: macos
+        run: ./scripts/macos-release-readiness.sh
       - name: Swift tests
         working-directory: macos
         run: swift test
@@ -64,6 +67,14 @@ jobs:
       - name: Development artifact package
         working-directory: macos
         run: ./scripts/package-dev-artifacts.sh
+      - name: Upload development artifact package
+        uses: actions/upload-artifact@v4
+        with:
+          name: QuantumLink-dev-${{ github.sha }}
+          path: |
+            macos/build/dist/QuantumLink-dev.tar.gz
+            macos/build/dist/QuantumLink-dev.tar.gz.sha256
+          if-no-files-found: error
 
   xcodegen-smoke:
     name: Unsigned Xcode project smoke

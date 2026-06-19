@@ -2144,18 +2144,33 @@ mod tests {
 
     #[test]
     fn std_command_runner_reports_non_zero_exit_with_command_context() {
+        let mut runner = StdCommandRunner;
+        let command = non_zero_exit_command();
+        let rendered = command.rendered();
+
+        let error = runner.run(&command).unwrap_err();
+
+        assert!(
+            error.message().contains("exited with status"),
+            "{}",
+            error.message()
+        );
+        assert!(error.message().contains(&rendered), "{}", error.message());
+    }
+
+    #[cfg(windows)]
+    fn non_zero_exit_command() -> SystemCommand {
+        system_command("cmd", &["/C", "exit", "7"])
+    }
+
+    #[cfg(not(windows))]
+    fn non_zero_exit_command() -> SystemCommand {
         let false_program = if std::path::Path::new("/usr/bin/false").exists() {
             "/usr/bin/false"
         } else {
             "/bin/false"
         };
-        let mut runner = StdCommandRunner;
-        let command = system_command(false_program, &[]);
-
-        let error = runner.run(&command).unwrap_err();
-
-        assert!(error.message().contains("exited with status"));
-        assert!(error.message().contains(false_program));
+        system_command(false_program, &[])
     }
 
     #[test]

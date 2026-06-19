@@ -7,15 +7,21 @@ use qlink_proto::{
     RouteMode,
 };
 use serde::{Deserialize, Serialize};
-use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+#[cfg(unix)]
+use std::io::{BufRead, BufReader};
+use std::io::{ErrorKind, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+#[cfg(unix)]
+use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(unix)]
 const MAX_CONTROL_REQUEST_BYTES: usize = 1024;
+#[cfg(unix)]
 const CONTROL_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(2);
 const NETWORK_OWNERSHIP_FILE: &str = "network-ownership.json";
 const NETWORK_OWNERSHIP_SCHEMA_VERSION: u8 = 1;
