@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "minitest/autorun"
+require "rexml/document"
 require "yaml"
 
 class WindowsReleaseWorkflowContractTest < Minitest::Test
@@ -8,6 +9,7 @@ class WindowsReleaseWorkflowContractTest < Minitest::Test
   WORKFLOW_PATH = File.join(REPO_ROOT, ".github/workflows/windows-release.yml")
   RUNBOOK_PATH = File.join(REPO_ROOT, "windows/docs/beta-runbook-windows.md")
   INSTALLER_README_PATH = File.join(REPO_ROOT, "windows/installer/README.md")
+  INSTALLER_WXS_PATH = File.join(REPO_ROOT, "windows/installer/QuantumLink.wxs")
   BUILD_SCRIPT_PATH = File.join(REPO_ROOT, "windows/scripts/build-windows.ps1")
   OPERATOR_CHECKLIST_PATH = File.join(REPO_ROOT, "docs/release-operator-checklist.md")
 
@@ -25,8 +27,13 @@ class WindowsReleaseWorkflowContractTest < Minitest::Test
     @workflow_yaml = YAML.load_file(WORKFLOW_PATH)
     @runbook = File.read(RUNBOOK_PATH)
     @installer_readme = File.read(INSTALLER_README_PATH)
+    @installer_wxs = File.read(INSTALLER_WXS_PATH)
     @build_script = File.read(BUILD_SCRIPT_PATH)
     @operator_checklist = File.read(OPERATOR_CHECKLIST_PATH)
+  end
+
+  def test_installer_source_is_well_formed_xml
+    REXML::Document.new(@installer_wxs)
   end
 
   def test_workflow_declares_manual_install_validation_inputs
