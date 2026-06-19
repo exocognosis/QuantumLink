@@ -264,6 +264,10 @@ class ValidateInstallContractTest < Minitest::Test
     assert_match(/\$report\.uninstallWait\s*=/, @script)
   end
 
+  def test_residual_finding_collector_accepts_empty_collections
+    assert_match(/function Add-ResidualFinding\b[\s\S]*\[Parameter\(Mandatory = \$true\)\]\s*\[AllowEmptyCollection\(\)\]\s*\[System\.Collections\.ArrayList\]\$Items/, @script)
+  end
+
   def test_redacts_host_identifiers_and_adapter_mac_addresses_by_default
     assert_match(/\[switch\]\$IncludeHostIdentifiers/, @script)
     assert_match(/computerName\s*=\s*\(ConvertTo-QuantumLinkEvidenceValue/, @script)

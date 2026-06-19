@@ -12,13 +12,12 @@
 
   Build (on Windows):
     Install the pinned WiX 6.0.2 dotnet tool first.
-    wix build installer\QuantumLink.wxs -d BuildDir=..\target\x86_64-pc-windows-msvc\release -ext WixToolset.Util.wixext/6.0.2 -o QuantumLink.msi
+    wix build -arch x64 installer\QuantumLink.wxs -d BuildDir=..\target\x86_64-pc-windows-msvc\release -ext WixToolset.Util.wixext/6.0.2 -o QuantumLink.msi
 
   Sign with an Authenticode certificate before distribution:
     signtool sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 QuantumLink.msi
 -->
-<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
-     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
 
   <Package Name="QuantumLink"
            Manufacturer="QuantumLink"
@@ -75,8 +74,7 @@
       <Directory Id="StateFolder" Name="QuantumLink">
         <Component Id="StateDir" Guid="0c5be1d8-7a92-4f04-9e61-d3b8a25c70f1" KeyPath="yes">
           <CreateFolder>
-            <util:PermissionEx User="SYSTEM" GenericAll="yes" />
-            <util:PermissionEx User="Administrators" GenericAll="yes" />
+            <PermissionEx Id="StateFolderAcl" Sddl="D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)" />
           </CreateFolder>
           <RemoveFolder Id="RemoveStateFolder" On="uninstall" />
         </Component>

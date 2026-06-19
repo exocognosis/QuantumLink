@@ -83,6 +83,18 @@ Describe "New-SkippedMsiSnapshot" {
     }
 }
 
+Describe "Add-ResidualFinding" {
+    It "accepts an empty findings collection" {
+        $items = [System.Collections.ArrayList]::new()
+
+        Add-ResidualFinding -Items $items -Category "cleanup" -Message "Residual check failed." -Detail $null
+
+        @($items).Count | Should -Be 1
+        $items[0].category | Should -Be "cleanup"
+        $items[0].message | Should -Be "Residual check failed."
+    }
+}
+
 Describe "Upgrade and rollback report constructors" {
     It "creates skipped upgrade evidence with required keys" {
         $result = New-QuantumLinkUpgradeReport -Reason "not requested"

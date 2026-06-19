@@ -38,7 +38,27 @@ class WindowsReleaseWorkflowContractTest < Minitest::Test
 
   def test_installer_state_directory_acl_uses_wix_supported_permissions
     refute_match(/<CreateFolder\b[^>]*\bDisableInheritance=/, @installer_wxs)
-    assert_match(/<CreateFolder>\s*<util:PermissionEx User="SYSTEM" GenericAll="yes" \/>\s*<util:PermissionEx User="Administrators" GenericAll="yes" \/>\s*<\/CreateFolder>/m, @installer_wxs)
+    assert_match(%r{<CreateFolder>\s*<PermissionEx Id="StateFolderAcl" Sddl="D:P\(A;OICI;FA;;;SY\)\(A;OICI;FA;;;BA\)" />\s*</CreateFolder>}m, @installer_wxs)
+  end
+
+  def test_build_script_builds_msi_as_x64
+    assert_in_order @build_script, [
+      "Invoke-WixBuild @(",
+      '"build"',
+      '"-arch"',
+      '"x64"',
+      "$installerSource"
+    ]
+  end
+
+  def test_installer_readme_manual_wix_build_builds_msi_as_x64
+    block = manual_fallback_powershell_block
+
+    assert_in_order block, [
+      "wix build windows\\installer\\QuantumLink.wxs `",
+      "    -arch x64 `",
+      "    -d BuildDir=target\\x86_64-pc-windows-msvc\\release `"
+    ]
   end
 
   def test_workflow_declares_manual_install_validation_inputs

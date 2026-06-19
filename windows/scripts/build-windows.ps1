@@ -176,6 +176,8 @@ if ($Msi) {
     Write-Host "==> Installer: wix build" -ForegroundColor Cyan
     Invoke-WixBuild @(
         "build",
+        "-arch",
+        "x64",
         $installerSource,
         "-d",
         "BuildDir=$target",

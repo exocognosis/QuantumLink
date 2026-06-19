@@ -1114,6 +1114,7 @@ function New-ResidualCheck {
 function Add-ResidualFinding {
     param(
         [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
         [System.Collections.ArrayList]$Items,
 
         [Parameter(Mandatory = $true)]

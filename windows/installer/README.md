@@ -111,6 +111,7 @@ Copy-Item windows\wintun\bin\amd64\wintun.dll target\x86_64-pc-windows-msvc\rele
 
 # 4. MSI
 wix build windows\installer\QuantumLink.wxs `
+    -arch x64 `
     -d BuildDir=target\x86_64-pc-windows-msvc\release `
     -d UiPublishDir=windows\ui\publish `
     -ext WixToolset.Util.wixext/6.0.2 `
