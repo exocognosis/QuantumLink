@@ -62,6 +62,7 @@ jobs:
       DOTNET_NOLOGO: "true"
       RUST_TARGET: x86_64-pc-windows-msvc
       WIX_EXTENSION: WixToolset.Util.wixext
+      WIX_VERSION: "6.0.2"
     steps:
       - uses: actions/checkout@v7
 
@@ -93,8 +94,8 @@ jobs:
           $dotnetTools | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           $env:PATH = "$dotnetTools;$env:PATH"
 
-          dotnet tool install --global wix
-          wix extension add -g $env:WIX_EXTENSION
+          dotnet tool install --global wix --version $env:WIX_VERSION
+          wix extension add -g "$env:WIX_EXTENSION/$env:WIX_VERSION"
           wix --version
           wix extension list
 

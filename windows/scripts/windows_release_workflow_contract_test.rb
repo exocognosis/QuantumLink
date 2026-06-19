@@ -8,6 +8,7 @@ class WindowsReleaseWorkflowContractTest < Minitest::Test
   WORKFLOW_PATH = File.join(REPO_ROOT, ".github/workflows/windows-release.yml")
   RUNBOOK_PATH = File.join(REPO_ROOT, "windows/docs/beta-runbook-windows.md")
   INSTALLER_README_PATH = File.join(REPO_ROOT, "windows/installer/README.md")
+  BUILD_SCRIPT_PATH = File.join(REPO_ROOT, "windows/scripts/build-windows.ps1")
   OPERATOR_CHECKLIST_PATH = File.join(REPO_ROOT, "docs/release-operator-checklist.md")
 
   SCRIPT_PATH = ".\\windows\\scripts\\validate-install.ps1"
@@ -24,6 +25,7 @@ class WindowsReleaseWorkflowContractTest < Minitest::Test
     @workflow_yaml = YAML.load_file(WORKFLOW_PATH)
     @runbook = File.read(RUNBOOK_PATH)
     @installer_readme = File.read(INSTALLER_README_PATH)
+    @build_script = File.read(BUILD_SCRIPT_PATH)
     @operator_checklist = File.read(OPERATOR_CHECKLIST_PATH)
   end
 
@@ -86,6 +88,20 @@ class WindowsReleaseWorkflowContractTest < Minitest::Test
       "$env:SKIP_VALIDATION_NETWORK_CHECKS -eq \"true\"",
       '$arguments += "-SkipNetworkChecks"'
     ]
+  end
+
+  def test_workflow_pins_wix_tool_and_extension_versions
+    env = @workflow_yaml.fetch("jobs").fetch("build").fetch("env")
+    step = workflow_step("Install WiX")
+    run = step.fetch("run")
+
+    assert_equal "6.0.2", env.fetch("WIX_VERSION")
+    assert_includes run, "dotnet tool install --global wix --version $env:WIX_VERSION"
+    assert_includes run, 'wix extension add -g "$env:WIX_EXTENSION/$env:WIX_VERSION"'
+    assert_includes @build_script, '$wixUtilExtension = "WixToolset.Util.wixext/$wixVersion"'
+    assert_includes @build_script, '$wixUtilExtension,'
+    refute_includes run, "dotnet tool install --global wix\n"
+    refute_includes run, "wix extension add -g $env:WIX_EXTENSION\n"
   end
 
   def test_workflow_downloads_and_verifies_upgrade_and_rollback_validation_inputs

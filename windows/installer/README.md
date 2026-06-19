@@ -20,7 +20,8 @@ Windows deployment requires:
 ## Prerequisites (Windows build host)
 
 1. Rust toolchain with the `x86_64-pc-windows-msvc` target.
-2. .NET 8 SDK (UI) and the WiX toolset: `dotnet tool install --global wix`.
+2. .NET 8 SDK (UI) and the pinned WiX toolset:
+   `dotnet tool install --global wix --version 6.0.2`.
 3. Windows SDK signing tools (`signtool.exe`) and access to the release
    Authenticode certificate.
 4. `wintun.dll` from <https://www.wintun.net/> - download the official
@@ -112,7 +113,7 @@ Copy-Item windows\wintun\bin\amd64\wintun.dll target\x86_64-pc-windows-msvc\rele
 wix build windows\installer\QuantumLink.wxs `
     -d BuildDir=target\x86_64-pc-windows-msvc\release `
     -d UiPublishDir=windows\ui\publish `
-    -ext WixToolset.Util.wixext `
+    -ext WixToolset.Util.wixext/6.0.2 `
     -o windows\QuantumLink.msi
 
 # 5. Sign (required for distribution)

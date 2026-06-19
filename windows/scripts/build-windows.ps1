@@ -125,6 +125,8 @@ $uiProject = Resolve-FilePath "ui\QuantumLink.Windows" $root
 $uiPublishDir = Resolve-FilePath "ui\publish" $root
 $installerSource = Resolve-FilePath "installer\QuantumLink.wxs" $root
 $defaultWintunDll = Resolve-FilePath "wintun\bin\amd64\wintun.dll" $root
+$wixVersion = if ([string]::IsNullOrWhiteSpace($env:WIX_VERSION)) { "6.0.2" } else { $env:WIX_VERSION.Trim() }
+$wixUtilExtension = "WixToolset.Util.wixext/$wixVersion"
 
 if ([string]::IsNullOrWhiteSpace($MsiOutputPath)) {
     $resolvedMsiOutputPath = Resolve-FilePath "QuantumLink.msi" $root
@@ -180,7 +182,7 @@ if ($Msi) {
         "-d",
         "UiPublishDir=$uiPublishDir",
         "-ext",
-        "WixToolset.Util.wixext",
+        $wixUtilExtension,
         "-o",
         $resolvedMsiOutputPath
     )
