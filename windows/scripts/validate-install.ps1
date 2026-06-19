@@ -1771,6 +1771,99 @@ function Complete-QuantumLinkValidation {
     return 1
 }
 
+function New-QuantumLinkUnhandledValidationReport {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$ErrorRecord
+    )
+
+    $message = Limit-ValidationString -Value $ErrorRecord.Exception.Message
+    $exceptionType = $null
+    if ($null -ne $ErrorRecord.Exception) {
+        $exceptionType = $ErrorRecord.Exception.GetType().FullName
+    }
+
+    return [ordered]@{
+        schemaVersion = $script:SchemaVersion
+        generatedAt = (Get-ValidationTimestamp)
+        scenario = "bootstrapFailure"
+        host = [ordered]@{
+            computerName = (ConvertTo-QuantumLinkEvidenceValue -Value $env:COMPUTERNAME -Include:$IncludeHostIdentifiers)
+            userName = (ConvertTo-QuantumLinkEvidenceValue -Value ([System.Environment]::UserName) -Include:$IncludeHostIdentifiers)
+            osCaption = [System.Environment]::OSVersion.ToString()
+            osVersion = $null
+            osBuild = $null
+            architecture = $env:PROCESSOR_ARCHITECTURE
+            powerShellVersion = $PSVersionTable.PSVersion.ToString()
+            osQueryError = "Host snapshot skipped after unhandled validation error."
+        }
+        msi = [ordered]@{
+            skipped = $false
+            required = $true
+            reason = $null
+            path = $MsiPath
+            resolvedPath = $null
+            exists = $null
+            sha256 = $null
+            lengthBytes = $null
+            error = "MSI snapshot was not completed."
+            productName = $null
+            manufacturer = $null
+            productVersion = $null
+            productCode = $null
+            upgradeCode = $null
+            packageCode = $null
+            metadataError = $null
+        }
+        upgradeFromMsi = (New-SkippedMsiSnapshot -Reason "Validation failed before upgrade baseline MSI inspection.")
+        rollbackToMsi = (New-SkippedMsiSnapshot -Reason "Validation failed before rollback MSI inspection.")
+        elevation = [ordered]@{
+            required = $null
+            isAdministrator = (Test-QuantumLinkAdministrator)
+        }
+        install = (New-FailedSkippedValidationSection -Reason "Validation failed before install started.")
+        service = (New-FailedSkippedValidationSection -Reason "Validation failed before service inspection.")
+        stateDirectory = (New-FailedSkippedValidationSection -Reason "Validation failed before state directory inspection.")
+        uiBinary = (New-FailedSkippedValidationSection -Reason "Validation failed before UI binary inspection.")
+        networkBeforeUninstall = (New-FailedSkippedValidationSection -Reason "Validation failed before network inspection.")
+        installWait = (New-FailedSkippedValidationSection -Reason "Validation failed before install footprint polling.")
+        upgrade = (New-QuantumLinkUpgradeReport -Reason "Validation failed before upgrade validation.")
+        rollback = (New-QuantumLinkRollbackReport -Reason "Validation failed before rollback validation.")
+        uninstall = (New-FailedSkippedValidationSection -Reason "Validation failed before uninstall.")
+        networkAfterUninstall = (New-FailedSkippedValidationSection -Reason "Validation failed before post-uninstall network inspection.")
+        uninstallWait = (New-FailedSkippedValidationSection -Reason "Validation failed before uninstall footprint polling.")
+        residualFindings = (New-FailedSkippedValidationSection -Reason "Validation failed before residual cleanup inspection.")
+        warnings = @("validate-install.ps1 encountered an unhandled error before normal validation completed.")
+        failures = @("Unhandled install validation error: $message")
+        unhandledError = [ordered]@{
+            message = $message
+            type = $exceptionType
+            category = [string]$ErrorRecord.CategoryInfo.Category
+            fullyQualifiedErrorId = [string]$ErrorRecord.FullyQualifiedErrorId
+            positionMessage = (Limit-ValidationString -Value $ErrorRecord.InvocationInfo.PositionMessage)
+            scriptStackTrace = (Limit-ValidationString -Value $ErrorRecord.ScriptStackTrace)
+        }
+        passed = $false
+    }
+}
+
+function Write-QuantumLinkUnhandledValidationReport {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$ErrorRecord,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    try {
+        $report = New-QuantumLinkUnhandledValidationReport -ErrorRecord $ErrorRecord
+        Write-QuantumLinkValidationReport -Report $report -Path $Path
+    } catch {
+        Write-Error -Message "Failed to write fallback install validation report: $($_.Exception.Message)" -ErrorAction Continue
+    }
+}
+
 function New-QuantumLinkContractReport {
     $report = New-QuantumLinkBaseReport -RequiresElevation $false
     $reason = "-ContractOnly supplied."
@@ -2359,7 +2452,14 @@ if ($MyInvocation.InvocationName -eq ".") {
     return
 }
 
-$scriptExitCode = Invoke-QuantumLinkInstallValidation
+try {
+    $scriptExitCode = Invoke-QuantumLinkInstallValidation
+} catch {
+    Write-QuantumLinkUnhandledValidationReport -ErrorRecord $_ -Path $ReportPath
+    Write-Error -Message "Unhandled install validation error: $($_.Exception.Message)" -ErrorAction Continue
+    exit 1
+}
+
 if ($scriptExitCode -ne 0) {
     exit 1
 }

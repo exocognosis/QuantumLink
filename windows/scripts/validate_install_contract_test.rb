@@ -228,6 +228,14 @@ class ValidateInstallContractTest < Minitest::Test
     assert_match(/exit\s+1/, @script)
   end
 
+  def test_unhandled_startup_errors_still_write_a_validation_report
+    assert_match(/function New-QuantumLinkUnhandledValidationReport\b/, @script)
+    assert_match(/scenario\s*=\s*"bootstrapFailure"/, @script)
+    assert_match(/unhandledError\s*=\s*\[ordered\]@\{/, @script)
+    assert_match(/function Write-QuantumLinkUnhandledValidationReport\b/, @script)
+    assert_match(/try\s*\{\s*\$scriptExitCode\s*=\s*Invoke-QuantumLinkInstallValidation\s*\}\s*catch\s*\{[\s\S]*Write-QuantumLinkUnhandledValidationReport\s+-ErrorRecord\s+\$_\s+-Path\s+\$ReportPath[\s\S]*Unhandled install validation error:/, @script)
+  end
+
   def test_covers_windows_footprint_and_network_snapshots
     assert_match(/Get-CimInstance\b[\s\S]*Win32_Service/, @script)
     assert_match(/Get-Acl\b/, @script)
