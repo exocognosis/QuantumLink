@@ -32,9 +32,11 @@ hex = "0.4"
 hkdf = "0.12"
 hmac = "0.12"
 mdns-sd = { version = "0.13", default-features = false, features = ["async"] }
-ml-dsa = { version = "0.1.0-rc.8", features = ["zeroize"] }
+# Keep the PQC signature crates on the same release-candidate dependency line
+# until slh-dsa supports the stable pkcs8 0.11 API.
+ml-dsa = { version = "=0.1.0-rc.8", features = ["zeroize"] }
 ml-kem = { version = "0.3.0-rc.2", features = ["getrandom", "zeroize"] }
-quinn = { version = "0.11.9", default-features = true }
+quinn = { version = "0.11.9", default-features = false, features = ["bloom", "log", "platform-verifier", "runtime-tokio", "rustls-aws-lc-rs"] }
 rand_core_06 = { package = "rand_core", version = "0.6", features = ["getrandom"] }
 rcgen = "0.14.7"
 reqwest = { version = "0.12", features = ["json"] }
@@ -43,7 +45,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha1 = "0.10"
 sha2 = "0.10"
-slh-dsa = { version = "0.2.0-rc.4", features = ["zeroize"] }
+slh-dsa = { version = "=0.2.0-rc.4", features = ["zeroize"] }
 thiserror = "1"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tracing = "0.1"

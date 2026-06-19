@@ -258,6 +258,8 @@ pub struct NetworkStatus {
     pub route_mode: Option<RouteMode>,
     pub protected_cidr: Option<String>,
     pub dry_run: bool,
+    #[serde(default)]
+    pub ownership_record_present: bool,
     pub commands: Vec<String>,
     pub nftables_rules: Vec<String>,
     pub error: Option<String>,
@@ -271,6 +273,7 @@ impl NetworkStatus {
             route_mode: None,
             protected_cidr: None,
             dry_run: true,
+            ownership_record_present: false,
             commands: Vec::new(),
             nftables_rules: Vec::new(),
             error: None,
@@ -503,6 +506,7 @@ mod tests {
                 route_mode: Some(RouteMode::GameOnly),
                 protected_cidr: Some("100.64.0.0/10".to_string()),
                 dry_run: true,
+                ownership_record_present: false,
                 commands: vec!["ip tuntap add dev qlink0 mode tun".to_string()],
                 nftables_rules: vec!["add table inet qlink".to_string()],
                 error: None,
@@ -551,6 +555,7 @@ mod tests {
             route_mode: Some(RouteMode::GameOnly),
             protected_cidr: Some("100.64.0.0/10".to_string()),
             dry_run: false,
+            ownership_record_present: true,
             commands: vec!["ip tuntap add dev qlink0 mode tun".to_string()],
             nftables_rules: vec!["add table inet qlink".to_string()],
             error: None,
@@ -559,6 +564,7 @@ mod tests {
         let applied_json = serde_json::to_string(&status).unwrap();
         assert!(applied_json.contains(r#""state":"applied""#));
         assert!(applied_json.contains(r#""dryRun":false"#));
+        assert!(applied_json.contains(r#""ownershipRecordPresent":true"#));
 
         status.network.state = NetworkPlanState::ApplyFailed;
         status.network.error = Some("nftables apply failed".to_string());
@@ -566,6 +572,25 @@ mod tests {
         let failed_json = serde_json::to_string(&status).unwrap();
         assert!(failed_json.contains(r#""state":"applyFailed""#));
         assert!(failed_json.contains(r#""error":"nftables apply failed""#));
+    }
+
+    #[test]
+    fn network_status_deserializes_legacy_payload_without_ownership_field() {
+        let status: NetworkStatus = serde_json::from_str(
+            r#"{
+                "state": "applied",
+                "interfaceName": "qlink0",
+                "routeMode": "gameOnly",
+                "protectedCidr": "100.64.0.0/10",
+                "dryRun": false,
+                "commands": [],
+                "nftablesRules": [],
+                "error": null
+            }"#,
+        )
+        .unwrap();
+
+        assert!(!status.ownership_record_present);
     }
 
     #[test]

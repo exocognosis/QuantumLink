@@ -8,6 +8,8 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 qlink-linux = { path = "../qlink-linux" }
 qlink-proto = { path = "../qlink-proto" }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [dev-dependencies]
