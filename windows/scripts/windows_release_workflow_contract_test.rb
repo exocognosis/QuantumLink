@@ -61,6 +61,16 @@ class WindowsReleaseWorkflowContractTest < Minitest::Test
     ]
   end
 
+  def test_installer_recursively_removes_state_directory_on_uninstall
+    assert_includes @installer_wxs, 'xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util"'
+    assert_match(/<Property Id="QL_STATE_FOLDER_PATH" Value="%ProgramData%\\QuantumLink" \/>/, @installer_wxs)
+    assert_in_order @installer_wxs, [
+      '<PermissionEx Id="StateFolderAcl" Sddl="D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)" />',
+      '<util:RemoveFolderEx Id="RemoveStateFolderTree" On="uninstall" Property="QL_STATE_FOLDER_PATH" />',
+      '<RemoveFolder Id="RemoveStateFolder" On="uninstall" />'
+    ]
+  end
+
   def test_workflow_declares_manual_install_validation_inputs
     inputs = workflow_dispatch_inputs
 

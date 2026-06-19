@@ -17,7 +17,8 @@
   Sign with an Authenticode certificate before distribution:
     signtool sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 QuantumLink.msi
 -->
-<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
 
   <Package Name="QuantumLink"
            Manufacturer="QuantumLink"
@@ -28,6 +29,7 @@
 
     <MajorUpgrade DowngradeErrorMessage="A newer version of QuantumLink is already installed." />
     <MediaTemplate EmbedCab="yes" />
+    <Property Id="QL_STATE_FOLDER_PATH" Value="%ProgramData%\QuantumLink" />
 
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="QuantumLink">
@@ -76,6 +78,7 @@
           <CreateFolder>
             <PermissionEx Id="StateFolderAcl" Sddl="D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)" />
           </CreateFolder>
+          <util:RemoveFolderEx Id="RemoveStateFolderTree" On="uninstall" Property="QL_STATE_FOLDER_PATH" />
           <RemoveFolder Id="RemoveStateFolder" On="uninstall" />
         </Component>
       </Directory>

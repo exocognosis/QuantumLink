@@ -221,11 +221,11 @@ Windows hardware or VMs.
   kill-switch filters and the Wintun adapter/session are expected to be torn
   down; protected routes are expected to be removed by the service's disconnect
   path. Verify these on every beta host.
-- Schedules removal of `C:\ProgramData\QuantumLink\`, but WiX `RemoveFolder`
-  only removes empty directories. State removal must be verified after
-  uninstall. If non-empty config, logs, encrypted peer cache, or DPAPI blobs
-  remain, beta is blocked until explicit cleanup implementation is added and
-  validated.
+- Schedules recursive removal of `C:\ProgramData\QuantumLink\` with WiX
+  `util:RemoveFolderEx`, followed by normal `RemoveFolder` cleanup. State
+  removal must be verified after uninstall. If config, logs, encrypted peer
+  cache, or DPAPI blobs remain, beta is blocked until cleanup is fixed and
+  rerun.
 - The Wintun *driver* is reference-counted by Windows and removed when
   the last Wintun-using product uninstalls - no action needed.
 
