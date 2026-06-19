@@ -167,14 +167,24 @@ class WindowsReleaseWorkflowContractTest < Minitest::Test
     upload_step = workflow_step("Upload install validation report")
 
     assert_includes run, "function Write-WorkflowBootstrapFailureReport"
+    assert_includes run, "function Write-WorkflowMissingValidationReport"
     assert_includes run, "workflowBootstrapFailure = [ordered]@{"
+    assert_includes run, "missingReportAfterValidator = [ordered]@{"
     assert_includes run, 'warnings = @("Windows release workflow failed before validate-install.ps1 completed.")'
     assert_includes run, 'failures = @("Windows install validation workflow bootstrap error: $message")'
+    assert_includes run, 'failures = @("Install validation exited with code $ExitCode and did not write its JSON report.")'
     assert_includes run, "passed = $false"
     assert_in_order run, [
       "try {",
       "Assert-Sha256Input -Name \"upgrade_from_msi_sha256\" -Value $upgradeSha256",
-      "& .\\windows\\scripts\\validate-install.ps1 @arguments",
+      "& pwsh -NoProfile -ExecutionPolicy Bypass -File \".\\windows\\scripts\\validate-install.ps1\" @arguments",
+      "$validationExitCode = $LASTEXITCODE",
+      "if (-not (Test-Path -LiteralPath $reportPath -PathType Leaf)) {",
+      "Write-WorkflowMissingValidationReport",
+      "if ($validationExitCode -eq 0) {",
+      "$validationExitCode = 1",
+      "if ($validationExitCode -ne 0) {",
+      "exit $validationExitCode",
       "} catch {",
       "Write-WorkflowBootstrapFailureReport -ErrorRecord $_ -Path $reportPath",
       "exit 1"

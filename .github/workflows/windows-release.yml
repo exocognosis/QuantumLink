@@ -356,6 +356,58 @@ jobs:
             }
           }
 
+          function Write-WorkflowMissingValidationReport {
+            param(
+              [Parameter(Mandatory = $true)]
+              [int]$ExitCode,
+
+              [Parameter(Mandatory = $true)]
+              [string]$Path,
+
+              [Parameter(Mandatory = $true)]
+              [string]$ValidationDirectory
+            )
+
+            try {
+              $directory = Split-Path -Parent $Path
+              if (-not [string]::IsNullOrWhiteSpace($directory)) {
+                New-Item -ItemType Directory -Path $directory -Force | Out-Null
+              }
+
+              $files = @()
+              if (Test-Path -LiteralPath $ValidationDirectory -PathType Container) {
+                $files = @(Get-ChildItem -LiteralPath $ValidationDirectory -Force |
+                  Select-Object Name, FullName, Length, LastWriteTimeUtc)
+              }
+
+              $report = [ordered]@{
+                schemaVersion = "1.1"
+                generatedAt = (Get-WorkflowValidationTimestamp)
+                scenario = "missingReportAfterValidator"
+                host = [ordered]@{
+                  os = [System.Environment]::OSVersion.ToString()
+                  machineName = $env:COMPUTERNAME
+                  runnerName = $env:RUNNER_NAME
+                }
+                msi = (Get-WorkflowMsiSnapshot -Path ".\windows\QuantumLink.msi")
+                warnings = @("validate-install.ps1 exited without producing install-validation-report.json.")
+                failures = @("Install validation exited with code $ExitCode and did not write its JSON report.")
+                missingReportAfterValidator = [ordered]@{
+                  exitCode = $ExitCode
+                  reportPath = $Path
+                  validationDirectory = $ValidationDirectory
+                  validationDirectoryExists = (Test-Path -LiteralPath $ValidationDirectory -PathType Container)
+                  validationDirectoryFiles = @($files)
+                }
+                passed = $false
+              }
+
+              $report | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $Path -Encoding UTF8
+            } catch {
+              Write-Error -Message "Failed to write missing install validation report evidence: $($_.Exception.Message)" -ErrorAction Continue
+            }
+          }
+
           function Get-WorkflowInput {
             param([AllowNull()][string]$Value)
 
@@ -467,7 +519,22 @@ jobs:
               $arguments += $rollbackMsiPath
             }
 
-            & .\windows\scripts\validate-install.ps1 @arguments
+            & pwsh -NoProfile -ExecutionPolicy Bypass -File ".\windows\scripts\validate-install.ps1" @arguments
+            $validationExitCode = $LASTEXITCODE
+
+            if (-not (Test-Path -LiteralPath $reportPath -PathType Leaf)) {
+              Write-WorkflowMissingValidationReport `
+                -ExitCode $validationExitCode `
+                -Path $reportPath `
+                -ValidationDirectory $validationDir
+              if ($validationExitCode -eq 0) {
+                $validationExitCode = 1
+              }
+            }
+
+            if ($validationExitCode -ne 0) {
+              exit $validationExitCode
+            }
           } catch {
             Write-WorkflowBootstrapFailureReport -ErrorRecord $_ -Path $reportPath
             Write-Error -Message "Windows install validation workflow bootstrap failed: $($_.Exception.Message)" -ErrorAction Continue
