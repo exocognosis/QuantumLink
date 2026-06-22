@@ -182,7 +182,12 @@ CI runs the same suites on a `macos-15` runner and then runs
 `perfgate` (the binary at `qlink-core/src/bin/perfgate.rs`) to
 diff observed values against `perf-baseline.json`. Any metric that
 regresses past the baseline's `regression_threshold_pct` (currently
-`20.0`) fails the `Performance` workflow.
+`20.0`) fails the `Performance` workflow. Baseline rows may also
+declare `regression_noise_floor_ms`; when present, a metric must exceed
+both the percentage threshold and that absolute millisecond floor before
+the row is treated as regressed. The current CI baseline uses a 2 ms
+floor only for the two sub-5 ms loopback SLO rows, where hosted-runner
+jitter is larger than the protocol signal being measured.
 
 ```sh
 # Locally, after running the bench suites:

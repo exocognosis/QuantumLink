@@ -6,12 +6,14 @@
     {
       "name": "slo.direct_warm",
       "kind": "slo_p50_ms",
-      "value_ms": 3.3
+      "value_ms": 3.3,
+      "regression_noise_floor_ms": 2.0
     },
     {
       "name": "slo.post_event_recovery",
       "kind": "slo_p50_ms",
-      "value_ms": 3.3
+      "value_ms": 3.3,
+      "regression_noise_floor_ms": 2.0
     },
     {
       "name": "slo.relay_fallback",
