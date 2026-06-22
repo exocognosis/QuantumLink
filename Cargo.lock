@@ -1929,6 +1929,7 @@ name = "qlinkd"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "qlink-core",
  "qlink-linux",
  "qlink-proto",
  "serde",

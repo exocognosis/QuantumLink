@@ -4,9 +4,9 @@ QuantumLink on SteamOS is a Linux daemon deployment inside the Steam silo. The r
 
 ## Components
 
-- `steam/steamos/rust/qlinkd`: SteamOS/Linux daemon scaffold for config loading, local status, mesh state, profile lifecycle, and future TUN ownership.
+- `steam/steamos/rust/qlinkd`: SteamOS/Linux daemon scaffold for config loading, local status, mesh state, profile lifecycle, explicit network activation, and the local TUN packet-pump boundary.
 - `steam/steamos/rust/qlinkctl`: local CLI for daemon status and SteamOS operator commands.
-- `steam/steamos/rust/qlink-linux`: Linux TUN, route, and nftables planning helpers.
+- `steam/steamos/rust/qlink-linux`: Linux TUN packet I/O, route, and nftables planning helpers.
 - `steam/steamos/rust/qlink-proto`: daemon config, status, invite, and local-control models.
 - `steam/steamos/rust/qlink-game`: game profile parsing and host-selection policy.
 - `steam/steamos/packaging/systemd`: systemd unit files.
@@ -45,6 +45,8 @@ The installer copies binaries to `/usr/local/bin` by default, creates `/etc/quan
 
 The packaged `qlinkd.service` starts the resident daemon in dry-run planning mode. It validates configuration, builds the intended Linux network plan, and exposes that plan through status, but it does not create TUN devices, change routes, or apply nftables rules by default.
 
+When started with the explicit `--activate-network` mode, `qlinkd` applies the owned TUN/route/nftables plan, opens the configured TUN device for raw Layer 3 packet I/O, initializes the shared `qlink-core` packet pump, and reports data-plane health in status. If TUN packet I/O cannot start after network activation, `qlinkd` runs record-backed network cleanup before exiting.
+
 The installed service also runs `qlinkd --deactivate-network` during stop and stop-post cleanup. Those teardown commands are idempotent: dry-run service starts have no ownership record and therefore no teardown work, while successful activated starts write `/var/lib/quantumlink/network-ownership.json` so stop removes only QuantumLink-owned TUN, route, and nftables state.
 
 Typical next steps:
@@ -54,6 +56,18 @@ sudoedit /etc/quantumlink/config.json
 sudo systemctl enable --now qlinkd
 sudo qlinkctl status
 ```
+
+`qlinkctl doctor` includes both network ownership and data-plane readiness:
+
+```text
+data-plane state: starting
+data-plane interface: qlink0
+packet I/O: available
+transport ready: no
+packet counters: observed=0 queued=0 dropped=0 emitted=0 accepted=0 rejected=0 transportErrors=0
+```
+
+`data-plane state: starting` with `transport ready: no` is expected until the SteamOS daemon is wired to the live peer transport/rendezvous session. It means the local TUN packet I/O runtime initialized, not that protected traffic is already flowing to remote peers.
 
 ## Runtime Modes
 
@@ -97,7 +111,8 @@ SteamOS may remount the root filesystem read-only after system updates. Re-run t
 
 - Linux creates a dedicated TUN interface, currently documented as `qlink0`.
 - Protected game/party routes use the overlay range `100.64.0.0/10`.
-- `qlinkd` owns route setup, nftables fail-closed policy, peer state, and profile application; the packaged service plans those changes until explicitly started with `--activate-network`, then records ownership for `--deactivate-network` cleanup.
+- `qlinkd` owns route setup, nftables fail-closed policy, peer state, profile application, and the local packet-pump boundary; the packaged service plans network changes until explicitly started with `--activate-network`, then records ownership for `--deactivate-network` cleanup.
+- The packet pump uses shared `qlink-core` packet framing and replay protection. Peer-transport selection and full Deck runtime validation remain separate gates.
 - Rendezvous services publish and look up short-lived signed peer records.
 - Peers attempt direct QUIC paths first, with optional ICE/STUN helpers as the traversal layer matures.
 - Relay services are fallback paths for hostile NAT or intentionally hidden paths.
@@ -107,11 +122,11 @@ SteamOS may remount the root filesystem read-only after system updates. Re-run t
 
 ```sh
 cargo check -p qlinkd -p qlinkctl -p qlink-linux -p qlink-proto -p qlink-game
-cargo test -p qlink-game
+cargo test -p qlink-game -p qlink-proto -p qlink-linux -p qlinkd -p qlinkctl
 bash steam/steamos/tests/install-steamos-test.sh
 bash -n steam/steamos/scripts/install-steamos.sh
 ```
 
 ## Production Boundaries
 
-The SteamOS runtime is a scaffold. Production readiness still requires complete TUN read/write integration in `qlinkd`, robust nftables apply/rollback behavior, non-root local control, hardened rendezvous/relay operations, signed release artifacts, update-channel design, and game compatibility validation for Steam launch options, LAN-discovery-heavy titles, voice chat, and anti-cheat behavior.
+The SteamOS runtime is still pre-production. This slice adds the local TUN packet I/O and packet-pump boundary, but production readiness still requires live peer transport wiring in `qlinkd`, Deck-host validation of the activated data plane, robust nftables rollback hardening, non-root local control, hardened rendezvous/relay operations, signed release artifacts, update-channel design, and game compatibility validation for Steam launch options, LAN-discovery-heavy titles, voice chat, and anti-cheat behavior.

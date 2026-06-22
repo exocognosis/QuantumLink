@@ -1,4 +1,4 @@
-use qlink_proto::{ConnectionPhase, DaemonStatus, NetworkPlanState, RouteMode};
+use qlink_proto::{ConnectionPhase, DaemonStatus, DataPlaneState, NetworkPlanState, RouteMode};
 
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
@@ -45,8 +45,10 @@ pub fn format_status(status: &DaemonStatus) -> Result<String, serde_json::Error>
 
 pub fn format_doctor(status: &DaemonStatus) -> String {
     let network = &status.network;
+    let data_plane = &status.data_plane;
     let phase = phase_label(status.phase);
     let state = network_state_label(network.state);
+    let data_plane_state = data_plane_state_label(data_plane.state);
     let mode = if network.dry_run {
         "dry-run"
     } else if network.state == NetworkPlanState::Applied {
@@ -81,10 +83,23 @@ pub fn format_doctor(status: &DaemonStatus) -> String {
         | (_, true, true) => "WARN - ownership record present; teardown may be pending".to_string(),
         _ => format!("WARN - network state {state} with mode {mode}"),
     };
+    let data_plane_verdict =
+        data_plane_health_verdict(data_plane.state, data_plane.error.as_deref());
     let verdict = match status.phase {
         ConnectionPhase::Failed => "FAIL - daemon phase failed".to_string(),
-        ConnectionPhase::Degraded if !network_verdict.starts_with("FAIL") => {
-            "WARN - daemon phase degraded".to_string()
+        _ if data_plane_verdict
+            .as_deref()
+            .is_some_and(|verdict| verdict.starts_with("FAIL")) =>
+        {
+            data_plane_verdict.unwrap()
+        }
+        _ if network_verdict.starts_with("FAIL") => network_verdict,
+        ConnectionPhase::Degraded => "WARN - daemon phase degraded".to_string(),
+        _ if data_plane_verdict
+            .as_deref()
+            .is_some_and(|verdict| verdict.starts_with("WARN")) =>
+        {
+            data_plane_verdict.unwrap()
         }
         _ => network_verdict,
     };
@@ -99,7 +114,13 @@ pub fn format_doctor(status: &DaemonStatus) -> String {
          route mode: {route_mode}\n\
          protected CIDR: {protected_cidr}\n\
          ownership record: {ownership_record}\n\
-         apply error: {apply_error}",
+         apply error: {apply_error}\n\
+         data-plane state: {data_plane_state}\n\
+         data-plane interface: {data_plane_interface}\n\
+         packet I/O: {packet_io}\n\
+         transport ready: {transport_ready}\n\
+         packet counters: observed={observed_packets} queued={queued_packets} dropped={dropped_packets} emitted={emitted_packets} accepted={accepted_packets} rejected={rejected_packets} transportErrors={transport_errors}\n\
+         data-plane error: {data_plane_error}",
         kill_switch = if status.kill_switch {
             "enabled"
         } else {
@@ -111,6 +132,25 @@ pub fn format_doctor(status: &DaemonStatus) -> String {
             .map(route_mode_label)
             .unwrap_or("unknown"),
         protected_cidr = network.protected_cidr.as_deref().unwrap_or("unknown"),
+        data_plane_interface = data_plane.interface_name.as_deref().unwrap_or("unknown"),
+        packet_io = if data_plane.packet_io_available {
+            "available"
+        } else {
+            "unavailable"
+        },
+        transport_ready = if data_plane.transport_ready {
+            "yes"
+        } else {
+            "no"
+        },
+        observed_packets = data_plane.metrics.observed_packets,
+        queued_packets = data_plane.metrics.queued_packets,
+        dropped_packets = data_plane.metrics.dropped_packets,
+        emitted_packets = data_plane.metrics.emitted_packets,
+        accepted_packets = data_plane.metrics.accepted_packets,
+        rejected_packets = data_plane.metrics.rejected_packets,
+        transport_errors = data_plane.metrics.transport_errors,
+        data_plane_error = data_plane.error.as_deref().unwrap_or("none"),
     )
 }
 
@@ -131,6 +171,28 @@ fn network_state_label(state: NetworkPlanState) -> &'static str {
         NetworkPlanState::Planned => "planned",
         NetworkPlanState::ApplyFailed => "applyFailed",
         NetworkPlanState::Applied => "applied",
+    }
+}
+
+fn data_plane_state_label(state: DataPlaneState) -> &'static str {
+    match state {
+        DataPlaneState::NotStarted => "notStarted",
+        DataPlaneState::Starting => "starting",
+        DataPlaneState::Ready => "ready",
+        DataPlaneState::Degraded => "degraded",
+        DataPlaneState::Failed => "failed",
+    }
+}
+
+fn data_plane_health_verdict(state: DataPlaneState, error: Option<&str>) -> Option<String> {
+    match (state, error) {
+        (DataPlaneState::Failed, Some(error)) => Some(format!("FAIL - data plane failed: {error}")),
+        (DataPlaneState::Failed, None) => Some("FAIL - data plane failed".to_string()),
+        (DataPlaneState::Degraded, Some(error)) => {
+            Some(format!("WARN - data plane degraded: {error}"))
+        }
+        (DataPlaneState::Degraded, None) => Some("WARN - data plane degraded".to_string()),
+        _ => None,
     }
 }
 
@@ -158,7 +220,10 @@ fn parse_status_response(line: &str) -> Result<DaemonStatus, ControlError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use qlink_proto::{NetworkPlanState, NetworkStatus, RouteMode};
+    use qlink_proto::{
+        DataPlaneState, DataPlaneStatus, NetworkPlanState, NetworkStatus, PacketPumpMetrics,
+        RouteMode,
+    };
     #[cfg(unix)]
     use std::path::PathBuf;
 
@@ -178,6 +243,36 @@ mod tests {
             ownership_record_present,
             commands: Vec::new(),
             nftables_rules: Vec::new(),
+            error: error.map(str::to_string),
+        };
+        status
+    }
+
+    fn packet_pump_metrics() -> PacketPumpMetrics {
+        PacketPumpMetrics {
+            observed_packets: 18,
+            queued_packets: 17,
+            dropped_packets: 1,
+            emitted_packets: 16,
+            accepted_packets: 15,
+            rejected_packets: 2,
+            transport_errors: 1,
+        }
+    }
+
+    fn status_with_data_plane(
+        state: DataPlaneState,
+        packet_io_available: bool,
+        transport_ready: bool,
+        error: Option<&str>,
+    ) -> DaemonStatus {
+        let mut status = status_with_network(NetworkPlanState::Planned, true, false, None);
+        status.data_plane = DataPlaneStatus {
+            interface_name: Some("qlink0".to_string()),
+            state,
+            packet_io_available,
+            transport_ready,
+            metrics: packet_pump_metrics(),
             error: error.map(str::to_string),
         };
         status
@@ -230,7 +325,13 @@ mod tests {
              route mode: gameOnly\n\
              protected CIDR: 100.64.0.0/10\n\
              ownership record: absent\n\
-             apply error: none"
+             apply error: none\n\
+             data-plane state: notStarted\n\
+             data-plane interface: unknown\n\
+             packet I/O: unavailable\n\
+             transport ready: no\n\
+             packet counters: observed=0 queued=0 dropped=0 emitted=0 accepted=0 rejected=0 transportErrors=0\n\
+             data-plane error: none"
         );
     }
 
@@ -330,6 +431,67 @@ mod tests {
         assert!(doctor.contains("route mode: unknown"));
         assert!(doctor.contains("protected CIDR: unknown"));
         assert!(doctor.contains("ownership record: absent"));
+        assert!(doctor.contains("data-plane state: notStarted"));
+        assert!(doctor.contains("packet I/O: unavailable"));
+        assert!(doctor.contains("transport ready: no"));
+        assert!(doctor.contains("packet counters: observed=0 queued=0 dropped=0 emitted=0 accepted=0 rejected=0 transportErrors=0"));
+    }
+
+    #[test]
+    fn format_doctor_reports_starting_data_plane_without_peer_transport_claims() {
+        let status = status_with_data_plane(DataPlaneState::Starting, true, false, None);
+        let doctor = format_doctor(&status);
+
+        assert!(doctor.contains("verdict: OK - dry-run planning healthy"));
+        assert!(doctor.contains("data-plane state: starting"));
+        assert!(doctor.contains("data-plane interface: qlink0"));
+        assert!(doctor.contains("packet I/O: available"));
+        assert!(doctor.contains("transport ready: no"));
+        assert!(doctor.contains("packet counters: observed=18 queued=17 dropped=1 emitted=16 accepted=15 rejected=2 transportErrors=1"));
+        assert!(!doctor.contains("peer transport ready"));
+    }
+
+    #[test]
+    fn format_doctor_fails_when_data_plane_failed() {
+        let status = status_with_data_plane(
+            DataPlaneState::Failed,
+            false,
+            false,
+            Some("packet pump stopped"),
+        );
+        let doctor = format_doctor(&status);
+
+        assert!(doctor.contains("verdict: FAIL - data plane failed: packet pump stopped"));
+        assert!(doctor.contains("data-plane state: failed"));
+        assert!(doctor.contains("data-plane error: packet pump stopped"));
+    }
+
+    #[test]
+    fn format_doctor_warns_when_data_plane_degraded() {
+        let status = status_with_data_plane(
+            DataPlaneState::Degraded,
+            true,
+            false,
+            Some("transport backpressure"),
+        );
+        let doctor = format_doctor(&status);
+
+        assert!(doctor.contains("verdict: WARN - data plane degraded: transport backpressure"));
+        assert!(doctor.contains("data-plane state: degraded"));
+        assert!(doctor.contains("transport ready: no"));
+    }
+
+    #[test]
+    fn format_doctor_keeps_fail_precedence_over_data_plane_degraded_warning() {
+        let mut status = status_with_data_plane(DataPlaneState::Degraded, true, false, None);
+        status.network.state = NetworkPlanState::ApplyFailed;
+        status.network.dry_run = false;
+        status.network.error = Some("nftables apply failed".to_string());
+
+        let doctor = format_doctor(&status);
+
+        assert!(doctor.contains("verdict: FAIL - network apply failed: nftables apply failed"));
+        assert!(doctor.contains("data-plane state: degraded"));
     }
 
     #[test]

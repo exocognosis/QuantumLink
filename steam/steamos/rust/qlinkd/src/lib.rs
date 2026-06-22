@@ -1,10 +1,15 @@
+pub mod data_plane;
+
+use data_plane::{packet_core_from_parts, BoxedTunDevice, DataPlaneError, DataPlaneRuntime};
+use qlink_core::packet_core::{FfiRouteMode, PacketTunnelCore};
 use qlink_linux::{
     LinuxNetworkPlan, LinuxRuntimePlan, NetworkApplyError, NetworkExecutor, NetworkOperation,
-    NetworkPlanError, NftablesExecutor, NftablesOperation, NftablesPlan,
+    NetworkPlanError, NftablesExecutor, NftablesOperation, NftablesPlan, TunDeviceConfig,
+    TunPacketIo,
 };
 use qlink_proto::{
-    ConnectionPhase, DaemonConfig, DaemonStatus, NetworkPlanState, NetworkStatus, PeerStatus,
-    RouteMode,
+    ConnectionPhase, DaemonConfig, DaemonStatus, DataPlaneState, DataPlaneStatus, NetworkPlanState,
+    NetworkStatus, PeerStatus, RouteMode,
 };
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
@@ -30,6 +35,9 @@ const QLINK_ROUTE_TABLE: u32 = 51820;
 const NFT_FAMILY: &str = "inet";
 const NFT_TABLE: &str = "qlink";
 const FULL_TUNNEL_CIDR: &str = "0.0.0.0/0";
+const DATA_PLANE_MTU: usize = 1280;
+
+type EngineDataPlaneRuntime = DataPlaneRuntime<BoxedTunDevice, PacketTunnelCore>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonPaths {
@@ -225,6 +233,42 @@ impl From<NetworkPlanError> for DaemonInitError {
     }
 }
 
+#[derive(Debug)]
+pub enum DaemonActivationError {
+    Network(NetworkApplyError),
+    DataPlane(DataPlaneError),
+    DataPlaneCleanupFailed {
+        data_plane: DataPlaneError,
+        cleanup: NetworkApplyError,
+    },
+}
+
+impl std::fmt::Display for DaemonActivationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Network(error) => write!(f, "{error}"),
+            Self::DataPlane(error) => write!(f, "{error}"),
+            Self::DataPlaneCleanupFailed {
+                data_plane,
+                cleanup,
+            } => write!(
+                f,
+                "{data_plane}; network cleanup after data-plane failure failed: {cleanup}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DaemonActivationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Network(error) => Some(error),
+            Self::DataPlane(error) => Some(error),
+            Self::DataPlaneCleanupFailed { data_plane, .. } => Some(data_plane),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct DaemonRuntimeState {
     pub phase: ConnectionPhase,
@@ -232,6 +276,7 @@ pub struct DaemonRuntimeState {
     pub peers: Vec<PeerStatus>,
     pub kill_switch: bool,
     pub network: NetworkRuntimeState,
+    pub data_plane: DataPlaneStatus,
 }
 
 impl DaemonRuntimeState {
@@ -242,6 +287,7 @@ impl DaemonRuntimeState {
             peers: Vec::new(),
             kill_switch,
             network: NetworkRuntimeState::NotStarted,
+            data_plane: DataPlaneStatus::not_started(),
         }
     }
 
@@ -252,15 +298,17 @@ impl DaemonRuntimeState {
             peers: self.peers.clone(),
             kill_switch: self.kill_switch,
             network: self.network.status(ownership_record_present),
+            data_plane: self.data_plane.clone(),
         }
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct DaemonEngine {
     config: DaemonConfig,
     paths: DaemonPaths,
     runtime: DaemonRuntimeState,
+    data_plane: Option<EngineDataPlaneRuntime>,
 }
 
 impl DaemonEngine {
@@ -270,6 +318,7 @@ impl DaemonEngine {
             config,
             paths,
             runtime,
+            data_plane: None,
         }
     }
 
@@ -281,11 +330,13 @@ impl DaemonEngine {
             peers: Vec::new(),
             kill_switch: config.kill_switch,
             network: NetworkRuntimeState::planned(&config, &plan),
+            data_plane: DataPlaneStatus::not_started(),
         };
         Ok(Self {
             config,
             paths,
             runtime,
+            data_plane: None,
         })
     }
 
@@ -293,7 +344,11 @@ impl DaemonEngine {
         let ownership_record_present = load_network_ownership(&self.paths)
             .map(|record| record.is_some())
             .unwrap_or(false);
-        self.runtime.status(ownership_record_present)
+        let mut status = self.runtime.status(ownership_record_present);
+        if let Some(data_plane) = &self.data_plane {
+            status.data_plane = data_plane.status();
+        }
+        status
     }
 
     pub fn runtime_state(&self) -> &DaemonRuntimeState {
@@ -310,6 +365,117 @@ impl DaemonEngine {
 
     pub fn mark_preparing(&mut self) {
         self.runtime.phase = ConnectionPhase::Preparing;
+    }
+
+    pub fn start_data_plane_with<T>(&mut self, tun: T) -> Result<(), DataPlaneError>
+    where
+        T: TunPacketIo + Send + 'static,
+    {
+        let interface_name = tun.config().name.clone();
+        if !matches!(self.runtime.network, NetworkRuntimeState::Applied(_)) {
+            let error = DataPlaneError::NetworkNotApplied(
+                "network must be activated before starting packet I/O".to_string(),
+            );
+            self.runtime.data_plane = DataPlaneStatus {
+                interface_name: Some(interface_name),
+                state: DataPlaneState::Failed,
+                packet_io_available: false,
+                transport_ready: false,
+                metrics: Default::default(),
+                error: Some(error.to_string()),
+            };
+            return Err(error);
+        }
+
+        self.runtime.data_plane = DataPlaneStatus {
+            interface_name: Some(interface_name.clone()),
+            state: DataPlaneState::Starting,
+            packet_io_available: false,
+            transport_ready: false,
+            metrics: Default::default(),
+            error: None,
+        };
+
+        let core = self.packet_core_for_data_plane()?;
+        let runtime = DataPlaneRuntime::new(BoxedTunDevice::new(tun), core);
+        self.runtime.data_plane = runtime.status();
+        self.data_plane = Some(runtime);
+        Ok(())
+    }
+
+    pub fn activate_network_and_start_data_plane_with<NE, NF, T, F>(
+        &mut self,
+        network_executor: &mut NE,
+        nftables_executor: &mut NF,
+        open_tun: F,
+    ) -> Result<(), DaemonActivationError>
+    where
+        NE: NetworkExecutor,
+        NF: NftablesExecutor,
+        T: TunPacketIo + Send + 'static,
+        F: FnOnce(TunDeviceConfig) -> Result<T, DataPlaneError>,
+    {
+        self.activate_network_with(network_executor, nftables_executor)
+            .map_err(DaemonActivationError::Network)?;
+
+        let tun_config = TunDeviceConfig::new(self.config.interface_name.clone(), DATA_PLANE_MTU);
+        let tun = open_tun(tun_config).map_err(|error| {
+            self.mark_data_plane_start_failed(&error);
+            self.cleanup_after_data_plane_start_failure(error, network_executor, nftables_executor)
+        })?;
+
+        self.start_data_plane_with(tun).map_err(|error| {
+            self.mark_data_plane_start_failed(&error);
+            self.cleanup_after_data_plane_start_failure(error, network_executor, nftables_executor)
+        })
+    }
+
+    pub fn data_plane_runtime_mut(&mut self) -> Option<&mut EngineDataPlaneRuntime> {
+        self.data_plane.as_mut()
+    }
+
+    fn packet_core_for_data_plane(&self) -> Result<PacketTunnelCore, DataPlaneError> {
+        packet_core_from_parts(
+            protected_cidr_for_record(&self.config).to_string(),
+            route_mode_for_packet_core(self.config.route_mode),
+            DATA_PLANE_MTU,
+        )
+    }
+
+    fn cleanup_after_data_plane_start_failure<NE, NF>(
+        &mut self,
+        error: DataPlaneError,
+        network_executor: &mut NE,
+        nftables_executor: &mut NF,
+    ) -> DaemonActivationError
+    where
+        NE: NetworkExecutor,
+        NF: NftablesExecutor,
+    {
+        match deactivate_network_with(&self.paths, network_executor, nftables_executor) {
+            Ok(()) => DaemonActivationError::DataPlane(error),
+            Err(cleanup) => DaemonActivationError::DataPlaneCleanupFailed {
+                data_plane: error,
+                cleanup,
+            },
+        }
+    }
+
+    fn mark_data_plane_start_failed(&mut self, error: &DataPlaneError) {
+        if let NetworkRuntimeState::Applied(plan) = self.runtime.network.clone() {
+            self.runtime.network = NetworkRuntimeState::ApplyFailed {
+                plan,
+                error: format!("data-plane startup failed: {error}"),
+            };
+        }
+        self.runtime.data_plane = DataPlaneStatus {
+            interface_name: Some(self.config.interface_name.clone()),
+            state: DataPlaneState::Failed,
+            packet_io_available: false,
+            transport_ready: false,
+            metrics: Default::default(),
+            error: Some(error.to_string()),
+        };
     }
 
     pub fn apply_network_with<NE, NF>(
@@ -389,6 +555,15 @@ impl DaemonEngine {
                 };
                 Err(error)
             }
+        }
+    }
+}
+
+fn route_mode_for_packet_core(route_mode: RouteMode) -> FfiRouteMode {
+    match route_mode {
+        RouteMode::FullTunnel => FfiRouteMode::FullTunnel,
+        RouteMode::GameOnly | RouteMode::ProtectedPrefixesOnly => {
+            FfiRouteMode::ProtectedPrefixesOnly
         }
     }
 }
@@ -767,7 +942,8 @@ fn validate_loaded_config(config: DaemonConfig, source: &str) -> std::io::Result
 mod tests {
     use super::*;
     use qlink_linux::{
-        NetworkApplyError, NetworkExecutor, NetworkOperation, NftablesExecutor, NftablesOperation,
+        LoopbackTunDevice, NetworkApplyError, NetworkExecutor, NetworkOperation, NftablesExecutor,
+        NftablesOperation, TunDeviceConfig,
     };
 
     #[test]
@@ -989,6 +1165,93 @@ mod tests {
             .commands
             .iter()
             .any(|command| { command == "ip route add 100.64.0.0/10 dev qlink0 table 51820" }));
+    }
+
+    #[test]
+    fn data_plane_does_not_start_before_network_activation() {
+        let mut engine = DaemonEngine::try_new(DaemonConfig::default(), DaemonPaths::default())
+            .expect("default config should produce a dry-run network plan");
+        let tun = LoopbackTunDevice::new(TunDeviceConfig::new("qlink0", 1280));
+
+        let error = engine.start_data_plane_with(tun).unwrap_err();
+        let status = engine.status();
+
+        assert!(error.message().contains("network must be activated"));
+        assert_eq!(status.data_plane.state, DataPlaneState::Failed);
+        assert_eq!(status.data_plane.interface_name.as_deref(), Some("qlink0"));
+        assert!(!status.data_plane.packet_io_available);
+        assert!(!status.data_plane.transport_ready);
+    }
+
+    #[test]
+    fn activated_network_can_start_data_plane_packet_io() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(&temp);
+        let mut engine = DaemonEngine::try_new(DaemonConfig::default(), paths)
+            .expect("default config should produce a dry-run network plan");
+        let mut network_executor = RecordingNetworkExecutor::default();
+        let mut nftables_executor = RecordingNftablesExecutor::default();
+        engine
+            .activate_network_with(&mut network_executor, &mut nftables_executor)
+            .expect("fake executors should apply");
+        let tun = LoopbackTunDevice::new(TunDeviceConfig::new("qlink0", 1280));
+
+        engine
+            .start_data_plane_with(tun)
+            .expect("applied network should permit packet I/O start");
+        let status = engine.status();
+
+        assert_eq!(status.data_plane.state, DataPlaneState::Starting);
+        assert_eq!(status.data_plane.interface_name.as_deref(), Some("qlink0"));
+        assert!(status.data_plane.packet_io_available);
+        assert!(!status.data_plane.transport_ready);
+        assert!(engine.data_plane_runtime_mut().is_some());
+    }
+
+    #[test]
+    fn activation_helper_cleans_up_network_when_tun_open_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(&temp);
+        let mut engine = DaemonEngine::try_new(DaemonConfig::default(), paths.clone())
+            .expect("default config should produce a dry-run network plan");
+        let mut network_executor = RecordingNetworkExecutor::default();
+        let mut nftables_executor = RecordingNftablesExecutor::default();
+
+        let error = engine
+            .activate_network_and_start_data_plane_with(
+                &mut network_executor,
+                &mut nftables_executor,
+                |_config| -> Result<LoopbackTunDevice, crate::data_plane::DataPlaneError> {
+                    Err(crate::data_plane::DataPlaneError::Tun(
+                        "tun open failed".to_string(),
+                    ))
+                },
+            )
+            .unwrap_err();
+        let status = engine.status();
+
+        assert!(error.to_string().contains("tun open failed"));
+        assert!(network_executor.operations.iter().any(|operation| matches!(
+            operation,
+            NetworkOperation::DeleteTun { name } if name == "qlink0"
+        )));
+        assert!(nftables_executor
+            .operations
+            .iter()
+            .any(|operation| matches!(
+                operation,
+                NftablesOperation::DeleteTable { family, table }
+                    if family == "inet" && table == "qlink"
+            )));
+        assert!(load_network_ownership(&paths).unwrap().is_none());
+        assert_eq!(status.network.state, NetworkPlanState::ApplyFailed);
+        assert_eq!(status.data_plane.state, DataPlaneState::Failed);
+        assert!(status
+            .network
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("data-plane startup failed"));
     }
 
     #[test]

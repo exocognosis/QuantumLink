@@ -1,6 +1,7 @@
 use crate::{
     crypto::{validate_suite_name, SUITE_FIPS203},
     error::{QlinkError, Result},
+    replay::ReplayWindow,
     routing::{RouteMode, RoutePolicy},
 };
 use chacha20poly1305::{
@@ -43,6 +44,7 @@ pub struct PacketTunnelCore {
     policy: RoutePolicy,
     frame_crypto: FrameCrypto,
     next_packet_number: u64,
+    inbound_replay: ReplayWindow,
     transport_outbox: VecDeque<Vec<u8>>,
     tunnel_outbox: VecDeque<TunnelPacket>,
     metrics: PacketCoreMetrics,
@@ -117,6 +119,7 @@ impl PacketTunnelCore {
             policy,
             frame_crypto,
             next_packet_number: 1,
+            inbound_replay: ReplayWindow::new(),
             transport_outbox: VecDeque::new(),
             tunnel_outbox: VecDeque::new(),
             metrics: PacketCoreMetrics::default(),
@@ -166,7 +169,7 @@ impl PacketTunnelCore {
     }
 
     pub fn accept_transport_frame(&mut self, frame: &[u8]) -> Result<()> {
-        let (_packet_number, protocol_family, packet) =
+        let (packet_number, protocol_family, packet) =
             match self.frame_crypto.decode_transport_frame(frame) {
                 Ok(decoded) => decoded,
                 Err(error) => {
@@ -174,6 +177,10 @@ impl PacketTunnelCore {
                     return Err(error);
                 }
             };
+        if !self.inbound_replay.observe(packet_number) {
+            self.metrics.dropped_malformed += 1;
+            return Err(QlinkError::Protocol("replayed transport frame".into()));
+        }
         self.metrics.transport_frames_in += 1;
         self.metrics.packets_to_tunnel += 1;
         self.tunnel_outbox.push_back(TunnelPacket {
@@ -436,6 +443,43 @@ mod tests {
 
         assert!(core.accept_transport_frame(&frame).is_err());
         assert!(core.pop_tunnel_packet().is_none());
+    }
+
+    #[test]
+    fn duplicate_transport_frame_is_rejected() {
+        let mut sender = test_core(SUITE_FIPS203);
+        let mut receiver = test_core(SUITE_FIPS203);
+        let packet = test_ipv4_packet([100, 127, 0, 10]);
+        sender.submit_tunnel_packet(2, &packet).unwrap();
+        let frame = sender.pop_transport_frame().unwrap();
+
+        receiver.accept_transport_frame(&frame).unwrap();
+
+        assert!(receiver.accept_transport_frame(&frame).is_err());
+        assert_eq!(receiver.metrics().transport_frames_in, 1);
+        assert_eq!(receiver.metrics().packets_to_tunnel, 1);
+        assert!(receiver.pop_tunnel_packet().is_some());
+        assert!(receiver.pop_tunnel_packet().is_none());
+    }
+
+    #[test]
+    fn stale_transport_frame_lower_than_window_is_rejected() {
+        let mut sender = test_core(SUITE_FIPS203);
+        let mut receiver = test_core(SUITE_FIPS203);
+        let packet = test_ipv4_packet([100, 127, 0, 10]);
+        let mut frames = Vec::new();
+        for _ in 0..129 {
+            sender.submit_tunnel_packet(2, &packet).unwrap();
+            frames.push(sender.pop_transport_frame().unwrap());
+        }
+
+        receiver.accept_transport_frame(&frames[128]).unwrap();
+
+        assert!(receiver.accept_transport_frame(&frames[0]).is_err());
+        assert_eq!(receiver.metrics().transport_frames_in, 1);
+        assert_eq!(receiver.metrics().packets_to_tunnel, 1);
+        assert!(receiver.pop_tunnel_packet().is_some());
+        assert!(receiver.pop_tunnel_packet().is_none());
     }
 
     #[test]

@@ -1,5 +1,7 @@
 #[cfg(unix)]
-use qlink_linux::{StdCommandRunner, SystemNetworkExecutor, SystemNftablesExecutor};
+use qlink_linux::{
+    LinuxTunDevice, StdCommandRunner, SystemNetworkExecutor, SystemNftablesExecutor,
+};
 #[cfg(unix)]
 use qlinkd::{deactivate_network_with, run_resident};
 use qlinkd::{load_config_or_default, DaemonEngine, DaemonPaths, RuntimeMode};
@@ -71,10 +73,12 @@ fn run_resident_command(mut engine: DaemonEngine, activate_network: bool) {
     if activate_network {
         let mut network_executor = SystemNetworkExecutor::new(StdCommandRunner);
         let mut nftables_executor = SystemNftablesExecutor::new(StdCommandRunner);
-        if let Err(error) =
-            engine.activate_network_with(&mut network_executor, &mut nftables_executor)
-        {
-            eprintln!("qlinkd network activation failed: {error}");
+        if let Err(error) = engine.activate_network_and_start_data_plane_with(
+            &mut network_executor,
+            &mut nftables_executor,
+            |config| LinuxTunDevice::open(config).map_err(Into::into),
+        ) {
+            eprintln!("qlinkd activation failed: {error}");
             std::process::exit(1);
         }
     }
