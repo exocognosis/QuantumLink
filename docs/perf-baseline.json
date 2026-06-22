@@ -1,77 +1,77 @@
 {
   "regression_threshold_pct": 20.0,
-  "captured_at": "2026-05-03",
-  "captured_on": "Apple Silicon developer workstation. WAN rows added 2026-05-03 from the same workstation. The WAN proxy has higher inherent variance than the loopback SLOs; expect drift on the first `macos-15` CI run. Refresh once macos-15 variance is characterized.",
+  "captured_at": "2026-06-22",
+  "captured_on": "GitHub Actions macos-15 hosted runner on main commit e13448c51e4d5180d24e25c906b8b08f3d99ba15. This is the CI gate baseline; workstation numbers remain documented in perf-baseline.md for historical context.",
   "metrics": [
     {
       "name": "slo.direct_warm",
       "kind": "slo_p50_ms",
-      "value_ms": 1.9
+      "value_ms": 3.3
     },
     {
       "name": "slo.post_event_recovery",
       "kind": "slo_p50_ms",
-      "value_ms": 2.0
+      "value_ms": 3.3
     },
     {
       "name": "slo.relay_fallback",
       "kind": "slo_p50_ms",
-      "value_ms": 204.9
+      "value_ms": 210.8
     },
     {
       "name": "slo.direct_warm.lan",
       "kind": "slo_p50_ms",
-      "value_ms": 15.5
+      "value_ms": 25.1
     },
     {
       "name": "slo.direct_warm.cable",
       "kind": "slo_p50_ms",
-      "value_ms": 162.1
+      "value_ms": 236.8
     },
     {
       "name": "slo.post_event_recovery.lan",
       "kind": "slo_p50_ms",
-      "value_ms": 14.9
+      "value_ms": 25.6
     },
     {
       "name": "slo.post_event_recovery.cable",
       "kind": "slo_p50_ms",
-      "value_ms": 168.8
+      "value_ms": 218.8
     },
     {
       "name": "slo.relay_fallback.lan",
       "kind": "slo_p50_ms",
-      "value_ms": 204.6
+      "value_ms": 210.9
     },
     {
       "name": "slo.relay_fallback.cable",
       "kind": "slo_p50_ms",
-      "value_ms": 205.0
+      "value_ms": 210.4
     },
     {
       "name": "slo.relay_fallback.mobile-3g",
       "kind": "slo_p50_ms",
-      "value_ms": 504.3
+      "value_ms": 511.0
     },
     {
       "name": "connector/cold_direct_connect",
       "kind": "criterion_estimate",
-      "value_ms": 2.98
+      "value_ms": 4.577
     },
     {
       "name": "connector/warm_direct_connect",
       "kind": "criterion_estimate",
-      "value_ms": 3.07
+      "value_ms": 5.552
     },
     {
       "name": "connector/reconnect_post_event",
       "kind": "criterion_estimate",
-      "value_ms": 2.83
+      "value_ms": 5.504
     },
     {
       "name": "ice/authenticated_check_round_trip",
       "kind": "criterion_estimate",
-      "value_ms": 0.028
+      "value_ms": 0.049
     }
   ]
 }
