@@ -27,7 +27,7 @@ jobs:
           cargo --version
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -118,7 +118,7 @@ jobs:
 
       - name: Upload criterion HTML report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: criterion-report-${{ github.run_id }}
           path: target/criterion
@@ -126,7 +126,7 @@ jobs:
 
       - name: Upload perf logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: perf-logs-${{ github.run_id }}
           path: build/perf-*.log
@@ -150,7 +150,7 @@ jobs:
         shell: bash
       - name: Upload Swift perf logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: perf-swift-${{ github.run_id }}
           path: build/perf-swift.log

@@ -68,7 +68,7 @@ jobs:
         working-directory: macos
         run: ./scripts/package-dev-artifacts.sh
       - name: Upload development artifact package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: QuantumLink-dev-${{ github.sha }}
           path: |
