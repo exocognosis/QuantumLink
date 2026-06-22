@@ -143,9 +143,10 @@ jobs:
       - name: Prepare build/ directory for tee'd logs
         run: mkdir -p build
       - name: Run Swift perf tests
+        working-directory: macos
         run: |
-          QLINK_CORE_DYLIB="$PWD/target/release/libqlink_core.dylib" \
-            swift test --filter RustMeshTransportPerformanceTests 2>&1 | tee build/perf-swift.log
+          QLINK_CORE_DYLIB="$GITHUB_WORKSPACE/target/release/libqlink_core.dylib" \
+            swift test --filter RustMeshTransportPerformanceTests 2>&1 | tee "$GITHUB_WORKSPACE/build/perf-swift.log"
         shell: bash
       - name: Upload Swift perf logs
         if: always()
