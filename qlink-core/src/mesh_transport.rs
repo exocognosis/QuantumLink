@@ -25,6 +25,10 @@
 //! (a) the link dies, (b) a network event demands reconnect, or (c) the
 //! handle is dropped.
 
+#![cfg_attr(not(feature = "dev-quic-carrier"), allow(dead_code, unused_imports))]
+
+#[cfg(feature = "dev-quic-carrier")]
+use crate::quic_transport::QuicEndpoint;
 use crate::{
     carrier_transport::CarrierSession,
     crypto::DeviceKeypair,
@@ -48,7 +52,6 @@ use crate::{
     },
     pqc_frame::PqcFrameProtector,
     pqc_session_wire::run_pqc_session_responder,
-    quic_transport::QuicEndpoint,
     rendezvous::RendezvousClient,
     session_crypto::PqcSessionContext,
     traversal::HOST_PRIORITY,
@@ -592,6 +595,29 @@ impl MeshTransportHandle {
     /// `config.local_peer_id` for the same reason `publish_self`
     /// requires the match: a connector that asserts a different
     /// identity than its published peer_id is unauthenticatable.
+    #[cfg(not(feature = "dev-quic-carrier"))]
+    pub fn new_with_keypair(
+        config: MeshTransportConfig,
+        local_device_keypair: Option<Arc<DeviceKeypair>>,
+    ) -> Result<Self> {
+        if let Some(local_device_keypair) = local_device_keypair.as_ref() {
+            let keypair_peer_id = local_device_keypair.public_key().peer_id();
+            if keypair_peer_id != config.local_peer_id {
+                return Err(QlinkError::Protocol(format!(
+                    "MeshTransportHandle local_device_keypair peer_id {keypair_peer_id} \
+                     does not match config.local_peer_id {}",
+                    config.local_peer_id
+                )));
+            }
+        }
+
+        Err(QlinkError::Protocol(
+            "native UDP live mesh carrier is not wired yet; enable dev-quic-carrier for legacy Quinn development carrier"
+                .into(),
+        ))
+    }
+
+    #[cfg(feature = "dev-quic-carrier")]
     pub fn new_with_keypair(
         config: MeshTransportConfig,
         local_device_keypair: Option<Arc<DeviceKeypair>>,
@@ -1278,6 +1304,7 @@ impl Drop for MeshTransportHandle {
 /// ACL, and forwards accepted frames into the shared inbound queue
 /// tagged with the verified peer_id. Runs until the server endpoint
 /// stops accepting (Drop on the endpoint, runtime shutdown, etc).
+#[cfg(feature = "dev-quic-carrier")]
 async fn run_responder_loop(
     server: QuicEndpoint,
     expected_mesh_id: String,
@@ -1693,7 +1720,7 @@ async fn run_session_manager(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "dev-quic-carrier"))]
 mod tests {
     use super::*;
     use crate::{

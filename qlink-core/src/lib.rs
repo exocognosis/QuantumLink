@@ -16,6 +16,7 @@ pub mod peer_acl;
 pub mod peer_store;
 pub mod pqc_frame;
 pub mod pqc_session_wire;
+#[cfg(feature = "dev-quic-carrier")]
 pub mod quic_transport;
 pub mod relay;
 pub mod rendezvous;
@@ -75,8 +76,49 @@ mod pqc_policy_tests {
             "qlink-core must declare the native-udp-carrier feature"
         );
         assert!(
-            manifest.contains("dev-quic-carrier = []"),
-            "qlink-core must track Quinn/rustls as a dev carrier until it is optional"
+            manifest.contains("dev-quic-carrier = [\"dep:quinn\", \"dep:rustls\", \"dep:rcgen\"]"),
+            "qlink-core must track Quinn/rustls as an explicit dev-only carrier"
+        );
+    }
+
+    #[test]
+    fn dev_quic_carrier_dependencies_are_optional_and_feature_gated() {
+        let manifest = include_str!("../Cargo.toml");
+        for dependency in ["quinn", "rustls", "rcgen"] {
+            let line = manifest
+                .lines()
+                .find(|line| line.starts_with(&format!("{dependency} = ")))
+                .unwrap_or_else(|| panic!("qlink-core Cargo.toml must declare {dependency}"));
+            assert!(
+                line.contains("optional = true"),
+                "{dependency} must be optional and excluded from default native-UDP builds"
+            );
+        }
+        assert!(
+            manifest.contains("dev-quic-carrier = [\"dep:quinn\", \"dep:rustls\", \"dep:rcgen\"]"),
+            "dev-quic-carrier must be the only feature that enables Quinn/rustls/rcgen"
+        );
+    }
+
+    #[test]
+    fn qlink_core_default_feature_set_is_native_udp_only() {
+        let manifest = include_str!("../Cargo.toml");
+        assert!(
+            manifest.contains("default = [\"native-udp-carrier\"]"),
+            "default qlink-core builds must stay native-UDP-only"
+        );
+        assert!(
+            !manifest.contains("default = [\"native-udp-carrier\", \"dev-quic-carrier\"]"),
+            "default qlink-core builds must not enable the dev QUIC carrier"
+        );
+    }
+
+    #[test]
+    fn default_build_sources_do_not_export_quic_carrier() {
+        let source = include_str!("lib.rs");
+        assert!(
+            source.contains("#[cfg(feature = \"dev-quic-carrier\")]\npub mod quic_transport;"),
+            "quic_transport must be compiled only for explicit dev-quic-carrier builds"
         );
     }
 

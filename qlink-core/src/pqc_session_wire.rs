@@ -117,13 +117,17 @@ fn message_name(message: &PqcSessionWireMessage) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "dev-quic-carrier")]
+    use crate::quic_transport::{QuicCertificate, QuicEndpoint};
     use crate::{
+        carrier_transport::NativeUdpSession,
         crypto::DeviceKeypair,
-        quic_transport::{QuicCertificate, QuicEndpoint},
         session_crypto::{PqcSessionContext, PQC_SESSION_SUITE},
     };
+    #[cfg(feature = "dev-quic-carrier")]
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
+    #[cfg(feature = "dev-quic-carrier")]
     #[tokio::test]
     async fn pqc_session_wire_establishes_matching_directional_keys() {
         let initiator_key = DeviceKeypair::generate().unwrap();
@@ -179,9 +183,7 @@ mod tests {
         let responder_key = DeviceKeypair::generate().unwrap();
         let responder_peer_id = responder_key.public_key().peer_id();
         let (initiator_session, responder_session) =
-            crate::carrier_transport::NativeUdpSession::loopback_pair()
-                .await
-                .unwrap();
+            NativeUdpSession::loopback_pair().await.unwrap();
         let initiator_session = crate::carrier_transport::CarrierSession::from(initiator_session);
         let responder_session = crate::carrier_transport::CarrierSession::from(responder_session);
         let carrier_binding = b"native-udp-loopback-test".to_vec();

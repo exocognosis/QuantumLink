@@ -4,13 +4,19 @@ use qlink_core::{
     discovery::{CandidateEndpoint, CandidateType, PeerRecord, UnsignedPeerRecord},
     dytallix_identity::MeshTrustPolicy,
     ice::{perform_ice_check, spawn_dev_ice_responder, IceCheckRequest, IceCredentials},
-    mesh_connection::{ConnectionOutcome, MeshConnector, MeshConnectorConfig, PathKind},
+    mesh_connection::{ConnectionOutcome, PathKind},
     mesh_transport::{MeshTransportConfig, MeshTransportHandle},
-    quic_transport::QuicEndpoint,
-    relay::{run_relay, spawn_dev_relay},
-    rendezvous::{run_rendezvous, spawn_dev_rendezvous, RendezvousClient},
+    relay::run_relay,
+    rendezvous::{run_rendezvous, RendezvousClient},
     stun::spawn_dev_stun,
     traversal::gather_local_candidates,
+};
+#[cfg(feature = "dev-quic-carrier")]
+use qlink_core::{
+    mesh_connection::{MeshConnector, MeshConnectorConfig},
+    quic_transport::QuicEndpoint,
+    relay::spawn_dev_relay,
+    rendezvous::spawn_dev_rendezvous,
 };
 use serde::Serialize;
 use std::{
@@ -368,6 +374,23 @@ impl DirectSendTimingReport {
     }
 }
 
+#[cfg(not(feature = "dev-quic-carrier"))]
+async fn run_direct_send_detailed(
+    _rendezvous_url: &str,
+    _mesh_id: &str,
+    _remote_peer_id: &str,
+    _bind_addr: &str,
+    _keyfile: Option<&str>,
+    _payload: &[u8],
+    _timeout_ms: u64,
+) -> qlink_core::Result<DirectSendRun> {
+    Err(qlink_core::QlinkError::Protocol(
+        "native UDP live mesh carrier is not wired yet; enable dev-quic-carrier for legacy Quinn development carrier"
+            .into(),
+    ))
+}
+
+#[cfg(feature = "dev-quic-carrier")]
 async fn run_direct_send_detailed(
     rendezvous_url: &str,
     mesh_id: &str,
@@ -552,6 +575,22 @@ fn load_or_generate_keypair(keyfile: Option<&str>) -> qlink_core::Result<DeviceK
     Ok(keypair)
 }
 
+#[cfg(not(feature = "dev-quic-carrier"))]
+async fn run_mesh_connect_demo(scenario: &str) -> qlink_core::Result<()> {
+    if scenario == "stun-gather" {
+        return run_stun_gather_demo().await;
+    }
+    if scenario == "ice-check" {
+        return run_ice_check_demo().await;
+    }
+
+    Err(qlink_core::QlinkError::Protocol(
+        "native UDP live mesh carrier is not wired yet; enable dev-quic-carrier for legacy Quinn development carrier"
+            .into(),
+    ))
+}
+
+#[cfg(feature = "dev-quic-carrier")]
 async fn run_mesh_connect_demo(scenario: &str) -> qlink_core::Result<()> {
     if scenario == "stun-gather" {
         return run_stun_gather_demo().await;
@@ -779,18 +818,17 @@ async fn run_stun_gather_demo() -> qlink_core::Result<()> {
     let stun = spawn_dev_stun().await?;
     let stun_addr = stun.local_addr();
 
-    // Stand up a QUIC server so we have a realistic local addr to publish.
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-    let (server_endpoint, _cert) = QuicEndpoint::server(bind)?;
-    let quic_addr = server_endpoint.local_addr()?;
+    let socket = UdpSocket::bind(bind).await?;
+    let local_transport_addr = socket.local_addr()?;
 
     let started = Instant::now();
-    let (candidates, report) = gather_local_candidates(quic_addr, &[stun_addr]).await;
+    let (candidates, report) = gather_local_candidates(local_transport_addr, &[stun_addr]).await;
     let elapsed = started.elapsed();
 
     println!("scenario=stun-gather");
     println!("stun_addr={stun_addr}");
-    println!("quic_addr={quic_addr}");
+    println!("local_transport_addr={local_transport_addr}");
     println!("gather_elapsed_ms={}", elapsed.as_millis());
     println!("gathered_candidates={}", candidates.len());
     for (index, candidate) in candidates.iter().enumerate() {
@@ -806,7 +844,7 @@ async fn run_stun_gather_demo() -> qlink_core::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "dev-quic-carrier"))]
 mod tests {
     use super::*;
 

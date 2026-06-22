@@ -1,3 +1,7 @@
+#![cfg_attr(not(feature = "dev-quic-carrier"), allow(dead_code, unused_imports))]
+
+#[cfg(feature = "dev-quic-carrier")]
+use crate::quic_transport::{QuicCertificate, QuicEndpoint};
 use crate::{
     carrier_transport::CarrierSession,
     crypto::{DeviceKeypair, SessionKeys},
@@ -14,7 +18,6 @@ use crate::{
     peer_store::{InMemoryPeerStore, PeerStore},
     pqc_frame::PqcFrameProtector,
     pqc_session_wire::run_pqc_session_initiator,
-    quic_transport::{QuicCertificate, QuicEndpoint},
     rendezvous::RendezvousClient,
     session_crypto::PqcSessionContext,
     traversal::{candidate_socket_addr, HOST_PRIORITY},
@@ -525,6 +528,7 @@ impl MdnsObservationCache {
 pub struct MeshConnector {
     config: MeshConnectorConfig,
     rendezvous: RendezvousClient,
+    #[cfg(feature = "dev-quic-carrier")]
     quic: QuicEndpoint,
     cache: LastGoodCache,
     mdns_cache: MdnsObservationCache,
@@ -537,6 +541,7 @@ pub struct MeshConnector {
 }
 
 impl MeshConnector {
+    #[cfg(feature = "dev-quic-carrier")]
     pub fn new(
         config: MeshConnectorConfig,
         rendezvous: RendezvousClient,
@@ -546,6 +551,17 @@ impl MeshConnector {
             config,
             rendezvous,
             quic,
+            cache: LastGoodCache::default(),
+            mdns_cache: MdnsObservationCache::default(),
+            peer_store: Arc::new(InMemoryPeerStore::new()),
+        }
+    }
+
+    #[cfg(not(feature = "dev-quic-carrier"))]
+    pub fn new(config: MeshConnectorConfig, rendezvous: RendezvousClient) -> Self {
+        Self {
+            config,
+            rendezvous,
             cache: LastGoodCache::default(),
             mdns_cache: MdnsObservationCache::default(),
             peer_store: Arc::new(InMemoryPeerStore::new()),
@@ -640,6 +656,15 @@ impl MeshConnector {
         }
     }
 
+    #[cfg(not(feature = "dev-quic-carrier"))]
+    pub async fn connect(&self, _remote_peer_id: &str) -> Result<(MeshLink, ConnectionOutcome)> {
+        Err(QlinkError::Protocol(
+            "native UDP live mesh carrier is not wired yet; enable dev-quic-carrier for legacy Quinn development carrier"
+                .into(),
+        ))
+    }
+
+    #[cfg(feature = "dev-quic-carrier")]
     pub async fn connect(&self, remote_peer_id: &str) -> Result<(MeshLink, ConnectionOutcome)> {
         let started = Instant::now();
 
@@ -868,6 +893,7 @@ impl MeshConnector {
     /// request with USERNAME/MESSAGE-INTEGRITY. It still proves bidirectional
     /// UDP reachability — sufficient for v1 — and matches Quinn's data-plane
     /// flow so a successful probe directly yields the live session.
+    #[cfg(feature = "dev-quic-carrier")]
     async fn race_direct_probes(
         &self,
         candidates: &[CandidateEndpoint],
@@ -1490,7 +1516,7 @@ fn candidate_matches_addr(candidate: &CandidateEndpoint, addr: SocketAddr) -> bo
         && candidate.port == addr.port()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "dev-quic-carrier"))]
 mod tests {
     use super::*;
     use crate::{

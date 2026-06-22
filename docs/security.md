@@ -25,6 +25,7 @@ Implemented baseline:
 - Public peer-record minimization: clear aliases are replaced with sequence-rotating pseudonyms and rendezvous publication keeps relay candidates only by default.
 - Raw QUIC, raw relay, and legacy mesh loopback smoke paths fail closed unless an end-to-end app-layer PQC session exists.
 - Native UDP carrier seam with fragmented authenticated control-message support; current tests prove the PQC session wire establishes matching ML-KEM/SHAKE keys over this non-TLS carrier.
+- Default `qlink-core` builds keep the legacy Quinn/rustls/rcgen carrier dependencies out of the compiled dependency graph; the dev QUIC carrier remains available only with `--features dev-quic-carrier`.
 
 Dytallix wallet and registry boundary:
 
@@ -67,7 +68,7 @@ regenerate `peers.json` after rolling the new build.
 
 Not yet production-complete:
 
-- Switching rendezvous publication and direct mesh probing from Quinn/rustls to the native UDP carrier. Current Quinn/rustls carrier setup still configures `X25519MLKEM768`; the native carrier seam exists, but the live mesh dialer has not switched yet.
+- Switching rendezvous publication and direct mesh probing to the native UDP carrier. Default live mesh dialing fails closed until that path is wired. The optional `dev-quic-carrier` path still configures Quinn/rustls with `X25519MLKEM768` for development comparison smokes.
 - Full ICE/STUN/TURN candidate gathering and nomination beyond local host/STUN parser scaffolding.
 - Notarized Developer ID app and extension bundles.
 - Managed Device Attestation and SSO integration.
@@ -75,7 +76,7 @@ Not yet production-complete:
 - Production Dytallix mainnet or hardened production registry trust root.
 - Hardened public relay abuse controls.
 - Removal of non-transport platform classical primitives: macOS/Windows privacy redaction still uses SHA-256-derived aliases; macOS CMS/profile signing still uses platform SHA-256 and interacts with platform AES behavior.
-- Removal of transitive classical crypto from the dependency graph; Quinn/rustls/aws-lc/ring still include classical algorithms even though the app-layer mesh frame boundary no longer depends on them.
+- Removal of every classical primitive from every build/tooling path. Default `qlink-core` builds should exclude the dev Quinn/rustls/aws-lc/ring carrier graph, but optional dev-carrier builds, platform signing/redaction helpers, and lockfile contents remain outside a full zero-classical claim.
 - Full anonymity guarantees. QuantumLink minimizes app/control-plane metadata by default, but outer transport IPs, relay timing, account context, and endpoint behavior can still identify users unless a future relay/egress architecture is built specifically for that threat model.
 
 The development rendezvous and relay binaries are local protocol tools. Do not expose them on the public internet without adding TLS, authentication policy, rate limits, abuse monitoring, durable revocation, and retention controls.

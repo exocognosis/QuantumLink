@@ -463,6 +463,7 @@ mod tests {
 
     // === Async wire integration: client+server through real QUIC ===
 
+    #[cfg(feature = "dev-quic-carrier")]
     #[tokio::test]
     async fn responder_accepts_legitimate_inbound_assertion_over_quic() {
         use crate::quic_transport::QuicEndpoint;
@@ -498,6 +499,7 @@ mod tests {
         assert_eq!(observed_peer_id, expected_peer_id);
     }
 
+    #[cfg(feature = "dev-quic-carrier")]
     #[tokio::test]
     async fn responder_rejects_inbound_assertion_when_peer_is_in_denylist() {
         use crate::quic_transport::QuicEndpoint;
@@ -534,6 +536,7 @@ mod tests {
         assert!(decision.reason().contains("deny"));
     }
 
+    #[cfg(feature = "dev-quic-carrier")]
     #[tokio::test]
     async fn responder_rejects_inbound_assertion_for_wrong_mesh() {
         use crate::quic_transport::QuicEndpoint;
@@ -569,6 +572,7 @@ mod tests {
         assert!(decision.reason().contains("mesh"));
     }
 
+    #[cfg(feature = "dev-quic-carrier")]
     #[tokio::test]
     async fn responder_rejects_payload_exceeding_size_limit() {
         // The receiver caps wire size to defend against a malicious peer

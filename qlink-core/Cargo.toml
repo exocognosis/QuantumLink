@@ -33,11 +33,11 @@ mdns-sd = { version = "0.13", default-features = false, features = ["async"] }
 # until slh-dsa supports the stable pkcs8 0.11 API.
 ml-dsa = { version = "=0.1.0-rc.8", features = ["zeroize"] }
 ml-kem = { version = "0.3.0-rc.2", features = ["getrandom", "zeroize"] }
-quinn = { version = "0.11.9", default-features = false, features = ["bloom", "log", "platform-verifier", "runtime-tokio", "rustls-aws-lc-rs"] }
+quinn = { version = "0.11.9", optional = true, default-features = false, features = ["bloom", "log", "platform-verifier", "runtime-tokio", "rustls-aws-lc-rs"] }
 rand_core_06 = { package = "rand_core", version = "0.6", features = ["getrandom"] }
-rcgen = "0.14.7"
+rcgen = { version = "0.14.7", optional = true }
 reqwest = { version = "0.12", features = ["json"] }
-rustls = "0.23"
+rustls = { version = "0.23", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
@@ -51,7 +51,7 @@ zeroize = { version = "1", features = ["derive"] }
 [features]
 default = ["native-udp-carrier"]
 native-udp-carrier = []
-dev-quic-carrier = []
+dev-quic-carrier = ["dep:quinn", "dep:rustls", "dep:rcgen"]
 
 [dev-dependencies]
 criterion = { version = "0.5", default-features = false, features = ["async_tokio", "html_reports"] }
@@ -60,15 +60,19 @@ tempfile = "3"
 [[bench]]
 name = "connector"
 harness = false
+required-features = ["dev-quic-carrier"]
 
 [[bench]]
 name = "ice"
 harness = false
+required-features = ["dev-quic-carrier"]
 
 [[bench]]
 name = "slos"
 harness = false
+required-features = ["dev-quic-carrier"]
 
 [[bench]]
 name = "slos_wan"
 harness = false
+required-features = ["dev-quic-carrier"]

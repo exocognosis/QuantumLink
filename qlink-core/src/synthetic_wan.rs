@@ -326,6 +326,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "dev-quic-carrier")]
     #[tokio::test(flavor = "multi_thread")]
     async fn quic_handshake_completes_through_loopback_proxy() {
         // Confirms the proxy is faithful enough for a full Quinn

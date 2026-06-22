@@ -1,7 +1,6 @@
-use crate::{
-    error::{QlinkError, Result},
-    quic_transport::QuicDatagramSession,
-};
+use crate::error::{QlinkError, Result};
+#[cfg(feature = "dev-quic-carrier")]
+use crate::quic_transport::QuicDatagramSession;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -29,6 +28,7 @@ const MAX_PENDING_AUTHENTICATED_MESSAGE_LEN: usize = 64 * 1024;
 
 #[derive(Debug, Clone)]
 pub enum CarrierSession {
+    #[cfg(feature = "dev-quic-carrier")]
     Quic(QuicDatagramSession),
     NativeUdp(NativeUdpSession),
 }
@@ -36,6 +36,7 @@ pub enum CarrierSession {
 impl CarrierSession {
     pub async fn send_frame(&self, frame: Vec<u8>) -> Result<()> {
         match self {
+            #[cfg(feature = "dev-quic-carrier")]
             Self::Quic(session) => session.send_frame(frame).await,
             Self::NativeUdp(session) => session.send_frame(frame).await,
         }
@@ -43,6 +44,7 @@ impl CarrierSession {
 
     pub async fn receive_frame(&self) -> Result<Vec<u8>> {
         match self {
+            #[cfg(feature = "dev-quic-carrier")]
             Self::Quic(session) => session.receive_frame().await,
             Self::NativeUdp(session) => session.receive_frame().await,
         }
@@ -50,6 +52,7 @@ impl CarrierSession {
 
     pub async fn send_authenticated_message(&self, payload: Vec<u8>) -> Result<()> {
         match self {
+            #[cfg(feature = "dev-quic-carrier")]
             Self::Quic(session) => session.send_authenticated_message(payload).await,
             Self::NativeUdp(session) => session.send_authenticated_message(payload).await,
         }
@@ -57,6 +60,7 @@ impl CarrierSession {
 
     pub async fn receive_authenticated_message(&self, max_size: usize) -> Result<Vec<u8>> {
         match self {
+            #[cfg(feature = "dev-quic-carrier")]
             Self::Quic(session) => session.receive_authenticated_message(max_size).await,
             Self::NativeUdp(session) => session.receive_authenticated_message(max_size).await,
         }
@@ -64,12 +68,14 @@ impl CarrierSession {
 
     pub fn close(&self, reason: &[u8]) {
         match self {
+            #[cfg(feature = "dev-quic-carrier")]
             Self::Quic(session) => session.close(reason),
             Self::NativeUdp(session) => session.close(reason),
         }
     }
 }
 
+#[cfg(feature = "dev-quic-carrier")]
 impl From<QuicDatagramSession> for CarrierSession {
     fn from(session: QuicDatagramSession) -> Self {
         Self::Quic(session)
