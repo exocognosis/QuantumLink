@@ -186,8 +186,9 @@ regresses past the baseline's `regression_threshold_pct` (currently
 declare `regression_noise_floor_ms`; when present, a metric must exceed
 both the percentage threshold and that absolute millisecond floor before
 the row is treated as regressed. The current CI baseline uses a 2 ms
-floor only for the two sub-5 ms loopback SLO rows, where hosted-runner
-jitter is larger than the protocol signal being measured.
+floor for the two sub-5 ms loopback SLO rows and a 0.1 ms floor for
+the sub-millisecond ICE micro-benchmark, where hosted-runner jitter is
+larger than the protocol signal being measured.
 
 ```sh
 # Locally, after running the bench suites:

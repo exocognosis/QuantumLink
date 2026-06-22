@@ -73,7 +73,8 @@
     {
       "name": "ice/authenticated_check_round_trip",
       "kind": "criterion_estimate",
-      "value_ms": 0.049
+      "value_ms": 0.049,
+      "regression_noise_floor_ms": 0.1
     }
   ]
 }

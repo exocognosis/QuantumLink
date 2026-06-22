@@ -518,6 +518,14 @@ slo.relay_fallback.lan: n=15 p50=204.6ms p90=206.5ms p99=207.0ms max=207.0ms
             "larger absolute drift still fails"
         );
         assert!(
+            !is_regressed(0.049, 0.090, 20.0, Some(0.1)),
+            "sub-millisecond benchmark drift can exceed percentage thresholds without being material"
+        );
+        assert!(
+            is_regressed(0.049, 0.200, 20.0, Some(0.1)),
+            "sub-millisecond benchmarks still fail once absolute drift clears the floor"
+        );
+        assert!(
             !is_regressed(210.0, 230.0, 20.0, None),
             "metrics under the percentage threshold still pass"
         );
