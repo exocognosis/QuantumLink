@@ -491,13 +491,14 @@ impl MdnsObservationCache {
             Ok(guard) => guard,
             Err(_) => return Vec::new(),
         };
-        let cutoff = Instant::now()
-            .checked_sub(self.ttl)
-            .unwrap_or_else(Instant::now);
         let Some(entries) = guard.get_mut(peer_id) else {
             return Vec::new();
         };
-        entries.retain(|entry| entry.recorded_at >= cutoff);
+        // On freshly booted runners some platforms cannot represent
+        // `now - ttl`; in that case every in-process observation is fresh.
+        if let Some(cutoff) = Instant::now().checked_sub(self.ttl) {
+            entries.retain(|entry| entry.recorded_at >= cutoff);
+        }
         if entries.is_empty() {
             guard.remove(peer_id);
             return Vec::new();
