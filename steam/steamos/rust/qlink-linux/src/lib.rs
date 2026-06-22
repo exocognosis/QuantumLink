@@ -2,6 +2,14 @@ use std::{error::Error, fmt, process::Command as ProcessCommand};
 
 use qlink_proto::{ConfigValidationError, DaemonConfig, RouteMode};
 
+pub mod tun;
+
+pub use tun::{
+    protocol_family_for_packet, LoopbackTunDevice, TunDeviceConfig, TunPacketIo, TunPacketIoError,
+};
+#[cfg(unix)]
+pub use tun::{LinuxTunDevice, LinuxTunOpenRequest, TunDeviceOpener};
+
 const DEFAULT_MTU: u16 = 1280;
 const QLINK_FWMARK: u32 = 0x514c;
 const QLINK_ROUTE_TABLE: u32 = 51820;

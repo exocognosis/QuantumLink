@@ -281,6 +281,70 @@ impl NetworkStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DataPlaneState {
+    NotStarted,
+    Starting,
+    Ready,
+    Degraded,
+    Failed,
+}
+
+impl Default for DataPlaneState {
+    fn default() -> Self {
+        Self::NotStarted
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PacketPumpMetrics {
+    pub observed_packets: u64,
+    pub queued_packets: u64,
+    pub dropped_packets: u64,
+    pub emitted_packets: u64,
+    pub accepted_packets: u64,
+    pub rejected_packets: u64,
+    pub transport_errors: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DataPlaneStatus {
+    #[serde(default)]
+    pub interface_name: Option<String>,
+    #[serde(default)]
+    pub state: DataPlaneState,
+    #[serde(default)]
+    pub packet_io_available: bool,
+    #[serde(default)]
+    pub transport_ready: bool,
+    #[serde(default)]
+    pub metrics: PacketPumpMetrics,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+impl DataPlaneStatus {
+    pub fn not_started() -> Self {
+        Self {
+            interface_name: None,
+            state: DataPlaneState::NotStarted,
+            packet_io_available: false,
+            transport_ready: false,
+            metrics: PacketPumpMetrics::default(),
+            error: None,
+        }
+    }
+}
+
+impl Default for DataPlaneStatus {
+    fn default() -> Self {
+        Self::not_started()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DaemonStatus {
@@ -290,6 +354,8 @@ pub struct DaemonStatus {
     pub kill_switch: bool,
     #[serde(default = "NetworkStatus::not_started")]
     pub network: NetworkStatus,
+    #[serde(default = "DataPlaneStatus::not_started")]
+    pub data_plane: DataPlaneStatus,
 }
 
 impl DaemonStatus {
@@ -300,6 +366,7 @@ impl DaemonStatus {
             peers: Vec::new(),
             kill_switch,
             network: NetworkStatus::not_started(),
+            data_plane: DataPlaneStatus::not_started(),
         }
     }
 }
@@ -511,6 +578,7 @@ mod tests {
                 nftables_rules: vec!["add table inet qlink".to_string()],
                 error: None,
             },
+            data_plane: DataPlaneStatus::not_started(),
         };
 
         let json = serde_json::to_string(&status).unwrap();
@@ -544,6 +612,81 @@ mod tests {
 
         assert_eq!(status.phase, ConnectionPhase::Idle);
         assert_eq!(status.network, NetworkStatus::not_started());
+    }
+
+    #[test]
+    fn idle_status_starts_with_data_plane_not_started() {
+        let status = DaemonStatus::idle(true);
+
+        assert_eq!(status.data_plane, DataPlaneStatus::not_started());
+        assert_eq!(status.data_plane.state, DataPlaneState::NotStarted);
+        assert!(status.data_plane.interface_name.is_none());
+        assert!(!status.data_plane.packet_io_available);
+        assert!(!status.data_plane.transport_ready);
+        assert_eq!(status.data_plane.metrics, PacketPumpMetrics::default());
+        assert!(status.data_plane.error.is_none());
+    }
+
+    #[test]
+    fn status_deserializes_legacy_payload_without_data_plane_field() {
+        let status: DaemonStatus = serde_json::from_str(
+            r#"{
+                "phase": "idle",
+                "activeParty": null,
+                "peers": [],
+                "killSwitch": true,
+                "network": {
+                    "state": "notStarted",
+                    "interfaceName": null,
+                    "routeMode": null,
+                    "protectedCidr": null,
+                    "dryRun": true,
+                    "ownershipRecordPresent": false,
+                    "commands": [],
+                    "nftablesRules": [],
+                    "error": null
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(status.data_plane, DataPlaneStatus::not_started());
+    }
+
+    #[test]
+    fn status_serializes_data_plane_state_and_packet_pump_metrics() {
+        let mut status = DaemonStatus::idle(true);
+        status.data_plane = DataPlaneStatus {
+            interface_name: Some("qlink0".to_string()),
+            state: DataPlaneState::Ready,
+            packet_io_available: true,
+            transport_ready: true,
+            metrics: PacketPumpMetrics {
+                observed_packets: 10,
+                queued_packets: 9,
+                dropped_packets: 1,
+                emitted_packets: 8,
+                accepted_packets: 7,
+                rejected_packets: 2,
+                transport_errors: 1,
+            },
+            error: None,
+        };
+
+        let json = serde_json::to_string(&status).unwrap();
+
+        assert!(json.contains(r#""dataPlane":"#));
+        assert!(json.contains(r#""interfaceName":"qlink0""#));
+        assert!(json.contains(r#""state":"ready""#));
+        assert!(json.contains(r#""packetIoAvailable":true"#));
+        assert!(json.contains(r#""transportReady":true"#));
+        assert!(json.contains(r#""observedPackets":10"#));
+        assert!(json.contains(r#""queuedPackets":9"#));
+        assert!(json.contains(r#""droppedPackets":1"#));
+        assert!(json.contains(r#""emittedPackets":8"#));
+        assert!(json.contains(r#""acceptedPackets":7"#));
+        assert!(json.contains(r#""rejectedPackets":2"#));
+        assert!(json.contains(r#""transportErrors":1"#));
     }
 
     #[test]

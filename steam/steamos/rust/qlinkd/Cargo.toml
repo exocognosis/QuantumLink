@@ -6,6 +6,7 @@ rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+qlink-core = { path = "../../../../qlink-core" }
 qlink-linux = { path = "../qlink-linux" }
 qlink-proto = { path = "../qlink-proto" }
 libc = "0.2"
