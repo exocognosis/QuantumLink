@@ -3305,13 +3305,23 @@ mod tests {
         sequence: u64,
         cert_der: Vec<u8>,
     ) -> PeerRecord {
+        signed_record_with_ttl(keypair, endpoints, 60, sequence, cert_der)
+    }
+
+    fn signed_record_with_ttl(
+        keypair: &DeviceKeypair,
+        endpoints: Vec<CandidateEndpoint>,
+        ttl_seconds: u64,
+        sequence: u64,
+        cert_der: Vec<u8>,
+    ) -> PeerRecord {
         let body = UnsignedPeerRecord::new(
             MESH_ID,
             "test-peer",
             keypair.public_key(),
             endpoints,
             vec!["100.127.0.10/32".to_string()],
-            60,
+            ttl_seconds,
             sequence,
         )
         .with_device_certificate(cert_der);

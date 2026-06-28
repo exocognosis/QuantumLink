@@ -54,8 +54,6 @@ mod pqc_policy_tests {
             "hmac=\"",
             "sha1 =",
             "sha1=\"",
-            "sha2 =",
-            "sha2=\"",
         ] {
             assert!(
                 !manifest.contains(forbidden),

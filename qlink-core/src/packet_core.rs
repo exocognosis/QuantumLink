@@ -372,6 +372,7 @@ mod tests {
         assert!(core.pop_tunnel_packet().is_none());
     }
 
+    #[test]
     fn selected_pqc_suite_does_not_change_packet_frame_codec() {
         let packet = test_ipv4_packet([100, 127, 0, 10]);
         let mut fips203 = test_core(SUITE_FIPS203);

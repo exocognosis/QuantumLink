@@ -32,7 +32,7 @@ mdns-sd = { version = "0.13", default-features = false, features = ["async"] }
 # Keep the PQC signature crates on the same release-candidate dependency line
 # until slh-dsa supports the stable pkcs8 0.11 API.
 ml-dsa = { version = "=0.1.0-rc.8", features = ["zeroize"] }
-ml-kem = { version = "0.3.0-rc.2", features = ["getrandom", "zeroize"] }
+ml-kem = { version = "=0.3.0-rc.2", features = ["getrandom", "zeroize"] }
 quinn = { version = "0.11.9", optional = true, default-features = false, features = ["bloom", "log", "platform-verifier", "runtime-tokio", "rustls-aws-lc-rs"] }
 rand_core_06 = { package = "rand_core", version = "0.6", features = ["getrandom"] }
 rcgen = { version = "0.14.7", optional = true }
