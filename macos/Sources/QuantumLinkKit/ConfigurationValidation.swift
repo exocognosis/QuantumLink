@@ -15,6 +15,7 @@ public enum ConfigurationValidationError: Error, LocalizedError {
   case invalidRoute(String)
   case invalidAddress(String)
   case invalidEndpoint(String)
+  case invalidCryptoSuite(String)
   case invalidDytallixIdentity(String)
 
   public var errorDescription: String? {
@@ -29,6 +30,8 @@ public enum ConfigurationValidationError: Error, LocalizedError {
       "Invalid IPv4 address: \(address)"
     case .invalidEndpoint(let endpoint):
       "Invalid endpoint address: \(endpoint)"
+    case .invalidCryptoSuite(let suite):
+      "Invalid crypto suite: \(suite)"
     case .invalidDytallixIdentity(let message):
       "Invalid Dytallix identity configuration: \(message)"
     }
@@ -71,6 +74,7 @@ public enum ConfigurationValidator {
     for endpoint in configuration.rendezvousServers + configuration.relayServers {
       try validateEndpoint(endpoint)
     }
+    try validateCryptoSuite(configuration.crypto.suite)
 
     var warnings: [String] = []
     if configuration.protectedRoutes.isEmpty {
@@ -88,6 +92,12 @@ public enum ConfigurationValidator {
     try validateDytallixIdentity(configuration, warnings: &warnings)
 
     return ConfigurationValidationReport(configuration: configuration, warnings: warnings)
+  }
+
+  private static func validateCryptoSuite(_ suite: String) throws {
+    guard PQCAlgorithm(suiteIdentifier: suite) != nil else {
+      throw ConfigurationValidationError.invalidCryptoSuite(suite)
+    }
   }
 
   private static func validateDytallixIdentity(

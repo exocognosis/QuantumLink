@@ -146,7 +146,7 @@ public struct InboundTransportFrame: Equatable, Sendable {
     }
 }
 
-private let disabledDevQuicLoopbackReason =
+let disabledDevQuicLoopbackReason =
     "dev-quic-loopback is disabled because raw Quinn DATAGRAM bypasses the app-layer PQC frame session"
 
 public protocol TunnelTransporting: AnyObject, TransportFrameSink {

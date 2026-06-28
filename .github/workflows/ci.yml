@@ -26,16 +26,8 @@ jobs:
       - name: Rust strict PQC carrier checks
         run: |
           cargo test -p qlink-core --lib pqc_policy_tests --no-default-features --features native-udp-carrier -- --nocapture
-          forbidden_native_deps="$(
-            cargo metadata --manifest-path qlink-core/Cargo.toml --locked --no-default-features --features native-udp-carrier --format-version=1 \
-              | jq -r '.resolve.nodes as $nodes
-                | def normal_deps($id):
-                    ($nodes[] | select(.id == $id) | .deps[]? | select(any(.dep_kinds[]?; .kind == null)) | .pkg);
-                  def walk_normal($id):
-                    $id, (normal_deps($id) as $dep | walk_normal($dep));
-                  [walk_normal(.resolve.root)] | unique[]
-                  | select(test("#(quinn|quinn-proto|rustls|rcgen|aws-lc-rs|ring)@"))'
-          )"
+          cargo tree --manifest-path qlink-core/Cargo.toml --locked --no-default-features --features native-udp-carrier --target all -e normal --prefix none > native-carrier-deps.txt
+          forbidden_native_deps="$(grep -E '^(quinn|quinn-proto|rustls|rcgen|aws-lc-rs|ring) v' native-carrier-deps.txt || true)"
           if [[ -n "$forbidden_native_deps" ]]; then
             printf 'forbidden native-UDP dependency resolved:\n%s\n' "$forbidden_native_deps"
             exit 1

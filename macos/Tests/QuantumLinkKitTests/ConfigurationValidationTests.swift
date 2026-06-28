@@ -16,7 +16,26 @@ final class ConfigurationValidationTests: XCTestCase {
 
     XCTAssertEqual(report.configuration.meshID, "mesh-example7e3a91")
     XCTAssertEqual(report.configuration.overlayIPv4Address, "100.64.10.2")
+    XCTAssertEqual(report.configuration.crypto.suite, PQCAlgorithm.fips203.suiteIdentifier)
     XCTAssertTrue(report.warnings.isEmpty)
+  }
+
+  func testLegacyHKDFCryptoSuiteIsRejected() throws {
+    let configuration = TunnelConfiguration(
+      meshID: "devmesh",
+      deviceAlias: "mac",
+      overlayIPv4Address: "100.127.0.2",
+      tunnelRemoteAddress: "100.127.0.1",
+      protectedRoutes: ["100.127.0.0/16"],
+      dnsServers: ["100.127.0.1"],
+      rendezvousServers: ["127.0.0.1:9471"],
+      crypto: CryptoPolicy(suite: "QLINK-FIPS203-MLKEM768-HKDFSHA256-v1")
+    )
+
+    XCTAssertThrowsError(try ConfigurationValidator.validate(configuration: configuration)) {
+      error in
+      XCTAssertTrue(error.localizedDescription.contains("Invalid crypto suite"))
+    }
   }
 
   func testInvalidEndpointIsRejected() throws {
