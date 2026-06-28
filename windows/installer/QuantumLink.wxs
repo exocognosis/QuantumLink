@@ -11,8 +11,8 @@
     removed by the service during disconnect)
 
   Build (on Windows):
-    dotnet tool install --global wix
-    wix build installer\QuantumLink.wxs -d BuildDir=..\target\x86_64-pc-windows-msvc\release -o QuantumLink.msi
+    Install the pinned WiX 6.0.2 dotnet tool first.
+    wix build -arch x64 installer\QuantumLink.wxs -d BuildDir=..\target\x86_64-pc-windows-msvc\release -ext WixToolset.Util.wixext/6.0.2 -o QuantumLink.msi
 
   Sign with an Authenticode certificate before distribution:
     signtool sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 QuantumLink.msi
@@ -29,6 +29,7 @@
 
     <MajorUpgrade DowngradeErrorMessage="A newer version of QuantumLink is already installed." />
     <MediaTemplate EmbedCab="yes" />
+    <Property Id="QL_STATE_FOLDER_PATH" Value="%ProgramData%\QuantumLink" />
 
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="QuantumLink">
@@ -74,10 +75,10 @@
     <StandardDirectory Id="CommonAppDataFolder">
       <Directory Id="StateFolder" Name="QuantumLink">
         <Component Id="StateDir" Guid="0c5be1d8-7a92-4f04-9e61-d3b8a25c70f1" KeyPath="yes">
-          <CreateFolder DisableInheritance="yes">
-            <util:PermissionEx User="SYSTEM" GenericAll="yes" />
-            <util:PermissionEx User="Administrators" GenericAll="yes" />
+          <CreateFolder>
+            <PermissionEx Id="StateFolderAcl" Sddl="D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)" />
           </CreateFolder>
+          <util:RemoveFolderEx Id="RemoveStateFolderTree" On="uninstall" Property="QL_STATE_FOLDER_PATH" />
           <RemoveFolder Id="RemoveStateFolder" On="uninstall" />
         </Component>
       </Directory>

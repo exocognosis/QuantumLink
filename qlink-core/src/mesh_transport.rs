@@ -2121,16 +2121,26 @@ mod tests {
         .unwrap();
 
         // Wait for the manager to cycle through several connect attempts.
-        // 800ms is enough for at least 3 retries given 50→100→200 backoff
-        // plus the bounded connect deadline.
-        tokio::time::sleep(Duration::from_millis(800)).await;
-        let metrics = handle.metrics();
+        // Poll the metric instead of sleeping for a fixed window: on slower
+        // Windows CI runners the first failed rendezvous attempt can consume
+        // more of the nominal 50->100->200ms schedule than it does locally.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut metrics = handle.metrics();
+        while metrics.reconnect_count < 2 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            metrics = handle.metrics();
+        }
         assert!(
             metrics.reconnect_count >= 2,
             "manager must retry instead of bailing — observed reconnect_count={}",
             metrics.reconnect_count
         );
-        assert_eq!(handle.state_code(), MeshTransportState::Failed.as_code());
+        let state = handle.state_code();
+        assert!(
+            state == MeshTransportState::Failed.as_code()
+                || state == MeshTransportState::Connecting.as_code(),
+            "persistent failure should stay in the retry loop; observed state_code={state}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

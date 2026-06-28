@@ -20,15 +20,18 @@ Windows deployment requires:
 ## Prerequisites (Windows build host)
 
 1. Rust toolchain with the `x86_64-pc-windows-msvc` target.
-2. .NET 8 SDK (UI) and the WiX toolset: `dotnet tool install --global wix`.
+2. .NET 8 SDK (UI) and the pinned WiX toolset:
+   `dotnet tool install --global wix --version 6.0.2`.
 3. Windows SDK signing tools (`signtool.exe`) and access to the release
    Authenticode certificate.
 4. `wintun.dll` from <https://www.wintun.net/> - download the official
    signed distribution and copy the matching-arch DLL
    (`bin/amd64/wintun.dll` for x64) to
    `windows\wintun\bin\amd64\wintun.dll`, or pass `-WintunDllPath` to the
-   build script. Wintun's license permits redistribution alongside your
-   application; keep the upstream license text with the artifact.
+   build script. Copy the upstream license/copying file to
+   `windows\wintun\LICENSE.txt` for manual release staging. Wintun's license
+   permits redistribution alongside your application; keep the upstream license
+   text with the artifact.
 
 ## GitHub release workflow inputs
 
@@ -55,6 +58,34 @@ Set `skip_validation_network_checks` only when the runner cannot collect
 adapter, route, or WFP evidence; that option does not replace full beta
 validation on clean Windows hosts.
 
+Additional manual workflow inputs:
+
+- `expected_publisher_subject`: optional exact Authenticode publisher subject
+  enforced by release evidence verification.
+- `expected_publisher_thumbprint`: optional publisher certificate thumbprint
+  enforced by release evidence verification.
+- `upgrade_from_msi_url`: optional older MSI to install before validating an
+  upgrade to the generated MSI.
+- `upgrade_from_msi_sha256`: required SHA-256 checksum when
+  `upgrade_from_msi_url` is supplied.
+- `validate_rollback`: runs rollback validation after successful upgrade
+  validation. This requires `upgrade_from_msi_url`.
+- `rollback_to_msi_url`: optional rollback target MSI. If omitted during
+  rollback validation, `validate-install.ps1` rolls back to the upgrade source.
+- `rollback_to_msi_sha256`: required SHA-256 checksum when
+  `rollback_to_msi_url` is supplied.
+- `rollback_mode`: `UninstallReinstall` by default, or `DirectDowngrade` when
+  direct downgrade behavior should be exercised.
+
+The release workflow runs `.\windows\scripts\verify-windows-release.ps1` before
+uploading artifacts. It writes
+`windows/build/release/windows-release-evidence.json` alongside the MSI,
+`SHA256SUMS.txt`, and `WINTUN-LICENSE.txt`. For signed manual artifacts and all
+tag releases, this evidence requires a valid MSI signature and trusted
+timestamp. When `run_install_validation` is enabled, the evidence also requires
+`.\windows\build\validation\install-validation-report.json` and checks that the
+report's MSI SHA-256 matches the staged release MSI.
+
 ## Build steps
 
 Run these commands from the repository root (the directory containing
@@ -80,20 +111,48 @@ Copy-Item windows\wintun\bin\amd64\wintun.dll target\x86_64-pc-windows-msvc\rele
 
 # 4. MSI
 wix build windows\installer\QuantumLink.wxs `
+    -arch x64 `
     -d BuildDir=target\x86_64-pc-windows-msvc\release `
     -d UiPublishDir=windows\ui\publish `
-    -ext WixToolset.Util.wixext `
+    -ext WixToolset.Util.wixext/6.0.2 `
     -o windows\QuantumLink.msi
 
 # 5. Sign (required for distribution)
 signtool sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 windows\QuantumLink.msi
 
-# 6. Verify signature and publish checksum
+# 6. Verify signature
 Get-AuthenticodeSignature .\windows\QuantumLink.msi
-Get-FileHash .\windows\QuantumLink.msi -Algorithm SHA256 | Format-List > .\windows\QuantumLink.msi.sha256
 
-# 7. Generate install/uninstall validation evidence
+# 7. Stage release artifacts and checksums
+$releaseDir = ".\windows\build\release"
+Remove-Item -Path $releaseDir -Recurse -Force -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Path $releaseDir -Force | Out-Null
+
+$stagedMsi = Join-Path $releaseDir "QuantumLink-manual-windows-x64.msi"
+Copy-Item -Path ".\windows\QuantumLink.msi" -Destination $stagedMsi -Force
+Copy-Item -Path ".\windows\wintun\LICENSE.txt" -Destination (Join-Path $releaseDir "WINTUN-LICENSE.txt") -Force
+
+$checksumsPath = Join-Path $releaseDir "SHA256SUMS.txt"
+Get-ChildItem -Path $releaseDir -File |
+    Sort-Object Name |
+    ForEach-Object {
+        $hash = Get-FileHash -Algorithm SHA256 -Path $_.FullName
+        "{0}  {1}" -f $hash.Hash.ToLowerInvariant(), $_.Name
+    } |
+    Set-Content -Path $checksumsPath -Encoding ascii
+Get-Content $checksumsPath
+
+# 8. Generate install/uninstall validation evidence
 .\windows\scripts\validate-install.ps1 -MsiPath .\windows\QuantumLink.msi -ReportPath .\windows\build\validation\install-validation-report.json
+
+# 9. Generate release evidence for the staged artifact set
+.\windows\scripts\verify-windows-release.ps1 `
+    -ArtifactDirectory .\windows\build\release `
+    -MsiPath $stagedMsi `
+    -ChecksumsPath .\windows\build\release\SHA256SUMS.txt `
+    -WintunLicensePath .\windows\build\release\WINTUN-LICENSE.txt `
+    -WintunDllPath .\windows\wintun\bin\amd64\wintun.dll `
+    -EvidencePath .\windows\build\release\windows-release-evidence.json
 ```
 
 ## Release operator checklist
@@ -110,7 +169,16 @@ Get-FileHash .\windows\QuantumLink.msi -Algorithm SHA256 | Format-List > .\windo
 - [ ] Build the WiX MSI, then Authenticode-sign and timestamp `QuantumLink.msi`.
 - [ ] Verify the MSI signature shows the expected publisher and a trusted
       timestamp.
+- [ ] For manual release workflow runs, set `expected_publisher_subject` and/or
+      `expected_publisher_thumbprint` when publisher identity should be
+      enforced by `windows-release-evidence.json`.
 - [ ] Generate and publish the SHA-256 checksum next to the MSI.
+- [ ] If validating upgrade, configure `upgrade_from_msi_url` and
+      `upgrade_from_msi_sha256`. If validating rollback, also set
+      `validate_rollback`, choose `rollback_mode`, and optionally configure
+      `rollback_to_msi_url` plus `rollback_to_msi_sha256`.
+- [ ] Confirm `windows-release-evidence.json` is uploaded alongside the MSI,
+      `SHA256SUMS.txt`, and `WINTUN-LICENSE.txt`.
 - [ ] Run the Windows beta runbook on clean Windows 10 22H2 and Windows 11 x64
       VMs plus at least one physical x64 Windows machine.
 - [ ] Treat any install, Wintun, WFP, leak-test, service lifecycle, checksum,
@@ -125,10 +193,12 @@ command passes, release Rust artifacts build, and the WinUI 3 app builds.
 
 The Windows release workflow sources Wintun from the pinned URL/checksum, builds
 the WiX MSI, optionally Authenticode-signs manual artifacts, requires signing
-for tag releases, creates checksums, and uploads the Wintun license text with
-the artifacts. For manual runs with `run_install_validation` enabled, it also
+for tag releases, creates checksums, verifies the release evidence contract, and
+uploads `windows-release-evidence.json` plus the Wintun license text with the
+artifacts. For manual runs with `run_install_validation` enabled, it also
 installs and uninstalls the generated MSI on `windows-latest` by running
-`.\windows\scripts\validate-install.ps1`, then uploads
+`.\windows\scripts\validate-install.ps1`, optionally exercises upgrade and
+rollback validation from the configured MSI URLs, then uploads
 `windows/build/validation/install-validation-report.json` as
 `QuantumLink-Windows-InstallValidation-<run-number>`.
 
@@ -151,11 +221,11 @@ Windows hardware or VMs.
   kill-switch filters and the Wintun adapter/session are expected to be torn
   down; protected routes are expected to be removed by the service's disconnect
   path. Verify these on every beta host.
-- Schedules removal of `C:\ProgramData\QuantumLink\`, but WiX `RemoveFolder`
-  only removes empty directories. State removal must be verified after
-  uninstall. If non-empty config, logs, encrypted peer cache, or DPAPI blobs
-  remain, beta is blocked until explicit cleanup implementation is added and
-  validated.
+- Schedules recursive removal of `C:\ProgramData\QuantumLink\` with WiX
+  `util:RemoveFolderEx`, followed by normal `RemoveFolder` cleanup. State
+  removal must be verified after uninstall. If config, logs, encrypted peer
+  cache, or DPAPI blobs remain, beta is blocked until cleanup is fixed and
+  rerun.
 - The Wintun *driver* is reference-counted by Windows and removed when
   the last Wintun-using product uninstalls - no action needed.
 

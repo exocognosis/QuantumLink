@@ -14,6 +14,41 @@ on:
         description: "Skips adapter/route/WFP evidence inside validate-install.ps1 if a runner cannot collect network evidence."
         type: boolean
         default: false
+      expected_publisher_subject:
+        description: "Optional exact Authenticode publisher subject expected on the staged MSI."
+        type: string
+        default: ""
+      expected_publisher_thumbprint:
+        description: "Optional Authenticode publisher certificate thumbprint expected on the staged MSI."
+        type: string
+        default: ""
+      upgrade_from_msi_url:
+        description: "Optional older MSI URL to install before validating upgrade to the generated MSI."
+        type: string
+        default: ""
+      upgrade_from_msi_sha256:
+        description: "Required SHA-256 when upgrade_from_msi_url is supplied."
+        type: string
+        default: ""
+      validate_rollback:
+        description: "Validate rollback after a successful upgrade validation."
+        type: boolean
+        default: false
+      rollback_to_msi_url:
+        description: "Optional rollback target MSI URL. Defaults to upgrade_from_msi_url when omitted."
+        type: string
+        default: ""
+      rollback_to_msi_sha256:
+        description: "Required SHA-256 when rollback_to_msi_url is supplied."
+        type: string
+        default: ""
+      rollback_mode:
+        description: "Rollback validation strategy used by validate-install.ps1."
+        type: choice
+        default: UninstallReinstall
+        options:
+          - UninstallReinstall
+          - DirectDowngrade
 
 permissions:
   contents: write
@@ -27,6 +62,7 @@ jobs:
       DOTNET_NOLOGO: "true"
       RUST_TARGET: x86_64-pc-windows-msvc
       WIX_EXTENSION: WixToolset.Util.wixext
+      WIX_VERSION: "6.0.2"
     steps:
       - uses: actions/checkout@v7
 
@@ -58,10 +94,14 @@ jobs:
           $dotnetTools | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           $env:PATH = "$dotnetTools;$env:PATH"
 
-          dotnet tool install --global wix
-          wix extension add -g $env:WIX_EXTENSION
+          dotnet tool install --global wix --version $env:WIX_VERSION
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          wix extension add -g "$env:WIX_EXTENSION/$env:WIX_VERSION"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           wix --version
-          wix extension list
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          wix extension list -g
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Stage Wintun DLL
         shell: pwsh
@@ -226,23 +266,280 @@ jobs:
       - name: Validate MSI install and uninstall
         if: github.event_name == 'workflow_dispatch' && inputs.run_install_validation
         shell: pwsh
+        env:
+          SKIP_VALIDATION_NETWORK_CHECKS: ${{ inputs.skip_validation_network_checks }}
+          UPGRADE_FROM_MSI_URL: ${{ inputs.upgrade_from_msi_url }}
+          UPGRADE_FROM_MSI_SHA256: ${{ inputs.upgrade_from_msi_sha256 }}
+          VALIDATE_ROLLBACK: ${{ inputs.validate_rollback }}
+          ROLLBACK_TO_MSI_URL: ${{ inputs.rollback_to_msi_url }}
+          ROLLBACK_TO_MSI_SHA256: ${{ inputs.rollback_to_msi_sha256 }}
+          ROLLBACK_MODE: ${{ inputs.rollback_mode }}
         run: |
           $ErrorActionPreference = "Stop"
 
-          New-Item -ItemType Directory -Path ".\windows\build\validation" -Force | Out-Null
+          $validationDir = ".\windows\build\validation"
+          $reportPath = ".\windows\build\validation\install-validation-report.json"
 
-          $arguments = @(
-            "-MsiPath",
-            ".\windows\QuantumLink.msi",
-            "-ReportPath",
-            ".\windows\build\validation\install-validation-report.json"
-          )
-
-          if ("${{ inputs.skip_validation_network_checks }}" -eq "true") {
-            $arguments += "-SkipNetworkChecks"
+          function Get-WorkflowValidationTimestamp {
+            return (Get-Date).ToUniversalTime().ToString("o")
           }
 
-          & .\windows\scripts\validate-install.ps1 @arguments
+          function Get-WorkflowMsiSnapshot {
+            param([string]$Path)
+
+            $snapshot = [ordered]@{
+              path = $Path
+              resolvedPath = $null
+              exists = $false
+              sha256 = $null
+              lengthBytes = $null
+              error = $null
+            }
+
+            try {
+              $resolvedPath = (Resolve-Path -LiteralPath $Path -ErrorAction Stop).ProviderPath
+              $item = Get-Item -LiteralPath $resolvedPath -ErrorAction Stop
+              $snapshot.resolvedPath = $resolvedPath
+              $snapshot.exists = $true
+              $snapshot.lengthBytes = $item.Length
+              $snapshot.sha256 = (Get-FileHash -Algorithm SHA256 -Path $resolvedPath -ErrorAction Stop).Hash.ToLowerInvariant()
+            } catch {
+              $snapshot.error = $_.Exception.Message
+            }
+
+            return $snapshot
+          }
+
+          function Write-WorkflowBootstrapFailureReport {
+            param(
+              [Parameter(Mandatory = $true)]
+              [object]$ErrorRecord,
+
+              [Parameter(Mandatory = $true)]
+              [string]$Path
+            )
+
+            try {
+              $directory = Split-Path -Parent $Path
+              if (-not [string]::IsNullOrWhiteSpace($directory)) {
+                New-Item -ItemType Directory -Path $directory -Force | Out-Null
+              }
+
+              $message = if ($ErrorRecord.Exception) { $ErrorRecord.Exception.Message } else { [string]$ErrorRecord }
+              $exceptionType = if ($ErrorRecord.Exception) { $ErrorRecord.Exception.GetType().FullName } else { $ErrorRecord.GetType().FullName }
+              $report = [ordered]@{
+                schemaVersion = "1.1"
+                generatedAt = (Get-WorkflowValidationTimestamp)
+                scenario = "workflowBootstrap"
+                host = [ordered]@{
+                  os = [System.Environment]::OSVersion.ToString()
+                  machineName = $env:COMPUTERNAME
+                  runnerName = $env:RUNNER_NAME
+                }
+                msi = (Get-WorkflowMsiSnapshot -Path ".\windows\QuantumLink.msi")
+                warnings = @("Windows release workflow failed before validate-install.ps1 completed.")
+                failures = @("Windows install validation workflow bootstrap error: $message")
+                workflowBootstrapFailure = [ordered]@{
+                  message = $message
+                  type = $exceptionType
+                  category = [string]$ErrorRecord.CategoryInfo.Category
+                  fullyQualifiedErrorId = [string]$ErrorRecord.FullyQualifiedErrorId
+                  positionMessage = [string]$ErrorRecord.InvocationInfo.PositionMessage
+                  scriptStackTrace = [string]$ErrorRecord.ScriptStackTrace
+                }
+                passed = $false
+              }
+
+              $report | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $Path -Encoding UTF8
+            } catch {
+              Write-Error -Message "Failed to write workflow bootstrap install validation report: $($_.Exception.Message)" -ErrorAction Continue
+            }
+          }
+
+          function Write-WorkflowMissingValidationReport {
+            param(
+              [Parameter(Mandatory = $true)]
+              [int]$ExitCode,
+
+              [Parameter(Mandatory = $true)]
+              [string]$Path,
+
+              [Parameter(Mandatory = $true)]
+              [string]$ValidationDirectory
+            )
+
+            try {
+              $directory = Split-Path -Parent $Path
+              if (-not [string]::IsNullOrWhiteSpace($directory)) {
+                New-Item -ItemType Directory -Path $directory -Force | Out-Null
+              }
+
+              $files = @()
+              if (Test-Path -LiteralPath $ValidationDirectory -PathType Container) {
+                $files = @(Get-ChildItem -LiteralPath $ValidationDirectory -Force |
+                  Select-Object Name, FullName, Length, LastWriteTimeUtc)
+              }
+
+              $report = [ordered]@{
+                schemaVersion = "1.1"
+                generatedAt = (Get-WorkflowValidationTimestamp)
+                scenario = "missingReportAfterValidator"
+                host = [ordered]@{
+                  os = [System.Environment]::OSVersion.ToString()
+                  machineName = $env:COMPUTERNAME
+                  runnerName = $env:RUNNER_NAME
+                }
+                msi = (Get-WorkflowMsiSnapshot -Path ".\windows\QuantumLink.msi")
+                warnings = @("validate-install.ps1 exited without producing install-validation-report.json.")
+                failures = @("Install validation exited with code $ExitCode and did not write its JSON report.")
+                missingReportAfterValidator = [ordered]@{
+                  exitCode = $ExitCode
+                  reportPath = $Path
+                  validationDirectory = $ValidationDirectory
+                  validationDirectoryExists = (Test-Path -LiteralPath $ValidationDirectory -PathType Container)
+                  validationDirectoryFiles = @($files)
+                }
+                passed = $false
+              }
+
+              $report | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $Path -Encoding UTF8
+            } catch {
+              Write-Error -Message "Failed to write missing install validation report evidence: $($_.Exception.Message)" -ErrorAction Continue
+            }
+          }
+
+          function Get-WorkflowInput {
+            param([AllowNull()][string]$Value)
+
+            if ([string]::IsNullOrWhiteSpace($Value)) {
+              return ""
+            }
+
+            return $Value.Trim()
+          }
+
+          function Assert-Sha256Input {
+            param(
+              [string]$Name,
+              [string]$Value
+            )
+
+            if (-not [string]::IsNullOrWhiteSpace($Value) -and $Value -notmatch '^[0-9a-fA-F]{64}$') {
+              throw "$Name must be a 64-character hex SHA-256 checksum."
+            }
+          }
+
+          function Save-VerifiedMsi {
+            param(
+              [string]$Url,
+              [string]$ExpectedSha256,
+              [string]$DestinationPath,
+              [string]$Description
+            )
+
+            Write-Host "Downloading $Description MSI from $Url"
+            Invoke-WebRequest -Uri $Url -OutFile $DestinationPath
+
+            if ((Get-Item $DestinationPath).Length -eq 0) {
+              throw "Downloaded $Description MSI is empty."
+            }
+
+            $expectedHash = $ExpectedSha256.ToLowerInvariant()
+            $actualHash = (Get-FileHash -Algorithm SHA256 -Path $DestinationPath).Hash.ToLowerInvariant()
+            if ($actualHash -ne $expectedHash) {
+              throw "$Description MSI SHA-256 mismatch. Expected $expectedHash but got $actualHash."
+            }
+          }
+
+          New-Item -ItemType Directory -Path $validationDir -Force | Out-Null
+
+          try {
+            $upgradeUrl = Get-WorkflowInput -Value $env:UPGRADE_FROM_MSI_URL
+            $upgradeSha256 = Get-WorkflowInput -Value $env:UPGRADE_FROM_MSI_SHA256
+            $rollbackUrl = Get-WorkflowInput -Value $env:ROLLBACK_TO_MSI_URL
+            $rollbackSha256 = Get-WorkflowInput -Value $env:ROLLBACK_TO_MSI_SHA256
+            $validateRollback = ($env:VALIDATE_ROLLBACK -eq "true")
+
+            if ($upgradeUrl -ne "" -and $upgradeSha256 -eq "") {
+              throw "upgrade_from_msi_sha256 is required when upgrade_from_msi_url is supplied."
+            }
+            if ($upgradeUrl -eq "" -and $upgradeSha256 -ne "") {
+              throw "upgrade_from_msi_url is required when upgrade_from_msi_sha256 is supplied."
+            }
+            if ($validateRollback -and $upgradeUrl -eq "") {
+              throw "validate_rollback requires upgrade_from_msi_url."
+            }
+            if ($rollbackUrl -ne "" -and -not $validateRollback) {
+              throw "rollback_to_msi_url requires validate_rollback."
+            }
+            if ($rollbackUrl -ne "" -and $rollbackSha256 -eq "") {
+              throw "rollback_to_msi_sha256 is required when rollback_to_msi_url is supplied."
+            }
+            if ($rollbackUrl -eq "" -and $rollbackSha256 -ne "") {
+              throw "rollback_to_msi_url is required when rollback_to_msi_sha256 is supplied."
+            }
+
+            Assert-Sha256Input -Name "upgrade_from_msi_sha256" -Value $upgradeSha256
+            Assert-Sha256Input -Name "rollback_to_msi_sha256" -Value $rollbackSha256
+
+            $arguments = @(
+              "-MsiPath",
+              ".\windows\QuantumLink.msi",
+              "-ReportPath",
+              $reportPath
+            )
+
+            if ($env:SKIP_VALIDATION_NETWORK_CHECKS -eq "true") {
+              $arguments += "-SkipNetworkChecks"
+            }
+
+            if ($upgradeUrl -ne "") {
+              $upgradeMsiPath = Join-Path $validationDir "upgrade-from.msi"
+              Save-VerifiedMsi -Url $upgradeUrl `
+                -ExpectedSha256 $upgradeSha256 `
+                -DestinationPath $upgradeMsiPath `
+                -Description "upgrade_from_msi_url"
+              $arguments += "-UpgradeFromMsiPath"
+              $arguments += $upgradeMsiPath
+            }
+
+            if ($validateRollback) {
+              $arguments += "-ValidateRollback"
+              $arguments += "-RollbackMode"
+              $arguments += $env:ROLLBACK_MODE
+            }
+
+            if ($rollbackUrl -ne "") {
+              $rollbackMsiPath = Join-Path $validationDir "rollback-to.msi"
+              Save-VerifiedMsi -Url $rollbackUrl `
+                -ExpectedSha256 $rollbackSha256 `
+                -DestinationPath $rollbackMsiPath `
+                -Description "rollback_to_msi_url"
+              $arguments += "-RollbackToMsiPath"
+              $arguments += $rollbackMsiPath
+            }
+
+            & pwsh -NoProfile -ExecutionPolicy Bypass -File ".\windows\scripts\validate-install.ps1" @arguments
+            $validationExitCode = $LASTEXITCODE
+
+            if (-not (Test-Path -LiteralPath $reportPath -PathType Leaf)) {
+              Write-WorkflowMissingValidationReport `
+                -ExitCode $validationExitCode `
+                -Path $reportPath `
+                -ValidationDirectory $validationDir
+              if ($validationExitCode -eq 0) {
+                $validationExitCode = 1
+              }
+            }
+
+            if ($validationExitCode -ne 0) {
+              exit $validationExitCode
+            }
+          } catch {
+            Write-WorkflowBootstrapFailureReport -ErrorRecord $_ -Path $reportPath
+            Write-Error -Message "Windows install validation workflow bootstrap failed: $($_.Exception.Message)" -ErrorAction Continue
+            exit 1
+          }
 
       - name: Upload install validation report
         if: always() && github.event_name == 'workflow_dispatch' && inputs.run_install_validation
@@ -250,7 +547,7 @@ jobs:
         with:
           name: QuantumLink-Windows-InstallValidation-${{ github.run_number }}
           path: windows/build/validation/install-validation-report.json
-          if-no-files-found: warn
+          if-no-files-found: error
 
       - name: Stage release artifacts and checksums
         shell: pwsh
@@ -288,6 +585,56 @@ jobs:
 
           Get-Content $checksumsPath
 
+      - name: Verify Windows release evidence
+        shell: pwsh
+        env:
+          SIGNING_AVAILABLE: ${{ steps.signing.outputs.available }}
+          RUN_INSTALL_VALIDATION: ${{ github.event_name == 'workflow_dispatch' && inputs.run_install_validation }}
+          EXPECTED_PUBLISHER_SUBJECT: ${{ inputs.expected_publisher_subject }}
+          EXPECTED_PUBLISHER_THUMBPRINT: ${{ inputs.expected_publisher_thumbprint }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $releaseDir = ".\windows\build\release"
+          $stagedMsi = @(
+            Get-ChildItem -Path $releaseDir -File -Filter "QuantumLink-*-windows-x64.msi" |
+              Sort-Object Name
+          )
+
+          if ($stagedMsi.Count -ne 1) {
+            Write-Error "Expected exactly one staged Windows MSI in $releaseDir but found $($stagedMsi.Count)."
+            exit 1
+          }
+
+          $arguments = @{
+            ArtifactDirectory = ".\windows\build\release"
+            MsiPath = $stagedMsi[0].FullName
+            ChecksumsPath = ".\windows\build\release\SHA256SUMS.txt"
+            WintunDllPath = ".\wintun\bin\amd64\wintun.dll"
+            WintunLicensePath = ".\windows\build\release\WINTUN-LICENSE.txt"
+            EvidencePath = ".\windows\build\release\windows-release-evidence.json"
+          }
+
+          if ($env:SIGNING_AVAILABLE -eq "true" -or $env:GITHUB_REF -like "refs/tags/v*") {
+            $arguments.RequireValidSignature = $true
+            $arguments.RequireTimestamp = $true
+          }
+
+          if (-not [string]::IsNullOrWhiteSpace($env:EXPECTED_PUBLISHER_SUBJECT)) {
+            $arguments.ExpectedPublisherSubject = $env:EXPECTED_PUBLISHER_SUBJECT.Trim()
+          }
+
+          if (-not [string]::IsNullOrWhiteSpace($env:EXPECTED_PUBLISHER_THUMBPRINT)) {
+            $arguments.ExpectedPublisherThumbprint = $env:EXPECTED_PUBLISHER_THUMBPRINT.Trim()
+          }
+
+          if ($env:RUN_INSTALL_VALIDATION -eq "true") {
+            $arguments.InstallValidationReportPath = ".\windows\build\validation\install-validation-report.json"
+            $arguments.RequireInstallValidation = $true
+          }
+
+          & .\windows\scripts\verify-windows-release.ps1 @arguments
+
       - name: Upload release artifacts
         uses: actions/upload-artifact@v7
         with:
@@ -296,6 +643,7 @@ jobs:
             windows/build/release/*.msi
             windows/build/release/WINTUN-LICENSE.txt
             windows/build/release/SHA256SUMS.txt
+            windows/build/release/windows-release-evidence.json
           if-no-files-found: error
 
       - name: Attach to GitHub Release
@@ -306,4 +654,5 @@ jobs:
             windows/build/release/*.msi
             windows/build/release/WINTUN-LICENSE.txt
             windows/build/release/SHA256SUMS.txt
+            windows/build/release/windows-release-evidence.json
           fail_on_unmatched_files: true
