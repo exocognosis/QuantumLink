@@ -23,6 +23,10 @@ public struct TransportSmokeResult: Equatable, Sendable {
 }
 
 public enum TransportSmokeRunner {
+    public static func isExpectedDisabledDevQuicLoopback(_ error: Error) -> Bool {
+        error.localizedDescription == disabledDevQuicLoopbackReason
+    }
+
     public static func run(
         configuration: TunnelConfiguration = .defaultDevelopment,
         mode: TransportSmokeMode = TransportSmokeMode(),

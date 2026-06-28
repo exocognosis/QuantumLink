@@ -57,11 +57,24 @@ enum QuantumLinkSmoke {
             print("preflight_mesh_id=\(configReport.configuration.meshID)")
 
             if options.runTransport {
-                let transport = try TransportSmokeRunner.run(
-                    configuration: configReport.configuration,
-                    mode: options.mode,
-                    libraryPath: options.dylibPath
-                )
+                let transport: TransportSmokeResult
+                do {
+                    transport = try TransportSmokeRunner.run(
+                        configuration: configReport.configuration,
+                        mode: options.mode,
+                        libraryPath: options.dylibPath
+                    )
+                } catch {
+                    if options.mode == .devQuicLoopback,
+                       TransportSmokeRunner.isExpectedDisabledDevQuicLoopback(error) {
+                        print("preflight_transport_kind=\(TunnelTransportKind.devQuicLoopback.rawValue)")
+                        print("preflight_transport_state=\(TunnelTransportState.failed.rawValue)")
+                        print("preflight_packet_round_trip=false")
+                        print("preflight_smoke_outcome=session-frame-protection-unavailable-fail-closed")
+                        return 0
+                    }
+                    throw error
+                }
                 print("preflight_transport_kind=\(transport.transportMetrics.kind.rawValue)")
                 print("preflight_transport_state=\(transport.transportMetrics.state.rawValue)")
                 print("preflight_packet_round_trip=\(transport.packetRoundTrip)")
