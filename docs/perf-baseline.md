@@ -165,10 +165,10 @@ these numbers up.
 
 ```sh
 # All four Rust bench suites (~60s combined).
-cargo bench -p qlink-core --bench slos       # loopback SLOs
-cargo bench -p qlink-core --bench slos_wan   # WAN-impaired SLOs
-cargo bench -p qlink-core --bench connector  # micro-benches
-cargo bench -p qlink-core --bench ice        # ICE round-trip floor
+cargo bench -p qlink-core --bench slos --no-default-features --features dev-quic-carrier       # loopback SLOs
+cargo bench -p qlink-core --bench slos_wan --no-default-features --features dev-quic-carrier   # WAN-impaired SLOs
+cargo bench -p qlink-core --bench connector --no-default-features --features dev-quic-carrier  # micro-benches
+cargo bench -p qlink-core --bench ice --no-default-features --features dev-quic-carrier        # ICE round-trip floor
 
 # Swift perf tests need the release dylib on disk.
 cargo build -p qlink-core --release

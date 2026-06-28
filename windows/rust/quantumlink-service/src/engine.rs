@@ -535,7 +535,7 @@ impl TunnelEngine {
         let status = self.status();
         let json = serde_json::json!({
             "service": env!("CARGO_PKG_VERSION"),
-            "qlinkCoreSuite": "QLINK-FIPS203-MLKEM768-HKDFSHA256-v1",
+            "qlinkCoreSuite": "QLINK-FIPS203-MLKEM768-SHAKE256-v1",
             "status": status,
         });
         quantumlink_proto::privacy::redact_peer_identifiers(

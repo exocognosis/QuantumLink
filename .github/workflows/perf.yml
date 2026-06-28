@@ -45,7 +45,7 @@ jobs:
         id: slos
         run: |
           set -o pipefail
-          cargo bench -p qlink-core --bench slos 2>&1 | tee build/perf-slos.log
+          cargo bench -p qlink-core --bench slos --no-default-features --features dev-quic-carrier 2>&1 | tee build/perf-slos.log
           # Surface the slo.* lines as a job summary section.
           {
             echo "## SLO scenarios"
@@ -60,7 +60,7 @@ jobs:
         id: slos_wan
         run: |
           set -o pipefail
-          cargo bench -p qlink-core --bench slos_wan 2>&1 | tee build/perf-slos-wan.log
+          cargo bench -p qlink-core --bench slos_wan --no-default-features --features dev-quic-carrier 2>&1 | tee build/perf-slos-wan.log
           {
             echo ""
             echo "## SLO scenarios — synthetic WAN"
@@ -74,8 +74,8 @@ jobs:
       - name: Run connector + ICE micro-benchmarks
         run: |
           set -o pipefail
-          cargo bench -p qlink-core --bench connector 2>&1 | tee build/perf-connector.log
-          cargo bench -p qlink-core --bench ice 2>&1 | tee build/perf-ice.log
+          cargo bench -p qlink-core --bench connector --no-default-features --features dev-quic-carrier 2>&1 | tee build/perf-connector.log
+          cargo bench -p qlink-core --bench ice --no-default-features --features dev-quic-carrier 2>&1 | tee build/perf-ice.log
           {
             echo ""
             echo "## Connector micro-benchmarks"

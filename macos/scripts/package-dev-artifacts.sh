@@ -30,22 +30,29 @@ cat > "$STAGE/RUNBOOK.md" <<'EOF'
 
 These artifacts are unsigned local development tools. They are not notarized and do not install a packet tunnel extension.
 
-Run the Swift-to-Rust local QUIC transport smoke:
+Validate the bundled example config:
+
+```sh
+./bin/QuantumLinkSmoke validate-config --config config/mesh.example.json
+```
+
+Verify the retired Swift-to-Rust local QUIC loopback fails closed:
 
 ```sh
 QLINK_CORE_DYLIB="$PWD/lib/libqlink_core.dylib" \
-./bin/QuantumLinkSmoke transport-loopback \
+! ./bin/QuantumLinkSmoke transport-loopback \
   --mode dev-quic-loopback \
   --dylib "$PWD/lib/libqlink_core.dylib"
 ```
 
-Run Rust control/data-plane smoke commands:
+Run Rust control/data-plane checks:
 
 ```sh
 ./bin/qlinkctl simulate-handshake
-./bin/qlinkctl quic-loopback
-./bin/qlinkctl mesh-loopback
-./bin/qlinkctl relay-loopback
+! ./bin/qlinkctl quic-loopback
+! ./bin/qlinkctl mesh-loopback
+! ./bin/qlinkctl relay-loopback
+! ./bin/qlinkctl relay-smoke
 ```
 EOF
 

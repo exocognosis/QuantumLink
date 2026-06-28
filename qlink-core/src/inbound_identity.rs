@@ -1,22 +1,19 @@
 //! Application-layer inbound identity assertions.
 //!
-//! Today the QUIC handshake authenticates only the *server* (the receiving
-//! peer presents the cert that's pinned in their signed rendezvous record).
-//! The connecting peer is anonymous to the receiver at handshake time, so
-//! a receiver running QuantumLink will accept inbound connections from
-//! anyone who knows its rendezvous record. The outbound `PeerAcl` shipped
-//! earlier closes the *outbound* half of the auth story; this module
-//! closes the inbound half.
+//! The carrier brings bytes to the receiver, but peer identity is asserted
+//! at the QuantumLink layer. The connecting peer is anonymous to the receiver
+//! until this assertion verifies, so this module closes the inbound half of
+//! the auth story.
 //!
 //! Flow:
 //!
-//! 1. Connecting peer (Alice) opens the QUIC connection.
-//! 2. Once the datagram session is up, Alice sends an [`InboundIdentityAssertion`]
-//!    as the first datagram. The assertion is signed with Alice's ML-DSA
+//! 1. Connecting peer (Alice) opens the carrier session.
+//! 2. Once the carrier session is up, Alice sends an [`InboundIdentityAssertion`]
+//!    as the first authenticated message. The assertion is signed with Alice's ML-DSA
 //!    device private key — the same key whose public half is in Alice's
 //!    signed rendezvous record.
 //! 3. Receiving peer (Bob) calls [`InboundIdentityAssertion::verify`]:
-//!    - peer_id must match SHA-256-derived hash of `device_public_key`
+//!    - peer_id must match SHAKE256-derived hash of `device_public_key`
 //!    - mesh_id must match what Bob expects
 //!    - timestamp must be within `max_age` of now (replay window)
 //!    - signature must verify against `device_public_key`
@@ -24,7 +21,7 @@
 //!    The combined helper returns a single `InboundDecision`:
 //!    accepted, rejected by ACL, rejected by crypto, etc.
 //! 5. If the decision is `Accepted`, Bob continues processing data frames.
-//!    Otherwise he closes the QUIC connection.
+//!    Otherwise he closes the carrier session.
 //!
 //! ## Anti-replay
 //!
@@ -43,11 +40,11 @@
 //! the receiver's view of the world.
 
 use crate::{
+    carrier_transport::CarrierSession,
     crypto::{DeviceKeypair, DevicePublicKey},
     discovery::now_unix,
     error::{QlinkError, Result},
     peer_acl::{PeerAcl, PeerAclDecision},
-    quic_transport::QuicDatagramSession,
 };
 use serde::{Deserialize, Serialize};
 
@@ -218,12 +215,11 @@ pub fn evaluate_inbound(
 }
 
 /// Client-side wire helper: signs a fresh assertion and sends it to the
-/// receiver as the first uni-stream message on the live QUIC connection.
-/// Call this immediately after `connect_with_trusted_cert` succeeds, before
-/// any data-plane datagrams. Rejection by the receiver surfaces as a
-/// connection close on subsequent reads, not as an explicit response.
+/// receiver as the first authenticated message on the live carrier session.
+/// Call this before any data-plane frames. Rejection by the receiver surfaces
+/// as a carrier close/subsequent read failure, not as an explicit response.
 pub async fn send_inbound_assertion(
-    session: &QuicDatagramSession,
+    session: &CarrierSession,
     keypair: &DeviceKeypair,
     mesh_id: &str,
 ) -> Result<()> {
@@ -238,12 +234,12 @@ pub async fn send_inbound_assertion(
 /// decision plus the parsed assertion (so callers can log the verified
 /// peer_id or include it in metrics on successful acceptance).
 ///
-/// Use this from the responder loop right after `accept_one`. On
+/// Use this from the responder loop right after accepting a carrier session. On
 /// `RejectedByCrypto` or `RejectedByAcl`, close the QUIC connection
 /// without further processing — never echo the rejection reason back to
 /// the peer (it leaks ACL contents).
 pub async fn receive_and_evaluate_inbound(
-    session: &QuicDatagramSession,
+    session: &CarrierSession,
     expected_mesh_id: &str,
     max_age_seconds: u64,
     inbound_acl: Option<&PeerAcl>,
@@ -380,7 +376,7 @@ mod tests {
     fn peer_id_must_match_public_key() {
         // Substitute a different peer_id while keeping the original
         // public key. Verification should reject before even checking
-        // the signature, because the binding `peer_id == sha256(pubkey)`
+        // the signature, because the binding `peer_id == shake256(pubkey)`
         // is the foundation of identity.
         let keypair = fresh_keypair();
         let mut assertion = InboundIdentityAssertion::sign(&keypair, "devmesh").unwrap();
@@ -467,6 +463,7 @@ mod tests {
 
     // === Async wire integration: client+server through real QUIC ===
 
+    #[cfg(feature = "dev-quic-carrier")]
     #[tokio::test]
     async fn responder_accepts_legitimate_inbound_assertion_over_quic() {
         use crate::quic_transport::QuicEndpoint;
@@ -479,7 +476,7 @@ mod tests {
 
         // Server side: accept one connection, run receive_and_evaluate_inbound.
         let server_handle = tokio::spawn(async move {
-            let session = server_endpoint.accept_one().await.unwrap();
+            let session = CarrierSession::from(server_endpoint.accept_one().await.unwrap());
             receive_and_evaluate_inbound(&session, "devmesh", 60, None)
                 .await
                 .map(|(decision, assertion)| (decision, assertion.peer_id))
@@ -492,6 +489,7 @@ mod tests {
             .connect_with_trusted_cert(server_addr, &server_cert)
             .await
             .unwrap();
+        let session = CarrierSession::from(session);
         send_inbound_assertion(&session, &client_keypair, "devmesh")
             .await
             .unwrap();
@@ -501,6 +499,7 @@ mod tests {
         assert_eq!(observed_peer_id, expected_peer_id);
     }
 
+    #[cfg(feature = "dev-quic-carrier")]
     #[tokio::test]
     async fn responder_rejects_inbound_assertion_when_peer_is_in_denylist() {
         use crate::quic_transport::QuicEndpoint;
@@ -517,7 +516,7 @@ mod tests {
         // The server's inbound ACL bans this peer.
         let acl = PeerAcl::new().with_deny([banned_peer_id.clone()]);
         let server_handle = tokio::spawn(async move {
-            let session = server_endpoint.accept_one().await.unwrap();
+            let session = CarrierSession::from(server_endpoint.accept_one().await.unwrap());
             receive_and_evaluate_inbound(&session, "devmesh", 60, Some(&acl))
                 .await
                 .map(|(decision, _)| decision)
@@ -527,6 +526,7 @@ mod tests {
             .connect_with_trusted_cert(server_addr, &server_cert)
             .await
             .unwrap();
+        let session = CarrierSession::from(session);
         send_inbound_assertion(&session, &client_keypair, "devmesh")
             .await
             .unwrap();
@@ -536,6 +536,7 @@ mod tests {
         assert!(decision.reason().contains("deny"));
     }
 
+    #[cfg(feature = "dev-quic-carrier")]
     #[tokio::test]
     async fn responder_rejects_inbound_assertion_for_wrong_mesh() {
         use crate::quic_transport::QuicEndpoint;
@@ -550,7 +551,7 @@ mod tests {
         // on the receiver should reject for mesh mismatch before any ACL
         // is consulted.
         let server_handle = tokio::spawn(async move {
-            let session = server_endpoint.accept_one().await.unwrap();
+            let session = CarrierSession::from(server_endpoint.accept_one().await.unwrap());
             receive_and_evaluate_inbound(&session, "mesh-b", 60, None)
                 .await
                 .map(|(decision, _)| decision)
@@ -561,6 +562,7 @@ mod tests {
             .connect_with_trusted_cert(server_addr, &server_cert)
             .await
             .unwrap();
+        let session = CarrierSession::from(session);
         send_inbound_assertion(&session, &client_keypair, "mesh-a")
             .await
             .unwrap();
@@ -570,6 +572,7 @@ mod tests {
         assert!(decision.reason().contains("mesh"));
     }
 
+    #[cfg(feature = "dev-quic-carrier")]
     #[tokio::test]
     async fn responder_rejects_payload_exceeding_size_limit() {
         // The receiver caps wire size to defend against a malicious peer
@@ -584,7 +587,7 @@ mod tests {
         let client_endpoint = QuicEndpoint::client(bind, &[]).unwrap();
 
         let server_handle = tokio::spawn(async move {
-            let session = server_endpoint.accept_one().await.unwrap();
+            let session = CarrierSession::from(server_endpoint.accept_one().await.unwrap());
             receive_and_evaluate_inbound(&session, "devmesh", 60, None).await
         });
 
@@ -595,6 +598,7 @@ mod tests {
             .connect_with_trusted_cert(server_addr, &server_cert)
             .await
             .unwrap();
+        let session = CarrierSession::from(session);
         // Send (cap + 1024) bytes so we cleanly exceed the 32 KB limit.
         let huge_payload = vec![0_u8; INBOUND_ASSERTION_MAX_WIRE_SIZE + 1024];
         session

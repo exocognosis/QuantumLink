@@ -426,7 +426,9 @@ public final class RustCoreLibrary {
 
     func createDevQuicTransport() throws -> UnsafeMutableRawPointer {
         guard let handle = symbols.devQuicTransportCreate() else {
-            throw RustCoreBridgeError.initializationFailed
+            throw RustCoreBridgeError.operationFailed(
+                "Rust dev QUIC transport is disabled because raw Quinn DATAGRAM bypasses the app-layer PQC frame session"
+            )
         }
         return handle
     }

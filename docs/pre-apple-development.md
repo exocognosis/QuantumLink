@@ -6,10 +6,10 @@ This runbook covers everything QuantumLink can validate before an Apple Develope
 
 - SwiftUI development app that runs without installing a packet tunnel extension.
 - Packet tunnel provider source that compiles against Network Extension.
-- Rust protocol core with hybrid handshake, device signatures, signed peer records, route policy, replay protection, QUIC DATAGRAM development transport, rendezvous, relay, and STUN parser scaffolding.
-- Swift FFI bridge to the Rust packet core and development QUIC transport.
+- Rust protocol core with an ML-KEM handshake, device signatures, signed peer records, route policy, replay protection, rendezvous, relay, and STUN parser scaffolding.
+- Swift FFI bridge to the Rust packet core and production mesh transport surfaces.
 - Swift packet-pump integration with fail-closed behavior.
-- Local Swift-to-Rust transport smoke path through `QuantumLinkSmoke`.
+- Local fail-closed transport checks through `QuantumLinkSmoke`.
 - Unsigned XcodeGen project scaffolding for app, extension, and smoke targets.
 - Rust XCFramework generation.
 - Development artifact packaging for local CLI and library testing.
@@ -27,7 +27,7 @@ This runbook covers everything QuantumLink can validate before an Apple Develope
 ./macos/scripts/preapple-check.sh
 ```
 
-The script runs Swift tests, Rust formatting, Rust tests, release builds, config validation, Swift transport preflight, Rust loopback smokes, XCFramework generation, and local development artifact packaging. If XcodeGen is installed, it also performs an unsigned release dry run that archives the app and produces local DMG and PKG artifacts.
+The script runs Swift tests, Rust formatting, Rust tests, release builds, config validation, fail-closed Swift/Rust transport checks, XCFramework generation, and local development artifact packaging. If XcodeGen is installed, it also performs an unsigned release dry run that archives the app and produces local DMG and PKG artifacts.
 
 On macOS, the release dry run builds a universal Rust XCFramework by default. Install both Rust macOS targets before running the full check:
 
@@ -40,27 +40,32 @@ rustup target add aarch64-apple-darwin x86_64-apple-darwin
 Validate the example mesh config:
 
 ```sh
-swift run QuantumLinkSmoke validate-config --config config/mesh.example.json
+cd macos
+swift run QuantumLinkSmoke validate-config --config ../config/mesh.example.json
 ```
 
-Run Swift packet pump plus Rust QUIC transport loopback:
+Verify the retired Swift packet pump plus Rust QUIC transport loopback fails closed:
 
 ```sh
+cd ..
 cargo build --workspace --release
-swift run QuantumLinkSmoke preflight \
-  --config config/mesh.example.json \
+cd macos
+! swift run QuantumLinkSmoke preflight \
+  --config ../config/mesh.example.json \
   --transport \
   --mode dev-quic-loopback \
-  --dylib "$PWD/target/release/libqlink_core.dylib"
+  --dylib "$PWD/../target/release/libqlink_core.dylib"
 ```
 
-Run Rust core smokes:
+Run Rust core checks:
 
 ```sh
+cd ..
 target/release/qlinkctl simulate-handshake
-target/release/qlinkctl quic-loopback
-target/release/qlinkctl mesh-loopback
-target/release/qlinkctl relay-loopback
+! target/release/qlinkctl quic-loopback
+! target/release/qlinkctl mesh-loopback
+! target/release/qlinkctl relay-loopback
+! target/release/qlinkctl relay-smoke
 ```
 
 Validate macOS release signing and entitlement wiring without Apple credentials:

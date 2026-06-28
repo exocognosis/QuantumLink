@@ -91,6 +91,8 @@ bool qlink_tunnel_core_metrics(
     QlinkTunnelMetrics *out
 );
 
+// Disabled in the strict PQC profile because raw Quinn DATAGRAM bypasses the
+// app-layer ML-KEM/SHAKE frame session. Always returns NULL.
 QlinkDevQuicTransportHandle *qlink_dev_quic_transport_create(void);
 
 void qlink_dev_quic_transport_destroy(QlinkDevQuicTransportHandle *handle);
