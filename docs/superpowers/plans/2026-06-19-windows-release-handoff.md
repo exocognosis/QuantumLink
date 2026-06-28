@@ -192,4 +192,3 @@ Windows beta deployment readiness. The next work should be:
 - Leak/WFP kill-switch proof with captured evidence.
 - Service hardening workstream from
   `docs/superpowers/plans/2026-06-15-windows-full-buildout.md`.
-
