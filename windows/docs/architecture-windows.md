@@ -58,7 +58,7 @@ exportDiagnostics | peerState`. One response per request, matching
 | Path | Contents | Protection |
 |------|----------|-----------|
 | `config.json` | TunnelConfiguration (camelCase JSON) | dir ACL |
-| `peers.json` | qlink-core FilePeerStore | ChaCha20-Poly1305 (key in DPAPI) |
+| `peers.json` | qlink-core FilePeerStore | SHAKE256 v3 envelope (key in DPAPI) |
 | `secrets\*.dpapi` | device seed, peer-store key | DPAPI machine scope + entropy + dir ACL |
 | `logs\` | service tracing output | dir ACL |
 

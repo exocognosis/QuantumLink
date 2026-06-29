@@ -23,6 +23,10 @@ public struct TransportSmokeResult: Equatable, Sendable {
 }
 
 public enum TransportSmokeRunner {
+    public static func isExpectedDisabledDevQuicLoopback(_ error: Error) -> Bool {
+        error.localizedDescription == disabledDevQuicLoopbackReason
+    }
+
     public static func run(
         configuration: TunnelConfiguration = .defaultDevelopment,
         mode: TransportSmokeMode = TransportSmokeMode(),
@@ -114,13 +118,13 @@ public enum TransportSmokeRunner {
 
     private static func makeTransport(
         mode: TransportSmokeMode,
-        library: RustCoreLibrary
+        library _: RustCoreLibrary
     ) -> TunnelTransporting {
         switch mode {
         case .developmentDrop:
-            DevelopmentDropTransportSender(reason: "Development drop transport selected")
+            return DevelopmentDropTransportSender(reason: "Development drop transport selected")
         case .devQuicLoopback:
-            RustDevQuicLoopbackTransport(library: library)
+            return RustDevQuicLoopbackTransport()
         }
     }
 

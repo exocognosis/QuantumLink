@@ -135,13 +135,21 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     private func loadConfiguration(from options: [String: NSObject]?) -> TunnelConfiguration {
-        guard
+        if
             let data = options?["configuration"] as? Data,
             let configuration = try? JSONDecoder().decode(TunnelConfiguration.self, from: data)
-        else {
-            return .defaultDevelopment
+        {
+            return configuration
         }
-        return configuration
+        if
+            let proto = protocolConfiguration as? NETunnelProviderProtocol,
+            let configuration = TunnelProviderConfigurationCodec.configuration(
+                from: proto.providerConfiguration
+            )
+        {
+            return configuration
+        }
+        return .defaultDevelopment
     }
 
     private func makeNetworkSettings(configuration: TunnelConfiguration) throws -> NEPacketTunnelNetworkSettings {
@@ -513,21 +521,21 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
             "pump_tunnel_packets_emitted=\(packetPump.counters.tunnelPacketsEmitted)",
             "pump_distinct_peers_seen=\(packetPump.counters.transportFramesAcceptedPerPeer.count)"
         ]
-        // Per-peer breakdown surfaced as a single comma-separated
-        // field. peer_id is pseudonymous + signed, so safe in the
-        // diagnostic export. Truncate at 12 entries to keep the
-        // summary readable; operators wanting the full breakdown
-        // pull the support bundle.
+        // Per-peer breakdown surfaced with ephemeral labels. Raw peer IDs are
+        // persistent identifiers and must not leave the tunnel in the default
+        // diagnostic string.
         if !packetPump.counters.transportFramesAcceptedPerPeer.isEmpty {
             let breakdown = packetPump.counters.transportFramesAcceptedPerPeer
                 .sorted { lhs, rhs in lhs.value > rhs.value }
                 .prefix(12)
-                .map { "\($0.key)=\($0.value)" }
+                .enumerated()
+                .map { index, element in "peer_\(index + 1)=\(element.value)" }
                 .joined(separator: ",")
             fields.append("pump_per_peer_frames=\(breakdown)")
         }
         if let lastError = transportMetrics.lastError {
-            fields.append("transport_last_error=\(PrivacyDefaults.redactNetworkIdentifiers(in: lastError))")
+            let redacted = Self.redactDiagnosticString(lastError, configuration: currentConfiguration)
+            fields.append("transport_last_error=\(redacted)")
         }
 
         if let metrics = try? packetPump.coreMetrics() {
@@ -538,6 +546,14 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
             fields.append("core_dropped_unprotected=\(metrics.droppedUnprotected)")
             fields.append("core_dropped_malformed=\(metrics.droppedMalformed)")
         }
+
+        let trustSummary = currentStatus().peerTrust
+        fields.append("dytallix_verified_peers=\(trustSummary.verifiedPeerCount)")
+        fields.append("dytallix_pending_peers=\(trustSummary.pendingPeerCount)")
+        fields.append("dytallix_unverified_peers=\(trustSummary.unverifiedPeerCount)")
+        fields.append("dytallix_failed_peers=\(trustSummary.failedPeerCount)")
+        let blockedHistoryCount = (transport as? RustMeshTransport)?.blockedPeerHistory.count ?? 0
+        fields.append("dytallix_blocked_history_peers=\(blockedHistoryCount)")
 
         fields.append("last_batch_packets=\(lastBatchPacketCount)")
         fields.append("network_events_observed=\(networkEventCount)")
@@ -550,6 +566,26 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
         fields.append("reasserting_pending=\(pendingReassertion)")
 
         return fields.joined(separator: " ")
+    }
+
+    private static func redactDiagnosticString(
+        _ value: String,
+        configuration: TunnelConfiguration
+    ) -> String {
+        var redacted = PrivacyDefaults.redactNetworkIdentifiers(in: value)
+        for identifier in [configuration.meshID, configuration.deviceAlias] where !identifier.isEmpty {
+            redacted = redacted.replacingOccurrences(of: identifier, with: "[redacted-id]")
+        }
+        let pattern = #"qlink_[A-Za-z0-9_\-]+"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else {
+            return redacted
+        }
+        let range = NSRange(redacted.startIndex..<redacted.endIndex, in: redacted)
+        return regex.stringByReplacingMatches(
+            in: redacted,
+            range: range,
+            withTemplate: "[redacted-id]"
+        )
     }
 
     private func currentStatus() -> TunnelStatus {
@@ -569,10 +605,26 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
         let bytesIn = transportMetrics.bytesReceived
         let bytesOut = transportMetrics.bytesSent
         let replayDrops = (try? packetPump.coreMetrics()?.droppedMalformed) ?? 0
+        let rustTransport = transport as? RustMeshTransport
+        let managedPeerIDs = rustTransport?.managedPeerIDs ?? []
+        let blockedPeerHistory = rustTransport?.blockedPeerHistory ?? []
+        let observedPeers = observedPeerStatuses(
+            defaultPathType: pathType,
+            bytesInByPeer: packetPump.counters.transportFramesAcceptedPerPeer,
+            managedPeerIDs: managedPeerIDs,
+            blockedPeerHistory: blockedPeerHistory,
+            rustTransport: rustTransport
+        )
+        let peerTrust = DytallixPeerTrustSummary(
+            peers: observedPeers,
+            policy: currentConfiguration.meshTrustPolicy,
+            identityMode: currentConfiguration.discoveryIdentityMode,
+            registryConfigured: currentConfiguration.dytallixIdentity != nil
+        )
         let metrics = MeshMetrics(
-            peerCount: 0,
-            directPeerCount: pathType == .direct ? 1 : 0,
-            relayPeerCount: pathType == .relay ? 1 : 0,
+            peerCount: observedPeers.count,
+            directPeerCount: pathType == .direct ? observedPeers.count : 0,
+            relayPeerCount: pathType == .relay ? observedPeers.count : 0,
             bytesIn: bytesIn,
             bytesOut: bytesOut,
             replayDrops: replayDrops,
@@ -586,11 +638,235 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
             dnsMode: currentConfiguration.dnsMode,
             overlayIPv4Address: currentConfiguration.overlayIPv4Address,
             protectedRoutes: currentConfiguration.protectedRoutes,
-            peers: [],
+            peers: observedPeers,
             metrics: metrics,
+            peerTrust: peerTrust,
             transport: transportMetrics,
             lastError: transportMetrics.lastError
         )
+    }
+
+    private func observedPeerStatuses(
+        defaultPathType: PathType,
+        bytesInByPeer: [String: UInt64],
+        managedPeerIDs: [String] = [],
+        blockedPeerHistory: [RustBlockedPeerHistoryEntry] = [],
+        rustTransport: RustMeshTransport? = nil
+    ) -> [PeerStatus] {
+        let blockedByPeer = latestBlockedHistoryByPeer(blockedPeerHistory)
+        let peerIDs = Set(bytesInByPeer.keys)
+            .union(managedPeerIDs)
+            .union(blockedByPeer.keys)
+        return peerIDs
+            .sorted()
+            .map { peerID in
+                let bytesIn = bytesInByPeer[peerID] ?? 0
+                let blockedEntry = blockedByPeer[peerID]
+                let trust = trustStatus(for: peerID, blockedHistory: blockedEntry)
+                let peerPathType = pathType(
+                    for: peerID,
+                    defaultPathType: defaultPathType,
+                    rustTransport: rustTransport,
+                    blockedHistory: blockedEntry,
+                    hasAcceptedTraffic: bytesIn > 0
+                )
+                return PeerStatus(
+                    identity: PeerIdentity(
+                        peerID: peerID,
+                        alias: peerAlias(from: peerID),
+                        publicKeyFingerprint: peerFingerprint(from: peerID)
+                    ),
+                    pathType: peerPathType,
+                    endpoints: [],
+                    overlayAddress: "",
+                    rttMilliseconds: nil,
+                    lastRekey: nil,
+                    bytesIn: bytesIn,
+                    bytesOut: 0,
+                    dytallixTrust: trust
+                )
+            }
+    }
+
+    private func latestBlockedHistoryByPeer(
+        _ entries: [RustBlockedPeerHistoryEntry]
+    ) -> [String: RustBlockedPeerHistoryEntry] {
+        entries.reduce(into: [:]) { result, entry in
+            let current = result[entry.peerID]
+            if current.map({ entry.observedAt > $0.observedAt }) ?? true {
+                result[entry.peerID] = entry
+            }
+        }
+    }
+
+    private func pathType(
+        for peerID: String,
+        defaultPathType: PathType,
+        rustTransport: RustMeshTransport?,
+        blockedHistory: RustBlockedPeerHistoryEntry? = nil,
+        hasAcceptedTraffic: Bool = false
+    ) -> PathType {
+        guard let state = rustTransport?.peerStateCode(peerID) else {
+            if blockedHistory != nil && !hasAcceptedTraffic {
+                return .unavailable
+            }
+            return defaultPathType
+        }
+        switch state {
+        case .ready:
+            return defaultPathType
+        case .connecting:
+            return .probing
+        case .failed, .stopped:
+            return .unavailable
+        }
+    }
+
+    private func trustStatus(
+        for peerID: String,
+        blockedHistory: RustBlockedPeerHistoryEntry? = nil
+    ) -> DytallixPeerTrustStatus {
+        if currentConfiguration.discoveryIdentityMode != .off,
+           currentConfiguration.dytallixIdentity != nil,
+           let rustTrust = (transport as? RustMeshTransport)?.peerTrustStatus(peerID),
+           let mapped = trustStatus(for: peerID, rustTrust: rustTrust) {
+            return mapped
+        }
+        if let blockedHistory,
+           let mapped = trustStatus(for: peerID, blockedHistoryEntry: blockedHistory) {
+            return mapped
+        }
+
+        let state: DytallixPeerTrustState
+        if currentConfiguration.discoveryIdentityMode == .off {
+            state = .notRequired
+        } else if currentConfiguration.dytallixIdentity == nil {
+            state = .notConfigured
+        } else {
+            state = .pending
+        }
+
+        return DytallixPeerTrustStatus(
+            policy: currentConfiguration.meshTrustPolicy,
+            identityMode: currentConfiguration.discoveryIdentityMode,
+            state: state,
+            checkedAt: Date(),
+            registryPeerID: peerID,
+            registryContractFingerprint: currentConfiguration.dytallixIdentity.map {
+                Self.contractFingerprint($0.contractAddress)
+            },
+            source: "transport-observed",
+            failureReason: state == .pending
+                ? "Awaiting registry decision from the transport."
+                : nil
+        )
+    }
+
+    private func trustStatus(
+        for peerID: String,
+        blockedHistoryEntry: RustBlockedPeerHistoryEntry
+    ) -> DytallixPeerTrustStatus? {
+        let failure = RustMeshPeerTrustFailure(rawValue: blockedHistoryEntry.failureCode)
+            ?? .registryVerificationFailed
+        guard let state = DytallixPeerTrustState(rustFailure: failure) else {
+            return nil
+        }
+
+        return DytallixPeerTrustStatus(
+            policy: currentConfiguration.meshTrustPolicy,
+            identityMode: currentConfiguration.discoveryIdentityMode,
+            state: state,
+            checkedAt: blockedHistoryEntry.checkedAt,
+            registryPeerID: peerID,
+            registryContractFingerprint: currentConfiguration.dytallixIdentity.map {
+                Self.contractFingerprint($0.contractAddress)
+            },
+            source: "rust-blocked-peer-history:\(blockedHistoryEntry.direction)",
+            failureReason: blockedHistoryEntry.failureReason
+        )
+    }
+
+    private func trustStatus(
+        for peerID: String,
+        rustTrust: RustMeshPeerTrustStatus
+    ) -> DytallixPeerTrustStatus? {
+        let state: DytallixPeerTrustState
+        let failureReason: String?
+        if rustTrust.failure != .none {
+            guard let mappedState = DytallixPeerTrustState(rustFailure: rustTrust.failure) else {
+                return nil
+            }
+            state = mappedState
+            switch rustTrust.failure {
+            case .none:
+                return nil
+            case .registryRequired:
+                failureReason = "Public mesh policy requires an active Dytallix registry record for this peer."
+            case .registryRevoked:
+                failureReason = "The peer's Dytallix registry record is revoked."
+            case .registrySuspended:
+                failureReason = "The peer's Dytallix registry record is suspended or inactive."
+            case .registryExpired:
+                failureReason = "The peer's Dytallix registry record has expired."
+            case .registryMismatch:
+                failureReason = "The peer record does not match the Dytallix registry binding."
+            case .registryLookupFailed:
+                failureReason = "Dytallix registry lookup failed under the active mesh policy."
+            case .registryVerificationFailed:
+                failureReason = "Dytallix registry verification failed."
+            }
+        } else {
+            switch rustTrust.decision {
+            case .accepted:
+                state = .verified
+                failureReason = nil
+            case .acceptedWithoutRegistryPrivate:
+                state = .unverified
+                failureReason = "Accepted by private mesh policy without an on-chain registry record."
+            case .acceptedWithoutRegistryDevelopment:
+                state = .notRequired
+                failureReason = nil
+            case .unknown:
+                return nil
+            }
+        }
+
+        return DytallixPeerTrustStatus(
+            policy: currentConfiguration.meshTrustPolicy,
+            identityMode: currentConfiguration.discoveryIdentityMode,
+            state: state,
+            checkedAt: rustTrust.checkedAt,
+            registryPeerID: peerID,
+            registryContractFingerprint: currentConfiguration.dytallixIdentity.map {
+                Self.contractFingerprint($0.contractAddress)
+            },
+            source: rustTrust.source.label,
+            failureReason: failureReason ?? Self.freshnessWarning(for: rustTrust.source)
+        )
+    }
+
+    private static func freshnessWarning(for source: RustMeshPeerTrustSource) -> String? {
+        switch source {
+        case .peerRecordCache:
+            return "Dytallix registry verification used a cached discovery record. Refresh discovery if this state persists."
+        case .unknown, .rendezvousLive:
+            return nil
+        }
+    }
+
+    private func peerAlias(from peerID: String) -> String {
+        guard peerID.count > 14 else { return peerID }
+        return "\(peerID.prefix(10))...\(peerID.suffix(4))"
+    }
+
+    private func peerFingerprint(from peerID: String) -> String {
+        String(peerID.suffix(16))
+    }
+
+    private static func contractFingerprint(_ contractAddress: String) -> String {
+        let trimmed = contractAddress.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count > 12 else { return trimmed }
+        return "\(trimmed.prefix(6))...\(trimmed.suffix(6))"
     }
 }
 

@@ -13,9 +13,6 @@ jobs:
   build:
     name: Build and (optionally) sign QuantumLink.app
     runs-on: macos-15
-    # Unsigned outputs from this workflow are validation artifacts only.
-    # Production macOS releases require signing, notarization, stapling, and
-    # private release credentials configured outside the public repository.
     env:
       QLINK_APP_BUNDLE_ID: ${{ vars.QLINK_APP_BUNDLE_ID }}
       QLINK_TUNNEL_BUNDLE_ID: ${{ vars.QLINK_TUNNEL_BUNDLE_ID }}
@@ -26,7 +23,7 @@ jobs:
       QLINK_SPARKLE_FEED_URL: ${{ vars.QLINK_SPARKLE_FEED_URL }}
       QLINK_SPARKLE_PUBLIC_ED_KEY: ${{ vars.QLINK_SPARKLE_PUBLIC_ED_KEY }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Show toolchain
         run: |
@@ -34,11 +31,14 @@ jobs:
           rustc --version
           xcodebuild -version
 
+      - name: Install Apple Rust targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
       - name: Install XcodeGen
         run: brew install xcodegen
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -54,30 +54,26 @@ jobs:
              && -n "${{ secrets.APPLE_NOTARY_API_KEY_BASE64 }}" \
              && -n "${{ secrets.APPLE_NOTARY_API_KEY_ID }}" \
              && -n "${{ secrets.APPLE_NOTARY_API_KEY_ISSUER_ID }}" \
+             && -n "${{ secrets.QLINK_APP_PROVISIONING_PROFILE_BASE64 }}" \
+             && -n "${{ secrets.QLINK_TUNNEL_PROVISIONING_PROFILE_BASE64 }}" \
+             && -n "${{ secrets.SPARKLE_EDDSA_PRIVATE_KEY }}" \
              && -n "${QLINK_APP_BUNDLE_ID:-}" \
              && -n "${QLINK_TUNNEL_BUNDLE_ID:-}" \
              && -n "${QLINK_APP_GROUP:-}" \
              && -n "${QLINK_DEVELOPMENT_TEAM:-}" \
              && -n "${QLINK_APP_PROVISIONING_PROFILE_SPECIFIER:-}" \
-             && -n "${QLINK_TUNNEL_PROVISIONING_PROFILE_SPECIFIER:-}" ]]; then
+             && -n "${QLINK_TUNNEL_PROVISIONING_PROFILE_SPECIFIER:-}" \
+             && -n "${QLINK_SPARKLE_FEED_URL:-}" \
+             && -n "${QLINK_SPARKLE_PUBLIC_ED_KEY:-}" ]]; then
             echo "available=true" >> "$GITHUB_OUTPUT"
           else
             echo "available=false" >> "$GITHUB_OUTPUT"
           fi
 
-          if [[ -n "${{ secrets.SPARKLE_EDDSA_PRIVATE_KEY }}" \
-             && -n "${QLINK_SPARKLE_FEED_URL:-}" \
-             && -n "${QLINK_SPARKLE_PUBLIC_ED_KEY:-}" ]]; then
-            echo "appcast_available=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "appcast_available=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Reject unsigned tag release
+      - name: Refuse unsigned tag release
         if: startsWith(github.ref, 'refs/tags/v') && steps.signing.outputs.available != 'true'
         run: |
-          echo "Refusing to attach unsigned macOS artifacts to an official tag release." >&2
-          echo "Configure Developer ID, provisioning, and notarization secrets before tagging." >&2
+          echo "Signed release credentials, provisioning profiles, and variables are required for v* tags." >&2
           exit 1
 
       - name: Import Developer ID certificate
@@ -113,6 +109,19 @@ jobs:
           if [[ -n "$installer_name" ]]; then
             echo "APPLE_DEVELOPER_ID_INSTALLER=$installer_name" >> "$GITHUB_ENV"
           fi
+
+      - name: Install provisioning profiles
+        if: steps.signing.outputs.available == 'true'
+        env:
+          APP_PROFILE_BASE64: ${{ secrets.QLINK_APP_PROVISIONING_PROFILE_BASE64 }}
+          TUNNEL_PROFILE_BASE64: ${{ secrets.QLINK_TUNNEL_PROVISIONING_PROFILE_BASE64 }}
+        run: |
+          set -euo pipefail
+          profile_dir="$HOME/Library/MobileDevice/Provisioning Profiles"
+          mkdir -p "$profile_dir"
+          echo -n "$APP_PROFILE_BASE64" | base64 -d -o "$profile_dir/QuantumLinkApp.provisionprofile"
+          echo -n "$TUNNEL_PROFILE_BASE64" | base64 -d -o "$profile_dir/QuantumLinkTunnel.provisionprofile"
+          ls -lh "$profile_dir"
 
       - name: Configure notary credentials
         if: steps.signing.outputs.available == 'true'
@@ -152,7 +161,7 @@ jobs:
           shasum -a 256 build/release/*.dmg build/release/*.pkg > build/release/SHA256SUMS.txt
 
       - name: Generate appcast (signing required)
-        if: steps.signing.outputs.available == 'true' && steps.signing.outputs.appcast_available == 'true'
+        if: steps.signing.outputs.available == 'true' && env.QLINK_SPARKLE_FEED_URL != ''
         working-directory: macos
         run: |
           set -euo pipefail
@@ -175,14 +184,11 @@ jobs:
           grep -q 'sparkle:edSignature' build/sparkle/appcast.xml
 
       - name: Upload release artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          # Workflow artifacts are for release validation. Only signed and
-          # notarized assets attached to a GitHub Release are production
-          # distributions.
           name: QuantumLink-macos-${{ github.ref_name }}
           path: |
-            macos/build/release/*.app
+            macos/build/release/export/QuantumLink.app
             macos/build/release/*.dmg
             macos/build/release/*.pkg
             macos/build/release/SHA256SUMS.txt
@@ -192,8 +198,8 @@ jobs:
           if-no-files-found: warn
 
       - name: Attach to GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v') && steps.signing.outputs.available == 'true'
-        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             macos/build/release/*.dmg

@@ -102,13 +102,20 @@ fn main() -> std::process::ExitCode {
         }
         Commands::Smoke => {
             init_tracing();
-            let report = match quantumlink_service::smoke::run_loopback_smoke_on_cli_stack() {
-                Ok(report) => report,
-                Err(error) => {
-                    eprintln!("smoke runner failed: {error}");
-                    return std::process::ExitCode::FAILURE;
-                }
-            };
+            // The smoke runs the full connect path — including PQC device
+            // keypair generation — inline. Those crypto routines use large
+            // stack buffers that exceed the 1 MiB default *main*-thread
+            // stack on Windows (in production this work runs on the engine's
+            // worker threads, which get the larger default thread stack).
+            // Run it on a dedicated thread with a generous stack so the CLI
+            // smoke gate behaves the same on every platform.
+            let report = std::thread::Builder::new()
+                .name("qlink-smoke".into())
+                .stack_size(8 * 1024 * 1024)
+                .spawn(quantumlink_service::smoke::run_loopback_smoke)
+                .expect("spawn smoke thread")
+                .join()
+                .expect("smoke thread panicked");
             println!(
                 "{}",
                 serde_json::to_string_pretty(&report.summary).unwrap_or_default()

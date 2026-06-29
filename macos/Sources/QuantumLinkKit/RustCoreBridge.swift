@@ -29,6 +29,116 @@ public enum TunnelPacketDisposition: Equatable, Sendable {
     case droppedUnprotected
 }
 
+public enum RustMeshPeerTrustDecision: UInt32, Sendable {
+    case unknown = 0
+    case accepted = 1
+    case acceptedWithoutRegistryPrivate = 2
+    case acceptedWithoutRegistryDevelopment = 3
+}
+
+public enum RustMeshPeerTrustFailure: UInt32, Sendable {
+    case none = 0
+    case registryRequired = 1
+    case registryRevoked = 2
+    case registrySuspended = 3
+    case registryExpired = 4
+    case registryMismatch = 5
+    case registryLookupFailed = 6
+    case registryVerificationFailed = 7
+}
+
+public struct RustMeshPeerTrustStatus: Equatable, Sendable {
+    public let decision: RustMeshPeerTrustDecision
+    public let failure: RustMeshPeerTrustFailure
+    public let checkedAt: Date?
+    public let source: RustMeshPeerTrustSource
+
+    public init(
+        decision: RustMeshPeerTrustDecision,
+        failure: RustMeshPeerTrustFailure = .none,
+        checkedAt: Date?,
+        source: RustMeshPeerTrustSource = .unknown
+    ) {
+        self.decision = decision
+        self.failure = failure
+        self.checkedAt = checkedAt
+        self.source = source
+    }
+}
+
+public enum RustMeshPeerTrustSource: UInt32, Sendable {
+    case unknown = 0
+    case rendezvousLive = 1
+    case peerRecordCache = 2
+
+    public var label: String {
+        switch self {
+        case .unknown:
+            "unknown"
+        case .rendezvousLive:
+            "rendezvous-live"
+        case .peerRecordCache:
+            "peer-record-cache"
+        }
+    }
+}
+
+public struct RustBlockedPeerHistoryEntry: Codable, Equatable, Sendable {
+    public let peerID: String
+    public let direction: String
+    public let failureCode: UInt32
+    public let failureReason: String
+    public let observedAt: Date
+    public let checkedAt: Date
+
+    public init(
+        peerID: String,
+        direction: String,
+        failureCode: UInt32,
+        failureReason: String,
+        observedAt: Date,
+        checkedAt: Date
+    ) {
+        self.peerID = peerID
+        self.direction = direction
+        self.failureCode = failureCode
+        self.failureReason = failureReason
+        self.observedAt = observedAt
+        self.checkedAt = checkedAt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.peerID = try container.decode(String.self, forKey: .peerID)
+        self.direction = try container.decode(String.self, forKey: .direction)
+        self.failureCode = try container.decode(UInt32.self, forKey: .failureCode)
+        self.failureReason = try container.decode(String.self, forKey: .failureReason)
+        let observedAtUnix = try container.decode(UInt64.self, forKey: .observedAtUnix)
+        let checkedAtUnix = try container.decode(UInt64.self, forKey: .checkedAtUnix)
+        self.observedAt = Date(timeIntervalSince1970: TimeInterval(observedAtUnix))
+        self.checkedAt = Date(timeIntervalSince1970: TimeInterval(checkedAtUnix))
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(peerID, forKey: .peerID)
+        try container.encode(direction, forKey: .direction)
+        try container.encode(failureCode, forKey: .failureCode)
+        try container.encode(failureReason, forKey: .failureReason)
+        try container.encode(UInt64(observedAt.timeIntervalSince1970), forKey: .observedAtUnix)
+        try container.encode(UInt64(checkedAt.timeIntervalSince1970), forKey: .checkedAtUnix)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case peerID = "peer_id"
+        case direction
+        case failureCode = "failure_code"
+        case failureReason = "failure_reason"
+        case observedAtUnix = "observed_at_unix"
+        case checkedAtUnix = "checked_at_unix"
+    }
+}
+
 public struct TunnelCorePacket: Equatable, Sendable {
     public let protocolFamily: UInt32
     public let bytes: Data
@@ -316,7 +426,9 @@ public final class RustCoreLibrary {
 
     func createDevQuicTransport() throws -> UnsafeMutableRawPointer {
         guard let handle = symbols.devQuicTransportCreate() else {
-            throw RustCoreBridgeError.initializationFailed
+            throw RustCoreBridgeError.operationFailed(
+                "Rust dev QUIC transport is disabled because raw Quinn DATAGRAM bypasses the app-layer PQC frame session"
+            )
         }
         return handle
     }
@@ -458,6 +570,39 @@ public final class RustCoreLibrary {
         }
         let bytes = consume(buffer: buffer)
         return String(data: bytes, encoding: .utf8)
+    }
+
+    func meshTransportPeerIDs(handle: UnsafeMutableRawPointer) -> [String]? {
+        guard let symbol = symbols.meshTransportPeerIDs else {
+            return nil
+        }
+        var buffer = QlinkOwnedBuffer()
+        let ok = withUnsafeMutablePointer(to: &buffer) { pointer in
+            symbol(handle, UnsafeMutableRawPointer(pointer))
+        }
+        guard ok else { return nil }
+        let bytes = consume(buffer: buffer)
+        guard let string = String(data: bytes, encoding: .utf8) else {
+            return []
+        }
+        return string
+            .split(whereSeparator: \.isNewline)
+            .map(String.init)
+    }
+
+    func meshTransportBlockedPeerHistory(
+        handle: UnsafeMutableRawPointer
+    ) -> [RustBlockedPeerHistoryEntry]? {
+        guard let symbol = symbols.meshTransportBlockedPeerHistory else {
+            return nil
+        }
+        var buffer = QlinkOwnedBuffer()
+        let ok = withUnsafeMutablePointer(to: &buffer) { pointer in
+            symbol(handle, UnsafeMutableRawPointer(pointer))
+        }
+        guard ok else { return nil }
+        let bytes = consume(buffer: buffer)
+        return try? JSONDecoder().decode([RustBlockedPeerHistoryEntry].self, from: bytes)
     }
 
     // MARK: - Device keypair (cert publishing + persistence)
@@ -607,6 +752,36 @@ public final class RustCoreLibrary {
         return ok ? stateCode : nil
     }
 
+    func meshTransportPeerTrustStatus(
+        handle: UnsafeMutableRawPointer,
+        peerID: String
+    ) -> RustMeshPeerTrustStatus? {
+        guard let symbol = symbols.meshTransportPeerTrustStatus else {
+            return nil
+        }
+        let bytes = Array(peerID.utf8)
+        var rawStatus = QlinkPeerTrustStatusRaw()
+        let ok = bytes.withUnsafeBufferPointer { buffer -> Bool in
+            withUnsafeMutablePointer(to: &rawStatus) { statusPtr in
+                symbol(handle, buffer.baseAddress, buffer.count, UnsafeMutableRawPointer(statusPtr))
+            }
+        }
+        guard ok else { return nil }
+        let decision = RustMeshPeerTrustDecision(rawValue: rawStatus.decisionCode) ?? .unknown
+        let failure = RustMeshPeerTrustFailure(rawValue: rawStatus.failureCode)
+            ?? .registryVerificationFailed
+        let checkedAt = rawStatus.checkedAtUnix > 0
+            ? Date(timeIntervalSince1970: TimeInterval(rawStatus.checkedAtUnix))
+            : nil
+        let source = RustMeshPeerTrustSource(rawValue: rawStatus.sourceCode) ?? .unknown
+        return RustMeshPeerTrustStatus(
+            decision: decision,
+            failure: failure,
+            checkedAt: checkedAt,
+            source: source
+        )
+    }
+
     func meshTransportSendFrameTo(
         handle: UnsafeMutableRawPointer,
         peerID: String,
@@ -749,6 +924,13 @@ private struct QlinkInboundFrame {
     }
 }
 
+private struct QlinkPeerTrustStatusRaw {
+    var decisionCode: UInt32 = 0
+    var failureCode: UInt32 = 0
+    var checkedAtUnix: UInt64 = 0
+    var sourceCode: UInt32 = 0
+}
+
 private struct QlinkTunnelMetrics {
     var packetsFromTunnel: UInt64 = 0
     var packetsToTunnel: UInt64 = 0
@@ -803,6 +985,8 @@ private struct Symbols {
     typealias MeshHandleEventFn = @convention(c) (UnsafeMutableRawPointer?, UInt32) -> Int32
     typealias MeshStateCodeFn = @convention(c) (UnsafeMutableRawPointer?) -> UInt32
     typealias MeshLastErrorFn = @convention(c) (UnsafeMutableRawPointer?, UnsafeMutableRawPointer?) -> Bool
+    typealias MeshPeerIDsFn = @convention(c) (UnsafeMutableRawPointer?, UnsafeMutableRawPointer?) -> Bool
+    typealias MeshBlockedPeerHistoryFn = @convention(c) (UnsafeMutableRawPointer?, UnsafeMutableRawPointer?) -> Bool
     // Device keypair handle management (used for cert publishing).
     typealias DeviceKeypairGenerateFn = @convention(c) (UnsafeMutablePointer<UInt8>?) -> UnsafeMutableRawPointer?
     typealias DeviceKeypairFromSeedFn = @convention(c) (UnsafePointer<UInt8>?) -> UnsafeMutableRawPointer?
@@ -817,6 +1001,7 @@ private struct Symbols {
     typealias MeshAddPeerFn = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<UInt8>?, Int) -> Int32
     typealias MeshRemovePeerFn = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<UInt8>?, Int) -> Void
     typealias MeshPeerStateCodeFn = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<UInt8>?, Int, UnsafeMutablePointer<UInt32>?) -> Bool
+    typealias MeshPeerTrustStatusFn = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<UInt8>?, Int, UnsafeMutableRawPointer?) -> Bool
     typealias MeshSendFrameToFn = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<UInt8>?, Int, UnsafePointer<UInt8>?, Int) -> Int32
     // Tracing bridge — surfaces Rust-side warnings/errors to the host logger.
     typealias TracingInstallFn = @convention(c) () -> Int32
@@ -846,6 +1031,8 @@ private struct Symbols {
     let meshTransportHandleNetworkEvent: MeshHandleEventFn
     let meshTransportStateCode: MeshStateCodeFn
     let meshTransportLastError: MeshLastErrorFn
+    let meshTransportPeerIDs: MeshPeerIDsFn?
+    let meshTransportBlockedPeerHistory: MeshBlockedPeerHistoryFn?
     let deviceKeypairGenerate: DeviceKeypairGenerateFn
     let deviceKeypairFromSeed: DeviceKeypairFromSeedFn
     let deviceKeypairDestroy: DeviceKeypairDestroyFn
@@ -857,6 +1044,7 @@ private struct Symbols {
     let meshTransportAddPeer: MeshAddPeerFn
     let meshTransportRemovePeer: MeshRemovePeerFn
     let meshTransportPeerStateCode: MeshPeerStateCodeFn
+    let meshTransportPeerTrustStatus: MeshPeerTrustStatusFn?
     let meshTransportSendFrameTo: MeshSendFrameToFn
     let tracingInstall: TracingInstallFn
     let tracingPopEvent: TracingPopEventFn
@@ -888,6 +1076,11 @@ private struct Symbols {
         )
         self.meshTransportStateCode = try load("qlink_mesh_transport_state_code", from: handle)
         self.meshTransportLastError = try load("qlink_mesh_transport_last_error", from: handle)
+        self.meshTransportPeerIDs = optionalLoad("qlink_mesh_transport_peer_ids", from: handle)
+        self.meshTransportBlockedPeerHistory = optionalLoad(
+            "qlink_mesh_transport_blocked_peer_history",
+            from: handle
+        )
         self.deviceKeypairGenerate = try load("qlink_device_keypair_generate", from: handle)
         self.deviceKeypairFromSeed = try load("qlink_device_keypair_from_seed", from: handle)
         self.deviceKeypairDestroy = try load("qlink_device_keypair_destroy", from: handle)
@@ -907,6 +1100,9 @@ private struct Symbols {
         self.meshTransportPeerStateCode = try load(
             "qlink_mesh_transport_peer_state_code", from: handle
         )
+        self.meshTransportPeerTrustStatus = optionalLoad(
+            "qlink_mesh_transport_peer_trust_status", from: handle
+        )
         self.meshTransportSendFrameTo = try load(
             "qlink_mesh_transport_send_frame_to", from: handle
         )
@@ -919,6 +1115,13 @@ private struct Symbols {
 private func load<T>(_ symbol: String, from handle: UnsafeMutableRawPointer) throws -> T {
     guard let pointer = dlsym(handle, symbol) else {
         throw RustCoreBridgeError.missingSymbol(symbol)
+    }
+    return unsafeBitCast(pointer, to: T.self)
+}
+
+private func optionalLoad<T>(_ symbol: String, from handle: UnsafeMutableRawPointer) -> T? {
+    guard let pointer = dlsym(handle, symbol) else {
+        return nil
     }
     return unsafeBitCast(pointer, to: T.self)
 }

@@ -1,13 +1,13 @@
-//! RFC 8445 ICE connectivity checks with RFC 5389 / RFC 8489 short-term
+//! RFC 8445-style connectivity checks with QuantumLink PQC-only short-term
 //! credential authentication.
 //!
 //! This module is the protocol layer for ICE checks. It exposes:
 //!
 //! - [`StunMessage`] / [`StunAttribute`]: full encode/decode of the STUN
-//!   binding request and binding success/error responses with the ICE
-//!   attributes the connector needs (USERNAME, MESSAGE-INTEGRITY, FINGERPRINT,
-//!   PRIORITY, ICE-CONTROLLING, ICE-CONTROLLED, USE-CANDIDATE,
-//!   XOR-MAPPED-ADDRESS, ERROR-CODE).
+//!   binding request and binding success/error responses with the attributes
+//!   the connector needs (USERNAME, MESSAGE-INTEGRITY, FINGERPRINT, PRIORITY,
+//!   ICE-CONTROLLING, ICE-CONTROLLED, USE-CANDIDATE, XOR-MAPPED-ADDRESS,
+//!   ERROR-CODE).
 //! - [`IceCredentials`]: the short-term `ufrag`/`password` pair exchanged via
 //!   the signed rendezvous record.
 //! - [`perform_ice_check`]: client-side connectivity check that builds and
@@ -34,19 +34,25 @@
 //! Behind symmetric NATs the mappings diverge and ICE may incorrectly green
 //! a path that QUIC cannot then reach; the connector falls back to relay if
 //! the post-ICE QUIC connect fails.
+//!
+//! QuantumLink's PQC-only profile intentionally replaces RFC 5389's legacy
+//! MESSAGE-INTEGRITY primitive. The attribute value is a SHAKE256-derived
+//! 20-byte tag so QuantumLink peers can authenticate checks without
+//! reintroducing retired hash/MAC primitives into the application stack. This
+//! is not interoperable with generic ICE/STUN servers.
 
 use crate::error::{QlinkError, Result};
-use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
-use sha1::Sha1;
+use sha3::{
+    digest::{ExtendableOutput, Update},
+    Shake256,
+};
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::{net::UdpSocket, task::JoinHandle};
-
-type HmacSha1 = Hmac<Sha1>;
 
 // Header constants (RFC 5389 §6).
 const HEADER_LEN: usize = 20;
@@ -610,12 +616,14 @@ fn parse_xor_mapped_address(
 }
 
 fn compute_message_integrity(buffer: &[u8], password: &str) -> [u8; MESSAGE_INTEGRITY_LEN] {
-    let mut mac = HmacSha1::new_from_slice(password.as_bytes())
-        .expect("HMAC-SHA1 accepts arbitrary key length");
-    mac.update(buffer);
-    let result = mac.finalize().into_bytes();
+    let mut xof = Shake256::default();
+    xof.update(b"QuantumLink ICE MESSAGE-INTEGRITY SHAKE256 v1");
+    xof.update(&(password.len() as u64).to_be_bytes());
+    xof.update(password.as_bytes());
+    xof.update(&(buffer.len() as u64).to_be_bytes());
+    xof.update(buffer);
     let mut out = [0_u8; MESSAGE_INTEGRITY_LEN];
-    out.copy_from_slice(&result);
+    xof.finalize_xof_into(&mut out);
     out
 }
 

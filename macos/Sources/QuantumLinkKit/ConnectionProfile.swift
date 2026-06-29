@@ -281,7 +281,7 @@ public struct ConnectionProfile: Codable, Equatable, Hashable, Identifiable, Sen
             if destinationIPAddress.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 missing.append("Destination IP")
             }
-        case .mesh:
+        case .mesh, .partyMesh:
             if deploymentDetails.peerDevices.filter(\.hasEndpoint).isEmpty {
                 missing.append("Mesh peer")
             }

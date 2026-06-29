@@ -3,18 +3,11 @@ use crate::{
     error::{QlinkError, Result},
     routing::{RouteMode, RoutePolicy},
 };
-use chacha20poly1305::{
-    aead::{Aead, KeyInit, Payload},
-    ChaCha20Poly1305, Key, Nonce,
-};
-use hkdf::Hkdf;
 use serde::Deserialize;
-use sha2::Sha256;
 use std::{collections::VecDeque, net::Ipv4Addr};
 
-const FRAME_MAGIC: &[u8; 6] = b"QLENC1";
+const FRAME_MAGIC: &[u8; 6] = b"QLPKT1";
 const FRAME_HEADER_LEN: usize = 6 + 8 + 2 + 4;
-const FRAME_TAG_LEN: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PacketDisposition {
@@ -41,7 +34,7 @@ pub struct PacketCoreMetrics {
 #[derive(Debug)]
 pub struct PacketTunnelCore {
     policy: RoutePolicy,
-    frame_crypto: FrameCrypto,
+    frame_codec: PacketFrameCodec,
     next_packet_number: u64,
     transport_outbox: VecDeque<Vec<u8>>,
     tunnel_outbox: VecDeque<TunnelPacket>,
@@ -111,11 +104,11 @@ impl PacketTunnelCore {
             .as_ref()
             .map(|crypto| crypto.suite.as_str())
             .unwrap_or(SUITE_FIPS203);
-        let frame_crypto = FrameCrypto::new(suite)?;
+        let frame_codec = PacketFrameCodec::new(suite)?;
 
         Ok(Self {
             policy,
-            frame_crypto,
+            frame_codec,
             next_packet_number: 1,
             transport_outbox: VecDeque::new(),
             tunnel_outbox: VecDeque::new(),
@@ -150,7 +143,7 @@ impl PacketTunnelCore {
         let mut normalized_packet = packet.to_vec();
         normalize_ipv4_packet(&mut normalized_packet)?;
 
-        let frame = self.frame_crypto.encode_transport_frame(
+        let frame = self.frame_codec.encode_transport_frame(
             self.next_packet_number,
             protocol_family,
             &normalized_packet,
@@ -167,7 +160,7 @@ impl PacketTunnelCore {
 
     pub fn accept_transport_frame(&mut self, frame: &[u8]) -> Result<()> {
         let (_packet_number, protocol_family, packet) =
-            match self.frame_crypto.decode_transport_frame(frame) {
+            match self.frame_codec.decode_transport_frame(frame) {
                 Ok(decoded) => decoded,
                 Err(error) => {
                     self.metrics.dropped_malformed += 1;
@@ -257,31 +250,12 @@ fn ipv4_header_checksum(header: &[u8]) -> u16 {
 }
 
 #[derive(Debug, Clone)]
-struct FrameCrypto {
-    suite: String,
-    key: [u8; 32],
-    nonce_prefix: [u8; 4],
-}
+struct PacketFrameCodec;
 
-impl FrameCrypto {
+impl PacketFrameCodec {
     fn new(suite: &str) -> Result<Self> {
         validate_suite_name(suite)?;
-
-        let hkdf = Hkdf::<Sha256>::new(Some(b"QuantumLink packet frame AEAD v1"), suite.as_bytes());
-        let mut output = [0_u8; 36];
-        hkdf.expand(b"packet-frame-key", &mut output)
-            .map_err(|_| QlinkError::Crypto("packet frame HKDF expand failed".into()))?;
-
-        let mut key = [0_u8; 32];
-        key.copy_from_slice(&output[..32]);
-        let mut nonce_prefix = [0_u8; 4];
-        nonce_prefix.copy_from_slice(&output[32..]);
-
-        Ok(Self {
-            suite: suite.to_string(),
-            key,
-            nonce_prefix,
-        })
+        Ok(Self)
     }
 
     fn encode_transport_frame(
@@ -292,39 +266,15 @@ impl FrameCrypto {
     ) -> Result<Vec<u8>> {
         let family = u16::try_from(protocol_family)
             .map_err(|_| QlinkError::Protocol("protocol family does not fit in frame".into()))?;
-        let ciphertext_len = packet
-            .len()
-            .checked_add(FRAME_TAG_LEN)
-            .ok_or_else(|| QlinkError::Protocol("packet is too large for frame".into()))?;
-        let ciphertext_len = u32::try_from(ciphertext_len)
+        let packet_len = u32::try_from(packet.len())
             .map_err(|_| QlinkError::Protocol("packet is too large for frame".into()))?;
 
-        let mut header = Vec::with_capacity(FRAME_HEADER_LEN);
-        header.extend_from_slice(FRAME_MAGIC);
-        header.extend_from_slice(&packet_number.to_be_bytes());
-        header.extend_from_slice(&family.to_be_bytes());
-        header.extend_from_slice(&ciphertext_len.to_be_bytes());
-
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&self.key));
-        let nonce = self.nonce(packet_number);
-        let ciphertext = cipher
-            .encrypt(
-                Nonce::from_slice(&nonce),
-                Payload {
-                    msg: packet,
-                    aad: &header,
-                },
-            )
-            .map_err(|_| QlinkError::Crypto("packet frame encryption failed".into()))?;
-        if ciphertext.len() != ciphertext_len as usize {
-            return Err(QlinkError::Crypto(
-                "packet frame ciphertext length mismatch".into(),
-            ));
-        }
-
-        let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + ciphertext.len());
-        frame.extend_from_slice(&header);
-        frame.extend_from_slice(&ciphertext);
+        let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + packet.len());
+        frame.extend_from_slice(FRAME_MAGIC);
+        frame.extend_from_slice(&packet_number.to_be_bytes());
+        frame.extend_from_slice(&family.to_be_bytes());
+        frame.extend_from_slice(&packet_len.to_be_bytes());
+        frame.extend_from_slice(packet);
         Ok(frame)
     }
 
@@ -345,41 +295,21 @@ impl FrameCrypto {
 
         let mut len = [0_u8; 4];
         len.copy_from_slice(&frame[16..20]);
-        let ciphertext_len = u32::from_be_bytes(len) as usize;
+        let packet_len = u32::from_be_bytes(len) as usize;
 
-        let ciphertext_start = FRAME_HEADER_LEN;
-        let ciphertext_end = ciphertext_start + ciphertext_len;
-        if frame.len() != ciphertext_end {
+        let packet_start = FRAME_HEADER_LEN;
+        let packet_end = packet_start + packet_len;
+        if frame.len() != packet_end {
             return Err(QlinkError::Protocol(
                 "transport frame length mismatch".into(),
             ));
         }
 
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&self.key));
-        let nonce = self.nonce(packet_number);
-        let packet = cipher
-            .decrypt(
-                Nonce::from_slice(&nonce),
-                Payload {
-                    msg: &frame[ciphertext_start..ciphertext_end],
-                    aad: &frame[..FRAME_HEADER_LEN],
-                },
-            )
-            .map_err(|_| {
-                QlinkError::Crypto(format!(
-                    "packet frame authentication failed for suite {}",
-                    self.suite
-                ))
-            })?;
-
-        Ok((packet_number, u16::from_be_bytes(family) as u32, packet))
-    }
-
-    fn nonce(&self, packet_number: u64) -> [u8; 12] {
-        let mut nonce = [0_u8; 12];
-        nonce[..4].copy_from_slice(&self.nonce_prefix);
-        nonce[4..].copy_from_slice(&packet_number.to_be_bytes());
-        nonce
+        Ok((
+            packet_number,
+            u16::from_be_bytes(family) as u32,
+            frame[packet_start..packet_end].to_vec(),
+        ))
     }
 }
 
@@ -399,7 +329,12 @@ mod tests {
         );
 
         let frame = core.pop_transport_frame().unwrap();
-        assert!(!contains_subslice(&frame, &packet));
+        let mut expected_packet = packet.clone();
+        normalize_ipv4_packet(&mut expected_packet).unwrap();
+        assert!(
+            contains_subslice(&frame, &expected_packet),
+            "packet core must not apply a classical inner packet cipher; PQC mesh frame protection owns transport secrecy"
+        );
 
         core.accept_transport_frame(&frame).unwrap();
         let restored = core.pop_tunnel_packet().unwrap();
@@ -425,21 +360,20 @@ mod tests {
     }
 
     #[test]
-    fn tampered_transport_frame_is_rejected() {
+    fn malformed_transport_frame_is_rejected() {
         let mut core = test_core(SUITE_FIPS204);
         let packet = test_ipv4_packet([100, 127, 0, 10]);
         core.submit_tunnel_packet(2, &packet).unwrap();
 
         let mut frame = core.pop_transport_frame().unwrap();
-        let last = frame.last_mut().unwrap();
-        *last ^= 0x01;
+        frame.pop();
 
         assert!(core.accept_transport_frame(&frame).is_err());
         assert!(core.pop_tunnel_packet().is_none());
     }
 
     #[test]
-    fn selected_pqc_suite_changes_transport_frame_encryption() {
+    fn selected_pqc_suite_does_not_change_packet_frame_codec() {
         let packet = test_ipv4_packet([100, 127, 0, 10]);
         let mut fips203 = test_core(SUITE_FIPS203);
         let mut fips205 = test_core(SUITE_FIPS205);
@@ -449,16 +383,16 @@ mod tests {
 
         let fips203_frame = fips203.pop_transport_frame().unwrap();
         let fips205_frame = fips205.pop_transport_frame().unwrap();
+        let mut expected_packet = packet.clone();
+        normalize_ipv4_packet(&mut expected_packet).unwrap();
 
-        assert_ne!(fips203_frame, fips205_frame);
-        assert!(!contains_subslice(&fips203_frame, &packet));
-        assert!(!contains_subslice(&fips205_frame, &packet));
-
-        assert!(fips203.accept_transport_frame(&fips205_frame).is_err());
+        assert_eq!(fips203_frame, fips205_frame);
+        assert!(contains_subslice(&fips203_frame, &expected_packet));
+        fips203.accept_transport_frame(&fips205_frame).unwrap();
     }
 
     #[test]
-    fn packet_metadata_is_normalized_before_transport_encryption() {
+    fn packet_metadata_is_normalized_before_transport_framing() {
         let mut core = test_core(SUITE_FIPS203);
         let mut packet = test_ipv4_packet([100, 127, 0, 10]);
         packet[1] = 0xff;

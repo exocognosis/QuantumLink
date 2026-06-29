@@ -34,7 +34,7 @@ QuantumLink mesh peers
 
 | Path | Contents |
 |------|----------|
-| `rust/qlink-core` | Shared protocol core (copied from QuantumLinkOS, Windows-clean) |
+| `../qlink-core` | Shared protocol core (shared with macOS; produces qlink_core.dll / .lib / qlink_core.dll.lib) |
 | `rust/quantumlink-proto` | Product models + IPC schema (port of `Models.swift`/`TunnelMessages.swift`) |
 | `rust/quantumlink-service` | Privileged Windows service (Wintun, WFP, DPAPI, named pipe) |
 | `ui/QuantumLink.Windows` | WinUI 3 dashboard (C#, unprivileged, pipe client) |

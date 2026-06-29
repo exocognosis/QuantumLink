@@ -68,6 +68,8 @@ struct BaselineMetric {
     name: String,
     kind: BaselineKind,
     value_ms: f64,
+    #[serde(default)]
+    regression_noise_floor_ms: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -209,6 +211,23 @@ fn fail(msg: impl AsRef<str>) -> ! {
     process::exit(2);
 }
 
+fn is_regressed(
+    baseline_ms: f64,
+    observed_ms: f64,
+    threshold_pct: f64,
+    noise_floor_ms: Option<f64>,
+) -> bool {
+    let delta_ms = observed_ms - baseline_ms;
+    let delta_pct = delta_ms / baseline_ms * 100.0;
+    if delta_pct <= threshold_pct {
+        return false;
+    }
+    match noise_floor_ms {
+        Some(floor_ms) => delta_ms > floor_ms,
+        None => true,
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -280,7 +299,12 @@ fn main() {
             }),
             Some(Some(observed_ms)) => {
                 let delta_pct = (observed_ms - metric.value_ms) / metric.value_ms * 100.0;
-                let status = if delta_pct > threshold {
+                let status = if is_regressed(
+                    metric.value_ms,
+                    observed_ms,
+                    threshold,
+                    metric.regression_noise_floor_ms,
+                ) {
                     Status::Regressed
                 } else {
                     Status::Ok
@@ -476,6 +500,34 @@ slo.relay_fallback.lan: n=15 p50=204.6ms p90=206.5ms p99=207.0ms max=207.0ms
         assert_eq!(
             strip_label_annotation("slo.bench(no-space)"),
             "slo.bench(no-space)"
+        );
+    }
+
+    #[test]
+    fn regression_noise_floor_absorbs_tiny_runner_jitter() {
+        assert!(
+            is_regressed(3.3, 4.4, 20.0, None),
+            "without a noise floor, the percentage gate still applies"
+        );
+        assert!(
+            !is_regressed(3.3, 4.4, 20.0, Some(2.0)),
+            "1.1ms of drift is runner noise for sub-5ms SLO rows"
+        );
+        assert!(
+            is_regressed(3.3, 5.6, 20.0, Some(2.0)),
+            "larger absolute drift still fails"
+        );
+        assert!(
+            !is_regressed(0.049, 0.090, 20.0, Some(0.1)),
+            "sub-millisecond benchmark drift can exceed percentage thresholds without being material"
+        );
+        assert!(
+            is_regressed(0.049, 0.200, 20.0, Some(0.1)),
+            "sub-millisecond benchmarks still fail once absolute drift clears the floor"
+        );
+        assert!(
+            !is_regressed(210.0, 230.0, 20.0, None),
+            "metrics under the percentage threshold still pass"
         );
     }
 }

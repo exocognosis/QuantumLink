@@ -3,9 +3,3 @@ contact_links:
   - name: Security reports
     url: https://github.com/exocognosis/QuantumLink/security
     about: Please report suspected vulnerabilities privately.
-  - name: Support policy
-    url: https://github.com/exocognosis/QuantumLink/blob/main/SUPPORT.md
-    about: Review what belongs in public support issues.
-  - name: Open source boundaries
-    url: https://github.com/exocognosis/QuantumLink/blob/main/docs/open-source-boundaries.md
-    about: See what is public source and what remains private production infrastructure.

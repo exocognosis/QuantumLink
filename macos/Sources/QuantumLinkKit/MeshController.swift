@@ -254,10 +254,17 @@ public final class AppMeshController: ObservableObject, MeshControlling {
     }
 
     private func observeTunnelStatusChanges() {
-        statusObserverTask = Task { @MainActor [weak self] in
-            let notifications = NotificationCenter.default.notifications(named: .NEVPNStatusDidChange)
+        statusObserverTask = Task { [weak self] in
+            // `NotificationCenter.notifications(named:)` yields non-Sendable
+            // `Notification` values. Under the Swift 6 language mode the Xcode
+            // project builds with (SWIFT_VERSION = 6.0), those cannot cross
+            // this @MainActor Task's isolation boundary, so iterating the raw
+            // sequence fails to compile. We only need the change signal, not
+            // the notification, so map the sequence to `Void` first.
+            let statusChanges = NotificationCenter.default
+                .notifications(named: .NEVPNStatusDidChange)
                 .map { _ in () }
-            for await _ in notifications {
+            for await _ in statusChanges {
                 guard let self else { return }
                 await self.refresh()
             }
@@ -410,7 +417,7 @@ public final class SimulatedMeshController: ObservableObject, MeshControlling {
            ProcessInfo.processInfo.environment["QLINK_CORE_DYLIB"]?.isEmpty ?? true {
             return (
                 DevelopmentDropTransportSender(
-                    reason: "Set QLINK_CORE_DYLIB and QLINK_TRANSPORT_MODE=dev-quic-loopback to run the local transport smoke path"
+                    reason: "Local transport smoke is disabled in the strict PQC profile; use production mesh integration checks with a mesh transport config"
                 ).metrics,
                 nil
             )

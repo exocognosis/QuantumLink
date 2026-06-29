@@ -17,19 +17,19 @@ The current handshake is post-quantum only for session establishment. It does no
 
 Supported suite identifiers:
 
-- `QLINK-FIPS203-MLKEM768-HKDFSHA256-v1`
-- `QLINK-FIPS204-MLDSA65-HKDFSHA256-v1`
-- `QLINK-FIPS205-SLHDSA-SHA2-128S-HKDFSHA256-v1`
+- `QLINK-FIPS203-MLKEM768-SHAKE256-v1`
+- `QLINK-FIPS204-MLDSA65-SHAKE256-v1`
+- `QLINK-FIPS205-SLHDSA-SHAKE128S-SHAKE256-v1`
 
 Implemented crypto behavior:
 
 - ML-KEM-768 three-message session establishment.
-- SHA-256 transcript hashing.
-- HKDF-SHA-256 directional key derivation with suite binding.
+- SHAKE256 transcript binding.
+- SHAKE256 directional key derivation with suite binding.
 - ML-DSA-65 device credentials by default.
-- SLH-DSA-SHA2-128S signing and verification for the FIPS 205 suite path.
+- SLH-DSA-SHAKE-128S signing and verification for the FIPS 205 suite path.
 - Signed, expiring peer records containing peer identity, device public key, routes, endpoint candidates, ICE credentials, QUIC certificate material, expiration, and sequence number.
-- ChaCha20-Poly1305 packet-frame protection in `PacketTunnelCore` using suite-bound HKDF-derived frame keys.
+- Suite-validated packet framing in `PacketTunnelCore` plus app-layer PQC frame protection on negotiated session paths.
 - Monotonic packet-number replay protection.
 
 The legacy `QLINK-HYBRID-X25519-MLKEM768-HKDFSHA256-v1` suite is intentionally rejected. Production peer sessions still need to install negotiated session keys into packet-frame encryption; current packet-frame keys are development suite-bound keys.

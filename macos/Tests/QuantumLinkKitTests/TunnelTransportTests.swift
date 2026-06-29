@@ -62,29 +62,23 @@ final class TunnelTransportTests: XCTestCase {
         XCTAssertEqual(decoded.transport?.framesReceived, 1)
     }
 
-    func testRustDevQuicLoopbackTransportWhenDylibIsConfigured() throws {
-        guard
-            let path = ProcessInfo.processInfo.environment["QLINK_CORE_DYLIB"],
-            FileManager.default.fileExists(atPath: path)
-        else {
-            throw XCTSkip("Set QLINK_CORE_DYLIB to libqlink_core.dylib to run the Rust dev QUIC transport integration test.")
-        }
+    func testRustDevQuicLoopbackTransportIsDisabled() throws {
+        let transport = RustDevQuicLoopbackTransport()
 
-        let transport = RustDevQuicLoopbackTransport(library: try RustCoreLibrary(path: path))
-        try transport.start()
-        try transport.sendTransportFrame(Data([0xaa, 0xbb]))
-
-        let received = try XCTUnwrap(transport.receiveTransportFrame())
-        XCTAssertEqual(received.frame, Data([0xaa, 0xbb]))
-        // Dev QUIC loopback has no peer identity to attribute.
-        XCTAssertNil(received.peerID)
+        XCTAssertThrowsError(try transport.start())
+        XCTAssertThrowsError(try transport.sendTransportFrame(Data([0xaa, 0xbb])))
+        XCTAssertNil(try transport.receiveTransportFrame())
         XCTAssertEqual(transport.metrics.kind, .devQuicLoopback)
-        XCTAssertEqual(transport.metrics.pathType, .direct)
-        XCTAssertEqual(transport.metrics.framesSent, 1)
-        XCTAssertEqual(transport.metrics.framesReceived, 1)
+        XCTAssertFalse(transport.isReady)
+        XCTAssertEqual(transport.metrics.pathType, .unavailable)
+        XCTAssertEqual(transport.metrics.sendFailures, 1)
+        XCTAssertEqual(
+            transport.metrics.lastError,
+            "dev-quic-loopback is disabled because raw Quinn DATAGRAM bypasses the app-layer PQC frame session"
+        )
     }
 
-    func testTransportSmokeRunnerWhenDylibIsConfigured() throws {
+    func testTransportSmokeRunnerDisablesDevQuicLoopbackWhenDylibIsConfigured() throws {
         guard
             let path = ProcessInfo.processInfo.environment["QLINK_CORE_DYLIB"],
             FileManager.default.fileExists(atPath: path)
@@ -92,16 +86,11 @@ final class TunnelTransportTests: XCTestCase {
             throw XCTSkip("Set QLINK_CORE_DYLIB to libqlink_core.dylib to run the Swift transport smoke integration test.")
         }
 
-        let result = try TransportSmokeRunner.run(
-            mode: .devQuicLoopback,
-            libraryPath: path
+        XCTAssertThrowsError(
+            try TransportSmokeRunner.run(
+                mode: .devQuicLoopback,
+                libraryPath: path
+            )
         )
-
-        XCTAssertTrue(result.packetRoundTrip)
-        XCTAssertEqual(result.transportMetrics.kind, .devQuicLoopback)
-        XCTAssertEqual(result.transportMetrics.framesSent, 1)
-        XCTAssertEqual(result.transportMetrics.framesReceived, 1)
-        XCTAssertEqual(result.coreMetrics.transportFramesOut, 1)
-        XCTAssertEqual(result.coreMetrics.transportFramesIn, 1)
     }
 }

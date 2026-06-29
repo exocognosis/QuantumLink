@@ -2,6 +2,7 @@ import Foundation
 
 public enum QuantumLinkDeploymentMode: String, Codable, CaseIterable, Hashable, Identifiable, Sendable {
     case mesh
+    case partyMesh
     case direct
     case localVPN
 
@@ -71,7 +72,7 @@ public enum QuantumLinkDeploymentMode: String, Codable, CaseIterable, Hashable, 
         profile: ConnectionProfile? = nil
     ) -> [String] {
         switch self {
-        case .mesh:
+        case .mesh, .partyMesh:
             guard let hostRoute = hostRoute(for: destinationIPAddress) else {
                 return base.protectedRoutes
             }
@@ -103,7 +104,7 @@ public enum QuantumLinkDeploymentMode: String, Codable, CaseIterable, Hashable, 
 
     private var routeMode: RouteMode {
         switch self {
-        case .mesh:
+        case .mesh, .partyMesh:
             .splitTunnel
         case .direct:
             .protectedPrefixesOnly
@@ -114,7 +115,7 @@ public enum QuantumLinkDeploymentMode: String, Codable, CaseIterable, Hashable, 
 
     private var dnsMode: DNSMode {
         switch self {
-        case .mesh, .direct:
+        case .mesh, .partyMesh, .direct:
             .tunnelProvided
         case .localVPN:
             .system
@@ -123,7 +124,7 @@ public enum QuantumLinkDeploymentMode: String, Codable, CaseIterable, Hashable, 
 
     private var discoveryModes: [DiscoveryMode] {
         switch self {
-        case .mesh:
+        case .mesh, .partyMesh:
             [.rendezvous]
         case .direct:
             [.rendezvous, .localMDNS]
@@ -134,7 +135,7 @@ public enum QuantumLinkDeploymentMode: String, Codable, CaseIterable, Hashable, 
 
     private func rendezvousServers(from base: TunnelConfiguration, destinationIPAddress: String?, endpointPort: Int? = nil) -> [String] {
         switch self {
-        case .mesh, .direct:
+        case .mesh, .partyMesh, .direct:
             if let endpoint = remappedEndpoint(host: destinationIPAddress, from: base.rendezvousServers, endpointPort: endpointPort) {
                 return [endpoint]
             }
@@ -146,7 +147,7 @@ public enum QuantumLinkDeploymentMode: String, Codable, CaseIterable, Hashable, 
 
     private func relayServers(from base: TunnelConfiguration, destinationIPAddress: String?, endpointPort: Int? = nil) -> [String] {
         switch self {
-        case .mesh:
+        case .mesh, .partyMesh:
             if let endpoint = remappedEndpoint(host: destinationIPAddress, from: base.relayServers, endpointPort: endpointPort) {
                 return [endpoint]
             }

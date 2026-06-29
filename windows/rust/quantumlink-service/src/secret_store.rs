@@ -21,7 +21,7 @@ pub mod accounts {
     /// 32-byte ML-DSA seed for the local device keypair
     /// (`DeviceKeypairStore.defaultAccount`).
     pub const DEVICE_KEYPAIR_SEED: &str = "device-keypair-seed";
-    /// 32-byte ChaCha20-Poly1305 key encrypting the on-disk peer store
+    /// 32-byte SHAKE256 envelope key protecting the on-disk peer store
     /// (`PeerStoreKey.defaultAccount`).
     pub const PEER_STORE_KEY: &str = "peer-store-key";
 }

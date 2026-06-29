@@ -27,7 +27,7 @@ final class PeerStoreKeyTests: XCTestCase {
 
         try skipIfKeychainEntitlementMissing {
             let first = try store.loadOrGenerate()
-            XCTAssertEqual(first.count, 32, "ChaCha20-Poly1305 key must be exactly 32 bytes")
+            XCTAssertEqual(first.count, 32, "peer-store envelope key must be exactly 32 bytes")
 
             let second = try store.loadOrGenerate()
             XCTAssertEqual(first, second, "second load must reuse the persisted key")

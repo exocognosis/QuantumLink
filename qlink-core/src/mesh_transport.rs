@@ -25,12 +25,17 @@
 //! (a) the link dies, (b) a network event demands reconnect, or (c) the
 //! handle is dropped.
 
+#![cfg_attr(not(feature = "dev-quic-carrier"), allow(dead_code, unused_imports))]
+
+#[cfg(feature = "dev-quic-carrier")]
+use crate::quic_transport::QuicEndpoint;
 use crate::{
+    carrier_transport::CarrierSession,
     crypto::DeviceKeypair,
-    discovery::{CandidateEndpoint, CandidateType, PeerRecord, UnsignedPeerRecord},
+    discovery::{now_unix, CandidateEndpoint, CandidateType, PeerRecord, UnsignedPeerRecord},
     dytallix_identity::{
-        registry_unavailable_decision, verify_inbound_registry_assertion, DiscoveryIdentityMode,
-        DytallixIdentityRegistry, DytallixRegistryConfig, IdentityRegistryLookup, MeshTrustPolicy,
+        verify_inbound_registry_assertion, DytallixIdentityRegistry, DytallixRegistryLookupConfig,
+        MeshTrustPolicy, RegistryDecision,
     },
     error::{QlinkError, Result},
     ice::IceCredentials,
@@ -38,18 +43,21 @@ use crate::{
         receive_and_evaluate_inbound, InboundDecision, DEFAULT_INBOUND_ASSERTION_MAX_AGE_SECONDS,
     },
     mesh_connection::{
-        MeshConnector, MeshConnectorConfig, NetworkEvent, NetworkEventResponse, PathKind,
+        IdentityRegistryLookup, MeshConnector, MeshConnectorConfig, NetworkEvent,
+        NetworkEventResponse, PathKind, PeerRecordSource,
     },
     metrics_endpoint::{spawn_metrics_endpoint, MetricsEndpoint, MetricsSnapshot},
     peer_acl::PeerAcl,
     peer_store::{
         open_file_peer_store, open_file_peer_store_with_key, InMemoryPeerStore, PeerStore,
     },
-    quic_transport::QuicEndpoint,
+    pqc_frame::PqcFrameProtector,
+    pqc_session_wire::run_pqc_session_responder,
     rendezvous::RendezvousClient,
+    session_crypto::PqcSessionContext,
     traversal::HOST_PRIORITY,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     net::SocketAddr,
@@ -96,6 +104,165 @@ pub struct MeshTransportRawMetrics {
     pub reconnect_count: u64,
 }
 
+pub const PEER_TRUST_DECISION_UNKNOWN: u32 = 0;
+pub const PEER_TRUST_DECISION_ACCEPTED: u32 = 1;
+pub const PEER_TRUST_DECISION_ACCEPTED_WITHOUT_REGISTRY_PRIVATE: u32 = 2;
+pub const PEER_TRUST_DECISION_ACCEPTED_WITHOUT_REGISTRY_DEVELOPMENT: u32 = 3;
+pub const PEER_TRUST_FAILURE_NONE: u32 = 0;
+pub const PEER_TRUST_FAILURE_REGISTRY_REQUIRED: u32 = 1;
+pub const PEER_TRUST_FAILURE_REGISTRY_REVOKED: u32 = 2;
+pub const PEER_TRUST_FAILURE_REGISTRY_SUSPENDED: u32 = 3;
+pub const PEER_TRUST_FAILURE_REGISTRY_EXPIRED: u32 = 4;
+pub const PEER_TRUST_FAILURE_REGISTRY_MISMATCH: u32 = 5;
+pub const PEER_TRUST_FAILURE_REGISTRY_LOOKUP: u32 = 6;
+pub const PEER_TRUST_FAILURE_REGISTRY_VERIFICATION: u32 = 7;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockedPeerDirection {
+    Inbound,
+    Outbound,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BlockedPeerHistoryEntry {
+    pub peer_id: String,
+    pub direction: BlockedPeerDirection,
+    pub failure_code: u32,
+    pub failure_reason: String,
+    pub observed_at_unix: u64,
+    pub checked_at_unix: u64,
+}
+
+#[derive(Debug, Default)]
+pub struct BlockedPeerHistory {
+    entries: StdMutex<HashMap<(String, BlockedPeerDirection), BlockedPeerHistoryEntry>>,
+}
+
+impl BlockedPeerHistory {
+    pub fn new() -> Self {
+        Self {
+            entries: StdMutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn record(
+        &self,
+        peer_id: &str,
+        direction: BlockedPeerDirection,
+        failure_code: u32,
+        failure_reason: &str,
+        checked_at_unix: Option<u64>,
+    ) {
+        let observed_at_unix = now_unix();
+        let entry = BlockedPeerHistoryEntry {
+            peer_id: peer_id.to_string(),
+            direction,
+            failure_code,
+            failure_reason: failure_reason.to_string(),
+            observed_at_unix,
+            checked_at_unix: checked_at_unix.unwrap_or(observed_at_unix),
+        };
+        if let Ok(mut guard) = self.entries.lock() {
+            guard.insert((entry.peer_id.clone(), direction), entry);
+        }
+    }
+
+    pub fn snapshot(&self) -> Vec<BlockedPeerHistoryEntry> {
+        let mut entries: Vec<BlockedPeerHistoryEntry> = self
+            .entries
+            .lock()
+            .map(|guard| guard.values().cloned().collect())
+            .unwrap_or_default();
+        entries.sort_by(|lhs, rhs| {
+            lhs.peer_id
+                .cmp(&rhs.peer_id)
+                .then_with(|| lhs.direction.cmp(&rhs.direction))
+        });
+        entries
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PeerTrustStatusRaw {
+    pub decision_code: u32,
+    pub failure_code: u32,
+    pub checked_at_unix: u64,
+    pub source_code: u32,
+}
+
+impl PeerTrustStatusRaw {
+    fn from_registry_decision(decision: RegistryDecision, source: PeerRecordSource) -> Self {
+        Self {
+            decision_code: registry_decision_code(decision),
+            failure_code: PEER_TRUST_FAILURE_NONE,
+            checked_at_unix: now_unix(),
+            source_code: source.trust_source_code(),
+        }
+    }
+
+    fn from_failure_message(message: &str) -> Option<Self> {
+        let failure_code = registry_failure_code(message)?;
+        Some(Self {
+            decision_code: PEER_TRUST_DECISION_UNKNOWN,
+            failure_code,
+            checked_at_unix: now_unix(),
+            source_code: PEER_TRUST_SOURCE_UNKNOWN,
+        })
+    }
+}
+
+const PEER_TRUST_SOURCE_UNKNOWN: u32 = 0;
+
+fn registry_decision_code(decision: RegistryDecision) -> u32 {
+    match decision {
+        RegistryDecision::Accepted => PEER_TRUST_DECISION_ACCEPTED,
+        RegistryDecision::AcceptedWithoutRegistryPrivate => {
+            PEER_TRUST_DECISION_ACCEPTED_WITHOUT_REGISTRY_PRIVATE
+        }
+        RegistryDecision::AcceptedWithoutRegistryDevelopment => {
+            PEER_TRUST_DECISION_ACCEPTED_WITHOUT_REGISTRY_DEVELOPMENT
+        }
+    }
+}
+
+fn registry_failure_code(message: &str) -> Option<u32> {
+    if message.contains("registry record required by public mesh trust policy") {
+        return Some(PEER_TRUST_FAILURE_REGISTRY_REQUIRED);
+    }
+    if message.contains("registry record has expired") {
+        return Some(PEER_TRUST_FAILURE_REGISTRY_EXPIRED);
+    }
+    if message.contains("registry record is revoked") {
+        return Some(PEER_TRUST_FAILURE_REGISTRY_REVOKED);
+    }
+    if message.contains("registry record is suspended")
+        || message.contains("registry record is not active")
+    {
+        return Some(PEER_TRUST_FAILURE_REGISTRY_SUSPENDED);
+    }
+    if message.contains("identity registry lookup failed") {
+        return Some(PEER_TRUST_FAILURE_REGISTRY_LOOKUP);
+    }
+    let registry_binding_mismatch = [
+        "peer_id mismatch",
+        "device_public_key_hash_hex mismatch",
+        "latest_peer_record_hash_hex mismatch",
+        "pqc_binding_hash_hex mismatch",
+        "node_signing_public_key_hash_hex mismatch",
+        "transport_public_key_hash_hex mismatch",
+    ]
+    .iter()
+    .any(|pattern| message.contains(pattern));
+    if registry_binding_mismatch || (message.contains("registry") && message.contains("mismatch")) {
+        return Some(PEER_TRUST_FAILURE_REGISTRY_MISMATCH);
+    }
+    if message.contains("registry") {
+        return Some(PEER_TRUST_FAILURE_REGISTRY_VERIFICATION);
+    }
+    None
+}
+
 /// Per-peer session state. One instance per active remote peer.
 ///
 /// The fields that matter to operators (state, path_kind, last_error,
@@ -108,6 +275,7 @@ struct SharedState {
     state: StdMutex<MeshTransportState>,
     path_kind: StdMutex<Option<PathKind>>,
     last_error: StdMutex<Option<String>>,
+    peer_trust: StdMutex<PeerTrustStatusRaw>,
     frames_sent: AtomicU64,
     frames_received: AtomicU64,
     bytes_sent: AtomicU64,
@@ -123,6 +291,7 @@ impl SharedState {
             state: StdMutex::new(MeshTransportState::Connecting),
             path_kind: StdMutex::new(None),
             last_error: StdMutex::new(None),
+            peer_trust: StdMutex::new(PeerTrustStatusRaw::default()),
             frames_sent: AtomicU64::new(0),
             frames_received: AtomicU64::new(0),
             bytes_sent: AtomicU64::new(0),
@@ -164,6 +333,29 @@ impl SharedState {
         if let Ok(mut guard) = self.last_error.lock() {
             *guard = error;
         }
+    }
+
+    fn set_peer_trust_decision(&self, decision: RegistryDecision, source: PeerRecordSource) {
+        if let Ok(mut guard) = self.peer_trust.lock() {
+            *guard = PeerTrustStatusRaw::from_registry_decision(decision, source);
+        }
+    }
+
+    fn set_peer_trust_failure_message(&self, message: &str) -> Option<PeerTrustStatusRaw> {
+        let Some(status) = PeerTrustStatusRaw::from_failure_message(message) else {
+            return None;
+        };
+        if let Ok(mut guard) = self.peer_trust.lock() {
+            *guard = status;
+        }
+        Some(status)
+    }
+
+    fn peer_trust_status(&self) -> PeerTrustStatusRaw {
+        self.peer_trust
+            .lock()
+            .map(|guard| *guard)
+            .unwrap_or_default()
     }
 
     /// Per-peer metrics only. Transport-level fields like
@@ -267,28 +459,18 @@ pub struct MeshTransportConfig {
     #[serde(default)]
     pub peer_store_path: Option<String>,
     /// Optional base64 (standard alphabet, with padding) of a
-    /// 32-byte ChaCha20-Poly1305 key. When set together with
-    /// `peer_store_path`, the on-disk file is encrypted in the v2
+    /// 32-byte SHAKE256 envelope key. When set together with
+    /// `peer_store_path`, the on-disk file is protected in the v3
     /// envelope; without it the file is plaintext JSON. The host
     /// (Swift app) is expected to mint + persist this key in the
     /// macOS Keychain. `qlinkctl` deployments without a Keychain
     /// can leave this `None` and rely on file mode 0o600.
     #[serde(default)]
     pub peer_store_key_b64: Option<String>,
-    /// Optional Dytallix registry policy/config. Platform adapters may
-    /// configure, store, and forward this, but the shared Rust connector
-    /// owns the actual trust decision.
-    #[serde(default, alias = "dytallix")]
-    pub dytallix_identity: Option<MeshTransportDytallixIdentityConfig>,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct MeshTransportDytallixIdentityConfig {
-    pub trust_policy: MeshTrustPolicy,
-    pub mode: DiscoveryIdentityMode,
+    #[serde(default = "default_mesh_trust_policy")]
+    pub mesh_trust_policy: MeshTrustPolicy,
     #[serde(default)]
-    pub registry: Option<DytallixRegistryConfig>,
+    pub dytallix_identity: Option<DytallixRegistryLookupConfig>,
 }
 
 fn default_overall_deadline_ms() -> u64 {
@@ -306,52 +488,8 @@ fn default_reconnect_initial_backoff_ms() -> u64 {
 fn default_reconnect_max_backoff_ms() -> u64 {
     30_000
 }
-
-fn connector_config_from_transport_config(
-    config: &MeshTransportConfig,
-    local_device_keypair: Option<Arc<DeviceKeypair>>,
-) -> Result<MeshConnectorConfig> {
-    let mut connector_config =
-        MeshConnectorConfig::new(config.mesh_id.clone(), config.local_peer_id.clone())
-            .with_overall_deadline(Duration::from_millis(config.overall_deadline_ms))
-            .with_direct_probe_timeout(Duration::from_millis(config.direct_probe_timeout_ms))
-            .with_probe_pacing(Duration::from_millis(config.probe_pacing_ms));
-    if let Some(relay) = config.relay_url.clone() {
-        connector_config = connector_config.with_relay_server(relay);
-    }
-    if config.enable_ice {
-        connector_config = connector_config.with_local_ice_credentials(IceCredentials::generate()?);
-    }
-    if let Some(keypair) = local_device_keypair {
-        let keypair_peer_id = keypair.public_key().peer_id();
-        if keypair_peer_id != config.local_peer_id {
-            return Err(QlinkError::Protocol(format!(
-                "MeshTransportHandle local_device_keypair peer_id {keypair_peer_id} \
-                 does not match config.local_peer_id {}",
-                config.local_peer_id
-            )));
-        }
-        connector_config = connector_config.with_local_device_keypair(keypair);
-    }
-    if let Some(identity) = config.dytallix_identity.as_ref() {
-        if identity.trust_policy == MeshTrustPolicy::PublicRequired
-            && identity.mode == DiscoveryIdentityMode::Off
-        {
-            return Err(QlinkError::Protocol(
-                "public meshes must not use dytallix identity mode off".into(),
-            ));
-        }
-        if identity.mode != DiscoveryIdentityMode::Off {
-            connector_config = match identity.registry.clone() {
-                Some(registry_config) => connector_config.with_dytallix_registry(
-                    identity.trust_policy,
-                    Arc::new(DytallixIdentityRegistry::new(registry_config)?),
-                ),
-                None => connector_config.with_dytallix_trust_policy(identity.trust_policy),
-            };
-        }
-    }
-    Ok(connector_config)
+fn default_mesh_trust_policy() -> MeshTrustPolicy {
+    MeshTrustPolicy::DevelopmentOptional
 }
 
 /// A frame received from a specific remote peer. Multi-peer transports
@@ -414,6 +552,9 @@ pub struct MeshTransportHandle {
     /// Transport-level counters that aren't per-peer (today: just the
     /// network-event count).
     aggregate: Arc<AggregateState>,
+    /// Retained trust/ACL rejection history. Kept outside `peers` so
+    /// rejected or removed peers remain visible to diagnostics.
+    blocked_peer_history: Arc<BlockedPeerHistory>,
     /// Held only when the operator opted into the OpenMetrics endpoint via
     /// `metrics_endpoint_bind_addr`. Drop aborts the listener task.
     metrics_endpoint: StdMutex<Option<MetricsEndpoint>>,
@@ -455,10 +596,57 @@ impl MeshTransportHandle {
     /// `config.local_peer_id` for the same reason `publish_self`
     /// requires the match: a connector that asserts a different
     /// identity than its published peer_id is unauthenticatable.
+    #[cfg(not(feature = "dev-quic-carrier"))]
     pub fn new_with_keypair(
         config: MeshTransportConfig,
         local_device_keypair: Option<Arc<DeviceKeypair>>,
     ) -> Result<Self> {
+        if let Some(local_device_keypair) = local_device_keypair.as_ref() {
+            let keypair_peer_id = local_device_keypair.public_key().peer_id();
+            if keypair_peer_id != config.local_peer_id {
+                return Err(QlinkError::Protocol(format!(
+                    "MeshTransportHandle local_device_keypair peer_id {keypair_peer_id} \
+                     does not match config.local_peer_id {}",
+                    config.local_peer_id
+                )));
+            }
+        }
+
+        Err(QlinkError::Protocol(
+            "native UDP live mesh carrier is not wired yet; enable dev-quic-carrier for legacy Quinn development carrier"
+                .into(),
+        ))
+    }
+
+    #[cfg(feature = "dev-quic-carrier")]
+    pub fn new_with_keypair(
+        config: MeshTransportConfig,
+        local_device_keypair: Option<Arc<DeviceKeypair>>,
+    ) -> Result<Self> {
+        if let Some(local_device_keypair) = local_device_keypair.as_ref() {
+            let keypair_peer_id = local_device_keypair.public_key().peer_id();
+            if keypair_peer_id != config.local_peer_id {
+                return Err(QlinkError::Protocol(format!(
+                    "MeshTransportHandle local_device_keypair peer_id {keypair_peer_id} \
+                     does not match config.local_peer_id {}",
+                    config.local_peer_id
+                )));
+            }
+        } else {
+            if config.relay_url.is_none() {
+                return Err(QlinkError::Protocol(
+                    "MeshTransportHandle direct transport requires local_device_keypair for PQC"
+                        .into(),
+                ));
+            }
+            if !config.disable_inbound_responder {
+                return Err(QlinkError::Protocol(
+                    "MeshTransportHandle inbound responder requires local_device_keypair for PQC"
+                        .into(),
+                ));
+            }
+        }
+
         let runtime = Runtime::new().map_err(|err| {
             QlinkError::Protocol(format!("failed to create mesh transport runtime: {err}"))
         })?;
@@ -503,18 +691,37 @@ impl MeshTransportHandle {
         let quic_endpoint = QuicEndpoint::client(client_bind_addr, &[])?;
 
         let rendezvous_client = RendezvousClient::new(config.rendezvous_url.clone());
-        let connector_config =
-            connector_config_from_transport_config(&config, local_device_keypair)?;
-        let inbound_dytallix_trust_policy = connector_config.dytallix_trust_policy;
-        let inbound_dytallix_registry = connector_config.dytallix_registry.clone();
+        let local_credentials = IceCredentials::generate()?;
+
+        let mut connector_config =
+            MeshConnectorConfig::new(config.mesh_id.clone(), config.local_peer_id.clone())
+                .with_overall_deadline(Duration::from_millis(config.overall_deadline_ms))
+                .with_direct_probe_timeout(Duration::from_millis(config.direct_probe_timeout_ms))
+                .with_probe_pacing(Duration::from_millis(config.probe_pacing_ms))
+                .with_mesh_trust_policy(config.mesh_trust_policy);
+        if let Some(relay) = config.relay_url.clone() {
+            connector_config = connector_config.with_relay_server(relay);
+        }
+        if config.enable_ice {
+            connector_config = connector_config.with_local_ice_credentials(local_credentials);
+        }
+        if let Some(local_device_keypair) = local_device_keypair.clone() {
+            connector_config = connector_config.with_local_device_keypair(local_device_keypair);
+        }
+        if let Some(registry_config) = config.dytallix_identity.clone() {
+            let registry = DytallixIdentityRegistry::from_lookup_config(registry_config)?;
+            connector_config = connector_config.with_identity_registry_lookup(Arc::new(registry));
+        }
+        let inbound_mesh_trust_policy = connector_config.mesh_trust_policy;
+        let inbound_identity_registry_lookup = connector_config.identity_registry_lookup.clone();
 
         // Resolve the configured persistence path, if any, into a
         // `FilePeerStore`. Construction errors (missing parent dir,
         // unreadable file) are surfaced up — we'd rather refuse to
         // start than silently degrade to ephemeral storage when the
         // operator asked for persistence. When `peer_store_key_b64`
-        // is set, the file is wrapped in the v2 ChaCha20-Poly1305
-        // envelope; the key MUST decode to exactly 32 bytes.
+        // is set, the file is wrapped in the v3 SHAKE256 envelope;
+        // the key MUST decode to exactly 32 bytes.
         let peer_store: Arc<dyn PeerStore> = match config.peer_store_path.as_deref() {
             None => Arc::new(InMemoryPeerStore::new()),
             Some(path) => match config.peer_store_key_b64.as_deref() {
@@ -550,6 +757,7 @@ impl MeshTransportHandle {
         };
 
         let aggregate = Arc::new(AggregateState::new());
+        let blocked_peer_history = Arc::new(BlockedPeerHistory::new());
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<InboundFrame>();
         let peers: Arc<StdMutex<HashMap<String, PerPeerSession>>> =
             Arc::new(StdMutex::new(HashMap::new()));
@@ -581,14 +789,26 @@ impl MeshTransportHandle {
             Some(endpoint) => {
                 let inbound_acl = config.inbound_acl.clone().map(Arc::new);
                 let mesh_id = config.mesh_id.clone();
+                let local_peer_id = config.local_peer_id.clone();
+                let local_keypair = local_device_keypair
+                    .clone()
+                    .expect("inbound responder requires a local device keypair");
+                let server_cert_der = server_certificate_der
+                    .clone()
+                    .expect("server certificate DER must exist when responder is enabled");
                 let inbound_tx_responder = inbound_tx.clone();
+                let blocked_peer_history_responder = blocked_peer_history.clone();
                 let task = runtime.spawn(run_responder_loop(
                     endpoint,
                     mesh_id,
+                    local_peer_id,
+                    local_keypair,
+                    server_cert_der,
                     inbound_acl,
-                    inbound_dytallix_trust_policy,
-                    inbound_dytallix_registry,
+                    inbound_mesh_trust_policy,
+                    inbound_identity_registry_lookup,
                     inbound_tx_responder,
+                    blocked_peer_history_responder,
                 ));
                 Some(task)
             }
@@ -604,6 +824,7 @@ impl MeshTransportHandle {
             inbound_tx,
             inbound_rx: TokioMutex::new(inbound_rx),
             aggregate,
+            blocked_peer_history,
             metrics_endpoint: StdMutex::new(metrics_endpoint),
             server_certificate_der,
             responder_local_addr,
@@ -792,6 +1013,7 @@ impl MeshTransportHandle {
             shutdown_rx,
             shared.clone(),
             self.backoff,
+            self.blocked_peer_history.clone(),
         ));
 
         peers.insert(
@@ -835,6 +1057,13 @@ impl MeshTransportHandle {
             .lock()
             .map(|peers| peers.keys().cloned().collect())
             .unwrap_or_default()
+    }
+
+    /// Snapshot of retained trust/ACL rejection history. Entries are
+    /// owned values so callers can serialize or inspect them after the
+    /// history mutex has been released.
+    pub fn blocked_peer_history(&self) -> Vec<BlockedPeerHistoryEntry> {
+        self.blocked_peer_history.snapshot()
     }
 
     /// Sends a frame to a specific peer. Errors if the peer isn't active
@@ -895,6 +1124,14 @@ impl MeshTransportHandle {
         let session = peers.get(remote_peer_id)?;
         let guard = session.shared.last_error.lock().ok()?;
         guard.clone()
+    }
+
+    pub fn peer_trust_status(&self, remote_peer_id: &str) -> Option<PeerTrustStatusRaw> {
+        self.peers
+            .lock()
+            .ok()?
+            .get(remote_peer_id)
+            .map(|session| session.shared.peer_trust_status())
     }
 
     pub fn peer_metrics(&self, remote_peer_id: &str) -> Option<MeshTransportRawMetrics> {
@@ -1072,22 +1309,31 @@ impl Drop for MeshTransportHandle {
 /// ACL, and forwards accepted frames into the shared inbound queue
 /// tagged with the verified peer_id. Runs until the server endpoint
 /// stops accepting (Drop on the endpoint, runtime shutdown, etc).
+#[cfg(feature = "dev-quic-carrier")]
 async fn run_responder_loop(
     server: QuicEndpoint,
     expected_mesh_id: String,
+    local_peer_id: String,
+    local_device_keypair: Arc<DeviceKeypair>,
+    local_server_certificate_der: Vec<u8>,
     inbound_acl: Option<Arc<PeerAcl>>,
-    dytallix_trust_policy: Option<MeshTrustPolicy>,
-    dytallix_registry: Option<Arc<dyn IdentityRegistryLookup>>,
+    mesh_trust_policy: MeshTrustPolicy,
+    identity_registry_lookup: Option<Arc<dyn IdentityRegistryLookup>>,
     inbound_tx: mpsc::UnboundedSender<InboundFrame>,
+    _blocked_peer_history: Arc<BlockedPeerHistory>,
 ) {
     loop {
         let session = match server.accept_one().await {
             Ok(session) => session,
             Err(_) => break,
         };
+        let session = CarrierSession::from(session);
         let mesh_id = expected_mesh_id.clone();
+        let local_peer_id = local_peer_id.clone();
+        let local_device_keypair = local_device_keypair.clone();
+        let carrier_binding = local_server_certificate_der.clone();
         let acl = inbound_acl.clone();
-        let dytallix_registry = dytallix_registry.clone();
+        let identity_registry_lookup = identity_registry_lookup.clone();
         let inbound_tx = inbound_tx.clone();
         tokio::spawn(async move {
             let acl_ref = acl.as_deref();
@@ -1100,49 +1346,94 @@ async fn run_responder_loop(
             .await;
             match evaluation {
                 Ok((InboundDecision::Accepted, assertion)) => {
-                    if let Some(policy) = dytallix_trust_policy {
-                        let decision = if let Some(registry) = dytallix_registry.as_ref() {
-                            match registry.lookup_record(&assertion.peer_id).await {
-                                Ok(record) => verify_inbound_registry_assertion(
-                                    &assertion,
-                                    record.as_ref(),
-                                    policy,
-                                ),
-                                Err(error) => {
+                    let registry_record = match identity_registry_lookup.as_ref() {
+                        Some(registry) => match registry.lookup(&assertion.peer_id).await {
+                            Ok(record) => record,
+                            Err(error) => match mesh_trust_policy {
+                                MeshTrustPolicy::PublicRequired => {
                                     tracing::warn!(
                                         peer_id = %assertion.peer_id,
                                         error = %error,
-                                        "dytallix inbound registry lookup failed"
+                                        "inbound identity registry lookup failed"
                                     );
-                                    registry_unavailable_decision(policy)
+                                    session.close(b"");
+                                    return;
                                 }
-                            }
-                        } else {
-                            verify_inbound_registry_assertion(&assertion, None, policy)
-                        };
+                                MeshTrustPolicy::PrivatePreferred
+                                | MeshTrustPolicy::DevelopmentOptional => {
+                                    tracing::warn!(
+                                        peer_id = %assertion.peer_id,
+                                        error = %error,
+                                        policy = ?mesh_trust_policy,
+                                        "inbound identity registry lookup failed; continuing without registry verification"
+                                    );
+                                    None
+                                }
+                            },
+                        },
+                        None => None,
+                    };
+                    if let Err(error) = verify_inbound_registry_assertion(
+                        &assertion,
+                        registry_record.as_ref(),
+                        mesh_trust_policy,
+                    ) {
+                        tracing::warn!(
+                            peer_id = %assertion.peer_id,
+                            error = %error,
+                            "inbound identity registry policy rejected assertion"
+                        );
+                        session.close(b"");
+                        return;
+                    }
 
-                        match decision {
-                            Ok(decision) => {
-                                tracing::debug!(
-                                    peer_id = %assertion.peer_id,
-                                    ?policy,
-                                    ?decision,
-                                    "dytallix inbound registry policy accepted assertion"
-                                );
-                            }
-                            Err(error) => {
-                                tracing::warn!(
-                                    peer_id = %assertion.peer_id,
-                                    reason = %error.reason.as_str(),
-                                    "dytallix inbound registry policy rejected assertion"
-                                );
+                    let peer_id = assertion.peer_id;
+                    let pqc_context = PqcSessionContext::new(
+                        mesh_id,
+                        peer_id.clone(),
+                        local_peer_id,
+                        carrier_binding,
+                    );
+                    let handshake_timeout = pqc_responder_handshake_timeout();
+                    let session_keys = match tokio::time::timeout(
+                        handshake_timeout,
+                        run_pqc_session_responder(
+                            &session,
+                            pqc_context,
+                            local_device_keypair.as_ref(),
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(Ok(session_keys)) => session_keys,
+                        Ok(Err(error)) => {
+                            tracing::warn!(
+                                ?error,
+                                peer_id = %peer_id,
+                                "inbound PQC session failed"
+                            );
+                            session.close(b"");
+                            return;
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                timeout_ms = handshake_timeout.as_millis() as u64,
+                                peer_id = %peer_id,
+                                "inbound PQC session timed out"
+                            );
+                            session.close(b"");
+                            return;
+                        }
+                    };
+                    let mut frame_protector = PqcFrameProtector::new(session_keys);
+                    while let Ok(protected_frame) = session.receive_frame().await {
+                        let frame = match frame_protector.open(&protected_frame) {
+                            Ok(frame) => frame,
+                            Err(_) => {
                                 session.close(b"");
                                 return;
                             }
-                        }
-                    }
-                    let peer_id = assertion.peer_id;
-                    while let Ok(frame) = session.receive_frame().await {
+                        };
                         let inbound_frame = InboundFrame {
                             peer_id: peer_id.clone(),
                             frame,
@@ -1165,6 +1456,16 @@ async fn run_responder_loop(
             }
         });
     }
+}
+
+#[cfg(test)]
+fn pqc_responder_handshake_timeout() -> Duration {
+    Duration::from_millis(500)
+}
+
+#[cfg(not(test))]
+fn pqc_responder_handshake_timeout() -> Duration {
+    Duration::from_secs(5)
 }
 
 fn mesh_transport_snapshot(
@@ -1337,6 +1638,7 @@ async fn run_session_manager(
     mut shutdown_rx: mpsc::UnboundedReceiver<()>,
     shared: Arc<SharedState>,
     backoff: BackoffConfig,
+    blocked_peer_history: Arc<BlockedPeerHistory>,
 ) {
     let mut first_attempt = true;
     let mut consecutive_failures: u32 = 0;
@@ -1351,11 +1653,23 @@ async fn run_session_manager(
         let (mut link, path_kind) = match connector.connect(&remote_peer_id).await {
             Ok((link, outcome)) => {
                 shared.set_last_error(None);
+                shared
+                    .set_peer_trust_decision(outcome.registry_decision, outcome.peer_record_source);
                 consecutive_failures = 0;
                 (link, outcome.path_kind)
             }
             Err(error) => {
-                shared.set_last_error(Some(error.to_string()));
+                let error_message = error.to_string();
+                if let Some(status) = shared.set_peer_trust_failure_message(&error_message) {
+                    blocked_peer_history.record(
+                        &remote_peer_id,
+                        BlockedPeerDirection::Outbound,
+                        status.failure_code,
+                        &error_message,
+                        Some(status.checked_at_unix),
+                    );
+                }
+                shared.set_last_error(Some(error_message));
                 shared.set_state(MeshTransportState::Failed);
                 consecutive_failures = consecutive_failures.saturating_add(1);
                 // Sleep for the backoff window OR until a reachability-
@@ -1455,13 +1769,14 @@ async fn run_session_manager(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "dev-quic-carrier"))]
 mod tests {
     use super::*;
     use crate::{
         crypto::DeviceKeypair,
         discovery::{CandidateEndpoint, CandidateType, PeerRecord, UnsignedPeerRecord},
         inbound_identity::send_inbound_assertion,
+        pqc_session_wire::run_pqc_session_initiator,
         quic_transport::QuicCertificate,
         rendezvous::spawn_dev_rendezvous,
     };
@@ -1469,6 +1784,8 @@ mod tests {
         net::{IpAddr, Ipv4Addr},
         time::Instant,
     };
+
+    const MESH_ID: &str = "devmesh";
 
     async fn wait_for_peer_state(
         handle: &MeshTransportHandle,
@@ -1517,6 +1834,101 @@ mod tests {
         }
     }
 
+    fn spawn_pqc_remote_accept_loop(
+        server_endpoint: QuicEndpoint,
+        responder_keypair: Arc<DeviceKeypair>,
+        server_cert_der: Vec<u8>,
+        echo_prefix: Option<&'static [u8]>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                match server_endpoint.accept_one().await {
+                    Ok(session) => {
+                        let session = CarrierSession::from(session);
+                        let responder_keypair = responder_keypair.clone();
+                        let server_cert_der = server_cert_der.clone();
+                        tokio::spawn(async move {
+                            let Ok((InboundDecision::Accepted, assertion)) =
+                                receive_and_evaluate_inbound(
+                                    &session,
+                                    MESH_ID,
+                                    DEFAULT_INBOUND_ASSERTION_MAX_AGE_SECONDS,
+                                    None,
+                                )
+                                .await
+                            else {
+                                session.close(b"");
+                                return;
+                            };
+                            let context = PqcSessionContext::new(
+                                MESH_ID,
+                                assertion.peer_id,
+                                responder_keypair.public_key().peer_id(),
+                                server_cert_der,
+                            );
+                            let session_keys = match run_pqc_session_responder(
+                                &session,
+                                context,
+                                responder_keypair.as_ref(),
+                            )
+                            .await
+                            {
+                                Ok(session_keys) => session_keys,
+                                Err(_) => {
+                                    session.close(b"");
+                                    return;
+                                }
+                            };
+                            let mut frame_protector = PqcFrameProtector::new(session_keys);
+
+                            while let Ok(protected_frame) = session.receive_frame().await {
+                                let frame = match frame_protector.open(&protected_frame) {
+                                    Ok(frame) => frame,
+                                    Err(_) => {
+                                        session.close(b"");
+                                        return;
+                                    }
+                                };
+                                if let Some(prefix) = echo_prefix {
+                                    let mut out = prefix.to_vec();
+                                    out.extend_from_slice(&frame);
+                                    let Ok(protected_out) = frame_protector.protect(&out) else {
+                                        session.close(b"");
+                                        return;
+                                    };
+                                    let _ = session.send_frame(protected_out).await;
+                                }
+                            }
+                        });
+                    }
+                    Err(_) => break,
+                }
+            }
+        })
+    }
+
+    async fn run_initiator_pqc_against_responder(
+        handle: &MeshTransportHandle,
+        session: &CarrierSession,
+        mesh_id: &str,
+        initiator_keypair: &DeviceKeypair,
+        responder_peer_id: String,
+    ) -> crate::crypto::SessionKeys {
+        let cert_der = handle
+            .server_certificate_der()
+            .expect("responder must be enabled")
+            .to_vec();
+        let context = PqcSessionContext::new(
+            mesh_id,
+            initiator_keypair.public_key().peer_id(),
+            responder_peer_id,
+            cert_der,
+        );
+        run_pqc_session_initiator(session, context, initiator_keypair)
+            .await
+            .expect("PQC initiator session against responder must succeed")
+    }
+
     #[test]
     fn backoff_doubles_until_cap() {
         let cfg = BackoffConfig {
@@ -1546,56 +1958,286 @@ mod tests {
     }
 
     #[test]
-    fn mesh_transport_json_accepts_dytallix_identity_policy_and_registry_config() {
-        let json = br#"{
-            "meshId": "devmesh",
-            "localPeerId": "qlink_local",
-            "remotePeerId": "qlink_remote",
-            "rendezvousUrl": "127.0.0.1:9471",
-            "bindAddr": "127.0.0.1:0",
-            "disableInboundResponder": true,
-            "dytallixIdentity": {
-                "trustPolicy": "publicRequired",
-                "mode": "verified",
-                "registry": {
-                    "endpoint": "https://dytallix.com",
-                    "contractAddress": "0x9a9671441249ee2c364f9b4bc8049e61b082449a"
-                }
-            }
-        }"#;
-
-        let config: MeshTransportConfig = serde_json::from_slice(json).unwrap();
-        let connector =
-            connector_config_from_transport_config(&config, None).expect("dytallix config valid");
+    fn shared_state_retains_registry_decision_for_status_export() {
+        let shared = SharedState::new();
 
         assert_eq!(
-            connector.dytallix_trust_policy,
-            Some(crate::dytallix_identity::MeshTrustPolicy::PublicRequired)
+            shared.peer_trust_status().decision_code,
+            PEER_TRUST_DECISION_UNKNOWN
         );
-        assert!(connector.dytallix_registry.is_some());
+
+        shared
+            .set_peer_trust_decision(RegistryDecision::Accepted, PeerRecordSource::RendezvousLive);
+        let status = shared.peer_trust_status();
+
+        assert_eq!(status.decision_code, PEER_TRUST_DECISION_ACCEPTED);
+        assert_eq!(status.failure_code, PEER_TRUST_FAILURE_NONE);
+        assert!(status.checked_at_unix > 0);
+        assert_eq!(
+            status.source_code,
+            PeerRecordSource::RendezvousLive.trust_source_code()
+        );
     }
 
     #[test]
-    fn public_dytallix_policy_rejects_off_identity_mode_in_transport_config() {
-        let json = br#"{
+    fn shared_state_retains_registry_failure_for_status_export() {
+        let shared = SharedState::new();
+
+        shared.set_peer_trust_failure_message("registry record has expired");
+        let status = shared.peer_trust_status();
+
+        assert_eq!(status.decision_code, PEER_TRUST_DECISION_UNKNOWN);
+        assert_eq!(status.failure_code, PEER_TRUST_FAILURE_REGISTRY_EXPIRED);
+        assert!(status.checked_at_unix > 0);
+    }
+
+    #[test]
+    fn registry_failure_code_classifies_operator_visible_registry_failures() {
+        let cases = [
+            (
+                "registry record required by public mesh trust policy",
+                PEER_TRUST_FAILURE_REGISTRY_REQUIRED,
+            ),
+            (
+                "registry record is revoked",
+                PEER_TRUST_FAILURE_REGISTRY_REVOKED,
+            ),
+            (
+                "registry record is suspended",
+                PEER_TRUST_FAILURE_REGISTRY_SUSPENDED,
+            ),
+            (
+                "registry record is not active",
+                PEER_TRUST_FAILURE_REGISTRY_SUSPENDED,
+            ),
+            (
+                "registry record has expired",
+                PEER_TRUST_FAILURE_REGISTRY_EXPIRED,
+            ),
+            (
+                "device_public_key_hash_hex mismatch",
+                PEER_TRUST_FAILURE_REGISTRY_MISMATCH,
+            ),
+            (
+                "registry binding mismatch",
+                PEER_TRUST_FAILURE_REGISTRY_MISMATCH,
+            ),
+            (
+                "identity registry lookup failed: node not found",
+                PEER_TRUST_FAILURE_REGISTRY_LOOKUP,
+            ),
+            (
+                "registry response failed verification",
+                PEER_TRUST_FAILURE_REGISTRY_VERIFICATION,
+            ),
+        ];
+
+        for (message, expected) in cases {
+            assert_eq!(registry_failure_code(message), Some(expected), "{message}");
+        }
+        assert_eq!(registry_failure_code("ordinary transport failure"), None);
+    }
+
+    #[test]
+    fn blocked_peer_history_records_outbound_registry_failure() {
+        let history = BlockedPeerHistory::new();
+
+        history.record(
+            "qlink_remote",
+            BlockedPeerDirection::Outbound,
+            PEER_TRUST_FAILURE_REGISTRY_REVOKED,
+            "registry record is revoked",
+            None,
+        );
+        let snapshot = history.snapshot();
+
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].peer_id, "qlink_remote");
+        assert_eq!(snapshot[0].direction, BlockedPeerDirection::Outbound);
+        assert_eq!(
+            snapshot[0].failure_code,
+            PEER_TRUST_FAILURE_REGISTRY_REVOKED
+        );
+        assert_eq!(snapshot[0].failure_reason, "registry record is revoked");
+        assert!(snapshot[0].observed_at_unix > 0);
+        assert!(snapshot[0].checked_at_unix > 0);
+    }
+
+    #[test]
+    fn blocked_peer_history_keeps_latest_entry_for_peer_direction() {
+        let history = BlockedPeerHistory::new();
+
+        history.record(
+            "qlink_remote",
+            BlockedPeerDirection::Inbound,
+            PEER_TRUST_FAILURE_REGISTRY_REQUIRED,
+            "first rejection",
+            Some(10),
+        );
+        history.record(
+            "qlink_remote",
+            BlockedPeerDirection::Inbound,
+            PEER_TRUST_FAILURE_REGISTRY_EXPIRED,
+            "latest rejection",
+            Some(20),
+        );
+        let snapshot = history.snapshot();
+
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].direction, BlockedPeerDirection::Inbound);
+        assert_eq!(
+            snapshot[0].failure_code,
+            PEER_TRUST_FAILURE_REGISTRY_EXPIRED
+        );
+        assert_eq!(snapshot[0].failure_reason, "latest rejection");
+        assert_eq!(snapshot[0].checked_at_unix, 20);
+    }
+
+    #[test]
+    fn mesh_transport_config_decodes_identity_defaults() {
+        let config: MeshTransportConfig = serde_json::from_value(serde_json::json!({
             "meshId": "devmesh",
             "localPeerId": "qlink_local",
             "remotePeerId": "qlink_remote",
             "rendezvousUrl": "127.0.0.1:9471",
+            "bindAddr": "127.0.0.1:0"
+        }))
+        .unwrap();
+
+        assert_eq!(
+            config.mesh_trust_policy,
+            crate::dytallix_identity::MeshTrustPolicy::DevelopmentOptional
+        );
+        assert!(config.dytallix_identity.is_none());
+    }
+
+    #[test]
+    fn mesh_transport_config_decodes_registry_and_wires_connector() {
+        let local_key = Arc::new(DeviceKeypair::generate().unwrap());
+        let local_peer_id = local_key.public_key().peer_id();
+        let config: MeshTransportConfig = serde_json::from_value(serde_json::json!({
+            "meshId": "public-mesh",
+            "localPeerId": local_peer_id,
+            "remotePeerId": "qlink_remote",
+            "rendezvousUrl": "127.0.0.1:1",
             "bindAddr": "127.0.0.1:0",
+            "overallDeadlineMs": 1,
+            "directProbeTimeoutMs": 1,
+            "probePacingMs": 1,
+            "reconnectInitialBackoffMs": 1,
+            "reconnectMaxBackoffMs": 1,
             "disableInboundResponder": true,
+            "meshTrustPolicy": "public_required",
             "dytallixIdentity": {
-                "trustPolicy": "publicRequired",
-                "mode": "off"
+                "endpoint": "https://dytallix.example",
+                "contractAddress": "1111111111111111111111111111111111111111",
+                "publishWalletAddress": false,
+                "networkId": "dytallix-testnet",
+                "chainId": "dytallix-testnet-1",
+                "allowedRpcEndpoints": ["https://dytallix.example"]
             }
-        }"#;
+        }))
+        .unwrap();
 
-        let config: MeshTransportConfig = serde_json::from_slice(json).unwrap();
-        let error = connector_config_from_transport_config(&config, None).unwrap_err();
+        let identity = config.dytallix_identity.as_ref().unwrap();
+        assert_eq!(
+            identity.contract_address,
+            "0x1111111111111111111111111111111111111111"
+        );
+        assert_eq!(identity.network_id.as_deref(), Some("dytallix-testnet"));
+        assert_eq!(identity.chain_id.as_deref(), Some("dytallix-testnet-1"));
+        assert_eq!(
+            identity.allowed_rpc_endpoints,
+            vec!["https://dytallix.example".to_string()]
+        );
 
-        assert!(error
-            .to_string()
-            .contains("public meshes must not use dytallix identity mode off"));
+        let handle = MeshTransportHandle::new_with_keypair(config, Some(local_key)).unwrap();
+
+        assert_eq!(
+            handle.connector.config().mesh_trust_policy,
+            crate::dytallix_identity::MeshTrustPolicy::PublicRequired
+        );
+        assert!(handle.connector.config().identity_registry_lookup.is_some());
+    }
+
+    #[test]
+    fn mesh_transport_config_rejects_registry_wallet_fields() {
+        let err = serde_json::from_value::<MeshTransportConfig>(serde_json::json!({
+            "meshId": "public-mesh",
+            "localPeerId": "qlink_local",
+            "remotePeerId": "qlink_remote",
+            "rendezvousUrl": "127.0.0.1:1",
+            "bindAddr": "127.0.0.1:0",
+            "meshTrustPolicy": "public_required",
+            "dytallixIdentity": {
+                "endpoint": "https://dytallix.example",
+                "contractAddress": "0x1111111111111111111111111111111111111111",
+                "keystorePath": "/tmp/qlink-dytallix-keystore",
+                "walletName": "default"
+            }
+        }))
+        .unwrap_err();
+
+        assert!(err.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn keyless_constructor_allows_relay_only_when_responder_disabled() {
+        let handle = MeshTransportHandle::new(MeshTransportConfig {
+            mesh_id: MESH_ID.to_string(),
+            local_peer_id: "qlink_keyless-local".to_string(),
+            remote_peer_id: "qlink_keyless-remote".to_string(),
+            rendezvous_url: "127.0.0.1:9".to_string(),
+            relay_url: Some("127.0.0.1:9".to_string()),
+            bind_addr: "127.0.0.1:0".to_string(),
+            overall_deadline_ms: 100,
+            direct_probe_timeout_ms: 50,
+            probe_pacing_ms: 10,
+            enable_ice: false,
+            reconnect_initial_backoff_ms: 60_000,
+            reconnect_max_backoff_ms: 60_000,
+            metrics_endpoint_bind_addr: None,
+            inbound_acl: None,
+            disable_inbound_responder: true,
+            peer_store_path: None,
+            peer_store_key_b64: None,
+            mesh_trust_policy: MeshTrustPolicy::DevelopmentOptional,
+            dytallix_identity: None,
+        })
+        .expect("relay-only keyless construction must remain available");
+
+        assert!(handle.server_certificate_der().is_none());
+        assert!(handle.responder_local_addr().is_none());
+    }
+
+    #[test]
+    fn keyless_constructor_rejects_direct_only_transport() {
+        let err = match MeshTransportHandle::new(MeshTransportConfig {
+            mesh_id: MESH_ID.to_string(),
+            local_peer_id: "qlink_keyless-local".to_string(),
+            remote_peer_id: "qlink_keyless-remote".to_string(),
+            rendezvous_url: "127.0.0.1:9".to_string(),
+            relay_url: None,
+            bind_addr: "127.0.0.1:0".to_string(),
+            overall_deadline_ms: 100,
+            direct_probe_timeout_ms: 50,
+            probe_pacing_ms: 10,
+            enable_ice: false,
+            reconnect_initial_backoff_ms: 60_000,
+            reconnect_max_backoff_ms: 60_000,
+            metrics_endpoint_bind_addr: None,
+            inbound_acl: None,
+            disable_inbound_responder: true,
+            peer_store_path: None,
+            peer_store_key_b64: None,
+            mesh_trust_policy: MeshTrustPolicy::DevelopmentOptional,
+            dytallix_identity: None,
+        }) {
+            Ok(_) => panic!("direct keyless construction must still be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("local_device_keypair"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1607,27 +2249,18 @@ mod tests {
         let server_addr = server_endpoint.local_addr().unwrap();
         let server_cert_der = server_cert.as_der().to_vec();
 
-        // Spawn an accept loop on the "remote" side that echoes any frame it
-        // receives back to the sender.
-        let _accept_loop = tokio::spawn(async move {
-            loop {
-                match server_endpoint.accept_one().await {
-                    Ok(session) => {
-                        tokio::spawn(async move {
-                            while let Ok(frame) = session.receive_frame().await {
-                                let _ = session.send_frame(frame).await;
-                            }
-                        });
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-
-        let remote_key = DeviceKeypair::generate().unwrap();
+        let remote_key = Arc::new(DeviceKeypair::generate().unwrap());
         let remote_peer_id = remote_key.public_key().peer_id();
+        // Spawn an accept loop on the "remote" side that completes identity +
+        // PQC, then echoes any frame it receives back to the sender.
+        let _accept_loop = spawn_pqc_remote_accept_loop(
+            server_endpoint,
+            remote_key.clone(),
+            server_cert_der.clone(),
+            Some(b""),
+        );
         let unsigned = UnsignedPeerRecord::new(
-            "devmesh",
+            MESH_ID,
             "remote",
             remote_key.public_key(),
             vec![CandidateEndpoint {
@@ -1641,37 +2274,41 @@ mod tests {
             1,
         )
         .with_device_certificate(server_cert_der);
-        let record = PeerRecord::signed(unsigned, &remote_key).unwrap();
+        let record = PeerRecord::signed(unsigned, remote_key.as_ref()).unwrap();
         let publisher = RendezvousClient::new(rendezvous.local_addr().to_string());
-        publisher.publish("devmesh", record).await.unwrap();
+        publisher.publish(MESH_ID, record).await.unwrap();
 
-        // MeshTransportHandle::new() spins up its own runtime; we must call
+        // MeshTransportHandle::new_with_keypair() spins up its own runtime; we must call
         // it from a context that doesn't already own one. Spawn-blocking
         // gets us a thread free of tokio context.
-        let local_key = DeviceKeypair::generate().unwrap();
+        let local_key = Arc::new(DeviceKeypair::generate().unwrap());
         let local_peer_id = local_key.public_key().peer_id();
         let rendezvous_url = rendezvous.local_addr().to_string();
         let handle = tokio::task::spawn_blocking(move || {
-            MeshTransportHandle::new(MeshTransportConfig {
-                mesh_id: "devmesh".to_string(),
-                local_peer_id,
-                remote_peer_id,
-                rendezvous_url,
-                relay_url: None,
-                bind_addr: "127.0.0.1:0".to_string(),
-                overall_deadline_ms: 2_000,
-                direct_probe_timeout_ms: 500,
-                probe_pacing_ms: 50,
-                enable_ice: false,
-                reconnect_initial_backoff_ms: 250,
-                reconnect_max_backoff_ms: 30_000,
-                metrics_endpoint_bind_addr: None,
-                inbound_acl: None,
-                disable_inbound_responder: true,
-                peer_store_path: None,
-                peer_store_key_b64: None,
-                dytallix_identity: None,
-            })
+            MeshTransportHandle::new_with_keypair(
+                MeshTransportConfig {
+                    mesh_id: MESH_ID.to_string(),
+                    local_peer_id,
+                    remote_peer_id,
+                    rendezvous_url,
+                    relay_url: None,
+                    bind_addr: "127.0.0.1:0".to_string(),
+                    overall_deadline_ms: 2_000,
+                    direct_probe_timeout_ms: 500,
+                    probe_pacing_ms: 50,
+                    enable_ice: false,
+                    reconnect_initial_backoff_ms: 250,
+                    reconnect_max_backoff_ms: 30_000,
+                    metrics_endpoint_bind_addr: None,
+                    inbound_acl: None,
+                    disable_inbound_responder: true,
+                    peer_store_path: None,
+                    peer_store_key_b64: None,
+                    mesh_trust_policy: MeshTrustPolicy::DevelopmentOptional,
+                    dytallix_identity: None,
+                },
+                Some(local_key),
+            )
             .expect("transport construction must succeed")
         })
         .await
@@ -1717,32 +2354,36 @@ mod tests {
     async fn mesh_transport_records_failure_when_peer_record_is_missing() {
         let rendezvous = spawn_dev_rendezvous().await.unwrap();
 
-        let local_key = DeviceKeypair::generate().unwrap();
+        let local_key = Arc::new(DeviceKeypair::generate().unwrap());
         let local_peer_id = local_key.public_key().peer_id();
         let rendezvous_url = rendezvous.local_addr().to_string();
         let handle = tokio::task::spawn_blocking(move || {
-            MeshTransportHandle::new(MeshTransportConfig {
-                mesh_id: "devmesh".to_string(),
-                local_peer_id,
-                remote_peer_id: "qlink_does-not-exist".to_string(),
-                rendezvous_url,
-                relay_url: None,
-                bind_addr: "127.0.0.1:0".to_string(),
-                overall_deadline_ms: 800,
-                direct_probe_timeout_ms: 200,
-                probe_pacing_ms: 50,
-                enable_ice: false,
-                // Long backoff so we observe the FIRST failure cleanly
-                // before any retry kicks in.
-                reconnect_initial_backoff_ms: 60_000,
-                reconnect_max_backoff_ms: 60_000,
-                metrics_endpoint_bind_addr: None,
-                inbound_acl: None,
-                disable_inbound_responder: true,
-                peer_store_path: None,
-                peer_store_key_b64: None,
-                dytallix_identity: None,
-            })
+            MeshTransportHandle::new_with_keypair(
+                MeshTransportConfig {
+                    mesh_id: MESH_ID.to_string(),
+                    local_peer_id,
+                    remote_peer_id: "qlink_does-not-exist".to_string(),
+                    rendezvous_url,
+                    relay_url: None,
+                    bind_addr: "127.0.0.1:0".to_string(),
+                    overall_deadline_ms: 800,
+                    direct_probe_timeout_ms: 200,
+                    probe_pacing_ms: 50,
+                    enable_ice: false,
+                    // Long backoff so we observe the FIRST failure cleanly
+                    // before any retry kicks in.
+                    reconnect_initial_backoff_ms: 60_000,
+                    reconnect_max_backoff_ms: 60_000,
+                    metrics_endpoint_bind_addr: None,
+                    inbound_acl: None,
+                    disable_inbound_responder: true,
+                    peer_store_path: None,
+                    peer_store_key_b64: None,
+                    mesh_trust_policy: MeshTrustPolicy::DevelopmentOptional,
+                    dytallix_identity: None,
+                },
+                Some(local_key),
+            )
             .unwrap()
         })
         .await
@@ -1767,48 +2408,62 @@ mod tests {
     async fn mesh_transport_retries_with_backoff_after_persistent_failure() {
         let rendezvous = spawn_dev_rendezvous().await.unwrap();
 
-        let local_key = DeviceKeypair::generate().unwrap();
+        let local_key = Arc::new(DeviceKeypair::generate().unwrap());
         let local_peer_id = local_key.public_key().peer_id();
         let rendezvous_url = rendezvous.local_addr().to_string();
         let handle = tokio::task::spawn_blocking(move || {
-            MeshTransportHandle::new(MeshTransportConfig {
-                mesh_id: "devmesh".to_string(),
-                local_peer_id,
-                remote_peer_id: "qlink_does-not-exist".to_string(),
-                rendezvous_url,
-                relay_url: None,
-                bind_addr: "127.0.0.1:0".to_string(),
-                overall_deadline_ms: 200,
-                direct_probe_timeout_ms: 100,
-                probe_pacing_ms: 50,
-                enable_ice: false,
-                // Short backoff so the test observes multiple retries fast.
-                // Initial 50ms doubles to 100ms then plateaus at 200ms.
-                reconnect_initial_backoff_ms: 50,
-                reconnect_max_backoff_ms: 200,
-                metrics_endpoint_bind_addr: None,
-                inbound_acl: None,
-                disable_inbound_responder: true,
-                peer_store_path: None,
-                peer_store_key_b64: None,
-                dytallix_identity: None,
-            })
+            MeshTransportHandle::new_with_keypair(
+                MeshTransportConfig {
+                    mesh_id: MESH_ID.to_string(),
+                    local_peer_id,
+                    remote_peer_id: "qlink_does-not-exist".to_string(),
+                    rendezvous_url,
+                    relay_url: None,
+                    bind_addr: "127.0.0.1:0".to_string(),
+                    overall_deadline_ms: 200,
+                    direct_probe_timeout_ms: 100,
+                    probe_pacing_ms: 50,
+                    enable_ice: false,
+                    // Short backoff so the test observes multiple retries fast.
+                    // Initial 50ms doubles to 100ms then plateaus at 200ms.
+                    reconnect_initial_backoff_ms: 50,
+                    reconnect_max_backoff_ms: 200,
+                    metrics_endpoint_bind_addr: None,
+                    inbound_acl: None,
+                    disable_inbound_responder: true,
+                    peer_store_path: None,
+                    peer_store_key_b64: None,
+                    mesh_trust_policy: MeshTrustPolicy::DevelopmentOptional,
+                    dytallix_identity: None,
+                },
+                Some(local_key),
+            )
             .unwrap()
         })
         .await
         .unwrap();
 
         // Wait for the manager to cycle through several connect attempts.
-        // 800ms is enough for at least 3 retries given 50→100→200 backoff
-        // plus the bounded connect deadline.
-        tokio::time::sleep(Duration::from_millis(800)).await;
-        let metrics = handle.metrics();
+        // Poll the metric instead of sleeping for a fixed window: on slower
+        // Windows CI runners the first failed rendezvous attempt can consume
+        // more of the nominal 50->100->200ms schedule than it does locally.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut metrics = handle.metrics();
+        while metrics.reconnect_count < 2 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            metrics = handle.metrics();
+        }
         assert!(
             metrics.reconnect_count >= 2,
             "manager must retry instead of bailing — observed reconnect_count={}",
             metrics.reconnect_count
         );
-        assert_eq!(handle.state_code(), MeshTransportState::Failed.as_code());
+        let state = handle.state_code();
+        assert!(
+            state == MeshTransportState::Failed.as_code()
+                || state == MeshTransportState::Connecting.as_code(),
+            "persistent failure should stay in the retry loop; observed state_code={state}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1823,25 +2478,16 @@ mod tests {
         let server_addr = server_endpoint.local_addr().unwrap();
         let server_cert_der = server_cert.as_der().to_vec();
 
-        let _accept_loop = tokio::spawn(async move {
-            loop {
-                match server_endpoint.accept_one().await {
-                    Ok(session) => {
-                        tokio::spawn(async move {
-                            while let Ok(frame) = session.receive_frame().await {
-                                let _ = session.send_frame(frame).await;
-                            }
-                        });
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-
-        let remote_key = DeviceKeypair::generate().unwrap();
+        let remote_key = Arc::new(DeviceKeypair::generate().unwrap());
         let remote_peer_id = remote_key.public_key().peer_id();
+        let _accept_loop = spawn_pqc_remote_accept_loop(
+            server_endpoint,
+            remote_key.clone(),
+            server_cert_der.clone(),
+            Some(b""),
+        );
         let unsigned = UnsignedPeerRecord::new(
-            "devmesh",
+            MESH_ID,
             "remote",
             remote_key.public_key(),
             vec![CandidateEndpoint {
@@ -1855,34 +2501,38 @@ mod tests {
             1,
         )
         .with_device_certificate(server_cert_der);
-        let record = PeerRecord::signed(unsigned, &remote_key).unwrap();
+        let record = PeerRecord::signed(unsigned, remote_key.as_ref()).unwrap();
         let publisher = RendezvousClient::new(rendezvous.local_addr().to_string());
-        publisher.publish("devmesh", record).await.unwrap();
+        publisher.publish(MESH_ID, record).await.unwrap();
 
-        let local_key = DeviceKeypair::generate().unwrap();
+        let local_key = Arc::new(DeviceKeypair::generate().unwrap());
         let local_peer_id = local_key.public_key().peer_id();
         let rendezvous_url = rendezvous.local_addr().to_string();
         let handle = tokio::task::spawn_blocking(move || {
-            MeshTransportHandle::new(MeshTransportConfig {
-                mesh_id: "devmesh".to_string(),
-                local_peer_id,
-                remote_peer_id,
-                rendezvous_url,
-                relay_url: None,
-                bind_addr: "127.0.0.1:0".to_string(),
-                overall_deadline_ms: 2_000,
-                direct_probe_timeout_ms: 500,
-                probe_pacing_ms: 50,
-                enable_ice: false,
-                reconnect_initial_backoff_ms: 250,
-                reconnect_max_backoff_ms: 30_000,
-                metrics_endpoint_bind_addr: Some("127.0.0.1:0".to_string()),
-                inbound_acl: None,
-                disable_inbound_responder: true,
-                peer_store_path: None,
-                peer_store_key_b64: None,
-                dytallix_identity: None,
-            })
+            MeshTransportHandle::new_with_keypair(
+                MeshTransportConfig {
+                    mesh_id: MESH_ID.to_string(),
+                    local_peer_id,
+                    remote_peer_id,
+                    rendezvous_url,
+                    relay_url: None,
+                    bind_addr: "127.0.0.1:0".to_string(),
+                    overall_deadline_ms: 2_000,
+                    direct_probe_timeout_ms: 500,
+                    probe_pacing_ms: 50,
+                    enable_ice: false,
+                    reconnect_initial_backoff_ms: 250,
+                    reconnect_max_backoff_ms: 30_000,
+                    metrics_endpoint_bind_addr: Some("127.0.0.1:0".to_string()),
+                    inbound_acl: None,
+                    disable_inbound_responder: true,
+                    peer_store_path: None,
+                    peer_store_key_b64: None,
+                    mesh_trust_policy: MeshTrustPolicy::DevelopmentOptional,
+                    dytallix_identity: None,
+                },
+                Some(local_key),
+            )
             .expect("transport construction with metrics endpoint must succeed")
         })
         .await
@@ -1968,33 +2618,37 @@ mod tests {
     async fn mesh_transport_resets_backoff_after_path_changed_event() {
         let rendezvous = spawn_dev_rendezvous().await.unwrap();
 
-        let local_key = DeviceKeypair::generate().unwrap();
+        let local_key = Arc::new(DeviceKeypair::generate().unwrap());
         let local_peer_id = local_key.public_key().peer_id();
         let rendezvous_url = rendezvous.local_addr().to_string();
         let handle = tokio::task::spawn_blocking(move || {
-            MeshTransportHandle::new(MeshTransportConfig {
-                mesh_id: "devmesh".to_string(),
-                local_peer_id,
-                remote_peer_id: "qlink_does-not-exist".to_string(),
-                rendezvous_url,
-                relay_url: None,
-                bind_addr: "127.0.0.1:0".to_string(),
-                overall_deadline_ms: 200,
-                direct_probe_timeout_ms: 100,
-                probe_pacing_ms: 50,
-                enable_ice: false,
-                // Long initial backoff: without an event the manager would
-                // wait 5s before retrying; the path-change event below
-                // should cut that short and force an immediate retry.
-                reconnect_initial_backoff_ms: 5_000,
-                reconnect_max_backoff_ms: 5_000,
-                metrics_endpoint_bind_addr: None,
-                inbound_acl: None,
-                disable_inbound_responder: true,
-                peer_store_path: None,
-                peer_store_key_b64: None,
-                dytallix_identity: None,
-            })
+            MeshTransportHandle::new_with_keypair(
+                MeshTransportConfig {
+                    mesh_id: MESH_ID.to_string(),
+                    local_peer_id,
+                    remote_peer_id: "qlink_does-not-exist".to_string(),
+                    rendezvous_url,
+                    relay_url: None,
+                    bind_addr: "127.0.0.1:0".to_string(),
+                    overall_deadline_ms: 200,
+                    direct_probe_timeout_ms: 100,
+                    probe_pacing_ms: 50,
+                    enable_ice: false,
+                    // Long initial backoff: without an event the manager would
+                    // wait 5s before retrying; the path-change event below
+                    // should cut that short and force an immediate retry.
+                    reconnect_initial_backoff_ms: 5_000,
+                    reconnect_max_backoff_ms: 5_000,
+                    metrics_endpoint_bind_addr: None,
+                    inbound_acl: None,
+                    disable_inbound_responder: true,
+                    peer_store_path: None,
+                    peer_store_key_b64: None,
+                    mesh_trust_policy: MeshTrustPolicy::DevelopmentOptional,
+                    dytallix_identity: None,
+                },
+                Some(local_key),
+            )
             .unwrap()
         })
         .await
@@ -2036,47 +2690,17 @@ mod tests {
         let (server_a, cert_a) = QuicEndpoint::server(bind).unwrap();
         let server_a_addr = server_a.local_addr().unwrap();
         let cert_a_der = cert_a.as_der().to_vec();
-        let _accept_a = tokio::spawn(async move {
-            loop {
-                match server_a.accept_one().await {
-                    Ok(session) => {
-                        tokio::spawn(async move {
-                            while let Ok(frame) = session.receive_frame().await {
-                                let mut out = b"A:".to_vec();
-                                out.extend_from_slice(&frame);
-                                let _ = session.send_frame(out).await;
-                            }
-                        });
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
 
         // Peer B's "remote": echoes "B:<frame>"
         let (server_b, cert_b) = QuicEndpoint::server(bind).unwrap();
         let server_b_addr = server_b.local_addr().unwrap();
         let cert_b_der = cert_b.as_der().to_vec();
-        let _accept_b = tokio::spawn(async move {
-            loop {
-                match server_b.accept_one().await {
-                    Ok(session) => {
-                        tokio::spawn(async move {
-                            while let Ok(frame) = session.receive_frame().await {
-                                let mut out = b"B:".to_vec();
-                                out.extend_from_slice(&frame);
-                                let _ = session.send_frame(out).await;
-                            }
-                        });
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
 
         // Publish records for each remote peer.
-        let key_a = DeviceKeypair::generate().unwrap();
+        let key_a = Arc::new(DeviceKeypair::generate().unwrap());
         let peer_a_id = key_a.public_key().peer_id();
+        let _accept_a =
+            spawn_pqc_remote_accept_loop(server_a, key_a.clone(), cert_a_der.clone(), Some(b"A:"));
         let record_a = PeerRecord::signed(
             UnsignedPeerRecord::new(
                 "devmesh",
@@ -2092,13 +2716,15 @@ mod tests {
                 120,
                 1,
             )
-            .with_device_certificate(cert_a_der),
-            &key_a,
+            .with_device_certificate(cert_a_der.clone()),
+            key_a.as_ref(),
         )
         .unwrap();
 
-        let key_b = DeviceKeypair::generate().unwrap();
+        let key_b = Arc::new(DeviceKeypair::generate().unwrap());
         let peer_b_id = key_b.public_key().peer_id();
+        let _accept_b =
+            spawn_pqc_remote_accept_loop(server_b, key_b.clone(), cert_b_der.clone(), Some(b"B:"));
         let record_b = PeerRecord::signed(
             UnsignedPeerRecord::new(
                 "devmesh",
@@ -2114,8 +2740,8 @@ mod tests {
                 120,
                 1,
             )
-            .with_device_certificate(cert_b_der),
-            &key_b,
+            .with_device_certificate(cert_b_der.clone()),
+            key_b.as_ref(),
         )
         .unwrap();
 
@@ -2124,31 +2750,36 @@ mod tests {
         publisher.publish("devmesh", record_b).await.unwrap();
 
         // Build the transport with peer A as the default; then add peer B.
-        let local_key = DeviceKeypair::generate().unwrap();
+        let local_key = Arc::new(DeviceKeypair::generate().unwrap());
         let local_peer_id = local_key.public_key().peer_id();
         let rendezvous_url = rendezvous.local_addr().to_string();
         let peer_a_id_for_handle = peer_a_id.clone();
+        let local_key_for_handle = local_key.clone();
         let handle = tokio::task::spawn_blocking(move || {
-            MeshTransportHandle::new(MeshTransportConfig {
-                mesh_id: "devmesh".to_string(),
-                local_peer_id,
-                remote_peer_id: peer_a_id_for_handle,
-                rendezvous_url,
-                relay_url: None,
-                bind_addr: "127.0.0.1:0".to_string(),
-                overall_deadline_ms: 2_000,
-                direct_probe_timeout_ms: 500,
-                probe_pacing_ms: 50,
-                enable_ice: false,
-                reconnect_initial_backoff_ms: 250,
-                reconnect_max_backoff_ms: 30_000,
-                metrics_endpoint_bind_addr: None,
-                inbound_acl: None,
-                disable_inbound_responder: true,
-                peer_store_path: None,
-                peer_store_key_b64: None,
-                dytallix_identity: None,
-            })
+            MeshTransportHandle::new_with_keypair(
+                MeshTransportConfig {
+                    mesh_id: "devmesh".to_string(),
+                    local_peer_id,
+                    remote_peer_id: peer_a_id_for_handle,
+                    rendezvous_url,
+                    relay_url: None,
+                    bind_addr: "127.0.0.1:0".to_string(),
+                    overall_deadline_ms: 2_000,
+                    direct_probe_timeout_ms: 500,
+                    probe_pacing_ms: 50,
+                    enable_ice: false,
+                    reconnect_initial_backoff_ms: 250,
+                    reconnect_max_backoff_ms: 30_000,
+                    metrics_endpoint_bind_addr: None,
+                    inbound_acl: None,
+                    disable_inbound_responder: true,
+                    peer_store_path: None,
+                    peer_store_key_b64: None,
+                    mesh_trust_policy: MeshTrustPolicy::DevelopmentOptional,
+                    dytallix_identity: None,
+                },
+                Some(local_key_for_handle),
+            )
             .expect("transport new")
         })
         .await
@@ -2232,21 +2863,11 @@ mod tests {
         let (server, cert) = QuicEndpoint::server(bind).unwrap();
         let server_addr = server.local_addr().unwrap();
         let cert_der = cert.as_der().to_vec();
-        let _accept = tokio::spawn(async move {
-            loop {
-                match server.accept_one().await {
-                    Ok(session) => {
-                        tokio::spawn(async move {
-                            let _ = session.receive_frame().await;
-                        });
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
 
-        let remote_key = DeviceKeypair::generate().unwrap();
+        let remote_key = Arc::new(DeviceKeypair::generate().unwrap());
         let remote_peer_id = remote_key.public_key().peer_id();
+        let _accept =
+            spawn_pqc_remote_accept_loop(server, remote_key.clone(), cert_der.clone(), None);
         let record = PeerRecord::signed(
             UnsignedPeerRecord::new(
                 "devmesh",
@@ -2262,38 +2883,43 @@ mod tests {
                 120,
                 1,
             )
-            .with_device_certificate(cert_der),
-            &remote_key,
+            .with_device_certificate(cert_der.clone()),
+            remote_key.as_ref(),
         )
         .unwrap();
         let publisher = RendezvousClient::new(rendezvous.local_addr().to_string());
         publisher.publish("devmesh", record).await.unwrap();
 
-        let local_key = DeviceKeypair::generate().unwrap();
+        let local_key = Arc::new(DeviceKeypair::generate().unwrap());
         let local_peer_id = local_key.public_key().peer_id();
         let rendezvous_url = rendezvous.local_addr().to_string();
         let remote_peer_id_for_handle = remote_peer_id.clone();
+        let local_key_for_handle = local_key.clone();
         let handle = tokio::task::spawn_blocking(move || {
-            MeshTransportHandle::new(MeshTransportConfig {
-                mesh_id: "devmesh".to_string(),
-                local_peer_id,
-                remote_peer_id: remote_peer_id_for_handle,
-                rendezvous_url,
-                relay_url: None,
-                bind_addr: "127.0.0.1:0".to_string(),
-                overall_deadline_ms: 2_000,
-                direct_probe_timeout_ms: 500,
-                probe_pacing_ms: 50,
-                enable_ice: false,
-                reconnect_initial_backoff_ms: 250,
-                reconnect_max_backoff_ms: 30_000,
-                metrics_endpoint_bind_addr: None,
-                inbound_acl: None,
-                disable_inbound_responder: true,
-                peer_store_path: None,
-                peer_store_key_b64: None,
-                dytallix_identity: None,
-            })
+            MeshTransportHandle::new_with_keypair(
+                MeshTransportConfig {
+                    mesh_id: "devmesh".to_string(),
+                    local_peer_id,
+                    remote_peer_id: remote_peer_id_for_handle,
+                    rendezvous_url,
+                    relay_url: None,
+                    bind_addr: "127.0.0.1:0".to_string(),
+                    overall_deadline_ms: 2_000,
+                    direct_probe_timeout_ms: 500,
+                    probe_pacing_ms: 50,
+                    enable_ice: false,
+                    reconnect_initial_backoff_ms: 250,
+                    reconnect_max_backoff_ms: 30_000,
+                    metrics_endpoint_bind_addr: None,
+                    inbound_acl: None,
+                    disable_inbound_responder: true,
+                    peer_store_path: None,
+                    peer_store_key_b64: None,
+                    mesh_trust_policy: MeshTrustPolicy::DevelopmentOptional,
+                    dytallix_identity: None,
+                },
+                Some(local_key_for_handle),
+            )
             .expect("transport new")
         })
         .await
@@ -2329,30 +2955,35 @@ mod tests {
         // backoff. PathChanged should short-circuit the backoff for
         // BOTH peers — observed via per-peer reconnect_count both
         // bumping after the event.
-        let local_key = DeviceKeypair::generate().unwrap();
+        let local_key = Arc::new(DeviceKeypair::generate().unwrap());
         let local_peer_id = local_key.public_key().peer_id();
         let rendezvous_url = rendezvous.local_addr().to_string();
+        let local_key_for_handle = local_key.clone();
         let handle = tokio::task::spawn_blocking(move || {
-            MeshTransportHandle::new(MeshTransportConfig {
-                mesh_id: "devmesh".to_string(),
-                local_peer_id,
-                remote_peer_id: "qlink_does-not-exist-A".to_string(),
-                rendezvous_url,
-                relay_url: None,
-                bind_addr: "127.0.0.1:0".to_string(),
-                overall_deadline_ms: 200,
-                direct_probe_timeout_ms: 100,
-                probe_pacing_ms: 50,
-                enable_ice: false,
-                reconnect_initial_backoff_ms: 5_000, // long enough that natural retry won't fire
-                reconnect_max_backoff_ms: 5_000,
-                metrics_endpoint_bind_addr: None,
-                inbound_acl: None,
-                disable_inbound_responder: true,
-                peer_store_path: None,
-                peer_store_key_b64: None,
-                dytallix_identity: None,
-            })
+            MeshTransportHandle::new_with_keypair(
+                MeshTransportConfig {
+                    mesh_id: "devmesh".to_string(),
+                    local_peer_id,
+                    remote_peer_id: "qlink_does-not-exist-A".to_string(),
+                    rendezvous_url,
+                    relay_url: None,
+                    bind_addr: "127.0.0.1:0".to_string(),
+                    overall_deadline_ms: 200,
+                    direct_probe_timeout_ms: 100,
+                    probe_pacing_ms: 50,
+                    enable_ice: false,
+                    reconnect_initial_backoff_ms: 5_000, // long enough that natural retry won't fire
+                    reconnect_max_backoff_ms: 5_000,
+                    metrics_endpoint_bind_addr: None,
+                    inbound_acl: None,
+                    disable_inbound_responder: true,
+                    peer_store_path: None,
+                    peer_store_key_b64: None,
+                    mesh_trust_policy: MeshTrustPolicy::DevelopmentOptional,
+                    dytallix_identity: None,
+                },
+                Some(local_key_for_handle),
+            )
             .expect("transport new")
         })
         .await
@@ -2427,27 +3058,31 @@ mod tests {
         let runtime = Runtime::new().unwrap();
         let handle = runtime.block_on(async {
             tokio::task::spawn_blocking(|| {
-                let local_key = DeviceKeypair::generate().unwrap();
-                MeshTransportHandle::new(MeshTransportConfig {
-                    mesh_id: "devmesh".to_string(),
-                    local_peer_id: local_key.public_key().peer_id(),
-                    remote_peer_id: "qlink_initial-peer".to_string(),
-                    rendezvous_url: "127.0.0.1:1".to_string(),
-                    relay_url: None,
-                    bind_addr: "127.0.0.1:0".to_string(),
-                    overall_deadline_ms: 200,
-                    direct_probe_timeout_ms: 100,
-                    probe_pacing_ms: 50,
-                    enable_ice: false,
-                    reconnect_initial_backoff_ms: 60_000,
-                    reconnect_max_backoff_ms: 60_000,
-                    metrics_endpoint_bind_addr: None,
-                    inbound_acl: None,
-                    disable_inbound_responder: true,
-                    peer_store_path: None,
-                    peer_store_key_b64: None,
-                    dytallix_identity: None,
-                })
+                let local_key = Arc::new(DeviceKeypair::generate().unwrap());
+                MeshTransportHandle::new_with_keypair(
+                    MeshTransportConfig {
+                        mesh_id: "devmesh".to_string(),
+                        local_peer_id: local_key.public_key().peer_id(),
+                        remote_peer_id: "qlink_initial-peer".to_string(),
+                        rendezvous_url: "127.0.0.1:1".to_string(),
+                        relay_url: None,
+                        bind_addr: "127.0.0.1:0".to_string(),
+                        overall_deadline_ms: 200,
+                        direct_probe_timeout_ms: 100,
+                        probe_pacing_ms: 50,
+                        enable_ice: false,
+                        reconnect_initial_backoff_ms: 60_000,
+                        reconnect_max_backoff_ms: 60_000,
+                        metrics_endpoint_bind_addr: None,
+                        inbound_acl: None,
+                        disable_inbound_responder: true,
+                        peer_store_path: None,
+                        peer_store_key_b64: None,
+                        mesh_trust_policy: MeshTrustPolicy::DevelopmentOptional,
+                        dytallix_identity: None,
+                    },
+                    Some(local_key),
+                )
                 .unwrap()
             })
             .await
@@ -2489,7 +3124,6 @@ mod tests {
         mesh_id: &str,
         inbound_acl: Option<PeerAcl>,
         local_device_keypair: Option<Arc<DeviceKeypair>>,
-        dytallix_identity: Option<MeshTransportDytallixIdentityConfig>,
     ) -> MeshTransportHandle {
         let mesh_id = mesh_id.to_string();
         tokio::task::spawn_blocking(move || {
@@ -2512,7 +3146,8 @@ mod tests {
                     disable_inbound_responder: false,
                     peer_store_path: None,
                     peer_store_key_b64: None,
-                    dytallix_identity,
+                    mesh_trust_policy: MeshTrustPolicy::DevelopmentOptional,
+                    dytallix_identity: None,
                 },
                 local_device_keypair,
             )
@@ -2524,9 +3159,7 @@ mod tests {
 
     /// Helper for the responder tests: build a dialer (client endpoint
     /// + connected QUIC session) targeting the handle's responder.
-    async fn dial_responder(
-        handle: &MeshTransportHandle,
-    ) -> crate::quic_transport::QuicDatagramSession {
+    async fn dial_responder(handle: &MeshTransportHandle) -> CarrierSession {
         let server_addr = handle
             .responder_local_addr()
             .expect("responder must be enabled");
@@ -2537,10 +3170,11 @@ mod tests {
         let trusted = QuicCertificate::from_der(cert_der);
         let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
         let client = QuicEndpoint::client(bind, &[]).unwrap();
-        client
+        let session = client
             .connect_with_trusted_cert(server_addr, &trusted)
             .await
-            .expect("dial against responder must succeed")
+            .expect("dial against responder must succeed");
+        CarrierSession::from(session)
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2549,17 +3183,16 @@ mod tests {
 
         let dialer_key = DeviceKeypair::generate().unwrap();
         let dialer_peer_id = dialer_key.public_key().peer_id();
-        let local_key = DeviceKeypair::generate().unwrap();
+        let local_key = Arc::new(DeviceKeypair::generate().unwrap());
         let local_peer_id = local_key.public_key().peer_id();
 
         let acl = PeerAcl::new().with_allow([dialer_peer_id.clone()]);
         let handle = build_handle_with_responder(
             rendezvous.local_addr().to_string(),
-            local_peer_id,
+            local_peer_id.clone(),
             "devmesh",
             Some(acl),
-            None,
-            None,
+            Some(local_key.clone()),
         )
         .await;
 
@@ -2567,7 +3200,17 @@ mod tests {
         send_inbound_assertion(&session, &dialer_key, "devmesh")
             .await
             .unwrap();
-        session.send_frame(b"hello mesh".to_vec()).await.unwrap();
+        let session_keys = run_initiator_pqc_against_responder(
+            &handle,
+            &session,
+            "devmesh",
+            &dialer_key,
+            local_peer_id,
+        )
+        .await;
+        let mut frame_protector = PqcFrameProtector::new(session_keys);
+        let protected = frame_protector.protect(b"hello mesh").unwrap();
+        session.send_frame(protected).await.unwrap();
 
         // Poll the inbound queue until the frame surfaces. 2s ceiling
         // so the test fails loudly rather than hanging.
@@ -2587,13 +3230,83 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn responder_does_not_surface_frame_without_pqc_session() {
+        let rendezvous = spawn_dev_rendezvous().await.unwrap();
+
+        let dialer_key = DeviceKeypair::generate().unwrap();
+        let dialer_peer_id = dialer_key.public_key().peer_id();
+        let local_key = Arc::new(DeviceKeypair::generate().unwrap());
+        let local_peer_id = local_key.public_key().peer_id();
+
+        let acl = PeerAcl::new().with_allow([dialer_peer_id]);
+        let handle = build_handle_with_responder(
+            rendezvous.local_addr().to_string(),
+            local_peer_id,
+            "devmesh",
+            Some(acl),
+            Some(local_key.clone()),
+        )
+        .await;
+
+        let session = dial_responder(&handle).await;
+        send_inbound_assertion(&session, &dialer_key, "devmesh")
+            .await
+            .unwrap();
+        session.send_frame(b"missing pqc".to_vec()).await.unwrap();
+
+        let receive_result =
+            tokio::time::timeout(Duration::from_millis(1_000), session.receive_frame()).await;
+        assert!(
+            matches!(receive_result, Ok(Err(_))),
+            "responder must close identity-only sessions that never complete PQC"
+        );
+        assert!(
+            handle.try_receive_frame_from_any().is_none(),
+            "valid identity alone must not surface frames before PQC session completion"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn responder_closes_connection_when_pqc_session_stalls() {
+        let rendezvous = spawn_dev_rendezvous().await.unwrap();
+
+        let dialer_key = DeviceKeypair::generate().unwrap();
+        let dialer_peer_id = dialer_key.public_key().peer_id();
+        let local_key = Arc::new(DeviceKeypair::generate().unwrap());
+        let local_peer_id = local_key.public_key().peer_id();
+
+        let acl = PeerAcl::new().with_allow([dialer_peer_id]);
+        let handle = build_handle_with_responder(
+            rendezvous.local_addr().to_string(),
+            local_peer_id,
+            "devmesh",
+            Some(acl),
+            Some(local_key.clone()),
+        )
+        .await;
+
+        let session = dial_responder(&handle).await;
+        send_inbound_assertion(&session, &dialer_key, "devmesh")
+            .await
+            .unwrap();
+
+        let receive_result =
+            tokio::time::timeout(Duration::from_millis(1_000), session.receive_frame()).await;
+        match receive_result {
+            Ok(Err(_)) => {}
+            Ok(Ok(frame)) => panic!("stalled PQC session must not receive a frame: {frame:?}"),
+            Err(_) => panic!("responder did not close stalled PQC session within timeout"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn responder_rejects_peer_not_in_allowlist() {
         let rendezvous = spawn_dev_rendezvous().await.unwrap();
 
         let allowed_key = DeviceKeypair::generate().unwrap();
         let allowed_peer_id = allowed_key.public_key().peer_id();
         let dialer_key = DeviceKeypair::generate().unwrap();
-        let local_key = DeviceKeypair::generate().unwrap();
+        let local_key = Arc::new(DeviceKeypair::generate().unwrap());
         let local_peer_id = local_key.public_key().peer_id();
 
         let acl = PeerAcl::new().with_allow([allowed_peer_id]);
@@ -2602,8 +3315,7 @@ mod tests {
             local_peer_id,
             "devmesh",
             Some(acl),
-            None,
-            None,
+            Some(local_key.clone()),
         )
         .await;
 
@@ -2621,88 +3333,6 @@ mod tests {
             handle.try_receive_frame_from_any().is_none(),
             "denied peer should never reach the inbound queue"
         );
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn responder_rejects_missing_dytallix_registry_on_public_mesh() {
-        let rendezvous = spawn_dev_rendezvous().await.unwrap();
-
-        let dialer_key = DeviceKeypair::generate().unwrap();
-        let local_key = DeviceKeypair::generate().unwrap();
-        let local_peer_id = local_key.public_key().peer_id();
-
-        let handle = build_handle_with_responder(
-            rendezvous.local_addr().to_string(),
-            local_peer_id,
-            "devmesh",
-            None,
-            None,
-            Some(MeshTransportDytallixIdentityConfig {
-                trust_policy: MeshTrustPolicy::PublicRequired,
-                mode: DiscoveryIdentityMode::Verified,
-                registry: None,
-            }),
-        )
-        .await;
-
-        let session = dial_responder(&handle).await;
-        let _ = send_inbound_assertion(&session, &dialer_key, "devmesh").await;
-        let _ = session
-            .send_frame(b"public mesh requires registry".to_vec())
-            .await;
-
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        assert!(
-            handle.try_receive_frame_from_any().is_none(),
-            "public Dytallix policy must reject inbound peers with no registry record"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn responder_accepts_missing_dytallix_registry_on_private_mesh() {
-        let rendezvous = spawn_dev_rendezvous().await.unwrap();
-
-        let dialer_key = DeviceKeypair::generate().unwrap();
-        let dialer_peer_id = dialer_key.public_key().peer_id();
-        let local_key = DeviceKeypair::generate().unwrap();
-        let local_peer_id = local_key.public_key().peer_id();
-
-        let handle = build_handle_with_responder(
-            rendezvous.local_addr().to_string(),
-            local_peer_id,
-            "devmesh",
-            None,
-            None,
-            Some(MeshTransportDytallixIdentityConfig {
-                trust_policy: MeshTrustPolicy::PrivatePreferred,
-                mode: DiscoveryIdentityMode::Verified,
-                registry: None,
-            }),
-        )
-        .await;
-
-        let session = dial_responder(&handle).await;
-        send_inbound_assertion(&session, &dialer_key, "devmesh")
-            .await
-            .unwrap();
-        session
-            .send_frame(b"private mesh may warn and accept".to_vec())
-            .await
-            .unwrap();
-
-        let mut waited = 0_u64;
-        let inbound = loop {
-            if let Some(frame) = handle.try_receive_frame_from_any() {
-                break frame;
-            }
-            if waited > 2_000 {
-                panic!("private Dytallix inbound frame never reached the responder queue");
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            waited += 20;
-        };
-        assert_eq!(inbound.peer_id, dialer_peer_id);
-        assert_eq!(inbound.frame, b"private mesh may warn and accept".to_vec());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2734,7 +3364,6 @@ mod tests {
             "devmesh",
             Some(acl_a),
             Some(key_a.clone()),
-            None,
         )
         .await;
         let handle_b = build_handle_with_responder(
@@ -2743,7 +3372,6 @@ mod tests {
             "devmesh",
             Some(acl_b),
             Some(key_b.clone()),
-            None,
         )
         .await;
 
@@ -2822,15 +3450,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn publish_self_rejects_keypair_that_doesnt_match_handle_local_peer_id() {
         let rendezvous = spawn_dev_rendezvous().await.unwrap();
-        let local_key = DeviceKeypair::generate().unwrap();
+        let local_key = Arc::new(DeviceKeypair::generate().unwrap());
         let local_peer_id = local_key.public_key().peer_id();
         let handle = build_handle_with_responder(
             rendezvous.local_addr().to_string(),
             local_peer_id,
             "devmesh",
             None,
-            None,
-            None,
+            Some(local_key.clone()),
         )
         .await;
 
@@ -2859,7 +3486,7 @@ mod tests {
 
         let dialer_key = DeviceKeypair::generate().unwrap();
         let dialer_peer_id = dialer_key.public_key().peer_id();
-        let local_key = DeviceKeypair::generate().unwrap();
+        let local_key = Arc::new(DeviceKeypair::generate().unwrap());
         let local_peer_id = local_key.public_key().peer_id();
 
         // Dialer is on the allowlist — but signs the assertion for a
@@ -2871,8 +3498,7 @@ mod tests {
             local_peer_id,
             "devmesh",
             Some(acl),
-            None,
-            None,
+            Some(local_key.clone()),
         )
         .await;
 

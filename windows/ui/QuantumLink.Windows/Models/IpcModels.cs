@@ -55,7 +55,6 @@ public sealed record TunnelStatus
     [JsonPropertyName("transport")] public TunnelTransportMetrics? Transport { get; init; }
     [JsonPropertyName("pump")] public PacketPumpMetrics? Pump { get; init; }
     [JsonPropertyName("killSwitchEngaged")] public bool? KillSwitchEngaged { get; init; }
-    [JsonPropertyName("dytallixIdentity")] public DytallixIdentityConfiguration? DytallixIdentity { get; init; }
     [JsonPropertyName("lastError")] public string? LastError { get; init; }
 }
 
@@ -115,7 +114,7 @@ public sealed record PacketPumpMetrics
 
 public sealed record CryptoPolicy
 {
-    [JsonPropertyName("suite")] public string Suite { get; init; } = "QLINK-FIPS203-MLKEM768-HKDFSHA256-v1";
+    [JsonPropertyName("suite")] public string Suite { get; init; } = "QLINK-FIPS203-MLKEM768-SHAKE256-v1";
     [JsonPropertyName("rekeyAfterSeconds")] public double RekeyAfterSeconds { get; init; } = 3600;
     [JsonPropertyName("rekeyAfterBytes")] public ulong RekeyAfterBytes { get; init; } = 1_073_741_824;
 }
@@ -138,23 +137,4 @@ public sealed record TunnelConfiguration
     [JsonPropertyName("mtu")] public uint Mtu { get; init; } = 1280;
     [JsonPropertyName("crypto")] public CryptoPolicy Crypto { get; init; } = new();
     [JsonPropertyName("killSwitch")] public string KillSwitch { get; init; } = "failClosed";
-    [JsonPropertyName("dytallixIdentity")] public DytallixIdentityConfiguration? DytallixIdentity { get; init; }
-}
-
-public sealed record DytallixRegistryConfiguration
-{
-    [JsonPropertyName("endpoint")] public string Endpoint { get; init; } = "https://dytallix.com";
-    [JsonPropertyName("contractAddress")] public string ContractAddress { get; init; } = "";
-    [JsonPropertyName("keystorePath")] public string? KeystorePath { get; init; }
-    [JsonPropertyName("walletName")] public string? WalletName { get; init; }
-    [JsonPropertyName("networkId")] public string? NetworkId { get; init; }
-    [JsonPropertyName("chainId")] public string? ChainId { get; init; }
-    [JsonPropertyName("allowedRpcEndpoints")] public List<string> AllowedRpcEndpoints { get; init; } = [];
-}
-
-public sealed record DytallixIdentityConfiguration
-{
-    [JsonPropertyName("trustPolicy")] public string TrustPolicy { get; init; } = "privatePreferred";
-    [JsonPropertyName("mode")] public string Mode { get; init; } = "off";
-    [JsonPropertyName("registry")] public DytallixRegistryConfiguration? Registry { get; init; }
 }

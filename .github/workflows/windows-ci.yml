@@ -10,7 +10,7 @@ jobs:
     name: Rust (x86_64-pc-windows-msvc)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -32,11 +32,8 @@ jobs:
         run: cargo build --release -p quantumlink-service -p qlink-core
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          # Raw Windows build outputs are CI validation artifacts, not
-          # production release artifacts. Production distribution uses a
-          # signed MSI published through the official release channel.
           name: quantumlink-windows-rust
           path: |
             target/release/quantumlink-service.exe
@@ -47,8 +44,8 @@ jobs:
     name: WinUI 3 app
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-dotnet@v5
         with:
           dotnet-version: '8.0.x'
       - name: Build UI

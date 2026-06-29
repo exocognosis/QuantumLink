@@ -36,27 +36,30 @@
 //! - Local device keypair. Persistence of the long-term secret is a
 //!   separate concern (Keychain on macOS, key file for `qlinkctl`).
 //!
-//! ## Encryption
+//! ## Protected At-Rest Cache
 //!
 //! Optional, opt-in. Open a `FilePeerStore` via
-//! `open_file_peer_store_with_key` and the on-disk file is wrapped in
-//! ChaCha20-Poly1305 AEAD with a 32-byte key. The host (Swift app)
-//! mints the key on first launch and persists it in the macOS
-//! Keychain (`com.quantumlink.macos.secrets` /
-//! `peer-store-key`); subsequent launches reload the key and pass it
-//! across the FFI in base64 form via `MeshTransportConfig.peer_store_key_b64`.
+//! `open_file_peer_store_with_key` and the on-disk file is wrapped in a
+//! SHAKE256 protected envelope with a 32-byte key. The host (Swift app)
+//! mints the key on first launch and persists it in the macOS Keychain
+//! (`com.quantumlink.macos.secrets` / `peer-store-key`); subsequent
+//! launches reload the key and pass it across the FFI in base64 form via
+//! `MeshTransportConfig.peer_store_key_b64`.
 //!
 //! Without a key, the file is written as plaintext JSON (v1 format,
-//! preserved for back-compat). With a key, the file uses the v2
-//! envelope: `{"version":2,"nonce_b64":"...","ciphertext_b64":"..."}`
-//! where the ciphertext is the v1 inner JSON encrypted with a fresh
-//! 12-byte nonce on every write.
+//! preserved for back-compat). With a key, the file uses the v3
+//! envelope: `{"version":3,"nonce_b64":"...","ciphertext_b64":"..."}`
+//! where the ciphertext field stores a masked v1 inner JSON plus a
+//! SHAKE256 authentication tag, with a fresh 24-byte nonce on every
+//! write.
 //!
-//! Reads tolerate either format; an attempt to load v2 without a key
-//! (or with the wrong key) silently treats the cache as empty,
-//! consistent with the existing "malformed file → empty" recovery
-//! behavior. Records are still signed, so an attacker who flipped
-//! the file format alone cannot inject forged records.
+//! Reads tolerate plaintext v1 and protected v3; an attempt to load v3
+//! without a key (or with the wrong key) silently treats the cache as
+//! empty, consistent with the existing "malformed file → empty" recovery
+//! behavior. Legacy v2 protected files are also treated as empty rather
+//! than decoded with the retired classical envelope. Records are still
+//! signed, so an attacker who flipped the file format alone cannot inject
+//! forged records.
 //!
 //! ## TTL eviction
 //!
@@ -75,12 +78,12 @@ use crate::{
     error::{QlinkError, Result},
 };
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-use chacha20poly1305::{
-    aead::{Aead, KeyInit, Payload},
-    ChaCha20Poly1305, Key, Nonce,
-};
 use rand_core_06::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
+use sha3::{
+    digest::{ExtendableOutput, Update, XofReader},
+    Shake256,
+};
 use std::{
     collections::{BTreeMap, HashMap},
     fs,
@@ -186,15 +189,15 @@ impl PeerStore for InMemoryPeerStore {
 ///
 /// Construct with `FilePeerStore::open(path)` for plaintext-on-disk
 /// (back-compat / dev tooling), or `FilePeerStore::open_with_key(path, key)`
-/// for ChaCha20-Poly1305-encrypted storage. The encryption mode is a
+/// for SHAKE256-protected storage. The protection mode is a
 /// privacy hardening for environments where disk read-access is in
 /// scope of the threat model — records are signed but their
 /// aggregate reveals "who this device talks to."
 #[derive(Debug)]
 pub struct FilePeerStore {
     path: PathBuf,
-    /// Optional 32-byte ChaCha20-Poly1305 key. When set, on-disk
-    /// records are written in the v2 encrypted envelope; when None,
+    /// Optional 32-byte SHAKE256 envelope key. When set, on-disk
+    /// records are written in the v3 protected envelope; when None,
     /// the v1 plaintext format is used. Wrapped in a Mutex so
     /// `rotate_key` can swap it without `&mut self` (typical use is
     /// `Arc<dyn PeerStore>`, so interior mutability is required).
@@ -213,15 +216,15 @@ struct FileStoreInner {
 struct PlaintextFormat {
     /// Bumped on incompatible schema changes. v1 format readers
     /// fall back to empty when they encounter an unknown version
-    /// or the v2 encrypted envelope (which lives at version=2).
+    /// or the v3 protected envelope (which lives at version=3).
     version: u32,
     meshes: BTreeMap<String, BTreeMap<String, PeerRecord>>,
 }
 
-/// Encrypted on-disk envelope (v2). The inner JSON has the same
+/// Protected on-disk envelope (v3). The inner JSON has the same
 /// shape as the v1 plaintext format; only the meshes map is
-/// encrypted. The 12-byte nonce is regenerated on every write so
-/// repeated saves don't reuse it.
+/// masked and tagged. The 24-byte nonce is regenerated on every
+/// write so repeated saves don't reuse it.
 #[derive(Serialize, Deserialize)]
 struct EncryptedFormat {
     version: u32,
@@ -230,29 +233,79 @@ struct EncryptedFormat {
 }
 
 const PLAINTEXT_FORMAT_VERSION: u32 = 1;
-const ENCRYPTED_FORMAT_VERSION: u32 = 2;
-/// Constant 16-byte AAD prefix that ties the ciphertext to the
-/// store's identity. Prevents a swapped envelope from authenticating
-/// against a different file's key (e.g. someone copies a
-/// `peers.json` to another machine).
+const LEGACY_PROTECTED_FORMAT_VERSION: u32 = 2;
+const ENCRYPTED_FORMAT_VERSION: u32 = 3;
+const PEER_STORE_NONCE_LEN: usize = 24;
+const PEER_STORE_TAG_LEN: usize = 32;
+/// Constant AAD for peer-store envelope domain separation. This binds
+/// tags to the peer-store purpose, not to a specific file or machine;
+/// copying an envelope with the same key preserves authenticity.
 const ENCRYPTION_AAD: &[u8] = b"qlink-peer-store";
+const PEER_STORE_STREAM_LABEL: &[u8] = b"QuantumLink peer-store SHAKE256 stream v3";
+const PEER_STORE_TAG_LABEL: &[u8] = b"QuantumLink peer-store SHAKE256 tag v3";
+
+fn shake256_xof(label: &[u8], chunks: &[&[u8]], out: &mut [u8]) {
+    let mut hasher = Shake256::default();
+    hasher.update(label);
+    hasher.update(&(out.len() as u64).to_be_bytes());
+    for chunk in chunks {
+        hasher.update(&(chunk.len() as u64).to_be_bytes());
+        hasher.update(chunk);
+    }
+    let mut reader = hasher.finalize_xof();
+    reader.read(out);
+}
+
+fn peer_store_mask(key: &[u8; 32], nonce: &[u8], input: &[u8]) -> Vec<u8> {
+    let mut stream = vec![0_u8; input.len()];
+    shake256_xof(
+        PEER_STORE_STREAM_LABEL,
+        &[key.as_slice(), nonce, ENCRYPTION_AAD],
+        &mut stream,
+    );
+    input
+        .iter()
+        .zip(stream.iter())
+        .map(|(byte, mask)| byte ^ mask)
+        .collect()
+}
+
+fn peer_store_tag(key: &[u8; 32], nonce: &[u8], ciphertext: &[u8]) -> [u8; PEER_STORE_TAG_LEN] {
+    let mut tag = [0_u8; PEER_STORE_TAG_LEN];
+    shake256_xof(
+        PEER_STORE_TAG_LABEL,
+        &[key.as_slice(), nonce, ENCRYPTION_AAD, ciphertext],
+        &mut tag,
+    );
+    tag
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right.iter())
+        .fold(0_u8, |diff, (a, b)| diff | (a ^ b))
+        == 0
+}
 
 impl FilePeerStore {
     /// Opens or creates a peer store at `path` in plaintext mode.
     /// The parent directory must exist. On-disk format is the v1
-    /// JSON map; readers tolerate v2-encrypted envelopes by silently
+    /// JSON map; readers tolerate protected envelopes by silently
     /// returning an empty cache (rather than treating them as
     /// corrupt — the operator may simply have left the key behind).
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
         Self::open_internal(path.into(), None)
     }
 
-    /// Opens or creates an encrypted peer store at `path`. Subsequent
-    /// writes use the v2 ChaCha20-Poly1305 envelope. Reads accept
-    /// both v1 plaintext (for migration after the key was added) and
-    /// v2 encrypted; v2 envelopes that don't authenticate under the
-    /// supplied key are treated as empty rather than failing the
-    /// whole runtime.
+    /// Opens or creates a protected peer store at `path`. Subsequent
+    /// writes use the v3 SHAKE256 envelope. Reads accept both v1
+    /// plaintext (for migration after the key was added) and v3
+    /// protected; v3 envelopes that don't authenticate under the
+    /// supplied key are treated as empty rather than failing the whole
+    /// runtime.
     pub fn open_with_key(path: impl Into<PathBuf>, key: [u8; 32]) -> Result<Self> {
         Self::open_internal(path.into(), Some(key))
     }
@@ -275,10 +328,10 @@ impl FilePeerStore {
         })
     }
 
-    /// Decodes an on-disk file. Recognizes v1 plaintext, v2
-    /// encrypted (when the key is supplied + matches), and gracefully
+    /// Decodes an on-disk file. Recognizes v1 plaintext, v3
+    /// protected (when the key is supplied + matches), and gracefully
     /// degrades to "empty" on every other input — including
-    /// malformed JSON, unknown versions, mismatched keys, and v2
+    /// malformed JSON, unknown versions, mismatched keys, and v3
     /// envelopes encountered without a key. The "empty on
     /// corruption" stance matches the existing back-compat policy:
     /// a stale file shouldn't brick the runtime.
@@ -287,7 +340,7 @@ impl FilePeerStore {
         encryption_key: Option<&[u8; 32]>,
     ) -> BTreeMap<String, BTreeMap<String, PeerRecord>> {
         // Sniff version first via a partial decode. This avoids
-        // having to try the v1 schema and v2 schema in sequence.
+        // having to try the plaintext and protected schemas in sequence.
         #[derive(Deserialize)]
         struct VersionHeader {
             version: u32,
@@ -307,27 +360,32 @@ impl FilePeerStore {
                     BTreeMap::new()
                 }
             },
+            LEGACY_PROTECTED_FORMAT_VERSION => {
+                tracing::warn!(
+                    "peer store legacy v2 envelope uses a retired classical primitive; \
+                     treating as empty"
+                );
+                BTreeMap::new()
+            }
             ENCRYPTED_FORMAT_VERSION => {
                 let Some(key) = encryption_key else {
                     tracing::warn!(
-                        "peer store on disk is encrypted (v2) but no key was supplied; \
+                        "peer store on disk is protected (v3) but no key was supplied; \
                          treating as empty (set MeshTransportConfig.peer_store_key_b64)"
                     );
                     return BTreeMap::new();
                 };
                 match serde_json::from_slice::<EncryptedFormat>(bytes) {
-                    Ok(envelope) => {
-                        Self::decrypt_envelope(&envelope, key).unwrap_or_else(|reason| {
-                            tracing::warn!(
-                                ?reason,
-                                "peer store v2 envelope failed to decrypt; treating as empty"
-                            );
-                            BTreeMap::new()
-                        })
-                    }
+                    Ok(envelope) => Self::open_envelope(&envelope, key).unwrap_or_else(|reason| {
+                        tracing::warn!(
+                            ?reason,
+                            "peer store v3 envelope failed to open; treating as empty"
+                        );
+                        BTreeMap::new()
+                    }),
                     Err(_) => {
                         tracing::warn!(
-                            "peer store v2 envelope failed to decode; treating as empty"
+                            "peer store v3 envelope failed to decode; treating as empty"
                         );
                         BTreeMap::new()
                     }
@@ -340,32 +398,32 @@ impl FilePeerStore {
         }
     }
 
-    fn decrypt_envelope(
+    fn open_envelope(
         envelope: &EncryptedFormat,
         key: &[u8; 32],
     ) -> std::result::Result<BTreeMap<String, BTreeMap<String, PeerRecord>>, &'static str> {
         let nonce_bytes = B64
             .decode(&envelope.nonce_b64)
             .map_err(|_| "nonce base64 decode failed")?;
-        if nonce_bytes.len() != 12 {
-            return Err("nonce must be exactly 12 bytes");
+        if nonce_bytes.len() != PEER_STORE_NONCE_LEN {
+            return Err("nonce must be exactly 24 bytes");
         }
-        let ciphertext = B64
+        let encoded_payload = B64
             .decode(&envelope.ciphertext_b64)
             .map_err(|_| "ciphertext base64 decode failed")?;
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
-        let plaintext = cipher
-            .decrypt(
-                Nonce::from_slice(&nonce_bytes),
-                Payload {
-                    msg: &ciphertext,
-                    aad: ENCRYPTION_AAD,
-                },
-            )
-            .map_err(|_| "ciphertext authentication failed (wrong key or tampered file)")?;
+        if encoded_payload.len() < PEER_STORE_TAG_LEN {
+            return Err("ciphertext is too short to carry a tag");
+        }
+        let split_at = encoded_payload.len() - PEER_STORE_TAG_LEN;
+        let (ciphertext, tag) = encoded_payload.split_at(split_at);
+        let expected_tag = peer_store_tag(key, &nonce_bytes, ciphertext);
+        if !constant_time_eq(tag, &expected_tag) {
+            return Err("ciphertext authentication failed (wrong key or tampered file)");
+        }
+        let plaintext = peer_store_mask(key, &nonce_bytes, ciphertext);
         // Inner shape matches v1 plaintext.
         let parsed: PlaintextFormat =
-            serde_json::from_slice(&plaintext).map_err(|_| "decrypted payload is not v1 JSON")?;
+            serde_json::from_slice(&plaintext).map_err(|_| "opened payload is not v1 JSON")?;
         Ok(parsed.meshes)
     }
 
@@ -388,15 +446,15 @@ impl FilePeerStore {
 }
 
 impl FilePeerStore {
-    /// Rotates the on-disk encryption key. The cache is decrypted
-    /// under the current key (if any), re-encrypted under
+    /// Rotates the on-disk protection key. The cache is opened under
+    /// the current key (if any), protected under
     /// `new_key`, and atomically replaced on disk. After return,
     /// the in-memory state is preserved and subsequent writes use
     /// the new key.
     ///
     /// Pass `Some(...)` for `new_key` to migrate from plaintext to
-    /// encrypted (or to roll an existing encrypted store under a
-    /// fresh key); pass `None` to drop encryption entirely (writes
+    /// protected (or to roll an existing protected store under a
+    /// fresh key); pass `None` to drop at-rest protection entirely (writes
     /// out the v1 plaintext format). The latter is useful when an
     /// operator decommissions the Keychain item and wants to keep
     /// the cache without re-priming it.
@@ -421,7 +479,7 @@ impl FilePeerStore {
             });
             guard.records.clone()
         };
-        // Replace the encryption key BEFORE persisting so the
+        // Replace the protection key BEFORE persisting so the
         // write goes out under the new key. We use unsafe interior
         // mutation via a separate Mutex around the key — but
         // simpler: just rebuild the persist payload manually here
@@ -464,24 +522,17 @@ impl FilePeerStore {
                     meshes: snapshot.clone(),
                 };
                 let inner_bytes = serde_json::to_vec(&inner)?;
-                let mut nonce = [0_u8; 12];
+                let mut nonce = [0_u8; PEER_STORE_NONCE_LEN];
                 OsRng.fill_bytes(&mut nonce);
-                let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
-                let ciphertext = cipher
-                    .encrypt(
-                        Nonce::from_slice(&nonce),
-                        Payload {
-                            msg: &inner_bytes,
-                            aad: ENCRYPTION_AAD,
-                        },
-                    )
-                    .map_err(|_| {
-                        QlinkError::Crypto("peer store envelope encryption failed".into())
-                    })?;
+                let ciphertext = peer_store_mask(key, &nonce, &inner_bytes);
+                let tag = peer_store_tag(key, &nonce, &ciphertext);
+                let mut encoded_payload = Vec::with_capacity(ciphertext.len() + tag.len());
+                encoded_payload.extend_from_slice(&ciphertext);
+                encoded_payload.extend_from_slice(&tag);
                 let envelope = EncryptedFormat {
                     version: ENCRYPTED_FORMAT_VERSION,
                     nonce_b64: B64.encode(nonce),
-                    ciphertext_b64: B64.encode(&ciphertext),
+                    ciphertext_b64: B64.encode(&encoded_payload),
                 };
                 serde_json::to_vec_pretty(&envelope)?
             }
@@ -653,10 +704,10 @@ pub fn open_file_peer_store(path: impl AsRef<Path>) -> Result<FilePeerStore> {
     FilePeerStore::open(path.to_path_buf())
 }
 
-/// Encrypted variant of `open_file_peer_store`. Subsequent writes go
-/// to disk in the v2 ChaCha20-Poly1305 envelope. The host (Swift app)
-/// is responsible for minting + persisting the key — typically in
-/// macOS Keychain.
+/// Protected variant of `open_file_peer_store`. Subsequent writes go
+/// to disk in the v3 SHAKE256 envelope. The host (Swift app) is
+/// responsible for minting + persisting the key — typically in macOS
+/// Keychain.
 pub fn open_file_peer_store_with_key(
     path: impl AsRef<Path>,
     key: [u8; 32],
@@ -934,7 +985,38 @@ mod tests {
         assert!(store.load("devmesh", &dead.body.peer_id).is_none());
     }
 
-    // MARK: - Encryption (v2 envelope)
+    // MARK: - Protected envelope (v3)
+
+    #[test]
+    fn protected_store_uses_v3_shake_envelope_shape() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("peers.json");
+        let key = [42_u8; 32];
+
+        let (_, record) = fresh_signed_record("devmesh");
+        let peer_id = record.body.peer_id.clone();
+        {
+            let store = open_file_peer_store_with_key(&path, key).unwrap();
+            store.store("devmesh", &record);
+        }
+
+        let raw = fs::read(&path).unwrap();
+        let envelope: EncryptedFormat = serde_json::from_slice(&raw).unwrap();
+        let nonce = B64.decode(&envelope.nonce_b64).unwrap();
+        let ciphertext = B64.decode(&envelope.ciphertext_b64).unwrap();
+
+        assert_eq!(envelope.version, ENCRYPTED_FORMAT_VERSION);
+        assert_eq!(envelope.version, 3);
+        assert_eq!(nonce.len(), 24);
+        assert!(
+            ciphertext.len() >= 32,
+            "protected payload must carry an authentication tag"
+        );
+        assert!(
+            !String::from_utf8_lossy(&raw).contains(&peer_id),
+            "peer_id leaked into the protected file"
+        );
+    }
 
     #[test]
     fn encrypted_store_round_trips_through_disk_with_correct_key() {
@@ -950,15 +1032,15 @@ mod tests {
             store.store("devmesh", &record);
         }
 
-        // The on-disk file should be a v2 envelope, not the v1
+        // The on-disk file should be a v3 envelope, not the v1
         // plaintext `meshes` map. A weak but real test: peer_id
-        // must NOT appear unencrypted on disk.
+        // must NOT appear in cleartext on disk.
         let raw = fs::read_to_string(&path).unwrap();
         assert!(raw.contains("\"version\""));
         assert!(raw.contains("ciphertext_b64"));
         assert!(
             !raw.contains(&peer_id),
-            "peer_id leaked into the encrypted file: {raw}"
+            "peer_id leaked into the protected file: {raw}"
         );
 
         // Reopening with the same key returns the record.
@@ -981,7 +1063,7 @@ mod tests {
         }
 
         // Open with a different key — must not panic, must not
-        // decrypt, must report empty rather than poisoning the
+        // open, must report empty rather than poisoning the
         // runtime with a hard error (consistent with other
         // "malformed file → empty" recovery paths in this module).
         let wrong_key = [2_u8; 32];
@@ -991,7 +1073,7 @@ mod tests {
     }
 
     #[test]
-    fn encrypted_store_treats_v2_file_with_no_key_as_empty() {
+    fn encrypted_store_treats_v3_file_with_no_key_as_empty() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("peers.json");
         let key = [7_u8; 32];
@@ -1002,7 +1084,7 @@ mod tests {
             store.store("devmesh", &record);
         }
 
-        // Reopen in plaintext mode — the v2 envelope is unreadable
+        // Reopen in plaintext mode — the v3 envelope is unreadable
         // and we recover by treating the cache as empty rather than
         // refusing to start.
         let store = open_file_peer_store(&path).unwrap();
@@ -1031,7 +1113,7 @@ mod tests {
         let store = open_file_peer_store_with_key(&path, key).unwrap();
         assert!(store.load("devmesh", &peer_id).is_some());
 
-        // First write through the encrypted store re-encodes to v2.
+        // First write through the protected store re-encodes to v3.
         let (_, replacement) = fresh_signed_record("devmesh");
         store.store("devmesh", &replacement);
         let raw = fs::read_to_string(&path).unwrap();
@@ -1079,16 +1161,16 @@ mod tests {
             store.rotate_key(None).unwrap();
         }
 
-        // After dropping encryption, a plaintext-mode opener reads
+        // After dropping at-rest protection, a plaintext-mode opener reads
         // the records.
         let plain_view = open_file_peer_store(&path).unwrap();
         assert!(plain_view.load("devmesh", &peer_id).is_some());
 
         // Subsequent writes from the (still-loaded) original store
         // should also be plaintext now — verified by re-opening
-        // with the encrypted opener and getting empty (the file is
+        // with the protected opener and getting empty (the file is
         // a v1 plaintext envelope; plaintext readers handle it,
-        // encrypted readers also try v1 and succeed). Adjust to
+        // protected readers also try v1 and succeed). Adjust to
         // assert the on-disk shape.
         let raw = fs::read_to_string(&path).unwrap();
         assert!(raw.contains("\"version\""));
@@ -1108,10 +1190,10 @@ mod tests {
         let store = open_file_peer_store(&path).unwrap();
         store.store("devmesh", &record);
 
-        // Promote to encrypted via rotate_key.
+        // Promote to protected via rotate_key.
         store.rotate_key(Some(new_key)).unwrap();
 
-        // The on-disk file is now a v2 envelope.
+        // The on-disk file is now a v3 envelope.
         let raw = fs::read_to_string(&path).unwrap();
         assert!(raw.contains("ciphertext_b64"));
         assert!(
@@ -1119,7 +1201,7 @@ mod tests {
             "peer_id leaked into the file after rotation: {raw}"
         );
 
-        // Subsequent writes from the same handle stay encrypted.
+        // Subsequent writes from the same handle stay protected.
         let (_, second_record) = fresh_signed_record("devmesh");
         store.store("devmesh", &second_record);
         let raw_after = fs::read_to_string(&path).unwrap();
@@ -1142,18 +1224,17 @@ mod tests {
         let count = store.rotate_key(Some(new_key)).unwrap();
         assert_eq!(count, 0);
 
-        // The file exists and is a valid v2 envelope (empty meshes).
+        // The file exists and is a valid v3 envelope (empty meshes).
         let view = open_file_peer_store_with_key(&path, new_key).unwrap();
         assert_eq!(view.len(), 0);
     }
 
     #[test]
     fn encrypted_store_uses_a_fresh_nonce_per_write() {
-        // Reusing a (key, nonce) pair under ChaCha20-Poly1305 is
-        // catastrophic — the keystream becomes recoverable. This
-        // test guards against accidental nonce reuse by checking
+        // Reusing a (key, nonce) pair would reuse the SHAKE256 mask.
+        // This test guards against accidental nonce reuse by checking
         // that two writes of the same content land at different
-        // nonces on disk.
+        // protected payloads on disk.
         let dir = tempdir().unwrap();
         let path = dir.path().join("peers.json");
         let key = [13_u8; 32];

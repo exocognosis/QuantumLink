@@ -19,7 +19,7 @@ jobs:
       # one machine-parseable line per scenario.
       RUSTFLAGS: "-C debuginfo=0"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Show toolchain
         run: |
@@ -27,7 +27,7 @@ jobs:
           cargo --version
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -45,7 +45,7 @@ jobs:
         id: slos
         run: |
           set -o pipefail
-          cargo bench -p qlink-core --bench slos 2>&1 | tee build/perf-slos.log
+          cargo bench -p qlink-core --bench slos --no-default-features --features dev-quic-carrier 2>&1 | tee build/perf-slos.log
           # Surface the slo.* lines as a job summary section.
           {
             echo "## SLO scenarios"
@@ -60,7 +60,7 @@ jobs:
         id: slos_wan
         run: |
           set -o pipefail
-          cargo bench -p qlink-core --bench slos_wan 2>&1 | tee build/perf-slos-wan.log
+          cargo bench -p qlink-core --bench slos_wan --no-default-features --features dev-quic-carrier 2>&1 | tee build/perf-slos-wan.log
           {
             echo ""
             echo "## SLO scenarios — synthetic WAN"
@@ -74,8 +74,8 @@ jobs:
       - name: Run connector + ICE micro-benchmarks
         run: |
           set -o pipefail
-          cargo bench -p qlink-core --bench connector 2>&1 | tee build/perf-connector.log
-          cargo bench -p qlink-core --bench ice 2>&1 | tee build/perf-ice.log
+          cargo bench -p qlink-core --bench connector --no-default-features --features dev-quic-carrier 2>&1 | tee build/perf-connector.log
+          cargo bench -p qlink-core --bench ice --no-default-features --features dev-quic-carrier 2>&1 | tee build/perf-ice.log
           {
             echo ""
             echo "## Connector micro-benchmarks"
@@ -117,14 +117,16 @@ jobs:
         shell: bash
 
       - name: Upload criterion HTML report
-        uses: actions/upload-artifact@v4
+        if: always()
+        uses: actions/upload-artifact@v7
         with:
           name: criterion-report-${{ github.run_id }}
           path: target/criterion
           if-no-files-found: warn
 
       - name: Upload perf logs
-        uses: actions/upload-artifact@v4
+        if: always()
+        uses: actions/upload-artifact@v7
         with:
           name: perf-logs-${{ github.run_id }}
           path: build/perf-*.log
@@ -135,16 +137,20 @@ jobs:
     runs-on: macos-15
     needs: rust-benchmarks
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build dylib
         run: cargo build -p qlink-core --release
+      - name: Prepare build/ directory for tee'd logs
+        run: mkdir -p build
       - name: Run Swift perf tests
+        working-directory: macos
         run: |
-          QLINK_CORE_DYLIB="$PWD/target/release/libqlink_core.dylib" \
-            swift test --filter RustMeshTransportPerformanceTests 2>&1 | tee build/perf-swift.log
+          QLINK_CORE_DYLIB="$GITHUB_WORKSPACE/target/release/libqlink_core.dylib" \
+            swift test --filter RustMeshTransportPerformanceTests 2>&1 | tee "$GITHUB_WORKSPACE/build/perf-swift.log"
         shell: bash
       - name: Upload Swift perf logs
-        uses: actions/upload-artifact@v4
+        if: always()
+        uses: actions/upload-artifact@v7
         with:
           name: perf-swift-${{ github.run_id }}
           path: build/perf-swift.log

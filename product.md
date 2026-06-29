@@ -60,9 +60,9 @@ legal and technical backing.
 ### Post-quantum mesh data plane
 
 QuantumLink's shared core owns ML-KEM-768 session establishment, ML-DSA-65
-device credentials, SLH-DSA-SHA2-128S support for the FIPS 205 path, transcript
-binding, suite-bound HKDF derivation, ChaCha20-Poly1305 packet-frame protection,
-and monotonic packet-number replay protection.
+device credentials, SLH-DSA-SHAKE-128S support for the FIPS 205 path,
+SHAKE256 transcript binding, SHAKE256 directional derivation, app-layer PQC
+frame protection, and monotonic replay protection.
 
 The legacy hybrid X25519/ML-KEM suite identifier is intentionally rejected. The
 v1 direction is post-quantum session establishment without a classical
@@ -158,13 +158,17 @@ Implemented or scaffolded behavior includes:
 - ML-KEM-768 three-message session establishment.
 - ML-DSA-65 device credentials by default.
 - SLH-DSA-SHA2-128S signing and verification for the FIPS 205 suite path.
-- SHA-256 transcript hashing and HKDF-SHA-256 directional key derivation.
+- SHAKE256 transcript binding and SHAKE256 directional key derivation.
 - Signed, expiring peer records.
-- ChaCha20-Poly1305 packet-frame protection in `PacketTunnelCore`.
-- Monotonic packet-number replay protection.
-- Rust QUIC DATAGRAM loopback, mesh transport wrapper, rendezvous lookup,
-  direct probes, optional ICE, relay fallback, peer-store persistence,
-  per-peer state, and network-event reconnect behavior.
+- App-layer PQC frame protection with replay rejection for direct mesh links.
+- Packet core framing and metadata normalization; the packet core is not a
+  classical encryption boundary.
+- Native UDP carrier session-wire test coverage; default live mesh dialing
+  fails closed until rendezvous publication and direct probing are wired to the
+  native UDP carrier.
+- Optional dev-only QUIC DATAGRAM carrier transport behind `dev-quic-carrier`,
+  rendezvous lookup, direct probes, optional ICE, relay fallback, peer-store
+  persistence, per-peer state, and network-event reconnect behavior.
 - macOS SwiftUI app, `NEPacketTunnelProvider` scaffold, `QuantumLinkKit`,
   Keychain-backed identity paths, MDM payload templates, XcodeGen project, and
   packaging/release scripts.
@@ -176,7 +180,8 @@ Production gaps include:
 
 - Apple-granted Network Extension entitlements and production provisioning.
 - Developer ID signing, notarization, stapling, and Gatekeeper validation.
-- Production peer-session key installation into packet-frame encryption.
+- Wiring live rendezvous publication and direct probing to the native UDP
+  carrier.
 - Hardened public rendezvous and relay infrastructure.
 - Signed update pipeline with a post-quantum manifest layer.
 - Real Dytallix contract/client integration for public identity enforcement.
@@ -289,7 +294,8 @@ For every discovered peer:
 6. For public meshes, require an active record with matching `peer_id`, matching
    device public key hash, matching or policy-fresh peer record hash, and any
    configured reputation/staking threshold.
-7. Dial QUIC/PQC transport only after registry policy passes.
+7. Start the QuantumLink carrier and app-layer PQC session only after registry
+   policy passes.
 8. Complete the existing inbound identity assertion before accepting traffic.
 
 Rejected peers should produce operator-readable reasons such as
@@ -365,8 +371,9 @@ The runtime architecture is intentionally split:
   packet pump, profile management, MDM helpers, and support bundles.
 - `quantumlink-service`: Windows privileged tunnel service and platform runtime.
 - `qlink-core`: Rust protocol core for crypto orchestration, signed peer
-  records, routing, packet-frame protection, replay protection, QUIC transport,
-  rendezvous, relay, ICE/STUN helpers, metrics, tracing, and FFI.
+  records, routing, app-layer PQC frame protection, replay protection, native
+  UDP carrier work, optional dev QUIC carrier support, rendezvous, relay,
+  ICE/STUN helpers, metrics, tracing, and FFI.
 
 Control-plane services help peers find and reach each other. They are not the
 steady-state trust center for packet confidentiality. Relay fallback can see

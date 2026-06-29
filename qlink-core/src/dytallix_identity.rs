@@ -10,108 +10,46 @@ use dytallix_sdk::{
     keystore::Keystore,
     transaction::{estimate_default_gas_limits, Message, Transaction},
 };
-use serde::{Deserialize, Serialize};
+use reqwest::Url;
+use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
-use std::{fmt, future::Future, path::PathBuf, pin::Pin};
+use std::{fmt, path::PathBuf};
 
-pub const REGISTRY_CONTRACT_NAME: &str = "quantumlink-node-registry";
-pub const REGISTRY_CONTRACT_VERSION: u8 = 1;
-pub const PUBLIC_TESTNET_ENDPOINT: &str = "https://dytallix.com";
+const REGISTRY_CONTRACT_NAME: &str = "quantumlink-node-registry";
+const REGISTRY_CONTRACT_VERSION: u8 = 1;
 const CONTRACT_CALL_GAS_LIMIT: u64 = 1_000_000;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum MeshTrustPolicy {
-    #[serde(
-        rename = "publicRequired",
-        alias = "PublicRequired",
-        alias = "public_required"
-    )]
     PublicRequired,
-    #[serde(
-        rename = "privatePreferred",
-        alias = "PrivatePreferred",
-        alias = "private_preferred"
-    )]
     PrivatePreferred,
-    #[serde(
-        rename = "developmentOptional",
-        alias = "DevelopmentOptional",
-        alias = "development_optional"
-    )]
     DevelopmentOptional,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum DiscoveryIdentityMode {
-    #[serde(rename = "off", alias = "Off")]
-    Off,
-    #[serde(rename = "verified", alias = "Verified")]
-    Verified,
-    #[serde(
-        rename = "publicWallet",
-        alias = "PublicWallet",
-        alias = "public_wallet"
-    )]
-    PublicWallet,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum RegistryNodeStatus {
-    #[serde(rename = "active", alias = "Active")]
     Active,
-    #[serde(rename = "revoked", alias = "Revoked")]
     Revoked,
-    #[serde(rename = "suspended", alias = "Suspended")]
     Suspended,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
 pub struct RegistryNodeRecord {
     pub peer_id: String,
     pub owner_daddr: String,
-    pub device_public_key_hash: [u8; 32],
-    pub latest_peer_record_hash: [u8; 32],
+    pub device_public_key_hash_hex: String,
+    pub pqc_binding_hash_hex: String,
+    pub node_signing_public_key_hash_hex: String,
+    pub transport_public_key_hash_hex: String,
+    pub latest_peer_record_hash_hex: String,
     pub status: RegistryNodeStatus,
-    pub updated_at: u64,
-    #[serde(default)]
-    pub expires_at: Option<u64>,
-    #[serde(default)]
-    pub reputation_score: Option<u64>,
-    #[serde(default)]
+    pub reputation_score: u64,
     pub stake_status: Option<String>,
-    #[serde(default)]
-    pub metadata_commitment: Option<[u8; 32]>,
-}
-
-impl RegistryNodeRecord {
-    pub fn from_peer_record(
-        owner_daddr: impl Into<String>,
-        peer_record: &PeerRecord,
-        status: RegistryNodeStatus,
-        updated_at: u64,
-    ) -> Result<Self> {
-        Ok(Self {
-            peer_id: peer_record.body.peer_id.clone(),
-            owner_daddr: owner_daddr.into(),
-            device_public_key_hash: device_public_key_hash(peer_record)?,
-            latest_peer_record_hash: latest_peer_record_hash(peer_record)?,
-            status,
-            updated_at,
-            expires_at: Some(peer_record.body.expires_at_unix),
-            reputation_score: None,
-            stake_status: None,
-            metadata_commitment: None,
-        })
-    }
-
-    pub fn owner_for_diagnostics(&self, mode: DiscoveryIdentityMode, raw: bool) -> String {
-        if raw || mode == DiscoveryIdentityMode::PublicWallet {
-            self.owner_daddr.clone()
-        } else {
-            "[redacted-dytallix-wallet]".to_string()
-        }
-    }
+    pub updated_at: u64,
+    pub expires_at: Option<u64>,
+    pub metadata_commitment_hex: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,89 +57,16 @@ pub enum RegistryDecision {
     Accepted,
     AcceptedWithoutRegistryPrivate,
     AcceptedWithoutRegistryDevelopment,
-    AcceptedRegistryUnavailablePrivate,
-    AcceptedRegistryUnavailableDevelopment,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RegistryDecisionSource {
-    RegistryRecord,
-    RegistryMissing,
-    RegistryUnavailable,
-    DevelopmentBypass,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum RegistryRejectionReason {
-    #[serde(rename = "rejected_missing_registry")]
-    RejectedMissingRegistry,
-    #[serde(rename = "rejected_revoked")]
-    RejectedRevoked,
-    #[serde(rename = "rejected_suspended")]
-    RejectedSuspended,
-    #[serde(rename = "rejected_key_mismatch")]
-    RejectedKeyMismatch,
-    #[serde(rename = "rejected_record_hash_mismatch")]
-    RejectedRecordHashMismatch,
-    #[serde(rename = "registry_unavailable")]
-    RegistryUnavailable,
-    #[serde(rename = "rejected_expired")]
-    RejectedExpired,
-    #[serde(rename = "rejected_peer_id_mismatch")]
-    RejectedPeerIdMismatch,
-    #[serde(rename = "rejected_signature_invalid")]
-    RejectedSignatureInvalid,
-}
-
-impl RegistryRejectionReason {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::RejectedMissingRegistry => "rejected_missing_registry",
-            Self::RejectedRevoked => "rejected_revoked",
-            Self::RejectedSuspended => "rejected_suspended",
-            Self::RejectedKeyMismatch => "rejected_key_mismatch",
-            Self::RejectedRecordHashMismatch => "rejected_record_hash_mismatch",
-            Self::RegistryUnavailable => "registry_unavailable",
-            Self::RejectedExpired => "rejected_expired",
-            Self::RejectedPeerIdMismatch => "rejected_peer_id_mismatch",
-            Self::RejectedSignatureInvalid => "rejected_signature_invalid",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RegistryVerificationError {
-    pub reason: RegistryRejectionReason,
-    pub source: RegistryDecisionSource,
-    pub detail: String,
-}
-
-impl RegistryVerificationError {
-    fn new(
-        reason: RegistryRejectionReason,
-        source: RegistryDecisionSource,
-        detail: impl Into<String>,
-    ) -> Self {
-        Self {
-            reason,
-            source,
-            detail: detail.into(),
-        }
-    }
-}
-
-impl fmt::Display for RegistryVerificationError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {}", self.reason.as_str(), self.detail)
-    }
-}
-
-impl std::error::Error for RegistryVerificationError {}
-
-impl From<RegistryVerificationError> for QlinkError {
-    fn from(value: RegistryVerificationError) -> Self {
-        QlinkError::Protocol(value.to_string())
-    }
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DytallixRegistryLookupConfig {
+    pub endpoint: String,
+    pub contract_address: String,
+    pub network_id: Option<String>,
+    pub chain_id: Option<String>,
+    pub allowed_rpc_endpoints: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -209,92 +74,26 @@ impl From<RegistryVerificationError> for QlinkError {
 pub struct DytallixRegistryConfig {
     pub endpoint: String,
     pub contract_address: String,
-    #[serde(default)]
-    pub keystore_path: Option<PathBuf>,
-    #[serde(default)]
+    pub keystore_path: PathBuf,
     pub wallet_name: Option<String>,
-    #[serde(default)]
-    pub network_id: Option<String>,
-    #[serde(default)]
-    pub chain_id: Option<String>,
-    #[serde(default)]
-    pub allowed_rpc_endpoints: Vec<String>,
 }
 
-impl DytallixRegistryConfig {
-    pub fn new(
-        endpoint: impl Into<String>,
-        contract_address: impl Into<String>,
-        keystore_path: Option<PathBuf>,
-        wallet_name: Option<String>,
-    ) -> Result<Self> {
-        let config = Self {
-            endpoint: endpoint.into(),
-            contract_address: normalize_contract_address(&contract_address.into())?,
-            keystore_path,
-            wallet_name,
-            network_id: None,
-            chain_id: None,
-            allowed_rpc_endpoints: Vec::new(),
-        };
-        config.validate_endpoint_allowlist()?;
-        Ok(config)
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistryContractMethod {
+    RegisterNode,
+    UpdateNode,
+    RevokeNode,
+    GetNode,
+}
 
-    pub fn public_testnet(contract_address: impl Into<String>) -> Result<Self> {
-        Self::new(
-            PUBLIC_TESTNET_ENDPOINT,
-            contract_address,
-            Some(Keystore::default_path()),
-            Some("quantumlink".to_string()),
-        )
-    }
-
-    pub fn lookup_only(
-        endpoint: impl Into<String>,
-        contract_address: impl Into<String>,
-    ) -> Result<Self> {
-        Self::new(endpoint, contract_address, None, None)
-    }
-
-    pub fn with_network_pins(
-        mut self,
-        network_id: Option<String>,
-        chain_id: Option<String>,
-        allowed_rpc_endpoints: Vec<String>,
-    ) -> Result<Self> {
-        self.network_id = normalize_optional_pin(network_id);
-        self.chain_id = normalize_optional_pin(chain_id);
-        self.allowed_rpc_endpoints = normalize_endpoint_allowlist(allowed_rpc_endpoints);
-        self.validate_endpoint_allowlist()?;
-        Ok(self)
-    }
-
-    pub fn wallet_keystore_path(&self) -> Result<PathBuf> {
-        self.keystore_path.clone().ok_or_else(|| {
-            QlinkError::Protocol(
-                "dytallix registry write requires keystorePath; lookup-only registry was configured"
-                    .into(),
-            )
-        })
-    }
-
-    fn validate_endpoint_allowlist(&self) -> Result<()> {
-        if self.allowed_rpc_endpoints.is_empty() {
-            return Ok(());
+impl RegistryContractMethod {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RegisterNode => "register_node",
+            Self::UpdateNode => "update_node",
+            Self::RevokeNode => "revoke_node",
+            Self::GetNode => "get_node",
         }
-        let endpoint = normalize_endpoint_pin(&self.endpoint);
-        if self
-            .allowed_rpc_endpoints
-            .iter()
-            .any(|allowed| normalize_endpoint_pin(allowed) == endpoint)
-        {
-            return Ok(());
-        }
-        Err(QlinkError::Protocol(format!(
-            "dytallix registry endpoint is not in the pinned allowlist: {}",
-            self.endpoint
-        )))
     }
 }
 
@@ -310,17 +109,13 @@ impl WalletAuthorization {
         record: &RegistryNodeRecord,
         keypair: &DytallixKeypair,
     ) -> Result<Self> {
-        Self::sign_payload(
-            &canonical_wallet_record_payload_bytes(method, record)?,
-            keypair,
-        )
+        let payload = canonical_wallet_record_payload_bytes(method, record)?;
+        Self::sign_payload(&payload, keypair)
     }
 
     pub fn sign_revoke(peer_id: &str, block_time: u64, keypair: &DytallixKeypair) -> Result<Self> {
-        Self::sign_payload(
-            &canonical_wallet_revoke_payload_bytes(peer_id, block_time)?,
-            keypair,
-        )
+        let payload = canonical_wallet_revoke_payload_bytes(peer_id, block_time)?;
+        Self::sign_payload(&payload, keypair)
     }
 
     fn sign_payload(payload: &[u8], keypair: &DytallixKeypair) -> Result<Self> {
@@ -353,6 +148,7 @@ impl DeviceBindingAuthorization {
                 "device keypair does not match peer record device public key".into(),
             ));
         }
+
         let payload = canonical_binding_payload_bytes(owner_daddr, peer_record)?;
         let signature = keypair.sign(&payload);
         Ok(Self {
@@ -370,6 +166,20 @@ pub struct RegisterNodeRequest {
     pub wallet_authorization: WalletAuthorization,
     #[serde(flatten)]
     pub device_binding_authorization: DeviceBindingAuthorization,
+}
+
+impl RegisterNodeRequest {
+    pub fn new(
+        record: RegistryNodeRecord,
+        wallet_authorization: WalletAuthorization,
+        device_binding_authorization: DeviceBindingAuthorization,
+    ) -> Self {
+        Self {
+            record,
+            wallet_authorization,
+            device_binding_authorization,
+        }
+    }
 }
 
 pub type UpdateNodeRequest = RegisterNodeRequest;
@@ -398,24 +208,7 @@ pub struct RegistryQueryResponse {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RegistryContractMethod {
-    RegisterNode,
-    UpdateNode,
-    RevokeNode,
-    GetNode,
-}
-
-impl RegistryContractMethod {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::RegisterNode => "register_node",
-            Self::UpdateNode => "update_node",
-            Self::RevokeNode => "revoke_node",
-            Self::GetNode => "get_node",
-        }
-    }
-}
+pub type RegistryContractResponse = RegistryQueryResponse;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncodedContractCall {
@@ -437,40 +230,464 @@ pub struct DytallixEnrollmentWallet {
     pub created_wallet: bool,
 }
 
-pub trait IdentityRegistryLookup: fmt::Debug + Send + Sync {
-    fn lookup_record<'a>(
-        &'a self,
-        peer_id: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<RegistryNodeRecord>>> + Send + 'a>>;
-}
-
-#[derive(Debug)]
-pub struct DytallixIdentityRegistry {
-    config: DytallixRegistryConfig,
-    http: reqwest::Client,
-}
-
-impl IdentityRegistryLookup for DytallixIdentityRegistry {
-    fn lookup_record<'a>(
-        &'a self,
-        peer_id: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<RegistryNodeRecord>>> + Send + 'a>> {
-        Box::pin(async move { self.lookup(peer_id).await })
+impl RegistryNodeRecord {
+    pub fn from_peer_record(
+        owner_daddr: impl Into<String>,
+        peer_record: &PeerRecord,
+        status: RegistryNodeStatus,
+        updated_at: u64,
+    ) -> Result<Self> {
+        let owner_daddr = owner_daddr.into();
+        Ok(Self {
+            peer_id: peer_record.body.peer_id.clone(),
+            owner_daddr: owner_daddr.clone(),
+            device_public_key_hash_hex: device_public_key_hash_hex(peer_record)?,
+            pqc_binding_hash_hex: pqc_binding_hash_hex(&owner_daddr, peer_record)?,
+            node_signing_public_key_hash_hex: node_signing_public_key_hash_hex(peer_record)?,
+            transport_public_key_hash_hex: transport_public_key_hash_hex(peer_record),
+            latest_peer_record_hash_hex: latest_peer_record_hash_hex(peer_record)?,
+            status,
+            reputation_score: 0,
+            stake_status: None,
+            updated_at,
+            expires_at: Some(peer_record.body.expires_at_unix),
+            metadata_commitment_hex: None,
+        })
     }
+}
+
+pub fn verify_registry_binding(
+    peer_record: &PeerRecord,
+    registry_record: Option<&RegistryNodeRecord>,
+    policy: MeshTrustPolicy,
+) -> Result<RegistryDecision> {
+    verify_peer_record_identity(peer_record)?;
+
+    let Some(registry_record) = registry_record else {
+        return match policy {
+            MeshTrustPolicy::PublicRequired => Err(QlinkError::Protocol(
+                "registry record required by public mesh trust policy".into(),
+            )),
+            MeshTrustPolicy::PrivatePreferred => {
+                Ok(RegistryDecision::AcceptedWithoutRegistryPrivate)
+            }
+            MeshTrustPolicy::DevelopmentOptional => {
+                Ok(RegistryDecision::AcceptedWithoutRegistryDevelopment)
+            }
+        };
+    };
+
+    if registry_record.status != RegistryNodeStatus::Active {
+        let status = match registry_record.status {
+            RegistryNodeStatus::Active => "active",
+            RegistryNodeStatus::Revoked => "revoked",
+            RegistryNodeStatus::Suspended => "suspended",
+        };
+        return Err(QlinkError::Protocol(format!("registry record is {status}")));
+    }
+    if registry_record
+        .expires_at
+        .is_some_and(|expires_at| expires_at <= now_unix())
+    {
+        return Err(QlinkError::Protocol(
+            "registry record has expired".to_string(),
+        ));
+    }
+
+    require_match(
+        "peer_id",
+        &registry_record.peer_id,
+        &peer_record.body.peer_id,
+    )?;
+    require_match(
+        "device_public_key_hash_hex",
+        &registry_record.device_public_key_hash_hex,
+        &device_public_key_hash_hex(peer_record)?,
+    )?;
+    require_match(
+        "latest_peer_record_hash_hex",
+        &registry_record.latest_peer_record_hash_hex,
+        &latest_peer_record_hash_hex(peer_record)?,
+    )?;
+    require_match(
+        "pqc_binding_hash_hex",
+        &registry_record.pqc_binding_hash_hex,
+        &pqc_binding_hash_hex(&registry_record.owner_daddr, peer_record)?,
+    )?;
+    require_match(
+        "node_signing_public_key_hash_hex",
+        &registry_record.node_signing_public_key_hash_hex,
+        &node_signing_public_key_hash_hex(peer_record)?,
+    )?;
+    require_match(
+        "transport_public_key_hash_hex",
+        &registry_record.transport_public_key_hash_hex,
+        &transport_public_key_hash_hex(peer_record),
+    )?;
+
+    Ok(RegistryDecision::Accepted)
+}
+
+pub fn verify_inbound_registry_assertion(
+    assertion: &InboundIdentityAssertion,
+    registry_record: Option<&RegistryNodeRecord>,
+    policy: MeshTrustPolicy,
+) -> Result<RegistryDecision> {
+    let Some(registry_record) = registry_record else {
+        return match policy {
+            MeshTrustPolicy::PublicRequired => Err(QlinkError::Protocol(
+                "registry record required by public mesh trust policy".into(),
+            )),
+            MeshTrustPolicy::PrivatePreferred => {
+                Ok(RegistryDecision::AcceptedWithoutRegistryPrivate)
+            }
+            MeshTrustPolicy::DevelopmentOptional => {
+                Ok(RegistryDecision::AcceptedWithoutRegistryDevelopment)
+            }
+        };
+    };
+
+    if registry_record.status != RegistryNodeStatus::Active {
+        let status = match registry_record.status {
+            RegistryNodeStatus::Active => "active",
+            RegistryNodeStatus::Revoked => "revoked",
+            RegistryNodeStatus::Suspended => "suspended",
+        };
+        return Err(QlinkError::Protocol(format!("registry record is {status}")));
+    }
+    if registry_record
+        .expires_at
+        .is_some_and(|expires_at| expires_at <= now_unix())
+    {
+        return Err(QlinkError::Protocol(
+            "registry record has expired".to_string(),
+        ));
+    }
+
+    require_match("peer_id", &registry_record.peer_id, &assertion.peer_id)?;
+    let assertion_key_hash =
+        device_public_key_hash_hex_from_public_key(&assertion.device_public_key)?;
+    require_match(
+        "device_public_key_hash_hex",
+        &registry_record.device_public_key_hash_hex,
+        &assertion_key_hash,
+    )?;
+    require_match(
+        "node_signing_public_key_hash_hex",
+        &registry_record.node_signing_public_key_hash_hex,
+        &assertion_key_hash,
+    )?;
+
+    Ok(RegistryDecision::Accepted)
+}
+
+pub fn device_public_key_hash_hex(peer_record: &PeerRecord) -> Result<String> {
+    device_public_key_hash_hex_from_public_key(&peer_record.body.device_public_key)
+}
+
+pub fn device_public_key_hash_hex_from_public_key(
+    device_public_key: &DevicePublicKey,
+) -> Result<String> {
+    let bytes = serde_json::to_vec(device_public_key)?;
+    Ok(sha256_hex(&bytes))
+}
+
+pub fn latest_peer_record_hash_hex(peer_record: &PeerRecord) -> Result<String> {
+    Ok(hex_encode(&peer_record.record_hash()?))
+}
+
+pub fn node_signing_public_key_hash_hex(peer_record: &PeerRecord) -> Result<String> {
+    device_public_key_hash_hex(peer_record)
+}
+
+pub fn transport_public_key_hash_hex(peer_record: &PeerRecord) -> String {
+    sha256_hex(&peer_record.body.device_certificate_der)
+}
+
+pub fn pqc_binding_hash_hex(owner_daddr: &str, peer_record: &PeerRecord) -> Result<String> {
+    Ok(sha256_hex(&canonical_binding_payload_bytes(
+        owner_daddr,
+        peer_record,
+    )?))
+}
+
+pub fn canonical_binding_payload_bytes(
+    owner_daddr: &str,
+    peer_record: &PeerRecord,
+) -> Result<Vec<u8>> {
+    let payload = CanonicalBindingPayload {
+        contract: "quantumlink-node-registry",
+        version: 1,
+        owner_daddr: owner_daddr.to_string(),
+        peer_id: peer_record.body.peer_id.clone(),
+        device_public_key_hash_hex: device_public_key_hash_hex(peer_record)?,
+        node_signing_public_key_hash_hex: node_signing_public_key_hash_hex(peer_record)?,
+        transport_public_key_hash_hex: transport_public_key_hash_hex(peer_record),
+        latest_peer_record_hash_hex: latest_peer_record_hash_hex(peer_record)?,
+    };
+    serde_json::to_vec(&payload).map_err(Into::into)
+}
+
+pub fn canonical_wallet_record_payload_bytes(
+    operation: RegistryContractMethod,
+    record: &RegistryNodeRecord,
+) -> Result<Vec<u8>> {
+    let payload = CanonicalWalletRecordPayload {
+        contract: REGISTRY_CONTRACT_NAME,
+        version: REGISTRY_CONTRACT_VERSION,
+        operation: operation.as_str(),
+        record,
+    };
+    serde_json::to_vec(&payload).map_err(Into::into)
+}
+
+pub fn canonical_wallet_revoke_payload_bytes(peer_id: &str, block_time: u64) -> Result<Vec<u8>> {
+    let payload = CanonicalWalletRevokePayload {
+        contract: REGISTRY_CONTRACT_NAME,
+        version: REGISTRY_CONTRACT_VERSION,
+        operation: RegistryContractMethod::RevokeNode.as_str(),
+        peer_id,
+        block_time,
+    };
+    serde_json::to_vec(&payload).map_err(Into::into)
+}
+
+pub fn encode_contract_args<T: Serialize>(request: &T) -> Result<String> {
+    let bytes = serde_json::to_vec(request)?;
+    Ok(hex::encode(bytes))
+}
+
+pub fn encode_contract_call_args<T: Serialize>(
+    method: RegistryContractMethod,
+    request: &T,
+) -> Result<EncodedContractCall> {
+    Ok(EncodedContractCall {
+        method: method.as_str(),
+        args_hex: encode_contract_args(request)?,
+    })
+}
+
+impl DytallixRegistryConfig {
+    pub fn new(
+        endpoint: impl Into<String>,
+        contract_address: impl Into<String>,
+        keystore_path: impl Into<PathBuf>,
+        wallet_name: Option<String>,
+    ) -> Result<Self> {
+        Ok(Self {
+            endpoint: endpoint.into(),
+            contract_address: normalize_contract_address(&contract_address.into())?,
+            keystore_path: keystore_path.into(),
+            wallet_name,
+        })
+    }
+}
+
+impl DytallixRegistryLookupConfig {
+    pub fn new(endpoint: impl Into<String>, contract_address: impl Into<String>) -> Result<Self> {
+        Ok(Self {
+            endpoint: endpoint.into(),
+            contract_address: normalize_contract_address(&contract_address.into())?,
+            network_id: None,
+            chain_id: None,
+            allowed_rpc_endpoints: Vec::new(),
+        })
+    }
+
+    pub fn with_network_pins(
+        mut self,
+        network_id: Option<String>,
+        chain_id: Option<String>,
+        allowed_rpc_endpoints: Vec<String>,
+    ) -> Result<Self> {
+        self.network_id = normalize_optional_pin(network_id);
+        self.chain_id = normalize_optional_pin(chain_id);
+        self.allowed_rpc_endpoints = normalize_endpoint_allowlist(allowed_rpc_endpoints);
+        self.validate_endpoint_allowlist()?;
+        Ok(self)
+    }
+
+    fn validate_endpoint_allowlist(&self) -> Result<()> {
+        if self.allowed_rpc_endpoints.is_empty() {
+            return Ok(());
+        }
+        let endpoint = normalize_endpoint_pin(&self.endpoint);
+        if self
+            .allowed_rpc_endpoints
+            .iter()
+            .any(|allowed| normalize_endpoint_pin(allowed) == endpoint)
+        {
+            return Ok(());
+        }
+        Err(QlinkError::Protocol(format!(
+            "dytallix registry endpoint is not in the pinned allowlist: {}",
+            self.endpoint
+        )))
+    }
+}
+
+fn normalize_optional_pin(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn normalize_endpoint_allowlist(endpoints: Vec<String>) -> Vec<String> {
+    endpoints
+        .into_iter()
+        .filter_map(|endpoint| normalize_optional_pin(Some(endpoint)))
+        .collect()
+}
+
+fn normalize_endpoint_pin(endpoint: &str) -> String {
+    endpoint.trim().trim_end_matches('/').to_ascii_lowercase()
+}
+
+pub fn ensure_dytallix_enrollment_wallet(
+    config: &DytallixRegistryConfig,
+) -> Result<DytallixEnrollmentWallet> {
+    let mut keystore =
+        Keystore::open_or_create(config.keystore_path.clone()).map_err(dytallix_sdk_error)?;
+    let mut created_wallet = false;
+    let wallet_name = match config.wallet_name.as_deref() {
+        Some(name) => {
+            if !keystore.list().iter().any(|entry| entry.name == name) {
+                let keypair = DytallixKeypair::generate();
+                keystore
+                    .add_keypair(&keypair, name)
+                    .map_err(dytallix_sdk_error)?;
+                created_wallet = true;
+            }
+            keystore.set_active(name).map_err(dytallix_sdk_error)?;
+            name.to_owned()
+        }
+        None => {
+            if let Some(active) = keystore.active() {
+                active.name.clone()
+            } else {
+                let name = "quantumlink";
+                if !keystore.list().iter().any(|entry| entry.name == name) {
+                    let keypair = DytallixKeypair::generate();
+                    keystore
+                        .add_keypair(&keypair, name)
+                        .map_err(dytallix_sdk_error)?;
+                    created_wallet = true;
+                }
+                keystore.set_active(name).map_err(dytallix_sdk_error)?;
+                name.to_owned()
+            }
+        }
+    };
+    keystore.save().map_err(dytallix_sdk_error)?;
+    harden_keystore_permissions(&config.keystore_path)?;
+    let wallet = keystore
+        .get_keypair(&wallet_name)
+        .map_err(dytallix_sdk_error)?;
+    let wallet_address = DAddr::from_public_key(wallet.public_key())
+        .map_err(|err| {
+            QlinkError::InvalidKey(format!("dytallix address derivation failed: {err}"))
+        })?
+        .to_string();
+
+    Ok(DytallixEnrollmentWallet {
+        keystore_path: config.keystore_path.clone(),
+        wallet_name,
+        wallet_address,
+        created_wallet,
+    })
+}
+
+#[cfg(unix)]
+fn harden_keystore_permissions(path: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = std::fs::metadata(path)
+        .map_err(|err| QlinkError::Protocol(format!("failed to inspect Dytallix keystore: {err}")))?
+        .permissions();
+    permissions.set_mode(0o600);
+    std::fs::set_permissions(path, permissions).map_err(|err| {
+        QlinkError::Protocol(format!(
+            "failed to harden Dytallix keystore permissions: {err}"
+        ))
+    })
+}
+
+#[cfg(not(unix))]
+fn harden_keystore_permissions(_path: &std::path::Path) -> Result<()> {
+    Ok(())
+}
+
+impl<'de> Deserialize<'de> for DytallixRegistryLookupConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct RawLookupConfig {
+            endpoint: String,
+            contract_address: String,
+            #[serde(default)]
+            publish_wallet_address: bool,
+            #[serde(default)]
+            network_id: Option<String>,
+            #[serde(default)]
+            chain_id: Option<String>,
+            #[serde(default)]
+            allowed_rpc_endpoints: Vec<String>,
+        }
+
+        let raw = RawLookupConfig::deserialize(deserializer)?;
+        let _ = raw.publish_wallet_address;
+        Self::new(raw.endpoint, raw.contract_address)
+            .and_then(|config| {
+                config.with_network_pins(raw.network_id, raw.chain_id, raw.allowed_rpc_endpoints)
+            })
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+pub struct DytallixIdentityRegistry {
+    lookup_config: DytallixRegistryLookupConfig,
+    write_config: Option<DytallixRegistryConfig>,
+    http: reqwest::Client,
 }
 
 impl DytallixIdentityRegistry {
     pub fn new(mut config: DytallixRegistryConfig) -> Result<Self> {
         config.contract_address = normalize_contract_address(&config.contract_address)?;
-        config.validate_endpoint_allowlist()?;
+        let lookup_config = DytallixRegistryLookupConfig {
+            endpoint: config.endpoint.clone(),
+            contract_address: config.contract_address.clone(),
+            network_id: None,
+            chain_id: None,
+            allowed_rpc_endpoints: Vec::new(),
+        };
+        Self::build(lookup_config, Some(config))
+    }
+
+    pub fn from_lookup_config(mut config: DytallixRegistryLookupConfig) -> Result<Self> {
+        config.contract_address = normalize_contract_address(&config.contract_address)?;
+        Self::build(config, None)
+    }
+
+    fn build(
+        lookup_config: DytallixRegistryLookupConfig,
+        write_config: Option<DytallixRegistryConfig>,
+    ) -> Result<Self> {
         let http = reqwest::Client::builder()
             .build()
             .map_err(|err| QlinkError::Protocol(format!("dytallix HTTP client failed: {err}")))?;
-        Ok(Self { config, http })
-    }
-
-    pub fn config(&self) -> &DytallixRegistryConfig {
-        &self.config
+        Ok(Self {
+            lookup_config,
+            write_config,
+            http,
+        })
     }
 
     pub async fn lookup(&self, peer_id: &str) -> Result<Option<RegistryNodeRecord>> {
@@ -480,7 +697,7 @@ impl DytallixIdentityRegistry {
         let call = encode_contract_call_args(RegistryContractMethod::GetNode, &request)?;
         let path = format!(
             "/api/contracts/{}/query/{}?args={}",
-            self.config.contract_address, call.method, call.args_hex
+            self.lookup_config.contract_address, call.method, call.args_hex
         );
         let response = decode_registry_query_response(self.get_json(&path).await?)?;
         if response.ok {
@@ -493,10 +710,6 @@ impl DytallixIdentityRegistry {
                     .unwrap_or_else(|| "unknown contract error".into())
             )))
         }
-    }
-
-    pub async fn status(&self, peer_id: &str) -> Result<Option<RegistryNodeRecord>> {
-        self.lookup(peer_id).await
     }
 
     pub async fn register(
@@ -531,11 +744,11 @@ impl DytallixIdentityRegistry {
 
     pub async fn revoke(&self, peer_id: &str, block_time: u64) -> Result<RegistrySubmission> {
         let wallet = self.load_wallet_keypair()?;
-        let wallet_authorization = WalletAuthorization::sign_revoke(peer_id, block_time, &wallet)?;
+        let wallet_auth = WalletAuthorization::sign_revoke(peer_id, block_time, &wallet)?;
         let request = RevokeNodeRequest {
             peer_id: peer_id.to_owned(),
             block_time,
-            wallet_authorization,
+            wallet_authorization: wallet_auth,
         };
         self.submit_contract_request(RegistryContractMethod::RevokeNode, &request, &wallet)
             .await
@@ -560,14 +773,10 @@ impl DytallixIdentityRegistry {
             RegistryNodeStatus::Active,
             updated_at,
         )?;
-        let wallet_authorization = WalletAuthorization::sign_record(method, &record, &wallet)?;
-        let device_binding_authorization =
-            DeviceBindingAuthorization::sign(&owner, peer_record, device_keypair)?;
-        let request = RegisterNodeRequest {
-            record,
-            wallet_authorization,
-            device_binding_authorization,
-        };
+        let wallet_auth = WalletAuthorization::sign_record(method, &record, &wallet)?;
+        let device_auth = DeviceBindingAuthorization::sign(&owner, peer_record, device_keypair)?;
+        let request = RegisterNodeRequest::new(record, wallet_auth, device_auth);
+
         self.submit_contract_request(method, &request, &wallet)
             .await
     }
@@ -579,15 +788,17 @@ impl DytallixIdentityRegistry {
         wallet: &DytallixKeypair,
     ) -> Result<RegistrySubmission> {
         let call = encode_contract_call_args(method, request)?;
+        let args_hex = call.args_hex.clone();
         let signed = self
-            .sign_contract_call(method, call.args_hex.clone(), wallet)
+            .sign_contract_call(method, args_hex.clone(), wallet)
             .await?;
-        let body = serde_json::json!({
-            "signed_tx": signed,
-            "address": self.config.contract_address,
-            "method": method.as_str(),
-            "args": call.args_hex,
-        });
+        let write_config = self.write_config()?;
+        let body = contract_call_submission_body(
+            method,
+            &write_config.contract_address,
+            args_hex,
+            &signed,
+        )?;
         let response = self.post_json_value("/contracts/call", &body).await?;
         validate_registry_submission_response(&response)?;
         let tx_hash = response
@@ -604,7 +815,8 @@ impl DytallixIdentityRegistry {
         args_hex: String,
         wallet: &DytallixKeypair,
     ) -> Result<dytallix_sdk::transaction::SignedTransaction> {
-        let client = DytallixClient::new(&self.config.endpoint)
+        let write_config = self.write_config()?;
+        let client = DytallixClient::new(&write_config.endpoint)
             .await
             .map_err(dytallix_sdk_error)?;
         let from = DAddr::from_public_key(wallet.public_key()).map_err(|err| {
@@ -620,19 +832,15 @@ impl DytallixIdentityRegistry {
             .map_err(dytallix_sdk_error)?;
         let message = Message::ContractCall {
             from: from.to_string(),
-            address: self.config.contract_address.clone(),
-            method: method.as_str().to_string(),
+            address: write_config.contract_address.clone(),
+            method: method.as_str().to_owned(),
             args: Some(args_hex),
             gas_limit: CONTRACT_CALL_GAS_LIMIT,
         };
         let (c_gas_limit, b_gas_limit) =
             estimate_default_gas_limits(std::slice::from_ref(&message));
         let tx = Transaction {
-            chain_id: self
-                .config
-                .chain_id
-                .clone()
-                .unwrap_or(chain_status.finalized_checkpoint),
+            chain_id: chain_status.finalized_checkpoint,
             nonce: account.nonce,
             msgs: vec![message],
             fee: 0,
@@ -647,9 +855,10 @@ impl DytallixIdentityRegistry {
     }
 
     fn load_wallet_keypair(&self) -> Result<DytallixKeypair> {
-        let keystore_path = self.config.wallet_keystore_path()?;
-        let keystore = Keystore::open(keystore_path).map_err(dytallix_sdk_error)?;
-        let wallet_name = if let Some(name) = self.config.wallet_name.as_deref() {
+        let write_config = self.write_config()?;
+        let keystore =
+            Keystore::open(write_config.keystore_path.clone()).map_err(dytallix_sdk_error)?;
+        let wallet_name = if let Some(name) = write_config.wallet_name.as_deref() {
             name.to_owned()
         } else {
             keystore
@@ -662,6 +871,15 @@ impl DytallixIdentityRegistry {
         keystore
             .get_keypair(&wallet_name)
             .map_err(dytallix_sdk_error)
+    }
+
+    fn write_config(&self) -> Result<&DytallixRegistryConfig> {
+        self.write_config.as_ref().ok_or_else(|| {
+            QlinkError::Protocol(
+                "dytallix registry write requires wallet configuration; lookup-only registry was configured"
+                    .into(),
+            )
+        })
     }
 
     async fn get_json<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T> {
@@ -711,424 +929,61 @@ impl DytallixIdentityRegistry {
         }
     }
 
-    fn url(&self, path: &str) -> Result<reqwest::Url> {
-        let endpoint = self.config.endpoint.trim_end_matches('/');
+    fn url(&self, path: &str) -> Result<Url> {
+        let endpoint = self.lookup_config.endpoint.trim_end_matches('/');
         let path = if path.starts_with('/') {
             path.to_owned()
         } else {
             format!("/{path}")
         };
-        reqwest::Url::parse(&format!("{endpoint}{path}"))
+        Url::parse(&format!("{endpoint}{path}"))
             .map_err(|err| QlinkError::Protocol(format!("invalid dytallix endpoint URL: {err}")))
     }
 }
 
-pub fn verify_registry_binding(
-    peer_record: &PeerRecord,
-    registry_record: Option<&RegistryNodeRecord>,
-    policy: MeshTrustPolicy,
-) -> std::result::Result<RegistryDecision, RegistryVerificationError> {
-    verify_peer_record_identity(peer_record)?;
-
-    let Some(registry_record) = registry_record else {
-        return match policy {
-            MeshTrustPolicy::PublicRequired => Err(RegistryVerificationError::new(
-                RegistryRejectionReason::RejectedMissingRegistry,
-                RegistryDecisionSource::RegistryMissing,
-                "registry record required by public mesh trust policy",
-            )),
-            MeshTrustPolicy::PrivatePreferred => {
-                Ok(RegistryDecision::AcceptedWithoutRegistryPrivate)
-            }
-            MeshTrustPolicy::DevelopmentOptional => {
-                Ok(RegistryDecision::AcceptedWithoutRegistryDevelopment)
-            }
-        };
-    };
-
-    verify_registry_record_status(registry_record)?;
-
-    if registry_record.peer_id != peer_record.body.peer_id {
-        return Err(RegistryVerificationError::new(
-            RegistryRejectionReason::RejectedPeerIdMismatch,
-            RegistryDecisionSource::RegistryRecord,
-            "peer_id mismatch",
-        ));
-    }
-    if registry_record.device_public_key_hash != device_public_key_hash(peer_record)? {
-        return Err(RegistryVerificationError::new(
-            RegistryRejectionReason::RejectedKeyMismatch,
-            RegistryDecisionSource::RegistryRecord,
-            "device_public_key_hash mismatch",
-        ));
-    }
-    if registry_record.latest_peer_record_hash != latest_peer_record_hash(peer_record)? {
-        return Err(RegistryVerificationError::new(
-            RegistryRejectionReason::RejectedRecordHashMismatch,
-            RegistryDecisionSource::RegistryRecord,
-            "latest_peer_record_hash mismatch",
-        ));
-    }
-
-    Ok(RegistryDecision::Accepted)
+#[derive(Serialize)]
+struct CanonicalBindingPayload {
+    contract: &'static str,
+    version: u8,
+    owner_daddr: String,
+    peer_id: String,
+    device_public_key_hash_hex: String,
+    node_signing_public_key_hash_hex: String,
+    transport_public_key_hash_hex: String,
+    latest_peer_record_hash_hex: String,
 }
 
-pub fn verify_inbound_registry_assertion(
-    assertion: &InboundIdentityAssertion,
-    registry_record: Option<&RegistryNodeRecord>,
-    policy: MeshTrustPolicy,
-) -> std::result::Result<RegistryDecision, RegistryVerificationError> {
-    let Some(registry_record) = registry_record else {
-        return match policy {
-            MeshTrustPolicy::PublicRequired => Err(RegistryVerificationError::new(
-                RegistryRejectionReason::RejectedMissingRegistry,
-                RegistryDecisionSource::RegistryMissing,
-                "no dytallix registry record for inbound identity assertion",
-            )),
-            MeshTrustPolicy::PrivatePreferred => {
-                Ok(RegistryDecision::AcceptedWithoutRegistryPrivate)
-            }
-            MeshTrustPolicy::DevelopmentOptional => {
-                Ok(RegistryDecision::AcceptedWithoutRegistryDevelopment)
-            }
-        };
-    };
-
-    verify_registry_record_status(registry_record)?;
-
-    if registry_record.peer_id != assertion.peer_id {
-        return Err(RegistryVerificationError::new(
-            RegistryRejectionReason::RejectedPeerIdMismatch,
-            RegistryDecisionSource::RegistryRecord,
-            "peer_id mismatch",
-        ));
-    }
-    if registry_record.device_public_key_hash
-        != device_public_key_hash_from_public_key(&assertion.device_public_key)?
-    {
-        return Err(RegistryVerificationError::new(
-            RegistryRejectionReason::RejectedKeyMismatch,
-            RegistryDecisionSource::RegistryRecord,
-            "device_public_key_hash mismatch",
-        ));
-    }
-
-    Ok(RegistryDecision::Accepted)
+#[derive(Serialize)]
+struct CanonicalWalletRecordPayload<'a> {
+    contract: &'static str,
+    version: u8,
+    operation: &'static str,
+    record: &'a RegistryNodeRecord,
 }
 
-fn verify_registry_record_status(
-    registry_record: &RegistryNodeRecord,
-) -> std::result::Result<(), RegistryVerificationError> {
-    match registry_record.status {
-        RegistryNodeStatus::Active => {}
-        RegistryNodeStatus::Revoked => {
-            return Err(RegistryVerificationError::new(
-                RegistryRejectionReason::RejectedRevoked,
-                RegistryDecisionSource::RegistryRecord,
-                "registry record is revoked",
-            ));
-        }
-        RegistryNodeStatus::Suspended => {
-            return Err(RegistryVerificationError::new(
-                RegistryRejectionReason::RejectedSuspended,
-                RegistryDecisionSource::RegistryRecord,
-                "registry record is suspended",
-            ));
-        }
-    }
-
-    if registry_record
-        .expires_at
-        .is_some_and(|expires_at| expires_at <= now_unix())
-    {
-        return Err(RegistryVerificationError::new(
-            RegistryRejectionReason::RejectedExpired,
-            RegistryDecisionSource::RegistryRecord,
-            "registry record has expired",
-        ));
-    }
-
-    Ok(())
+#[derive(Serialize)]
+struct CanonicalWalletRevokePayload<'a> {
+    contract: &'static str,
+    version: u8,
+    operation: &'static str,
+    peer_id: &'a str,
+    block_time: u64,
 }
 
-pub fn registry_unavailable_decision(
-    policy: MeshTrustPolicy,
-) -> std::result::Result<RegistryDecision, RegistryVerificationError> {
-    match policy {
-        MeshTrustPolicy::PublicRequired => Err(RegistryVerificationError::new(
-            RegistryRejectionReason::RegistryUnavailable,
-            RegistryDecisionSource::RegistryUnavailable,
-            "dytallix registry unavailable under public mesh trust policy",
-        )),
-        MeshTrustPolicy::PrivatePreferred => {
-            Ok(RegistryDecision::AcceptedRegistryUnavailablePrivate)
-        }
-        MeshTrustPolicy::DevelopmentOptional => {
-            Ok(RegistryDecision::AcceptedRegistryUnavailableDevelopment)
-        }
-    }
-}
-
-pub async fn verify_with_registry(
-    peer_record: &PeerRecord,
-    registry: Option<&dyn IdentityRegistryLookup>,
-    policy: MeshTrustPolicy,
-) -> std::result::Result<RegistryDecision, RegistryVerificationError> {
-    if policy == MeshTrustPolicy::DevelopmentOptional && registry.is_none() {
-        return verify_registry_binding(peer_record, None, policy);
-    }
-
-    let Some(registry) = registry else {
-        return verify_registry_binding(peer_record, None, policy);
-    };
-
-    match registry.lookup_record(&peer_record.body.peer_id).await {
-        Ok(record) => verify_registry_binding(peer_record, record.as_ref(), policy),
-        Err(error) => {
-            tracing::warn!(%error, "dytallix registry lookup failed");
-            registry_unavailable_decision(policy)
-        }
-    }
-}
-
-pub fn device_public_key_hash(
-    peer_record: &PeerRecord,
-) -> std::result::Result<[u8; 32], RegistryVerificationError> {
-    device_public_key_hash_from_public_key(&peer_record.body.device_public_key)
-}
-
-pub fn device_public_key_hash_from_public_key(
-    device_public_key: &DevicePublicKey,
-) -> std::result::Result<[u8; 32], RegistryVerificationError> {
-    let bytes = serde_json::to_vec(device_public_key).map_err(|err| {
-        RegistryVerificationError::new(
-            RegistryRejectionReason::RejectedSignatureInvalid,
-            RegistryDecisionSource::RegistryRecord,
-            format!("device public key serialization failed: {err}"),
-        )
-    })?;
-    Ok(Sha256::digest(bytes).into())
-}
-
-pub fn latest_peer_record_hash(
-    peer_record: &PeerRecord,
-) -> std::result::Result<[u8; 32], RegistryVerificationError> {
-    peer_record.record_hash().map_err(|err| {
-        RegistryVerificationError::new(
-            RegistryRejectionReason::RejectedSignatureInvalid,
-            RegistryDecisionSource::RegistryRecord,
-            format!("peer record hash failed: {err}"),
-        )
-    })
-}
-
-pub fn canonical_binding_payload_bytes(
-    owner_daddr: &str,
-    peer_record: &PeerRecord,
-) -> Result<Vec<u8>> {
-    #[derive(Serialize)]
-    struct Payload {
-        contract: &'static str,
-        version: u8,
-        owner_daddr: String,
-        peer_id: String,
-        device_public_key_hash: String,
-        latest_peer_record_hash: String,
-    }
-
-    let payload = Payload {
-        contract: REGISTRY_CONTRACT_NAME,
-        version: REGISTRY_CONTRACT_VERSION,
-        owner_daddr: owner_daddr.to_string(),
-        peer_id: peer_record.body.peer_id.clone(),
-        device_public_key_hash: hex::encode(
-            device_public_key_hash(peer_record).map_err(QlinkError::from)?,
-        ),
-        latest_peer_record_hash: hex::encode(
-            latest_peer_record_hash(peer_record).map_err(QlinkError::from)?,
-        ),
-    };
-    serde_json::to_vec(&payload).map_err(Into::into)
-}
-
-pub fn canonical_wallet_record_payload_bytes(
-    operation: RegistryContractMethod,
-    record: &RegistryNodeRecord,
-) -> Result<Vec<u8>> {
-    #[derive(Serialize)]
-    struct Payload<'a> {
-        contract: &'static str,
-        version: u8,
-        operation: &'static str,
-        record: &'a RegistryNodeRecord,
-    }
-    serde_json::to_vec(&Payload {
-        contract: REGISTRY_CONTRACT_NAME,
-        version: REGISTRY_CONTRACT_VERSION,
-        operation: operation.as_str(),
-        record,
-    })
-    .map_err(Into::into)
-}
-
-pub fn canonical_wallet_revoke_payload_bytes(peer_id: &str, block_time: u64) -> Result<Vec<u8>> {
-    #[derive(Serialize)]
-    struct Payload<'a> {
-        contract: &'static str,
-        version: u8,
-        operation: &'static str,
-        peer_id: &'a str,
-        block_time: u64,
-    }
-    serde_json::to_vec(&Payload {
-        contract: REGISTRY_CONTRACT_NAME,
-        version: REGISTRY_CONTRACT_VERSION,
-        operation: RegistryContractMethod::RevokeNode.as_str(),
-        peer_id,
-        block_time,
-    })
-    .map_err(Into::into)
-}
-
-pub fn encode_contract_args<T: Serialize>(request: &T) -> Result<String> {
-    Ok(hex::encode(serde_json::to_vec(request)?))
-}
-
-pub fn encode_contract_call_args<T: Serialize>(
-    method: RegistryContractMethod,
-    request: &T,
-) -> Result<EncodedContractCall> {
-    Ok(EncodedContractCall {
-        method: method.as_str(),
-        args_hex: encode_contract_args(request)?,
-    })
-}
-
-pub fn decode_registry_query_response(value: serde_json::Value) -> Result<RegistryQueryResponse> {
-    if let Some(result_hex) = value.get("result").and_then(|raw| raw.as_str()) {
-        let bytes = hex::decode(result_hex).map_err(|err| {
-            QlinkError::Protocol(format!("dytallix registry result is not valid hex: {err}"))
-        })?;
-        return serde_json::from_slice(&bytes).map_err(|err| {
-            QlinkError::Protocol(format!(
-                "dytallix registry result is not valid contract JSON: {err}"
-            ))
-        });
-    }
-    serde_json::from_value(value).map_err(|err| {
-        QlinkError::Protocol(format!(
-            "dytallix registry response is not valid JSON: {err}"
-        ))
-    })
-}
-
-pub fn validate_registry_submission_response(value: &serde_json::Value) -> Result<()> {
-    if value.get("result").is_none() && value.get("ok").is_none() {
-        return Ok(());
-    }
-    let contract_response = decode_registry_query_response(value.clone())?;
-    if contract_response.ok {
-        Ok(())
-    } else {
-        Err(QlinkError::Protocol(format!(
-            "dytallix registry contract rejected request: {}",
-            contract_response
-                .error
-                .unwrap_or_else(|| "unknown contract error".to_string())
-        )))
-    }
-}
-
-pub fn ensure_dytallix_enrollment_wallet(
-    config: &DytallixRegistryConfig,
-) -> Result<DytallixEnrollmentWallet> {
-    let keystore_path = config.wallet_keystore_path()?;
-    let mut keystore =
-        Keystore::open_or_create(keystore_path.clone()).map_err(dytallix_sdk_error)?;
-    let mut created_wallet = false;
-    let wallet_name = match config.wallet_name.as_deref() {
-        Some(name) => {
-            if !keystore.list().iter().any(|entry| entry.name == name) {
-                let keypair = DytallixKeypair::generate();
-                keystore
-                    .add_keypair(&keypair, name)
-                    .map_err(dytallix_sdk_error)?;
-                created_wallet = true;
-            }
-            keystore.set_active(name).map_err(dytallix_sdk_error)?;
-            name.to_string()
-        }
-        None => {
-            if let Some(active) = keystore.active() {
-                active.name.clone()
-            } else {
-                let name = "quantumlink";
-                let keypair = DytallixKeypair::generate();
-                keystore
-                    .add_keypair(&keypair, name)
-                    .map_err(dytallix_sdk_error)?;
-                keystore.set_active(name).map_err(dytallix_sdk_error)?;
-                created_wallet = true;
-                name.to_string()
-            }
-        }
-    };
-    keystore.save().map_err(dytallix_sdk_error)?;
-    harden_keystore_permissions(&keystore_path)?;
-    let wallet = keystore
-        .get_keypair(&wallet_name)
-        .map_err(dytallix_sdk_error)?;
-    let wallet_address = DAddr::from_public_key(wallet.public_key())
-        .map_err(|err| {
-            QlinkError::InvalidKey(format!("dytallix address derivation failed: {err}"))
-        })?
-        .to_string();
-
-    Ok(DytallixEnrollmentWallet {
-        keystore_path,
-        wallet_name,
-        wallet_address,
-        created_wallet,
-    })
-}
-
-fn verify_peer_record_identity(
-    peer_record: &PeerRecord,
-) -> std::result::Result<(), RegistryVerificationError> {
+fn verify_peer_record_identity(peer_record: &PeerRecord) -> Result<()> {
     if peer_record.body.device_public_key.peer_id() != peer_record.body.peer_id {
-        return Err(RegistryVerificationError::new(
-            RegistryRejectionReason::RejectedPeerIdMismatch,
-            RegistryDecisionSource::RegistryRecord,
-            "peer_id does not match device public key",
+        return Err(QlinkError::Protocol(
+            "peer_id does not match device public key".into(),
         ));
     }
     if peer_record.body.expires_at_unix <= now_unix() {
-        return Err(RegistryVerificationError::new(
-            RegistryRejectionReason::RejectedExpired,
-            RegistryDecisionSource::RegistryRecord,
-            "peer record has expired",
-        ));
+        return Err(QlinkError::RecordExpired);
     }
+
     peer_record
         .body
         .device_public_key
-        .verify(
-            &peer_record.body.canonical_bytes().map_err(|err| {
-                RegistryVerificationError::new(
-                    RegistryRejectionReason::RejectedSignatureInvalid,
-                    RegistryDecisionSource::RegistryRecord,
-                    format!("peer record canonicalization failed: {err}"),
-                )
-            })?,
-            &peer_record.signature,
-        )
-        .map_err(|err| {
-            RegistryVerificationError::new(
-                RegistryRejectionReason::RejectedSignatureInvalid,
-                RegistryDecisionSource::RegistryRecord,
-                err.to_string(),
-            )
-        })
+        .verify(&peer_record.body.canonical_bytes()?, &peer_record.signature)
 }
 
 fn normalize_contract_address(raw: &str) -> Result<String> {
@@ -1142,50 +997,81 @@ fn normalize_contract_address(raw: &str) -> Result<String> {
     Ok(format!("0x{hex}"))
 }
 
-fn normalize_optional_pin(value: Option<String>) -> Option<String> {
-    value.and_then(|value| {
-        let trimmed = value.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        }
-    })
-}
-
-fn normalize_endpoint_allowlist(endpoints: Vec<String>) -> Vec<String> {
-    endpoints
-        .into_iter()
-        .filter_map(|endpoint| normalize_optional_pin(Some(endpoint)))
-        .collect()
-}
-
-fn normalize_endpoint_pin(endpoint: &str) -> String {
-    endpoint.trim().trim_end_matches('/').to_ascii_lowercase()
+fn require_match(field: &str, actual: &str, expected: &str) -> Result<()> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(QlinkError::Protocol(format!("{field} mismatch")))
+    }
 }
 
 fn dytallix_sdk_error(err: impl fmt::Display) -> QlinkError {
     QlinkError::Protocol(format!("dytallix SDK error: {err}"))
 }
 
-#[cfg(unix)]
-fn harden_keystore_permissions(path: &std::path::Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+fn contract_call_submission_body<T: Serialize>(
+    method: RegistryContractMethod,
+    contract_address: &str,
+    args_hex: String,
+    signed_tx: &T,
+) -> Result<serde_json::Value> {
+    Ok(serde_json::json!({
+        "signed_tx": serde_json::to_value(signed_tx)?,
+        "address": contract_address,
+        "method": method.as_str(),
+        "args": args_hex,
+    }))
+}
 
-    let mut permissions = std::fs::metadata(path)
-        .map_err(|err| QlinkError::Protocol(format!("failed to inspect Dytallix keystore: {err}")))?
-        .permissions();
-    permissions.set_mode(0o600);
-    std::fs::set_permissions(path, permissions).map_err(|err| {
+fn decode_registry_query_response(value: serde_json::Value) -> Result<RegistryQueryResponse> {
+    if let Some(result_hex) = value.get("result").and_then(|raw| raw.as_str()) {
+        let bytes = hex::decode(result_hex).map_err(|err| {
+            QlinkError::Protocol(format!("dytallix registry result is not valid hex: {err}"))
+        })?;
+        return serde_json::from_slice(&bytes).map_err(|err| {
+            QlinkError::Protocol(format!(
+                "dytallix registry result is not valid contract JSON: {err}"
+            ))
+        });
+    }
+
+    serde_json::from_value(value).map_err(|err| {
         QlinkError::Protocol(format!(
-            "failed to harden Dytallix keystore permissions: {err}"
+            "dytallix registry response is not valid JSON: {err}"
         ))
     })
 }
 
-#[cfg(not(unix))]
-fn harden_keystore_permissions(_path: &std::path::Path) -> Result<()> {
-    Ok(())
+fn validate_registry_submission_response(value: &serde_json::Value) -> Result<()> {
+    if value.get("result").is_none() && value.get("ok").is_none() {
+        return Ok(());
+    }
+
+    let contract_response = decode_registry_query_response(value.clone())?;
+    if contract_response.ok {
+        return Ok(());
+    }
+
+    Err(QlinkError::Protocol(format!(
+        "dytallix registry contract rejected request: {}",
+        contract_response
+            .error
+            .unwrap_or_else(|| "unknown contract error".to_string())
+    )))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex_encode(&Sha256::digest(bytes))
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
 }
 
 #[cfg(test)]
@@ -1194,10 +1080,11 @@ mod tests {
     use crate::{
         crypto::DeviceKeypair,
         discovery::{CandidateEndpoint, CandidateType, PeerRecord, UnsignedPeerRecord},
-        error::QlinkError,
     };
+    use dytallix_core::{address::DAddr, keypair::DytallixKeypair, signature::verify_mldsa65};
+    use serde_json::json;
 
-    fn signed_peer_record() -> PeerRecord {
+    fn fresh_peer_record() -> PeerRecord {
         let keypair = DeviceKeypair::generate().unwrap();
         let body = UnsignedPeerRecord::new(
             "dytallix-mesh",
@@ -1217,20 +1104,540 @@ mod tests {
         PeerRecord::signed(body, &keypair).unwrap()
     }
 
-    fn active_record(peer_record: &PeerRecord) -> RegistryNodeRecord {
+    fn active_registry_record(peer_record: &PeerRecord) -> RegistryNodeRecord {
         RegistryNodeRecord::from_peer_record(
-            "dytallix1owner",
+            "daddr:owner:registry-test",
             peer_record,
             RegistryNodeStatus::Active,
-            crate::discovery::now_unix(),
+            1_725_000_000,
         )
         .unwrap()
     }
 
+    fn dytallix_owner() -> (DytallixKeypair, String) {
+        let keypair = DytallixKeypair::generate();
+        let owner = DAddr::from_public_key(keypair.public_key())
+            .unwrap()
+            .to_string();
+        (keypair, owner)
+    }
+
+    #[test]
+    fn rejects_expired_peer_record_even_when_registry_record_matches() {
+        let keypair = DeviceKeypair::generate().unwrap();
+        let mut body = UnsignedPeerRecord::new(
+            "dytallix-mesh",
+            "registry-test-node",
+            keypair.public_key(),
+            vec![CandidateEndpoint {
+                candidate_type: CandidateType::Host,
+                address: "192.0.2.10".to_string(),
+                port: 4433,
+                priority: 100,
+            }],
+            vec!["100.64.10.7/32".to_string()],
+            300,
+            42,
+        )
+        .with_device_certificate(b"test-quic-certificate-der".to_vec());
+        body.expires_at_unix = crate::discovery::now_unix().saturating_sub(1);
+        let peer_record = PeerRecord::signed(body, &keypair).unwrap();
+        let registry_record = active_registry_record(&peer_record);
+
+        let err = verify_registry_binding(
+            &peer_record,
+            Some(&registry_record),
+            MeshTrustPolicy::PublicRequired,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, QlinkError::RecordExpired));
+    }
+
+    #[test]
+    fn registry_config_normalizes_raw_contract_address() {
+        let config = DytallixRegistryConfig::new(
+            "https://dytallix.com",
+            "9a9671441249ee2c364f9b4bc8049e61b082449a",
+            "/tmp/keystore.json",
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.contract_address,
+            "0x9a9671441249ee2c364f9b4bc8049e61b082449a"
+        );
+    }
+
+    #[test]
+    fn registry_config_accepts_prefixed_contract_address() {
+        let config = DytallixRegistryConfig::new(
+            "https://dytallix.com",
+            "0x9a9671441249ee2c364f9b4bc8049e61b082449a",
+            "/tmp/keystore.json",
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.contract_address,
+            "0x9a9671441249ee2c364f9b4bc8049e61b082449a"
+        );
+    }
+
+    #[test]
+    fn contract_call_submission_body_includes_signed_tx_and_route_fields() {
+        let body = contract_call_submission_body(
+            RegistryContractMethod::RegisterNode,
+            "0x9a9671441249ee2c364f9b4bc8049e61b082449a",
+            "7b7d".to_string(),
+            &json!({ "transaction": "signed" }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            body["address"],
+            "0x9a9671441249ee2c364f9b4bc8049e61b082449a"
+        );
+        assert_eq!(body["method"], "register_node");
+        assert_eq!(body["args"], "7b7d");
+        assert_eq!(body["signed_tx"]["transaction"], "signed");
+    }
+
+    #[test]
+    fn registry_query_response_decodes_direct_contract_json() {
+        let response = decode_registry_query_response(json!({
+            "ok": true,
+            "node": null,
+            "events": [],
+            "error": null
+        }))
+        .unwrap();
+
+        assert!(response.ok);
+        assert!(response.node.is_none());
+    }
+
+    #[test]
+    fn registry_query_response_decodes_dytallix_result_hex_wrapper() {
+        let response_json = br#"{"ok":true,"node":null,"events":[],"error":null}"#;
+        let response = decode_registry_query_response(json!({
+            "contract_address": "0x9a9671441249ee2c364f9b4bc8049e61b082449a",
+            "method": "get_node",
+            "result": hex::encode(response_json)
+        }))
+        .unwrap();
+
+        assert!(response.ok);
+        assert!(response.node.is_none());
+    }
+
+    #[test]
+    fn registry_submission_response_accepts_successful_contract_result() {
+        let response_json = br#"{"ok":true,"node":null,"events":[],"error":null}"#;
+        validate_registry_submission_response(&json!({
+            "tx_hash": "0xabc",
+            "result": hex::encode(response_json)
+        }))
+        .unwrap();
+    }
+
+    #[test]
+    fn registry_submission_response_rejects_contract_error_result() {
+        let response_json =
+            br#"{"ok":false,"node":null,"events":[],"error":"node already registered"}"#;
+        let err = validate_registry_submission_response(&json!({
+            "tx_hash": "0xabc",
+            "result": hex::encode(response_json)
+        }))
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("dytallix registry contract rejected request: node already registered"));
+    }
+
+    #[test]
+    fn registry_submission_response_allows_async_ack_without_contract_result() {
+        validate_registry_submission_response(&json!({
+            "tx_hash": "0xabc"
+        }))
+        .unwrap();
+    }
+
+    #[test]
+    fn enrollment_creates_named_wallet_when_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let keystore_path = temp.path().join("keystore.json");
+        let config = DytallixRegistryConfig::new(
+            "https://dytallix.com",
+            "0x9a9671441249ee2c364f9b4bc8049e61b082449a",
+            &keystore_path,
+            Some("quantumlink".to_string()),
+        )
+        .unwrap();
+
+        let enrollment = ensure_dytallix_enrollment_wallet(&config).unwrap();
+
+        assert!(enrollment.created_wallet);
+        assert_eq!(enrollment.wallet_name, "quantumlink");
+        assert_eq!(enrollment.keystore_path, keystore_path);
+        assert!(enrollment.wallet_address.starts_with("dytallix1"));
+
+        let reopened = Keystore::open(enrollment.keystore_path).unwrap();
+        assert!(reopened.get_keypair("quantumlink").is_ok());
+        assert_eq!(
+            reopened.active().map(|entry| entry.name.as_str()),
+            Some("quantumlink")
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(temp.path().join("keystore.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    #[test]
+    fn enrollment_reuses_active_wallet_when_name_is_not_specified() {
+        let temp = tempfile::tempdir().unwrap();
+        let keystore_path = temp.path().join("keystore.json");
+        let existing_wallet = DytallixKeypair::generate();
+        let mut keystore = Keystore::open_or_create(keystore_path.clone()).unwrap();
+        keystore.add_keypair(&existing_wallet, "operator").unwrap();
+        keystore.set_active("operator").unwrap();
+        keystore.save().unwrap();
+        let existing_address = DAddr::from_public_key(existing_wallet.public_key())
+            .unwrap()
+            .to_string();
+        let config = DytallixRegistryConfig::new(
+            "https://dytallix.com",
+            "0x9a9671441249ee2c364f9b4bc8049e61b082449a",
+            &keystore_path,
+            None,
+        )
+        .unwrap();
+
+        let enrollment = ensure_dytallix_enrollment_wallet(&config).unwrap();
+
+        assert!(!enrollment.created_wallet);
+        assert_eq!(enrollment.wallet_name, "operator");
+        assert_eq!(enrollment.wallet_address, existing_address);
+        assert_eq!(Keystore::open(keystore_path).unwrap().list().len(), 1);
+    }
+
+    #[test]
+    fn registry_lookup_config_decodes_and_normalizes_contract_address() {
+        let config: DytallixRegistryLookupConfig = serde_json::from_value(json!({
+            "endpoint": "https://dytallix.com",
+            "contractAddress": "9a9671441249ee2c364f9b4bc8049e61b082449a",
+            "publishWalletAddress": false,
+            "networkId": " dytallix-testnet ",
+            "chainId": " dytallix-testnet-1 ",
+            "allowedRpcEndpoints": [" https://dytallix.com/ ", " "]
+        }))
+        .unwrap();
+
+        assert_eq!(config.endpoint, "https://dytallix.com");
+        assert_eq!(
+            config.contract_address,
+            "0x9a9671441249ee2c364f9b4bc8049e61b082449a"
+        );
+        assert_eq!(config.network_id.as_deref(), Some("dytallix-testnet"));
+        assert_eq!(config.chain_id.as_deref(), Some("dytallix-testnet-1"));
+        assert_eq!(
+            config.allowed_rpc_endpoints,
+            vec!["https://dytallix.com/".to_string()]
+        );
+    }
+
+    #[test]
+    fn registry_lookup_config_rejects_endpoint_outside_allowlist() {
+        let err = serde_json::from_value::<DytallixRegistryLookupConfig>(json!({
+            "endpoint": "https://evil.example",
+            "contractAddress": "0x9a9671441249ee2c364f9b4bc8049e61b082449a",
+            "networkId": "dytallix-testnet",
+            "chainId": "dytallix-testnet-1",
+            "allowedRpcEndpoints": ["https://dytallix.com"]
+        }))
+        .unwrap_err();
+
+        assert!(err.to_string().contains("pinned allowlist"));
+    }
+
+    #[test]
+    fn registry_lookup_config_rejects_wallet_fields() {
+        let err = serde_json::from_value::<DytallixRegistryLookupConfig>(json!({
+            "endpoint": "https://dytallix.com",
+            "contractAddress": "0x9a9671441249ee2c364f9b4bc8049e61b082449a",
+            "keystorePath": "/tmp/keystore.json",
+            "walletName": "default"
+        }))
+        .unwrap_err();
+
+        assert!(err.to_string().contains("unknown field"));
+    }
+
+    #[tokio::test]
+    async fn lookup_only_registry_rejects_write_methods_with_protocol_error() {
+        let registry = DytallixIdentityRegistry::from_lookup_config(
+            DytallixRegistryLookupConfig::new(
+                "https://dytallix.com",
+                "0x9a9671441249ee2c364f9b4bc8049e61b082449a",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let err = registry
+            .revoke("qlink_peer_without_wallet", 1_725_000_000)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, QlinkError::Protocol(_)));
+        assert!(err.to_string().contains("lookup-only registry"));
+    }
+
+    #[test]
+    fn registry_config_rejects_slash_or_query_contract_address() {
+        for address in [
+            "0x9a9671441249ee2c364f9b4bc8049e61b082449a/../../tx",
+            "0x9a9671441249ee2c364f9b4bc8049e61b082449a?args=evil",
+        ] {
+            let err = DytallixRegistryConfig::new(
+                "https://dytallix.com",
+                address,
+                "/tmp/keystore.json",
+                None,
+            )
+            .unwrap_err();
+
+            assert!(err.to_string().contains("Invalid contract address"));
+        }
+    }
+
+    #[test]
+    fn registry_config_rejects_non_hex_contract_address() {
+        let err = DytallixRegistryConfig::new(
+            "https://dytallix.com",
+            "0x9a9671441249ee2c364f9b4bc8049e61b08244zz",
+            "/tmp/keystore.json",
+            None,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("Invalid contract address"));
+    }
+
+    #[test]
+    fn registry_config_rejects_short_contract_address() {
+        let err = DytallixRegistryConfig::new(
+            "https://dytallix.com",
+            "0x9a9671441249ee2c364f9b4bc8049e61b08244",
+            "/tmp/keystore.json",
+            None,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("Invalid contract address"));
+    }
+
+    #[test]
+    fn register_call_args_are_hex_encoded_json() {
+        let device_keypair = DeviceKeypair::generate().unwrap();
+        let body = UnsignedPeerRecord::new(
+            "dytallix-mesh",
+            "registry-test-node",
+            device_keypair.public_key(),
+            vec![CandidateEndpoint {
+                candidate_type: CandidateType::Host,
+                address: "192.0.2.10".to_string(),
+                port: 4433,
+                priority: 100,
+            }],
+            vec!["100.64.10.7/32".to_string()],
+            300,
+            42,
+        )
+        .with_device_certificate(b"test-quic-certificate-der".to_vec());
+        let peer_record = PeerRecord::signed(body, &device_keypair).unwrap();
+        let (wallet_keypair, owner) = dytallix_owner();
+        let record = RegistryNodeRecord::from_peer_record(
+            owner.clone(),
+            &peer_record,
+            RegistryNodeStatus::Active,
+            1_725_000_000,
+        )
+        .unwrap();
+        let wallet_auth = WalletAuthorization::sign_record(
+            RegistryContractMethod::RegisterNode,
+            &record,
+            &wallet_keypair,
+        )
+        .unwrap();
+        let device_auth =
+            DeviceBindingAuthorization::sign(&owner, &peer_record, &device_keypair).unwrap();
+        let request = RegisterNodeRequest::new(record, wallet_auth, device_auth);
+
+        let call =
+            encode_contract_call_args(RegistryContractMethod::RegisterNode, &request).unwrap();
+        assert_eq!(call.method, "register_node");
+        let decoded = hex::decode(&call.args_hex).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
+
+        assert_eq!(value["record"]["peer_id"], peer_record.body.peer_id);
+        assert_eq!(value["record"]["owner_daddr"], owner);
+        assert!(value["actor_public_key_hex"].as_str().unwrap().len() > 1_000);
+        assert!(value["actor_signature_hex"].as_str().unwrap().len() > 1_000);
+        assert_eq!(
+            value["device_public_key_algorithm"],
+            peer_record.body.device_public_key.algorithm
+        );
+        assert_eq!(
+            value["device_public_key_hex"],
+            hex::encode(&peer_record.body.device_public_key.bytes)
+        );
+        assert!(
+            value["device_binding_signature_hex"]
+                .as_str()
+                .unwrap()
+                .len()
+                > 1_000
+        );
+    }
+
+    #[test]
+    fn wallet_authorization_signs_canonical_contract_payload_with_dytallix_keypair() {
+        let peer_record = fresh_peer_record();
+        let (wallet_keypair, owner) = dytallix_owner();
+        let record = RegistryNodeRecord::from_peer_record(
+            owner,
+            &peer_record,
+            RegistryNodeStatus::Active,
+            1_725_000_000,
+        )
+        .unwrap();
+
+        let auth = WalletAuthorization::sign_record(
+            RegistryContractMethod::RegisterNode,
+            &record,
+            &wallet_keypair,
+        )
+        .unwrap();
+        let payload =
+            canonical_wallet_record_payload_bytes(RegistryContractMethod::RegisterNode, &record)
+                .unwrap();
+        let payload_json: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        let signature = hex::decode(&auth.actor_signature_hex).unwrap();
+
+        assert_eq!(payload_json["operation"], "register_node");
+        assert!(payload_json.get("method").is_none());
+        assert_eq!(
+            auth.actor_public_key_hex,
+            hex::encode(wallet_keypair.public_key())
+        );
+        assert!(verify_mldsa65(wallet_keypair.public_key(), &payload, &signature).unwrap());
+
+        let mut changed = record.clone();
+        changed.peer_id.push_str("-changed");
+        let changed_payload =
+            canonical_wallet_record_payload_bytes(RegistryContractMethod::RegisterNode, &changed)
+                .unwrap();
+        assert!(
+            !verify_mldsa65(wallet_keypair.public_key(), &changed_payload, &signature).unwrap()
+        );
+    }
+
+    #[test]
+    fn wallet_revoke_authorization_uses_contract_operation_schema() {
+        let (wallet_keypair, _) = dytallix_owner();
+        let peer_id = "qlink_registry_revoke_test";
+        let block_time = 1_725_000_300;
+
+        let auth = WalletAuthorization::sign_revoke(peer_id, block_time, &wallet_keypair).unwrap();
+        let payload = canonical_wallet_revoke_payload_bytes(peer_id, block_time).unwrap();
+        let payload_json: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        let signature = hex::decode(&auth.actor_signature_hex).unwrap();
+
+        assert_eq!(payload_json["operation"], "revoke_node");
+        assert!(payload_json.get("method").is_none());
+        assert!(verify_mldsa65(wallet_keypair.public_key(), &payload, &signature).unwrap());
+    }
+
+    #[test]
+    fn device_binding_authorization_signs_owner_bound_payload_with_quantumlink_keypair() {
+        let device_keypair = DeviceKeypair::generate().unwrap();
+        let body = UnsignedPeerRecord::new(
+            "dytallix-mesh",
+            "registry-test-node",
+            device_keypair.public_key(),
+            vec![CandidateEndpoint {
+                candidate_type: CandidateType::Host,
+                address: "192.0.2.10".to_string(),
+                port: 4433,
+                priority: 100,
+            }],
+            vec!["100.64.10.7/32".to_string()],
+            300,
+            42,
+        )
+        .with_device_certificate(b"test-quic-certificate-der".to_vec());
+        let peer_record = PeerRecord::signed(body, &device_keypair).unwrap();
+        let (_, owner) = dytallix_owner();
+
+        let auth = DeviceBindingAuthorization::sign(&owner, &peer_record, &device_keypair).unwrap();
+        let payload = canonical_binding_payload_bytes(&owner, &peer_record).unwrap();
+        let signature = hex::decode(&auth.device_binding_signature_hex).unwrap();
+
+        assert_eq!(auth.device_public_key_algorithm, "ML-DSA-65");
+        assert_eq!(
+            auth.device_public_key_hex,
+            hex::encode(&peer_record.body.device_public_key.bytes)
+        );
+        peer_record
+            .body
+            .device_public_key
+            .verify(&payload, &signature)
+            .unwrap();
+
+        let changed_payload =
+            canonical_binding_payload_bytes("dytallix1differentowner", &peer_record).unwrap();
+        assert!(peer_record
+            .body
+            .device_public_key
+            .verify(&changed_payload, &signature)
+            .is_err());
+    }
+
+    #[test]
+    fn query_response_decodes_registry_node_record() {
+        let peer_record = fresh_peer_record();
+        let record = active_registry_record(&peer_record);
+        let response: RegistryQueryResponse = serde_json::from_value(json!({
+            "ok": true,
+            "node": record,
+            "events": [
+                { "type": "node_registered", "peer_id": peer_record.body.peer_id }
+            ],
+            "error": null
+        }))
+        .unwrap();
+
+        assert!(response.ok);
+        assert_eq!(response.node.unwrap().peer_id, peer_record.body.peer_id);
+        assert_eq!(response.events.len(), 1);
+        assert!(response.error.is_none());
+    }
+
     #[test]
     fn public_policy_accepts_active_matching_registry_record() {
-        let peer_record = signed_peer_record();
-        let registry_record = active_record(&peer_record);
+        let peer_record = fresh_peer_record();
+        let registry_record = active_registry_record(&peer_record);
 
         let decision = verify_registry_binding(
             &peer_record,
@@ -1244,149 +1651,335 @@ mod tests {
 
     #[test]
     fn public_policy_rejects_missing_registry_record() {
-        let peer_record = signed_peer_record();
+        let peer_record = fresh_peer_record();
 
         let err = verify_registry_binding(&peer_record, None, MeshTrustPolicy::PublicRequired)
             .unwrap_err();
 
-        assert!(matches!(
-            err.reason,
-            RegistryRejectionReason::RejectedMissingRegistry
-        ));
-        assert!(matches!(
-            err.source,
-            RegistryDecisionSource::RegistryMissing
-        ));
+        assert!(err.to_string().contains("registry record required"));
     }
 
     #[test]
-    fn private_and_development_policies_do_not_fail_closed_without_registry() {
-        let peer_record = signed_peer_record();
+    fn private_policy_accepts_valid_peer_record_without_registry() {
+        let peer_record = fresh_peer_record();
 
-        let private =
+        let decision =
             verify_registry_binding(&peer_record, None, MeshTrustPolicy::PrivatePreferred).unwrap();
-        let development =
+
+        assert_eq!(decision, RegistryDecision::AcceptedWithoutRegistryPrivate);
+    }
+
+    #[test]
+    fn development_policy_accepts_valid_peer_record_without_registry() {
+        let peer_record = fresh_peer_record();
+
+        let decision =
             verify_registry_binding(&peer_record, None, MeshTrustPolicy::DevelopmentOptional)
                 .unwrap();
 
-        assert_eq!(private, RegistryDecision::AcceptedWithoutRegistryPrivate);
         assert_eq!(
-            development,
+            decision,
             RegistryDecision::AcceptedWithoutRegistryDevelopment
         );
     }
 
     #[test]
-    fn public_policy_rejects_revoked_suspended_key_and_record_hash_mismatch() {
-        let peer_record = signed_peer_record();
+    fn rejects_revoked_or_suspended_registry_record() {
+        let peer_record = fresh_peer_record();
 
-        let mut revoked = active_record(&peer_record);
-        revoked.status = RegistryNodeStatus::Revoked;
-        assert_eq!(
-            verify_registry_binding(
+        for (status, expected) in [
+            (RegistryNodeStatus::Revoked, "registry record is revoked"),
+            (
+                RegistryNodeStatus::Suspended,
+                "registry record is suspended",
+            ),
+        ] {
+            let mut registry_record = RegistryNodeRecord::from_peer_record(
+                "daddr:owner:registry-test",
                 &peer_record,
-                Some(&revoked),
-                MeshTrustPolicy::PublicRequired
+                status,
+                crate::discovery::now_unix(),
             )
-            .unwrap_err()
-            .reason,
-            RegistryRejectionReason::RejectedRevoked
-        );
+            .unwrap();
+            registry_record.expires_at = Some(crate::discovery::now_unix().saturating_add(300));
 
-        let mut suspended = active_record(&peer_record);
-        suspended.status = RegistryNodeStatus::Suspended;
-        assert_eq!(
-            verify_registry_binding(
+            let err = verify_registry_binding(
                 &peer_record,
-                Some(&suspended),
-                MeshTrustPolicy::PublicRequired
+                Some(&registry_record),
+                MeshTrustPolicy::PrivatePreferred,
             )
-            .unwrap_err()
-            .reason,
-            RegistryRejectionReason::RejectedSuspended
-        );
-
-        let mut wrong_key = active_record(&peer_record);
-        wrong_key.device_public_key_hash = [0_u8; 32];
-        assert_eq!(
-            verify_registry_binding(
-                &peer_record,
-                Some(&wrong_key),
-                MeshTrustPolicy::PublicRequired
-            )
-            .unwrap_err()
-            .reason,
-            RegistryRejectionReason::RejectedKeyMismatch
-        );
-
-        let mut wrong_record = active_record(&peer_record);
-        wrong_record.latest_peer_record_hash = [9_u8; 32];
-        assert_eq!(
-            verify_registry_binding(
-                &peer_record,
-                Some(&wrong_record),
-                MeshTrustPolicy::PublicRequired
-            )
-            .unwrap_err()
-            .reason,
-            RegistryRejectionReason::RejectedRecordHashMismatch
-        );
-    }
-
-    #[test]
-    fn public_wallet_controls_address_redaction() {
-        let record = RegistryNodeRecord {
-            peer_id: "qlink_peer".to_string(),
-            owner_daddr: "dytallix1verypublicwallet".to_string(),
-            device_public_key_hash: [1_u8; 32],
-            latest_peer_record_hash: [2_u8; 32],
-            status: RegistryNodeStatus::Active,
-            updated_at: 10,
-            expires_at: None,
-            reputation_score: None,
-            stake_status: None,
-            metadata_commitment: None,
-        };
-
-        assert_eq!(
-            record.owner_for_diagnostics(DiscoveryIdentityMode::Verified, false),
-            "[redacted-dytallix-wallet]"
-        );
-        assert_eq!(
-            record.owner_for_diagnostics(DiscoveryIdentityMode::PublicWallet, false),
-            "dytallix1verypublicwallet"
-        );
-        assert_eq!(
-            record.owner_for_diagnostics(DiscoveryIdentityMode::Off, true),
-            "dytallix1verypublicwallet"
-        );
-    }
-
-    #[test]
-    fn registry_unavailable_fails_public_and_warns_private() {
-        let unavailable =
-            registry_unavailable_decision(MeshTrustPolicy::PublicRequired).unwrap_err();
-        assert_eq!(
-            unavailable.reason,
-            RegistryRejectionReason::RegistryUnavailable
-        );
-
-        let private = registry_unavailable_decision(MeshTrustPolicy::PrivatePreferred).unwrap();
-        assert_eq!(
-            private,
-            RegistryDecision::AcceptedRegistryUnavailablePrivate
-        );
-    }
-
-    #[test]
-    fn registry_errors_convert_to_protocol_errors_with_stable_reasons() {
-        let peer_record = signed_peer_record();
-        let err = verify_registry_binding(&peer_record, None, MeshTrustPolicy::PublicRequired)
             .unwrap_err();
-        let qlink_error: QlinkError = err.into();
 
-        assert!(qlink_error
+            assert!(err.to_string().contains(expected));
+        }
+    }
+
+    #[test]
+    fn rejects_expired_registry_record_for_all_policies() {
+        let peer_record = fresh_peer_record();
+        let mut registry_record = active_registry_record(&peer_record);
+        registry_record.expires_at = Some(crate::discovery::now_unix().saturating_sub(1));
+
+        for policy in [
+            MeshTrustPolicy::PublicRequired,
+            MeshTrustPolicy::PrivatePreferred,
+            MeshTrustPolicy::DevelopmentOptional,
+        ] {
+            let err =
+                verify_registry_binding(&peer_record, Some(&registry_record), policy).unwrap_err();
+
+            assert!(err.to_string().contains("registry record has expired"));
+        }
+    }
+
+    #[test]
+    fn rejects_peer_id_mismatch() {
+        let peer_record = fresh_peer_record();
+        let mut registry_record = active_registry_record(&peer_record);
+        registry_record.peer_id = "qlink_wrong-peer-id".to_string();
+
+        let err = verify_registry_binding(
+            &peer_record,
+            Some(&registry_record),
+            MeshTrustPolicy::PublicRequired,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("peer_id mismatch"));
+    }
+
+    #[test]
+    fn rejects_device_key_hash_mismatch() {
+        let peer_record = fresh_peer_record();
+        let mut registry_record = active_registry_record(&peer_record);
+        registry_record.device_public_key_hash_hex = "00".repeat(32);
+
+        let err = verify_registry_binding(
+            &peer_record,
+            Some(&registry_record),
+            MeshTrustPolicy::PublicRequired,
+        )
+        .unwrap_err();
+
+        assert!(err
             .to_string()
-            .contains("rejected_missing_registry"));
+            .contains("device_public_key_hash_hex mismatch"));
+    }
+
+    #[test]
+    fn rejects_latest_peer_record_hash_mismatch() {
+        let peer_record = fresh_peer_record();
+        let mut registry_record = active_registry_record(&peer_record);
+        registry_record.latest_peer_record_hash_hex = "11".repeat(32);
+
+        let err = verify_registry_binding(
+            &peer_record,
+            Some(&registry_record),
+            MeshTrustPolicy::PublicRequired,
+        )
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("latest_peer_record_hash_hex mismatch"));
+    }
+
+    #[test]
+    fn inbound_registry_policy_accepts_matching_assertion() {
+        let keypair = DeviceKeypair::generate().unwrap();
+        let body = UnsignedPeerRecord::new(
+            "dytallix-mesh",
+            "registry-test-node",
+            keypair.public_key(),
+            vec![CandidateEndpoint {
+                candidate_type: CandidateType::Host,
+                address: "192.0.2.10".to_string(),
+                port: 4433,
+                priority: 100,
+            }],
+            vec!["100.64.10.7/32".to_string()],
+            300,
+            42,
+        )
+        .with_device_certificate(b"test-quic-certificate-der".to_vec());
+        let peer_record = PeerRecord::signed(body, &keypair).unwrap();
+        let registry_record = active_registry_record(&peer_record);
+        let assertion =
+            crate::inbound_identity::InboundIdentityAssertion::sign(&keypair, "dytallix-mesh")
+                .unwrap();
+
+        let decision = verify_inbound_registry_assertion(
+            &assertion,
+            Some(&registry_record),
+            MeshTrustPolicy::PublicRequired,
+        )
+        .unwrap();
+
+        assert_eq!(decision, RegistryDecision::Accepted);
+    }
+
+    #[test]
+    fn inbound_public_policy_rejects_missing_registry_record() {
+        let keypair = DeviceKeypair::generate().unwrap();
+        let assertion =
+            crate::inbound_identity::InboundIdentityAssertion::sign(&keypair, "dytallix-mesh")
+                .unwrap();
+
+        let err =
+            verify_inbound_registry_assertion(&assertion, None, MeshTrustPolicy::PublicRequired)
+                .unwrap_err();
+
+        assert!(err.to_string().contains("registry record required"));
+    }
+
+    #[test]
+    fn rejects_pqc_binding_hash_mismatch() {
+        let peer_record = fresh_peer_record();
+        let mut registry_record = active_registry_record(&peer_record);
+        registry_record.pqc_binding_hash_hex = "22".repeat(32);
+
+        let err = verify_registry_binding(
+            &peer_record,
+            Some(&registry_record),
+            MeshTrustPolicy::PublicRequired,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("pqc_binding_hash_hex mismatch"));
+    }
+
+    #[test]
+    fn rejects_node_signing_public_key_hash_mismatch() {
+        let peer_record = fresh_peer_record();
+        let mut registry_record = active_registry_record(&peer_record);
+        registry_record.node_signing_public_key_hash_hex = "33".repeat(32);
+
+        let err = verify_registry_binding(
+            &peer_record,
+            Some(&registry_record),
+            MeshTrustPolicy::PublicRequired,
+        )
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("node_signing_public_key_hash_hex mismatch"));
+    }
+
+    #[test]
+    fn rejects_transport_public_key_hash_mismatch() {
+        let peer_record = fresh_peer_record();
+        let mut registry_record = active_registry_record(&peer_record);
+        registry_record.transport_public_key_hash_hex = "44".repeat(32);
+
+        let err = verify_registry_binding(
+            &peer_record,
+            Some(&registry_record),
+            MeshTrustPolicy::PublicRequired,
+        )
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("transport_public_key_hash_hex mismatch"));
+    }
+
+    #[test]
+    fn from_peer_record_populates_finalized_contract_fields() {
+        let peer_record = fresh_peer_record();
+        let registry_record = active_registry_record(&peer_record);
+
+        assert_eq!(registry_record.peer_id, peer_record.body.peer_id);
+        assert_eq!(registry_record.owner_daddr, "daddr:owner:registry-test");
+        assert_eq!(
+            registry_record.device_public_key_hash_hex,
+            device_public_key_hash_hex(&peer_record).unwrap()
+        );
+        assert_eq!(
+            registry_record.pqc_binding_hash_hex,
+            pqc_binding_hash_hex("daddr:owner:registry-test", &peer_record).unwrap()
+        );
+        assert_eq!(
+            registry_record.node_signing_public_key_hash_hex,
+            node_signing_public_key_hash_hex(&peer_record).unwrap()
+        );
+        assert_eq!(
+            registry_record.transport_public_key_hash_hex,
+            transport_public_key_hash_hex(&peer_record)
+        );
+        assert_eq!(
+            registry_record.latest_peer_record_hash_hex,
+            latest_peer_record_hash_hex(&peer_record).unwrap()
+        );
+        assert_eq!(registry_record.status, RegistryNodeStatus::Active);
+        assert_eq!(registry_record.reputation_score, 0_u64);
+        assert_eq!(registry_record.stake_status, None);
+        assert_eq!(registry_record.updated_at, 1_725_000_000);
+        assert_eq!(
+            registry_record.expires_at,
+            Some(peer_record.body.expires_at_unix)
+        );
+        assert_eq!(registry_record.metadata_commitment_hex, None);
+    }
+
+    #[test]
+    fn pqc_binding_hash_includes_owner_daddr() {
+        let peer_record = fresh_peer_record();
+        let first_owner = RegistryNodeRecord::from_peer_record(
+            "daddr:owner:first",
+            &peer_record,
+            RegistryNodeStatus::Active,
+            1_725_000_000,
+        )
+        .unwrap();
+        let second_owner = RegistryNodeRecord::from_peer_record(
+            "daddr:owner:second",
+            &peer_record,
+            RegistryNodeStatus::Active,
+            1_725_000_000,
+        )
+        .unwrap();
+
+        assert_ne!(
+            first_owner.pqc_binding_hash_hex,
+            second_owner.pqc_binding_hash_hex
+        );
+        assert_eq!(
+            first_owner.pqc_binding_hash_hex,
+            pqc_binding_hash_hex("daddr:owner:first", &peer_record).unwrap()
+        );
+    }
+
+    #[test]
+    fn trust_policy_serializes_as_snake_case() {
+        for (policy, json) in [
+            (MeshTrustPolicy::PublicRequired, "\"public_required\""),
+            (MeshTrustPolicy::PrivatePreferred, "\"private_preferred\""),
+            (
+                MeshTrustPolicy::DevelopmentOptional,
+                "\"development_optional\"",
+            ),
+        ] {
+            assert_eq!(serde_json::to_string(&policy).unwrap(), json);
+            assert_eq!(
+                serde_json::from_str::<MeshTrustPolicy>(json).unwrap(),
+                policy
+            );
+        }
+    }
+
+    #[test]
+    fn registry_node_status_serializes_as_snake_case() {
+        for (status, json) in [
+            (RegistryNodeStatus::Active, "\"active\""),
+            (RegistryNodeStatus::Revoked, "\"revoked\""),
+            (RegistryNodeStatus::Suspended, "\"suspended\""),
+        ] {
+            assert_eq!(serde_json::to_string(&status).unwrap(), json);
+            assert_eq!(
+                serde_json::from_str::<RegistryNodeStatus>(json).unwrap(),
+                status
+            );
+        }
     }
 }

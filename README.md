@@ -21,9 +21,9 @@ release mechanics.
 ## Product Pillars
 
 - **Post-quantum data plane** - ML-KEM-768 session establishment,
-  ML-DSA-65 and SLH-DSA device credentials, suite-bound HKDF keys,
-  ChaCha20-Poly1305 packet-frame protection, replay windows, and
-  protocol downgrade rejection.
+  ML-DSA-65 and SLH-DSA-SHAKE device credentials, SHAKE256 transcript
+  binding and directional key derivation, app-layer PQC frame
+  protection, replay windows, and protocol downgrade rejection.
 - **Server-minimized mesh control plane** - signed and expiring peer
   records, rendezvous discovery, relay fallback, peer-store caching,
   mDNS/local discovery support, and synthetic WAN test harnesses.
@@ -99,7 +99,7 @@ QuantumLink treats peer identity as part of the mesh, not as an
 afterthought bolted onto transport setup.
 
 - Device credentials are post-quantum signing keys, with ML-DSA-65 as
-  the default and SLH-DSA-SHA2-128S support for the FIPS 205 path.
+  the default and SLH-DSA-SHAKE-128S support for the FIPS 205 path.
 - Peer records are signed, expiring, sequence-numbered documents that
   bind peer ID, device public key, routes, endpoint candidates, ICE
   credentials, QUIC certificate material, and discovery metadata.
@@ -123,21 +123,43 @@ across platform silos.
 
 Supported suite identifiers:
 
-- `QLINK-FIPS203-MLKEM768-HKDFSHA256-v1`
-- `QLINK-FIPS204-MLDSA65-HKDFSHA256-v1`
-- `QLINK-FIPS205-SLHDSA-SHA2-128S-HKDFSHA256-v1`
+- `QLINK-FIPS203-MLKEM768-SHAKE256-v1`
+- `QLINK-FIPS204-MLDSA65-SHAKE256-v1`
+- `QLINK-FIPS205-SLHDSA-SHAKE128S-SHAKE256-v1`
 
 Implemented behavior includes ML-KEM-768 session establishment,
-SHA-256 transcript binding, HKDF-SHA-256 directional derivation,
-signed peer records, suite-bound packet-frame encryption, protected
-IPv4 route enforcement, selected metadata normalization, monotonic
-packet-number replay protection, QUIC DATAGRAM transport, relay
-fallback, rendezvous lookup/publish, STUN/ICE helpers, peer-store
-persistence, tracing export, and metrics surfaces.
+SHAKE256 transcript binding, SHAKE256 directional derivation, signed
+peer records, app-layer PQC frame protection with replay rejection,
+protected IPv4 route enforcement, selected metadata normalization,
+native UDP carrier session-wire coverage, optional dev-only QUIC
+DATAGRAM carrier transport behind `dev-quic-carrier`, fail-closed raw
+relay fallback, rendezvous lookup/publish, QuantumLink-only SHAKE-based
+ICE helpers, SHAKE256 v3 peer-store protection, tracing export, and
+metrics surfaces.
 
-The legacy hybrid X25519/ML-KEM suite identifier is intentionally
-rejected. QuantumLink's v1 cryptographic direction is post-quantum
-session establishment without a classical key-exchange fallback.
+The legacy hybrid X25519/ML-KEM app-layer suite identifier is
+intentionally rejected. QuantumLink's v1 app-layer cryptographic
+direction is post-quantum session establishment without a classical
+key-exchange fallback.
+
+Known blockers for a strict "zero classical in the full stack" profile:
+
+- The default `qlink-core` build excludes the dev Quinn/rustls/rcgen
+  carrier dependencies. The legacy Quinn/rustls carrier is still present
+  only behind `--features dev-quic-carrier`, where it configures the
+  hybrid `X25519MLKEM768` group for development comparison smokes.
+  Default live mesh dialing now fails closed until rendezvous publication
+  and direct probing are wired to the native UDP carrier.
+- macOS and Windows privacy-redaction helpers still use SHA-256-derived
+  stable aliases outside the packet/session boundary.
+- macOS CMS/profile signing still requests platform SHA-256, and tests
+  document platform AES behavior. That is OS distribution/signing
+  plumbing, not the mesh transport boundary, but it is not a zero-
+  classical stack.
+- Optional dev-carrier builds still pull transitive rustls/aws-lc/ring
+  classical algorithms through Quinn. The default core graph should not,
+  but lockfile contents and dev tooling are not a full zero-classical
+  stack claim.
 
 ## Build And Validate
 
@@ -145,9 +167,17 @@ Shared Rust workspace:
 
 ```sh
 cargo test --workspace
-cargo run -p qlink-core --bin qlinkctl -- quic-loopback
-cargo run -p qlink-core --bin qlinkctl -- mesh-loopback
-cargo run -p qlink-core --bin qlinkctl -- relay-loopback
+cargo run -p qlink-core --bin qlinkctl -- rendezvous
+```
+
+`quic-loopback`, `mesh-loopback`, `relay-loopback`, and `relay-smoke`
+are disabled in the strict PQC profile because they bypass or lack the
+app-layer PQC frame session.
+
+Legacy dev-carrier mesh publication is explicit opt-in:
+
+```sh
+cargo run -p qlink-core --no-default-features --features dev-quic-carrier --bin qlinkctl -- publish-self --once
 ```
 
 macOS:

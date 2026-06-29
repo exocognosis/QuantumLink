@@ -10,7 +10,7 @@ jobs:
     name: Rust workspace (shared core + cross-platform silo code)
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Show toolchain
         run: |
           rustc --version
@@ -23,18 +23,26 @@ jobs:
         run: cargo test --workspace
       - name: Rust formatting
         run: cargo fmt --all -- --check
-      - name: Rust QUIC smoke
-        run: cargo run -p qlink-core --bin qlinkctl -- quic-loopback
-      - name: Rust mesh and relay smokes
+      - name: Rust strict PQC carrier checks
         run: |
-          cargo run -p qlink-core --bin qlinkctl -- mesh-loopback
-          cargo run -p qlink-core --bin qlinkctl -- relay-loopback
+          cargo test -p qlink-core --lib pqc_policy_tests --no-default-features --features native-udp-carrier -- --nocapture
+          cargo tree --manifest-path qlink-core/Cargo.toml --locked --no-default-features --features native-udp-carrier --target all -e normal --prefix none > native-carrier-deps.txt
+          forbidden_native_deps="$(grep -E '^(quinn|quinn-proto|rustls|rcgen|aws-lc-rs|ring) v' native-carrier-deps.txt || true)"
+          if [[ -n "$forbidden_native_deps" ]]; then
+            printf 'forbidden native-UDP dependency resolved:\n%s\n' "$forbidden_native_deps"
+            exit 1
+          fi
+          cargo test -p qlink-core --lib native_udp_session --no-default-features --features native-udp-carrier -- --nocapture
+          cargo test -p qlink-core --lib pqc_session_wire_establishes_keys_over_native_udp_carrier --no-default-features --features native-udp-carrier -- --nocapture
+          cargo check -p qlink-core --bin qlinkctl --no-default-features --features native-udp-carrier
+      - name: Rust dev QUIC carrier tests
+        run: cargo test -p qlink-core --lib --no-default-features --features dev-quic-carrier -- --nocapture
 
   macos:
     name: macOS silo (Swift + XCFramework)
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Show toolchain
         run: |
           swift --version
@@ -42,8 +50,13 @@ jobs:
       # Build the shared core dylib once at the workspace root.
       - name: Build shared core
         run: cargo build -p qlink-core --release
+      # The XCFramework step builds a universal (arm64 + x86_64) static
+      # library, so both Apple targets must be installed.
       - name: Install Apple Rust targets
         run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - name: macOS release readiness
+        working-directory: macos
+        run: ./scripts/macos-release-readiness.sh
       - name: Swift tests
         working-directory: macos
         run: swift test
@@ -62,12 +75,20 @@ jobs:
       - name: Development artifact package
         working-directory: macos
         run: ./scripts/package-dev-artifacts.sh
+      - name: Upload development artifact package
+        uses: actions/upload-artifact@v7
+        with:
+          name: QuantumLink-dev-${{ github.sha }}
+          path: |
+            macos/build/dist/QuantumLink-dev.tar.gz
+            macos/build/dist/QuantumLink-dev.tar.gz.sha256
+          if-no-files-found: error
 
   xcodegen-smoke:
     name: Unsigned Xcode project smoke
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install XcodeGen
         run: brew install xcodegen
       - name: Build Rust XCFramework
@@ -75,7 +96,10 @@ jobs:
         run: QLINK_RUST_TARGETS="$(rustc -vV | awk '/^host:/ { print $2 }')" ./scripts/build-rust-xcframework.sh
       - name: Generate unsigned project
         working-directory: macos
-        run: ./scripts/generate-xcode-project.sh
+        # generate-xcode-project.sh re-runs build-rust-xcframework.sh; keep it
+        # host-only (matching the step above) so it does not require the
+        # x86_64 cross-target, which this smoke job does not install.
+        run: QLINK_RUST_TARGETS="$(rustc -vV | awk '/^host:/ { print $2 }')" ./scripts/generate-xcode-project.sh
       - name: Build unsigned app target
         working-directory: macos
         run: |

@@ -23,6 +23,11 @@ typedef struct QlinkOwnedPacket {
     QlinkOwnedBuffer buffer;
 } QlinkOwnedPacket;
 
+typedef struct QlinkInboundFrame {
+    QlinkOwnedBuffer frame;
+    QlinkOwnedBuffer peer_id;
+} QlinkInboundFrame;
+
 typedef struct QlinkTunnelMetrics {
     uint64_t packets_from_tunnel;
     uint64_t packets_to_tunnel;
@@ -40,6 +45,13 @@ typedef struct QlinkTransportMetrics {
     uint64_t send_failures;
     uint64_t receive_failures;
 } QlinkTransportMetrics;
+
+typedef struct QlinkPeerTrustStatus {
+    uint32_t decision_code;
+    uint32_t failure_code;
+    uint64_t checked_at_unix;
+    uint32_t source_code;
+} QlinkPeerTrustStatus;
 
 const char *qlink_core_version(void);
 const char *qlink_core_default_suite(void);
@@ -79,6 +91,8 @@ bool qlink_tunnel_core_metrics(
     QlinkTunnelMetrics *out
 );
 
+// Disabled in the strict PQC profile because raw Quinn DATAGRAM bypasses the
+// app-layer ML-KEM/SHAKE frame session. Always returns NULL.
 QlinkDevQuicTransportHandle *qlink_dev_quic_transport_create(void);
 
 void qlink_dev_quic_transport_destroy(QlinkDevQuicTransportHandle *handle);
@@ -138,7 +152,7 @@ int32_t qlink_mesh_transport_send_frame(
 
 bool qlink_mesh_transport_receive_frame(
     QlinkMeshTransportHandle *handle,
-    QlinkOwnedBuffer *out
+    QlinkInboundFrame *out
 );
 
 bool qlink_mesh_transport_metrics(
@@ -157,6 +171,30 @@ uint32_t qlink_mesh_transport_state_code(QlinkMeshTransportHandle *handle);
 bool qlink_mesh_transport_last_error(
     QlinkMeshTransportHandle *handle,
     QlinkOwnedBuffer *out
+);
+
+bool qlink_mesh_transport_peer_ids(
+    QlinkMeshTransportHandle *handle,
+    QlinkOwnedBuffer *out
+);
+
+bool qlink_mesh_transport_blocked_peer_history(
+    QlinkMeshTransportHandle *handle,
+    QlinkOwnedBuffer *out
+);
+
+bool qlink_mesh_transport_peer_state_code(
+    QlinkMeshTransportHandle *handle,
+    const uint8_t *peer_id,
+    uintptr_t peer_id_len,
+    uint32_t *out_state_code
+);
+
+bool qlink_mesh_transport_peer_trust_status(
+    QlinkMeshTransportHandle *handle,
+    const uint8_t *peer_id,
+    uintptr_t peer_id_len,
+    QlinkPeerTrustStatus *out
 );
 
 #ifdef __cplusplus

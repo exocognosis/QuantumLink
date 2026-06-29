@@ -118,9 +118,11 @@ final class SupportBundleExporterTests: XCTestCase {
         // redacted in default mode.
         XCTAssertFalse(body.contains("100.64.255.1"))
 
-        // Pseudonymous identifiers are kept (they're public by design).
-        XCTAssertTrue(body.contains("mesh-abc123"))
-        XCTAssertTrue(body.contains("device-deadbeef"))
+        // Persistent identifiers are redacted because they can correlate
+        // support bundles with Dytallix testnet and repeated mesh activity.
+        XCTAssertFalse(body.contains("mesh-abc123"))
+        XCTAssertFalse(body.contains("device-deadbeef"))
+        XCTAssertTrue(body.contains("[redacted-id]"))
         // Redaction sentinel appears at least once.
         XCTAssertTrue(body.contains("[redacted-ip]"))
     }
@@ -268,10 +270,6 @@ final class SupportBundleExporterTests: XCTestCase {
     }
 
     func testPumpDiagnosticsCarriesPerPeerBreakdown() throws {
-        // The per-peer counter is the load-bearing piece of the
-        // peer-attribution work shipped in earlier sessions; the
-        // bundle exposes it (peer_id is pseudonymous + signed,
-        // safe to ship in operator diagnostics).
         let exporter = makeExporter()
         let bundle = exporter.buildBundle(
             status: tunnelStatusWithLeakyError(),
@@ -283,13 +281,174 @@ final class SupportBundleExporterTests: XCTestCase {
         )
 
         let pump = try XCTUnwrap(bundle.pump)
-        XCTAssertEqual(pump.transportFramesAcceptedPerPeer["qlink_AAAA1111BBBB2222CCCC33"], 30)
-        XCTAssertEqual(pump.transportFramesAcceptedPerPeer["qlink_DDDD4444EEEE5555FFFF66"], 17)
-        // Sum of the per-peer breakdown is consistent with the
-        // overall counter.
+        XCTAssertNil(pump.transportFramesAcceptedPerPeer["qlink_AAAA1111BBBB2222CCCC33"])
+        XCTAssertNil(pump.transportFramesAcceptedPerPeer["qlink_DDDD4444EEEE5555FFFF66"])
+        XCTAssertEqual(pump.transportFramesAcceptedPerPeer["peer_1"], 30)
+        XCTAssertEqual(pump.transportFramesAcceptedPerPeer["peer_2"], 17)
         XCTAssertEqual(
             pump.transportFramesAcceptedPerPeer.values.reduce(0, +),
             pump.transportFramesAccepted
         )
+    }
+
+    func testRawPumpDiagnosticsCarriesPerPeerBreakdown() throws {
+        let exporter = makeExporter()
+        let bundle = exporter.buildBundle(
+            status: tunnelStatusWithLeakyError(),
+            meshMetrics: meshMetricsWithLeakyState(),
+            meshLastError: nil,
+            pumpCounters: leakyPumpCounters(),
+            configuration: leakyConfiguration(),
+            redactionMode: .raw
+        )
+
+        let pump = try XCTUnwrap(bundle.pump)
+        XCTAssertEqual(pump.transportFramesAcceptedPerPeer["qlink_AAAA1111BBBB2222CCCC33"], 30)
+        XCTAssertEqual(pump.transportFramesAcceptedPerPeer["qlink_DDDD4444EEEE5555FFFF66"], 17)
+        XCTAssertEqual(
+            pump.transportFramesAcceptedPerPeer.values.reduce(0, +),
+            pump.transportFramesAccepted
+        )
+    }
+
+    func testTunnelDiagnosticsCarriesDytallixTrustSummary() throws {
+        let exporter = makeExporter()
+        let status = TunnelStatus(
+            phase: .connected,
+            pathType: .direct,
+            routeMode: .splitTunnel,
+            dnsMode: .tunnelProvided,
+            overlayIPv4Address: "100.64.0.7",
+            protectedRoutes: ["100.64.0.0/10"],
+            peers: [],
+            metrics: MeshMetrics(),
+            peerTrust: DytallixPeerTrustSummary(
+                required: true,
+                policy: .publicRequired,
+                identityMode: .verified,
+                registryConfigured: true,
+                verifiedPeerCount: 2,
+                unverifiedPeerCount: 1,
+                pendingPeerCount: 3,
+                failedPeerCount: 4
+            )
+        )
+
+        let bundle = exporter.buildBundle(
+            status: status,
+            meshMetrics: nil,
+            meshLastError: nil,
+            pumpCounters: nil,
+            configuration: leakyConfiguration(),
+            redactionMode: .default
+        )
+
+        XCTAssertEqual(bundle.tunnel?.dytallixTrustRequired, true)
+        XCTAssertEqual(bundle.tunnel?.dytallixTrustPolicy, MeshTrustPolicy.publicRequired.rawValue)
+        XCTAssertEqual(bundle.tunnel?.dytallixIdentityMode, DiscoveryIdentityMode.verified.rawValue)
+        XCTAssertEqual(bundle.tunnel?.dytallixRegistryConfigured, true)
+        XCTAssertEqual(bundle.tunnel?.dytallixVerifiedPeerCount, 2)
+        XCTAssertEqual(bundle.tunnel?.dytallixUnverifiedPeerCount, 1)
+        XCTAssertEqual(bundle.tunnel?.dytallixPendingPeerCount, 3)
+        XCTAssertEqual(bundle.tunnel?.dytallixFailedPeerCount, 4)
+    }
+
+    func testSupportBundleCarriesBlockedPeerDiagnosticsWithoutTraffic() throws {
+        let exporter = makeExporter()
+        let blockedPeer = PeerStatus(
+            identity: PeerIdentity(
+                peerID: "qlink_blocked",
+                alias: "blocked-peer",
+                publicKeyFingerprint: "fp-blocked"
+            ),
+            pathType: .unavailable,
+            endpoints: [],
+            overlayAddress: "",
+            rttMilliseconds: nil,
+            lastRekey: nil,
+            bytesIn: 0,
+            bytesOut: 0,
+            dytallixTrust: DytallixPeerTrustStatus(
+                policy: .publicRequired,
+                identityMode: .verified,
+                state: .revoked,
+                checkedAt: Date(timeIntervalSince1970: 1_756_000_100),
+                registryPeerID: "dytallix-registry-peer",
+                source: "registry",
+                failureReason: "registry record revoked"
+            )
+        )
+        let status = TunnelStatus(
+            phase: .failed,
+            pathType: .unavailable,
+            routeMode: .splitTunnel,
+            dnsMode: .tunnelProvided,
+            overlayIPv4Address: "100.64.0.7",
+            protectedRoutes: ["100.64.0.0/10"],
+            peers: [blockedPeer],
+            metrics: MeshMetrics(),
+            peerTrust: DytallixPeerTrustSummary(
+                peers: [blockedPeer],
+                policy: .publicRequired,
+                identityMode: .verified,
+                registryConfigured: true
+            )
+        )
+
+        let bundle = exporter.buildBundle(
+            status: status,
+            meshMetrics: nil,
+            meshLastError: nil,
+            pumpCounters: nil,
+            configuration: leakyConfiguration(),
+            redactionMode: .default
+        )
+
+        let peer = try XCTUnwrap(bundle.peers.first)
+        XCTAssertEqual(bundle.peers.count, 1)
+        XCTAssertEqual(bundle.tunnel?.dytallixFailedPeerCount, 1)
+        XCTAssertEqual(peer.peerID, "[redacted-id]")
+        XCTAssertEqual(peer.alias, "[redacted-id]")
+        XCTAssertEqual(peer.pathType, PathType.unavailable.rawValue)
+        XCTAssertEqual(peer.bytesIn, 0)
+        XCTAssertEqual(peer.bytesOut, 0)
+        XCTAssertEqual(peer.dytallixTrustState, DytallixPeerTrustState.revoked.rawValue)
+        XCTAssertEqual(peer.dytallixTrustPolicy, MeshTrustPolicy.publicRequired.rawValue)
+        XCTAssertEqual(peer.dytallixIdentityMode, DiscoveryIdentityMode.verified.rawValue)
+        XCTAssertEqual(peer.dytallixRegistryPeerID, "[redacted-id]")
+        XCTAssertEqual(peer.dytallixFailureReason, "registry record revoked")
+    }
+
+    func testSupportBundleCarriesBlockedPeerHistorySnapshot() throws {
+        let exporter = makeExporter()
+        let observedAt = Date(timeIntervalSince1970: 3_000)
+        let checkedAt = Date(timeIntervalSince1970: 2_999)
+        let bundle = exporter.buildBundle(
+            status: nil,
+            meshMetrics: nil,
+            meshLastError: nil,
+            pumpCounters: nil,
+            configuration: leakyConfiguration(),
+            blockedPeerHistory: [
+                RustBlockedPeerHistoryEntry(
+                    peerID: "qlink_blocked",
+                    direction: "outbound",
+                    failureCode: 2,
+                    failureReason: "registry record is revoked by 10.0.0.7:9471",
+                    observedAt: observedAt,
+                    checkedAt: checkedAt
+                )
+            ],
+            redactionMode: .default
+        )
+
+        let blocked = try XCTUnwrap(bundle.blockedPeers.first)
+        XCTAssertEqual(bundle.blockedPeers.count, 1)
+        XCTAssertEqual(blocked.peerID, "[redacted-id]")
+        XCTAssertEqual(blocked.direction, "outbound")
+        XCTAssertEqual(blocked.failureCode, 2)
+        XCTAssertEqual(blocked.failureReason, "registry record is revoked by [redacted-ip]")
+        XCTAssertEqual(blocked.observedAt, observedAt)
+        XCTAssertEqual(blocked.checkedAt, checkedAt)
     }
 }

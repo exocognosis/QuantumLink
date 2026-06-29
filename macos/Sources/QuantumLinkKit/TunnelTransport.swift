@@ -26,16 +26,15 @@ public struct MeshTransportConfiguration: Codable, Equatable, Sendable {
     public let directProbeTimeoutMs: UInt64
     public let probePacingMs: UInt64
     public let enableICE: Bool
-    public let dytallixIdentity: DytallixIdentityConfiguration?
     /// Filesystem path of the persistent peer-record cache.
     /// Mirrors the Rust `peer_store_path`; `nil` keeps the
     /// connector's in-memory-only store. The parent directory must
     /// exist before tunnel start.
     public let peerStorePath: String?
-    /// Optional 32-byte ChaCha20-Poly1305 key, base64-encoded
+    /// Optional 32-byte SHAKE256 envelope key, base64-encoded
     /// (standard alphabet, with padding). Mirrors the Rust
     /// `peer_store_key_b64`. When set together with `peerStorePath`,
-    /// the on-disk cache file is written in the v2 encrypted
+    /// the on-disk cache file is written in the v3 protected
     /// envelope; without it the file is plaintext JSON. Mint via
     /// `PeerStoreKey.loadOrGenerateBase64()`.
     public let peerStoreKeyB64: String?
@@ -51,7 +50,6 @@ public struct MeshTransportConfiguration: Codable, Equatable, Sendable {
         directProbeTimeoutMs: UInt64 = 750,
         probePacingMs: UInt64 = 50,
         enableICE: Bool = false,
-        dytallixIdentity: DytallixIdentityConfiguration? = nil,
         peerStorePath: String? = nil,
         peerStoreKeyB64: String? = nil
     ) {
@@ -65,7 +63,6 @@ public struct MeshTransportConfiguration: Codable, Equatable, Sendable {
         self.directProbeTimeoutMs = directProbeTimeoutMs
         self.probePacingMs = probePacingMs
         self.enableICE = enableICE
-        self.dytallixIdentity = dytallixIdentity
         self.peerStorePath = peerStorePath
         self.peerStoreKeyB64 = peerStoreKeyB64
     }
@@ -81,7 +78,6 @@ public struct MeshTransportConfiguration: Codable, Equatable, Sendable {
         case directProbeTimeoutMs
         case probePacingMs
         case enableICE = "enableIce"
-        case dytallixIdentity
         case peerStorePath = "peerStorePath"
         case peerStoreKeyB64 = "peerStoreKeyB64"
     }
@@ -150,6 +146,9 @@ public struct InboundTransportFrame: Equatable, Sendable {
     }
 }
 
+let disabledDevQuicLoopbackReason =
+    "dev-quic-loopback is disabled because raw Quinn DATAGRAM bypasses the app-layer PQC frame session"
+
 public protocol TunnelTransporting: AnyObject, TransportFrameSink {
     var metrics: TunnelTransportMetrics { get }
     func start() throws
@@ -198,18 +197,18 @@ public final class DevelopmentDropTransportSender: TunnelTransporting {
 }
 
 public final class RustDevQuicLoopbackTransport: TunnelTransporting {
-    private let library: RustCoreLibrary
-    private var handle: UnsafeMutableRawPointer?
     public private(set) var metrics = TunnelTransportMetrics(
         kind: .devQuicLoopback,
         state: .stopped,
         pathType: .unavailable
     )
 
-    public var isReady: Bool { handle != nil && metrics.state == .ready }
+    public var isReady: Bool { false }
+
+    public init() {}
 
     public init(library: RustCoreLibrary) {
-        self.library = library
+        _ = library
     }
 
     deinit {
@@ -217,71 +216,25 @@ public final class RustDevQuicLoopbackTransport: TunnelTransporting {
     }
 
     public func start() throws {
-        if handle != nil {
-            return
-        }
-        do {
-            handle = try library.createDevQuicTransport()
-            metrics.state = .ready
-            metrics.pathType = .direct
-            metrics.lastError = nil
-            refreshMetrics()
-        } catch {
-            metrics.state = .failed
-            metrics.pathType = .unavailable
-            metrics.lastError = error.localizedDescription
-            throw error
-        }
+        metrics.state = .failed
+        metrics.pathType = .unavailable
+        metrics.lastError = disabledDevQuicLoopbackReason
+        throw RustCoreBridgeError.operationFailed(disabledDevQuicLoopbackReason)
     }
 
     public func stop() {
-        if let handle {
-            library.destroyDevQuicTransport(handle)
-        }
-        handle = nil
         metrics.state = .stopped
         metrics.pathType = .unavailable
     }
 
     public func sendTransportFrame(_ frame: Data) throws {
-        guard let handle else {
-            metrics.sendFailures += 1
-            metrics.lastError = "Dev QUIC transport is not started"
-            throw RustCoreBridgeError.operationFailed("Dev QUIC transport is not started")
-        }
-
-        do {
-            try library.sendDevQuicFrame(handle: handle, frame: frame)
-            refreshMetrics()
-        } catch {
-            metrics.sendFailures += 1
-            metrics.lastError = error.localizedDescription
-            throw error
-        }
+        metrics.sendFailures += 1
+        metrics.lastError = disabledDevQuicLoopbackReason
+        throw RustCoreBridgeError.operationFailed(disabledDevQuicLoopbackReason)
     }
 
     public func receiveTransportFrame() throws -> InboundTransportFrame? {
-        guard let handle else {
-            return nil
-        }
-        let frame = library.receiveDevQuicFrame(handle: handle)
-        refreshMetrics()
-        // Dev loopback has a single hard-coded session pair; there's no
-        // verified peer identity to report.
-        return frame.map { InboundTransportFrame(frame: $0, peerID: nil) }
-    }
-
-    private func refreshMetrics() {
-        guard let handle, let rustMetrics = try? library.devQuicTransportMetrics(handle: handle) else {
-            return
-        }
-
-        metrics.framesSent = rustMetrics.framesSent
-        metrics.framesReceived = rustMetrics.framesReceived
-        metrics.bytesSent = rustMetrics.bytesSent
-        metrics.bytesReceived = rustMetrics.bytesReceived
-        metrics.sendFailures = rustMetrics.sendFailures
-        metrics.receiveFailures = rustMetrics.receiveFailures
+        nil
     }
 }
 
@@ -439,6 +392,31 @@ public final class RustMeshTransport: TunnelTransporting {
         return RustMeshTransportState(rawValue: raw)
     }
 
+    /// Peer IDs the multi-peer transport is currently managing
+    /// (populated via `addPeer`; the connector dials them in the
+    /// background). Empty when the transport hasn't started or has no
+    /// peers configured.
+    public var managedPeerIDs: [String] {
+        guard let handle else { return [] }
+        return library.meshTransportPeerIDs(handle: handle) ?? []
+    }
+
+    /// Recently blocked peers the connector recorded after a trust
+    /// failure, surfaced for status + diagnostics. Empty when the
+    /// transport hasn't started.
+    public var blockedPeerHistory: [RustBlockedPeerHistoryEntry] {
+        guard let handle else { return [] }
+        return library.meshTransportBlockedPeerHistory(handle: handle) ?? []
+    }
+
+    /// Per-peer Dytallix trust status as last evaluated by the Rust
+    /// connector. `nil` when the transport hasn't started or the peer
+    /// has no recorded trust evaluation.
+    public func peerTrustStatus(_ peerID: String) -> RustMeshPeerTrustStatus? {
+        guard let handle else { return nil }
+        return library.meshTransportPeerTrustStatus(handle: handle, peerID: peerID)
+    }
+
     /// Sends a frame to a specific peer. Use this when `addPeer` /
     /// `removePeer` has populated multiple peers and the caller
     /// knows which one to target. For single-peer back-compat, use
@@ -583,7 +561,7 @@ public enum TunnelTransportFactory {
             return makeDevQuicLoopbackTransport()
         default:
             return DevelopmentDropTransportSender(
-                reason: "Set QLINK_TRANSPORT_MODE=mesh-quic for the production data plane, or QLINK_TRANSPORT_MODE=dev-quic-loopback for local QUIC smoke testing"
+                reason: "Set QLINK_TRANSPORT_MODE=mesh-quic for the production data plane"
             )
         }
     }
@@ -632,7 +610,7 @@ public enum TunnelTransportFactory {
             // directory, so ensure it exists before pointing at it.
             try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
             peerStorePath = dir.appendingPathComponent("peers.json").path
-            // Encryption is best-effort: if the Keychain isn't
+            // At-rest protection is best-effort: if the Keychain isn't
             // available (SPM smoke), silently ship with plaintext
             // on disk rather than failing the whole launch. The
             // file is still mode 0o600 in either case.
@@ -655,7 +633,6 @@ public enum TunnelTransportFactory {
             rendezvousURL: rendezvousURL ?? "127.0.0.1:9471",
             relayURL: relayURL,
             bindAddress: bindAddress,
-            dytallixIdentity: configuration.dytallixIdentity,
             peerStorePath: peerStorePath,
             peerStoreKeyB64: peerStoreKeyB64
         )
@@ -675,14 +652,7 @@ public enum TunnelTransportFactory {
     }
 
     private static func makeDevQuicLoopbackTransport() -> TunnelTransporting {
-        do {
-            let library = try RustCoreLibrary.openBundledOrConfigured()
-            return RustDevQuicLoopbackTransport(library: library)
-        } catch {
-            return DevelopmentDropTransportSender(
-                reason: "Rust dev QUIC transport unavailable: \(error.localizedDescription)"
-            )
-        }
+        RustDevQuicLoopbackTransport()
     }
 
     private static func makeMeshQuicTransport(

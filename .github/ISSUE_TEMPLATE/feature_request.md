@@ -15,9 +15,7 @@ assignees: ""
 ## Alternatives Considered
 
 
-## Platform, Security, Privacy, Licensing, or Operations Impact
+## Security, Privacy, or Apple Platform Impact
 
-Describe any effect on crypto, key storage, diagnostics, discovery
-metadata, Network Extension behavior, Windows service privilege, Wintun,
-WFP, DPAPI, signing, notarization, Authenticode, MDM, installers,
-updates, public/private release boundaries, or third-party licensing.
+Describe any effect on crypto, key storage, diagnostics, discovery metadata, Network Extension behavior, signing, notarization, MDM, or updates.
+

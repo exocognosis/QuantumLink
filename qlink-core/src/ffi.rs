@@ -1,37 +1,31 @@
 use crate::{
     crypto::DeviceKeypair,
     mesh_connection::NetworkEvent,
-    mesh_transport::{MeshTransportConfig, MeshTransportHandle, MeshTransportState},
+    mesh_transport::{
+        MeshTransportConfig, MeshTransportHandle, MeshTransportState, PeerTrustStatusRaw,
+    },
     packet_core::{PacketDisposition, PacketTunnelCore},
-    quic_transport::{QuicDatagramSession, QuicEndpoint},
     tracing_bridge,
 };
 use std::{
-    net::{IpAddr, Ipv4Addr, SocketAddr},
     os::raw::c_char,
     ptr, slice, str,
     sync::{Arc, Mutex},
-    time::Duration,
 };
-use tokio::runtime::Runtime;
 
 static VERSION: &[u8] = b"0.1.0\0";
-static SUITE: &[u8] = b"QLINK-FIPS203-MLKEM768-HKDFSHA256-v1\0";
+static SUITE: &[u8] = b"QLINK-FIPS203-MLKEM768-SHAKE256-v1\0";
 
 pub struct QlinkTunnelCoreHandle {
     core: Mutex<PacketTunnelCore>,
 }
 
 pub struct QlinkDevQuicTransportHandle {
-    _client_endpoint: QuicEndpoint,
-    _server_endpoint: QuicEndpoint,
-    client_session: QuicDatagramSession,
-    server_session: QuicDatagramSession,
     metrics: QlinkTransportMetrics,
-    runtime: Runtime,
 }
 
 #[repr(C)]
+#[derive(Default)]
 pub struct QlinkOwnedBuffer {
     pub ptr: *mut u8,
     pub len: usize,
@@ -74,6 +68,26 @@ pub struct QlinkTransportMetrics {
     pub bytes_received: u64,
     pub send_failures: u64,
     pub receive_failures: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct QlinkPeerTrustStatus {
+    pub decision_code: u32,
+    pub failure_code: u32,
+    pub checked_at_unix: u64,
+    pub source_code: u32,
+}
+
+impl From<PeerTrustStatusRaw> for QlinkPeerTrustStatus {
+    fn from(value: PeerTrustStatusRaw) -> Self {
+        Self {
+            decision_code: value.decision_code,
+            failure_code: value.failure_code,
+            checked_at_unix: value.checked_at_unix,
+            source_code: value.source_code,
+        }
+    }
 }
 
 #[no_mangle]
@@ -237,10 +251,7 @@ pub unsafe extern "C" fn qlink_tunnel_core_metrics(
 
 #[no_mangle]
 pub extern "C" fn qlink_dev_quic_transport_create() -> *mut QlinkDevQuicTransportHandle {
-    match create_dev_quic_transport() {
-        Ok(handle) => Box::into_raw(Box::new(handle)),
-        Err(_) => ptr::null_mut(),
-    }
+    ptr::null_mut()
 }
 
 #[no_mangle]
@@ -261,25 +272,12 @@ pub unsafe extern "C" fn qlink_dev_quic_transport_send_frame(
     let Some(handle) = handle.as_mut() else {
         return -1;
     };
-    let Some(frame) = borrowed_slice(frame, frame_len) else {
+    if borrowed_slice(frame, frame_len).is_none() {
         handle.metrics.send_failures += 1;
         return -1;
-    };
-
-    match handle
-        .runtime
-        .block_on(async { handle.client_session.send_frame(frame.to_vec()).await })
-    {
-        Ok(()) => {
-            handle.metrics.frames_sent += 1;
-            handle.metrics.bytes_sent += frame_len as u64;
-            0
-        }
-        Err(_) => {
-            handle.metrics.send_failures += 1;
-            -1
-        }
     }
+    handle.metrics.send_failures += 1;
+    -1
 }
 
 #[no_mangle]
@@ -294,26 +292,9 @@ pub unsafe extern "C" fn qlink_dev_quic_transport_receive_frame(
         handle.metrics.receive_failures += 1;
         return false;
     };
-
-    match handle.runtime.block_on(async {
-        tokio::time::timeout(
-            Duration::from_millis(25),
-            handle.server_session.receive_frame(),
-        )
-        .await
-    }) {
-        Ok(Ok(frame)) => {
-            handle.metrics.frames_received += 1;
-            handle.metrics.bytes_received += frame.len() as u64;
-            *out = owned_buffer_from_vec(frame);
-            true
-        }
-        Ok(Err(_)) => {
-            handle.metrics.receive_failures += 1;
-            false
-        }
-        Err(_) => false,
-    }
+    *out = QlinkOwnedBuffer::default();
+    handle.metrics.receive_failures += 1;
+    false
 }
 
 #[no_mangle]
@@ -370,35 +351,6 @@ fn owned_buffer_from_vec(mut bytes: Vec<u8>) -> QlinkOwnedBuffer {
     };
     std::mem::forget(bytes);
     buffer
-}
-
-fn create_dev_quic_transport() -> crate::Result<QlinkDevQuicTransportHandle> {
-    let runtime = Runtime::new()
-        .map_err(|err| crate::QlinkError::Protocol(format!("failed to create runtime: {err}")))?;
-    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-    let _runtime_guard = runtime.enter();
-    let (server_endpoint, server_cert) = QuicEndpoint::server(bind)?;
-    let client_endpoint = QuicEndpoint::client(bind, &[server_cert])?;
-    let server_addr = server_endpoint.local_addr()?;
-    let (client_session, server_session) = runtime.block_on(async {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            tokio::join!(
-                client_endpoint.connect(server_addr),
-                server_endpoint.accept_one()
-            )
-        })
-        .await
-        .map_err(|_| crate::QlinkError::Protocol("dev QUIC transport timed out".into()))
-    })?;
-
-    Ok(QlinkDevQuicTransportHandle {
-        _client_endpoint: client_endpoint,
-        _server_endpoint: server_endpoint,
-        client_session: client_session?,
-        server_session: server_session?,
-        metrics: QlinkTransportMetrics::default(),
-        runtime,
-    })
 }
 
 // ===================================================================
@@ -855,6 +807,48 @@ pub unsafe extern "C" fn qlink_mesh_transport_remove_peer(
     handle.remove_peer(peer_id_str);
 }
 
+/// Returns the active managed peer IDs as a newline-separated UTF-8
+/// buffer. The list includes peers whose session managers are currently
+/// failed/backing off, which lets operators see registry-rejected peers
+/// even before any inbound traffic is accepted.
+#[no_mangle]
+pub unsafe extern "C" fn qlink_mesh_transport_peer_ids(
+    handle: *mut MeshTransportHandle,
+    out: *mut QlinkOwnedBuffer,
+) -> bool {
+    let Some(handle) = handle.as_ref() else {
+        return false;
+    };
+    let Some(out) = out.as_mut() else {
+        return false;
+    };
+    let mut peer_ids = handle.peer_ids();
+    peer_ids.sort();
+    *out = owned_buffer_from_vec(peer_ids.join("\n").into_bytes());
+    true
+}
+
+/// Returns retained blocked/rejected peer history as a UTF-8 JSON array.
+/// Each entry contains `peer_id`, `direction`, `failure_code`,
+/// `failure_reason`, `observed_at_unix`, and `checked_at_unix`.
+#[no_mangle]
+pub unsafe extern "C" fn qlink_mesh_transport_blocked_peer_history(
+    handle: *mut MeshTransportHandle,
+    out: *mut QlinkOwnedBuffer,
+) -> bool {
+    let Some(handle) = handle.as_ref() else {
+        return false;
+    };
+    let Some(out) = out.as_mut() else {
+        return false;
+    };
+    let Ok(json) = serde_json::to_vec(&handle.blocked_peer_history()) else {
+        return false;
+    };
+    *out = owned_buffer_from_vec(json);
+    true
+}
+
 /// Per-peer state code (matches `qlink_mesh_transport_state_code`'s
 /// integer mapping: 0=connecting, 1=ready, 2=failed, 3=stopped).
 /// Returns false when the peer isn't active.
@@ -880,6 +874,42 @@ pub unsafe extern "C" fn qlink_mesh_transport_peer_state_code(
     match handle.peer_state_code(peer_id_str) {
         Some(code) => {
             *out = code;
+            true
+        }
+        None => false,
+    }
+}
+
+/// Per-peer Dytallix registry trust decision.
+/// Decision code: 0=unknown, 1=accepted/verified,
+/// 2=accepted without registry for private mesh,
+/// 3=accepted without registry for development mesh.
+/// Failure code: 0=none, 1=required record missing,
+/// 2=revoked, 3=suspended/inactive, 4=expired, 5=mismatch,
+/// 6=lookup failure, 7=verification failure.
+/// Returns false when the peer isn't active.
+#[no_mangle]
+pub unsafe extern "C" fn qlink_mesh_transport_peer_trust_status(
+    handle: *mut MeshTransportHandle,
+    peer_id: *const u8,
+    peer_id_len: usize,
+    out_status: *mut QlinkPeerTrustStatus,
+) -> bool {
+    let Some(handle) = handle.as_ref() else {
+        return false;
+    };
+    let Some(peer_id_bytes) = borrowed_slice(peer_id, peer_id_len) else {
+        return false;
+    };
+    let Ok(peer_id_str) = str::from_utf8(peer_id_bytes) else {
+        return false;
+    };
+    let Some(out) = out_status.as_mut() else {
+        return false;
+    };
+    match handle.peer_trust_status(peer_id_str) {
+        Some(status) => {
+            *out = status.into();
             true
         }
         None => false,
@@ -1028,31 +1058,26 @@ mod tests {
     }
 
     #[test]
-    fn ffi_dev_quic_transport_round_trips_frame() {
+    fn ffi_dev_quic_transport_is_disabled() {
         let handle = qlink_dev_quic_transport_create();
-        assert!(!handle.is_null());
+        assert!(handle.is_null());
 
         let frame = b"qlink-frame";
         let sent =
             unsafe { qlink_dev_quic_transport_send_frame(handle, frame.as_ptr(), frame.len()) };
-        assert_eq!(sent, 0);
+        assert_eq!(sent, -1);
 
         let mut received = QlinkOwnedBuffer {
             ptr: ptr::null_mut(),
             len: 0,
             cap: 0,
         };
-        assert!(unsafe { qlink_dev_quic_transport_receive_frame(handle, &mut received) });
-        let bytes = unsafe { slice::from_raw_parts(received.ptr, received.len).to_vec() };
-        assert_eq!(bytes, frame);
-        unsafe { qlink_owned_buffer_free(received) };
+        assert!(!unsafe { qlink_dev_quic_transport_receive_frame(handle, &mut received) });
+        assert!(received.ptr.is_null());
+        assert_eq!(received.len, 0);
 
         let mut metrics = QlinkTransportMetrics::default();
-        assert!(unsafe { qlink_dev_quic_transport_metrics(handle, &mut metrics) });
-        assert_eq!(metrics.frames_sent, 1);
-        assert_eq!(metrics.frames_received, 1);
-
-        unsafe { qlink_dev_quic_transport_destroy(handle) };
+        assert!(!unsafe { qlink_dev_quic_transport_metrics(handle, &mut metrics) });
     }
 
     fn test_ipv4_packet(destination: [u8; 4]) -> Vec<u8> {

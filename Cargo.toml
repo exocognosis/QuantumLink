@@ -4,6 +4,11 @@ members = [
     "dytallix/quantumlink-node-registry",
     "windows/rust/quantumlink-proto",
     "windows/rust/quantumlink-service",
+    "steam/steamos/rust/qlink-game",
+    "steam/steamos/rust/qlink-proto",
+    "steam/steamos/rust/qlink-linux",
+    "steam/steamos/rust/qlinkd",
+    "steam/steamos/rust/qlinkctl",
 ]
 resolver = "2"
 

@@ -10,7 +10,6 @@ public sealed partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
-        Root.DataContext = ViewModel;
         _ = ViewModel.InitializeAsync();
     }
 }

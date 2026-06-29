@@ -1,25 +1,26 @@
-use clap::{Args, Parser, Subcommand};
+use clap::{Parser, Subcommand};
 use qlink_core::{
     crypto::{answer_handshake, start_handshake, DeviceKeypair},
     discovery::{CandidateEndpoint, CandidateType, PeerRecord, UnsignedPeerRecord},
-    dytallix_identity::{
-        ensure_dytallix_enrollment_wallet, DytallixIdentityRegistry, DytallixRegistryConfig,
-    },
+    dytallix_identity::MeshTrustPolicy,
     ice::{perform_ice_check, spawn_dev_ice_responder, IceCheckRequest, IceCredentials},
-    local_loopback::{run_local_mesh_loopback, run_relay_loopback},
-    mesh_connection::{ConnectionOutcome, MeshConnector, MeshConnectorConfig, PathKind},
+    mesh_connection::{ConnectionOutcome, PathKind},
     mesh_transport::{MeshTransportConfig, MeshTransportHandle},
-    packet_core::{FfiRouteMode, PacketTunnelCore, PacketTunnelCoreConfig},
-    quic_transport::QuicEndpoint,
-    relay::{run_relay, spawn_dev_relay, RelayClient},
-    rendezvous::{run_rendezvous, spawn_dev_rendezvous, RendezvousClient},
+    relay::run_relay,
+    rendezvous::{run_rendezvous, RendezvousClient},
     stun::spawn_dev_stun,
     traversal::gather_local_candidates,
+};
+#[cfg(feature = "dev-quic-carrier")]
+use qlink_core::{
+    mesh_connection::{MeshConnector, MeshConnectorConfig},
+    quic_transport::QuicEndpoint,
+    relay::spawn_dev_relay,
+    rendezvous::spawn_dev_rendezvous,
 };
 use serde::Serialize;
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -125,72 +126,6 @@ enum Command {
         #[arg(long)]
         keyfile: Option<String>,
     },
-    Identity {
-        #[command(subcommand)]
-        command: IdentityCommand,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-enum IdentityCommand {
-    Register(IdentityRecordArgs),
-    Update(IdentityRecordArgs),
-    Revoke(IdentityRevokeArgs),
-    Status(IdentityStatusArgs),
-}
-
-#[derive(Debug, Args)]
-struct IdentityCommonArgs {
-    #[arg(long, default_value = "https://dytallix.com")]
-    endpoint: String,
-    #[arg(long)]
-    contract_address: String,
-    #[arg(long)]
-    keystore_path: Option<PathBuf>,
-    #[arg(long)]
-    wallet_name: Option<String>,
-}
-
-#[derive(Debug, Args)]
-struct IdentityRecordArgs {
-    #[command(flatten)]
-    common: IdentityCommonArgs,
-    #[arg(long)]
-    keyfile: String,
-    #[arg(long, default_value = "devmesh")]
-    mesh_id: String,
-    #[arg(long, default_value = "qlink")]
-    alias: String,
-    #[arg(long, default_value = "127.0.0.1")]
-    host: String,
-    #[arg(long, default_value_t = 4433)]
-    port: u16,
-    #[arg(long, default_value = "100.127.0.2/32")]
-    route: String,
-    #[arg(long, default_value_t = 300)]
-    ttl_seconds: u64,
-    #[arg(long, default_value_t = 1)]
-    sequence: u64,
-    #[arg(long)]
-    device_cert_der_b64: Option<String>,
-}
-
-#[derive(Debug, Args)]
-struct IdentityRevokeArgs {
-    #[command(flatten)]
-    common: IdentityCommonArgs,
-    #[arg(long)]
-    peer_id: String,
-}
-
-#[derive(Debug, Args)]
-struct IdentityStatusArgs {
-    #[arg(long, default_value = "https://dytallix.com")]
-    endpoint: String,
-    #[arg(long)]
-    contract_address: String,
-    #[arg(long)]
-    peer_id: String,
 }
 
 #[tokio::main]
@@ -262,81 +197,24 @@ async fn main() -> qlink_core::Result<()> {
             run_relay(&listen).await?;
         }
         Command::QuicLoopback => {
-            let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-            let (server_endpoint, server_cert) = QuicEndpoint::server(bind)?;
-            let client_endpoint = QuicEndpoint::client(bind, &[server_cert])?;
-            let server_addr = server_endpoint.local_addr()?;
-
-            let (client_session, server_session) =
-                tokio::time::timeout(Duration::from_secs(5), async {
-                    tokio::join!(
-                        client_endpoint.connect(server_addr),
-                        server_endpoint.accept_one()
-                    )
-                })
-                .await
-                .map_err(|_| qlink_core::QlinkError::Protocol("QUIC loopback timed out".into()))?;
-            let client_session = client_session?;
-            let server_session = server_session?;
-
-            let mut sender = dev_packet_core()?;
-            let mut receiver = dev_packet_core()?;
-            let packet = test_ipv4_packet([100, 127, 0, 10]);
-            sender.submit_tunnel_packet(2, &packet)?;
-            let frame = sender.pop_transport_frame().ok_or_else(|| {
-                qlink_core::QlinkError::Protocol("packet core produced no frame".into())
-            })?;
-
-            client_session.send_frame(frame).await?;
-            let received_frame = server_session.receive_frame().await?;
-            receiver.accept_transport_frame(&received_frame)?;
-            let restored = receiver.pop_tunnel_packet().ok_or_else(|| {
-                qlink_core::QlinkError::Protocol("receiver produced no tunnel packet".into())
-            })?;
-
-            println!("transport=quic_datagram");
-            println!("server_addr={server_addr}");
-            println!("packet_bytes={}", restored.bytes.len());
-            println!("protocol_family={}", restored.protocol_family);
-            println!("packet_round_trip={}", restored.bytes == packet);
+            return Err(qlink_core::QlinkError::Protocol(
+                "quic-loopback is disabled because raw Quinn DATAGRAM bypasses the app-layer PQC frame session".into(),
+            ));
         }
         Command::MeshLoopback => {
-            let result = run_local_mesh_loopback().await?;
-            println!("transport=quic_datagram");
-            println!("rendezvous_addr={}", result.rendezvous_addr);
-            println!("quic_server_addr={}", result.quic_server_addr);
-            println!("local_peer_id={}", result.local_peer_id);
-            println!("remote_peer_id={}", result.remote_peer_id);
-            println!("selected_path_type={:?}", result.selected_path_type);
-            println!("selected_path_score={}", result.selected_path_score);
-            println!("packet_bytes={}", result.packet_bytes);
-            println!("protocol_family={}", result.protocol_family);
-            println!("packet_round_trip={}", result.packet_round_trip);
+            return Err(qlink_core::QlinkError::Protocol(
+                "mesh-loopback is disabled because the legacy local loopback bypasses the app-layer PQC frame session; use direct-send or mesh-transport tests".into(),
+            ));
         }
         Command::RelayLoopback => {
-            let result = run_relay_loopback().await?;
-            println!("transport=relay_datagram");
-            println!("relay_addr={}", result.relay_addr);
-            println!("source_peer_id={}", result.source_peer_id);
-            println!("destination_peer_id={}", result.destination_peer_id);
-            println!("packet_bytes={}", result.packet_bytes);
-            println!("protocol_family={}", result.protocol_family);
-            println!("packet_round_trip={}", result.packet_round_trip);
+            return Err(qlink_core::QlinkError::Protocol(
+                "relay-loopback is disabled until relay has an end-to-end PQC session".into(),
+            ));
         }
-        Command::RelaySmoke { server } => {
-            let mut alice = RelayClient::connect(&server, "alice").await?;
-            let mut bob = RelayClient::connect(&server, "bob").await?;
-            alice.send_datagram("bob", b"hello via relay").await?;
-            let received = tokio::time::timeout(Duration::from_secs(5), bob.receive_datagram())
-                .await
-                .map_err(|_| qlink_core::QlinkError::Protocol("relay smoke timed out".into()))??
-                .ok_or_else(|| {
-                    qlink_core::QlinkError::Protocol("relay closed before response".into())
-                })?;
-
-            println!("relay_server={server}");
-            println!("source={}", received.0);
-            println!("payload={}", String::from_utf8_lossy(&received.1));
+        Command::RelaySmoke { .. } => {
+            return Err(qlink_core::QlinkError::Protocol(
+                "relay-smoke is disabled until relay has an end-to-end PQC session".into(),
+            ));
         }
         Command::RendezvousSmoke { server } => {
             let keypair = DeviceKeypair::generate()?;
@@ -432,161 +310,12 @@ async fn main() -> qlink_core::Result<()> {
             );
             println!("total_elapsed_ms={}", outcome.total_elapsed.as_millis());
         }
-        Command::Identity { command } => match command {
-            IdentityCommand::Register(args) => {
-                let (registry, peer_record, keypair) = identity_registry_and_record(&args)?;
-                let wallet = ensure_dytallix_enrollment_wallet(registry.config())?;
-                let submission = registry
-                    .register(&peer_record, &keypair, qlink_core::discovery::now_unix())
-                    .await?;
-                print_identity_submission(
-                    "register",
-                    &peer_record,
-                    &wallet.wallet_address,
-                    submission,
-                )?;
-            }
-            IdentityCommand::Update(args) => {
-                let (registry, peer_record, keypair) = identity_registry_and_record(&args)?;
-                let wallet = ensure_dytallix_enrollment_wallet(registry.config())?;
-                let submission = registry
-                    .update(&peer_record, &keypair, qlink_core::discovery::now_unix())
-                    .await?;
-                print_identity_submission(
-                    "update",
-                    &peer_record,
-                    &wallet.wallet_address,
-                    submission,
-                )?;
-            }
-            IdentityCommand::Revoke(args) => {
-                let registry = identity_registry_from_common(&args.common, true)?;
-                let submission = registry
-                    .revoke(&args.peer_id, qlink_core::discovery::now_unix())
-                    .await?;
-                println!("identity_action=revoke");
-                println!("peer_id={}", args.peer_id);
-                if let Some(tx_hash) = submission.tx_hash {
-                    println!("tx_hash={tx_hash}");
-                }
-            }
-            IdentityCommand::Status(args) => {
-                let config =
-                    DytallixRegistryConfig::lookup_only(args.endpoint, args.contract_address)?;
-                let registry = DytallixIdentityRegistry::new(config)?;
-                match registry.status(&args.peer_id).await? {
-                    Some(record) => {
-                        println!("identity_action=status");
-                        println!("peer_id={}", record.peer_id);
-                        println!("status={:?}", record.status);
-                        println!("owner_daddr={}", record.owner_daddr);
-                        println!("updated_at={}", record.updated_at);
-                        if let Some(expires_at) = record.expires_at {
-                            println!("expires_at={expires_at}");
-                        }
-                        println!(
-                            "device_public_key_hash={}",
-                            hex(&record.device_public_key_hash)
-                        );
-                        println!(
-                            "latest_peer_record_hash={}",
-                            hex(&record.latest_peer_record_hash)
-                        );
-                    }
-                    None => {
-                        println!("identity_action=status");
-                        println!("peer_id={}", args.peer_id);
-                        println!("status=missing");
-                    }
-                }
-            }
-        },
     }
 
     Ok(())
 }
 
-fn identity_registry_from_common(
-    common: &IdentityCommonArgs,
-    require_wallet: bool,
-) -> qlink_core::Result<DytallixIdentityRegistry> {
-    let keystore_path = if require_wallet {
-        Some(
-            common
-                .keystore_path
-                .clone()
-                .unwrap_or_else(dytallix_sdk::keystore::Keystore::default_path),
-        )
-    } else {
-        common.keystore_path.clone()
-    };
-    let config = DytallixRegistryConfig::new(
-        common.endpoint.clone(),
-        common.contract_address.clone(),
-        keystore_path,
-        common.wallet_name.clone(),
-    )?;
-    DytallixIdentityRegistry::new(config)
-}
-
-fn identity_registry_and_record(
-    args: &IdentityRecordArgs,
-) -> qlink_core::Result<(DytallixIdentityRegistry, PeerRecord, DeviceKeypair)> {
-    let registry = identity_registry_from_common(&args.common, true)?;
-    let keypair = load_or_generate_keypair(Some(&args.keyfile))?;
-    let record = build_identity_peer_record(args, &keypair)?;
-    Ok((registry, record, keypair))
-}
-
-fn build_identity_peer_record(
-    args: &IdentityRecordArgs,
-    keypair: &DeviceKeypair,
-) -> qlink_core::Result<PeerRecord> {
-    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-
-    let certificate_der = match args.device_cert_der_b64.as_deref() {
-        Some(raw) => B64.decode(raw).map_err(|err| {
-            qlink_core::QlinkError::Protocol(format!("device_cert_der_b64 is invalid: {err}"))
-        })?,
-        None => Vec::new(),
-    };
-    let body = UnsignedPeerRecord::new(
-        args.mesh_id.clone(),
-        args.alias.clone(),
-        keypair.public_key(),
-        vec![CandidateEndpoint {
-            candidate_type: CandidateType::Host,
-            address: args.host.clone(),
-            port: args.port,
-            priority: 120,
-        }],
-        vec![args.route.clone()],
-        args.ttl_seconds,
-        args.sequence,
-    )
-    .with_device_certificate(certificate_der);
-    PeerRecord::signed(body, keypair)
-}
-
-fn print_identity_submission(
-    action: &str,
-    peer_record: &PeerRecord,
-    wallet_address: &str,
-    submission: qlink_core::dytallix_identity::RegistrySubmission,
-) -> qlink_core::Result<()> {
-    println!("identity_action={action}");
-    println!("peer_id={}", peer_record.body.peer_id);
-    println!("owner_daddr={wallet_address}");
-    println!(
-        "latest_peer_record_hash={}",
-        hex(&peer_record.record_hash()?)
-    );
-    if let Some(tx_hash) = submission.tx_hash {
-        println!("tx_hash={tx_hash}");
-    }
-    Ok(())
-}
-
+#[cfg(test)]
 async fn run_direct_send(
     rendezvous_url: &str,
     mesh_id: &str,
@@ -634,25 +363,34 @@ impl DirectSendTimingReport {
             )
         });
         Self {
-            rendezvous_lookup_ms: run.outcome.timings.rendezvous_lookup.as_millis(),
-            direct_probe_wall_clock_ms: run.outcome.timings.direct_probe_wall_clock.as_millis(),
-            quic_connect_ms: established_attempt
-                .and_then(|attempt| attempt.quic_connect_elapsed)
-                .map(|elapsed| elapsed.as_millis()),
-            identity_assertion_ms: established_attempt
-                .and_then(|attempt| attempt.identity_assertion_elapsed)
-                .map(|elapsed| elapsed.as_millis()),
-            relay_connect_ms: run
-                .outcome
-                .timings
-                .relay_connect_elapsed
-                .map(|elapsed| elapsed.as_millis()),
+            rendezvous_lookup_ms: 0,
+            direct_probe_wall_clock_ms: run.outcome.total_elapsed.as_millis(),
+            quic_connect_ms: established_attempt.map(|attempt| attempt.elapsed.as_millis()),
+            identity_assertion_ms: None,
+            relay_connect_ms: None,
             datagram_delivery_ms: run.datagram_delivery_elapsed.as_millis(),
             total_elapsed_ms: run.outcome.total_elapsed.as_millis(),
         }
     }
 }
 
+#[cfg(not(feature = "dev-quic-carrier"))]
+async fn run_direct_send_detailed(
+    _rendezvous_url: &str,
+    _mesh_id: &str,
+    _remote_peer_id: &str,
+    _bind_addr: &str,
+    _keyfile: Option<&str>,
+    _payload: &[u8],
+    _timeout_ms: u64,
+) -> qlink_core::Result<DirectSendRun> {
+    Err(qlink_core::QlinkError::Protocol(
+        "native UDP live mesh carrier is not wired yet; enable dev-quic-carrier for legacy Quinn development carrier"
+            .into(),
+    ))
+}
+
+#[cfg(feature = "dev-quic-carrier")]
 async fn run_direct_send_detailed(
     rendezvous_url: &str,
     mesh_id: &str,
@@ -737,6 +475,7 @@ async fn run_publish_self(
                 disable_inbound_responder: false,
                 peer_store_path: peer_store_for_handle,
                 peer_store_key_b64: None,
+                mesh_trust_policy: MeshTrustPolicy::DevelopmentOptional,
                 dytallix_identity: None,
             },
             Some(keypair_for_handle),
@@ -836,6 +575,22 @@ fn load_or_generate_keypair(keyfile: Option<&str>) -> qlink_core::Result<DeviceK
     Ok(keypair)
 }
 
+#[cfg(not(feature = "dev-quic-carrier"))]
+async fn run_mesh_connect_demo(scenario: &str) -> qlink_core::Result<()> {
+    if scenario == "stun-gather" {
+        return run_stun_gather_demo().await;
+    }
+    if scenario == "ice-check" {
+        return run_ice_check_demo().await;
+    }
+
+    Err(qlink_core::QlinkError::Protocol(
+        "native UDP live mesh carrier is not wired yet; enable dev-quic-carrier for legacy Quinn development carrier"
+            .into(),
+    ))
+}
+
+#[cfg(feature = "dev-quic-carrier")]
 async fn run_mesh_connect_demo(scenario: &str) -> qlink_core::Result<()> {
     if scenario == "stun-gather" {
         return run_stun_gather_demo().await;
@@ -1063,18 +818,17 @@ async fn run_stun_gather_demo() -> qlink_core::Result<()> {
     let stun = spawn_dev_stun().await?;
     let stun_addr = stun.local_addr();
 
-    // Stand up a QUIC server so we have a realistic local addr to publish.
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-    let (server_endpoint, _cert) = QuicEndpoint::server(bind)?;
-    let quic_addr = server_endpoint.local_addr()?;
+    let socket = UdpSocket::bind(bind).await?;
+    let local_transport_addr = socket.local_addr()?;
 
     let started = Instant::now();
-    let (candidates, report) = gather_local_candidates(quic_addr, &[stun_addr]).await;
+    let (candidates, report) = gather_local_candidates(local_transport_addr, &[stun_addr]).await;
     let elapsed = started.elapsed();
 
     println!("scenario=stun-gather");
     println!("stun_addr={stun_addr}");
-    println!("quic_addr={quic_addr}");
+    println!("local_transport_addr={local_transport_addr}");
     println!("gather_elapsed_ms={}", elapsed.as_millis());
     println!("gathered_candidates={}", candidates.len());
     for (index, candidate) in candidates.iter().enumerate() {
@@ -1090,29 +844,7 @@ async fn run_stun_gather_demo() -> qlink_core::Result<()> {
     Ok(())
 }
 
-fn dev_packet_core() -> qlink_core::Result<PacketTunnelCore> {
-    PacketTunnelCore::new(PacketTunnelCoreConfig {
-        protected_routes: vec!["100.127.0.0/16".to_string()],
-        excluded_routes: vec![],
-        route_mode: FfiRouteMode::SplitTunnel,
-        mtu: 1280,
-        crypto: None,
-    })
-}
-
-fn test_ipv4_packet(destination: [u8; 4]) -> Vec<u8> {
-    let mut packet = vec![0_u8; 20];
-    packet[0] = 0x45;
-    packet[2] = 0;
-    packet[3] = 20;
-    packet[8] = 64;
-    packet[9] = 17;
-    packet[12..16].copy_from_slice(&[100, 127, 0, 2]);
-    packet[16..20].copy_from_slice(&destination);
-    packet
-}
-
-#[cfg(test)]
+#[cfg(all(test, feature = "dev-quic-carrier"))]
 mod tests {
     use super::*;
 
@@ -1147,6 +879,7 @@ mod tests {
                         disable_inbound_responder: false,
                         peer_store_path: None,
                         peer_store_key_b64: None,
+                        mesh_trust_policy: MeshTrustPolicy::DevelopmentOptional,
                         dytallix_identity: None,
                     },
                     Some(remote_key),
