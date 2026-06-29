@@ -15,6 +15,7 @@ public enum ConfigurationValidationError: Error, LocalizedError {
     case invalidRoute(String)
     case invalidAddress(String)
     case invalidEndpoint(String)
+    case invalidDytallixIdentity(String)
 
     public var errorDescription: String? {
         switch self {
@@ -28,6 +29,8 @@ public enum ConfigurationValidationError: Error, LocalizedError {
             "Invalid IPv4 address: \(address)"
         case .invalidEndpoint(let endpoint):
             "Invalid endpoint address: \(endpoint)"
+        case .invalidDytallixIdentity(let message):
+            "Invalid Dytallix identity configuration: \(message)"
         }
     }
 }
@@ -65,6 +68,12 @@ public enum ConfigurationValidator {
         }
         for endpoint in configuration.rendezvousServers + configuration.relayServers {
             try validateEndpoint(endpoint)
+        }
+        if configuration.dytallixIdentity?.trustPolicy == .publicRequired,
+           configuration.dytallixIdentity?.mode == .off {
+            throw ConfigurationValidationError.invalidDytallixIdentity(
+                "public meshes cannot disable Dytallix identity"
+            )
         }
 
         var warnings: [String] = []

@@ -1,6 +1,10 @@
 use crate::{
     crypto::DeviceKeypair,
     discovery::{CandidateEndpoint, CandidateType},
+    dytallix_identity::{
+        registry_unavailable_decision, verify_registry_binding, IdentityRegistryLookup,
+        MeshTrustPolicy,
+    },
     error::{QlinkError, Result},
     ice::{perform_ice_check, IceCheckRequest, IceCredentials},
     inbound_identity::send_inbound_assertion,
@@ -50,6 +54,12 @@ pub struct MeshConnectorConfig {
     /// candidate probe. Denied peers fail with a clear protocol error and
     /// never touch the network. Defaults to no ACL (all peers permitted).
     pub peer_acl: Option<PeerAcl>,
+    /// Optional Dytallix registry policy. `None` preserves private/dev
+    /// legacy behavior. When set, the connector evaluates the signed
+    /// `PeerRecord` against the shared registry policy before direct
+    /// probes, relay fallback, or inbound transport setup.
+    pub dytallix_trust_policy: Option<MeshTrustPolicy>,
+    pub dytallix_registry: Option<Arc<dyn IdentityRegistryLookup>>,
     /// Local device keypair. When set, the connector sends a signed
     /// `InboundIdentityAssertion` over a fresh uni-stream immediately
     /// after the QUIC handshake completes — this is what lets the
@@ -72,12 +82,29 @@ impl MeshConnectorConfig {
             ice_check_timeout: None,
             relay_server: None,
             peer_acl: None,
+            dytallix_trust_policy: None,
+            dytallix_registry: None,
             local_device_keypair: None,
         }
     }
 
     pub fn with_peer_acl(mut self, acl: PeerAcl) -> Self {
         self.peer_acl = Some(acl);
+        self
+    }
+
+    pub fn with_dytallix_trust_policy(mut self, policy: MeshTrustPolicy) -> Self {
+        self.dytallix_trust_policy = Some(policy);
+        self
+    }
+
+    pub fn with_dytallix_registry(
+        mut self,
+        policy: MeshTrustPolicy,
+        registry: Arc<dyn IdentityRegistryLookup>,
+    ) -> Self {
+        self.dytallix_trust_policy = Some(policy);
+        self.dytallix_registry = Some(registry);
         self
     }
 
@@ -647,6 +674,31 @@ impl MeshConnector {
             }
         };
         record.verify(&self.config.mesh_id)?;
+        if let Some(policy) = self.config.dytallix_trust_policy {
+            let decision = if let Some(registry) = self.config.dytallix_registry.as_ref() {
+                match registry.lookup_record(&record.body.peer_id).await {
+                    Ok(registry_record) => {
+                        verify_registry_binding(&record, registry_record.as_ref(), policy)
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            peer_id = %record.body.peer_id,
+                            error = %error,
+                            "dytallix registry lookup failed"
+                        );
+                        registry_unavailable_decision(policy)
+                    }
+                }
+            } else {
+                verify_registry_binding(&record, None, policy)
+            }?;
+            tracing::debug!(
+                peer_id = %record.body.peer_id,
+                ?policy,
+                ?decision,
+                "dytallix registry policy accepted peer record"
+            );
+        }
         let remote_ice_credentials = record.body.ice_credentials.clone();
         // The signed record carries the remote's QUIC server cert. We trust
         // it for the lifetime of this connect attempt; the ML-DSA signature
@@ -1934,6 +1986,84 @@ mod tests {
         assert!(
             !message.contains("rejected by ACL"),
             "request should NOT have been ACL-rejected: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn public_dytallix_policy_rejects_missing_registry_before_transport_probe() {
+        let rendezvous = spawn_dev_rendezvous().await.unwrap();
+        let rendezvous_client = RendezvousClient::new(rendezvous.local_addr().to_string());
+
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let (_unused_server, throwaway_cert) = QuicEndpoint::server(bind).unwrap();
+        let client_endpoint = QuicEndpoint::client(bind, &[throwaway_cert]).unwrap();
+
+        let local_key = DeviceKeypair::generate().unwrap();
+        let remote_key = DeviceKeypair::generate().unwrap();
+        let remote_peer_id = remote_key.public_key().peer_id();
+        let remote_record = signed_record(
+            &remote_key,
+            vec![CandidateEndpoint {
+                candidate_type: CandidateType::Host,
+                address: "127.0.0.1".to_string(),
+                port: 9,
+                priority: 120,
+            }],
+            1,
+        );
+        rendezvous_client
+            .publish(MESH_ID, remote_record)
+            .await
+            .unwrap();
+
+        let connector = MeshConnector::new(
+            MeshConnectorConfig::new(MESH_ID, local_key.public_key().peer_id())
+                .with_dytallix_trust_policy(
+                    crate::dytallix_identity::MeshTrustPolicy::PublicRequired,
+                ),
+            rendezvous_client,
+            client_endpoint,
+        );
+
+        let error = connector.connect(&remote_peer_id).await.unwrap_err();
+        assert!(
+            error.to_string().contains("rejected_missing_registry"),
+            "public meshes must fail closed before probes or relay: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn private_dytallix_policy_warns_and_continues_without_registry() {
+        let rendezvous = spawn_dev_rendezvous().await.unwrap();
+        let rendezvous_client = RendezvousClient::new(rendezvous.local_addr().to_string());
+
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let (_unused_server, throwaway_cert) = QuicEndpoint::server(bind).unwrap();
+        let client_endpoint = QuicEndpoint::client(bind, &[throwaway_cert]).unwrap();
+
+        let local_key = DeviceKeypair::generate().unwrap();
+        let remote_key = DeviceKeypair::generate().unwrap();
+        let remote_peer_id = remote_key.public_key().peer_id();
+        let remote_record = signed_record(&remote_key, vec![], 1);
+        rendezvous_client
+            .publish(MESH_ID, remote_record)
+            .await
+            .unwrap();
+
+        let connector = MeshConnector::new(
+            MeshConnectorConfig::new(MESH_ID, local_key.public_key().peer_id())
+                .with_dytallix_trust_policy(
+                    crate::dytallix_identity::MeshTrustPolicy::PrivatePreferred,
+                ),
+            rendezvous_client,
+            client_endpoint,
+        );
+
+        let error = connector.connect(&remote_peer_id).await.unwrap_err();
+        assert!(
+            error.to_string().contains("no direct candidate")
+                && !error.to_string().contains("rejected_missing_registry"),
+            "private meshes should continue past missing registry and fail only on transport: {error}"
         );
     }
 

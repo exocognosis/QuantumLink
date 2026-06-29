@@ -34,7 +34,7 @@
                 <ColumnDefinition Width="*" />
             </Grid.ColumnDefinitions>
             <Grid.RowDefinitions>
-                <RowDefinition /><RowDefinition /><RowDefinition /><RowDefinition /><RowDefinition />
+                <RowDefinition /><RowDefinition /><RowDefinition /><RowDefinition /><RowDefinition /><RowDefinition />
             </Grid.RowDefinitions>
 
             <TextBlock Grid.Row="0" Grid.Column="0" Text="Path" Opacity="0.6" />
@@ -45,8 +45,10 @@
             <TextBlock Grid.Row="2" Grid.Column="1" Text="{Binding RouteSummary, Mode=OneWay}" />
             <TextBlock Grid.Row="3" Grid.Column="0" Text="Kill switch" Opacity="0.6" />
             <TextBlock Grid.Row="3" Grid.Column="1" Text="{Binding KillSwitchEngaged, Mode=OneWay}" />
-            <TextBlock Grid.Row="4" Grid.Column="0" Text="Service" Opacity="0.6" />
-            <TextBlock Grid.Row="4" Grid.Column="1" Text="{Binding ServiceState, Mode=OneWay}" />
+            <TextBlock Grid.Row="4" Grid.Column="0" Text="Identity" Opacity="0.6" />
+            <TextBlock Grid.Row="4" Grid.Column="1" Text="{Binding IdentitySummary, Mode=OneWay}" />
+            <TextBlock Grid.Row="5" Grid.Column="0" Text="Service" Opacity="0.6" />
+            <TextBlock Grid.Row="5" Grid.Column="1" Text="{Binding ServiceState, Mode=OneWay}" />
         </Grid>
 
         <!-- Peers -->

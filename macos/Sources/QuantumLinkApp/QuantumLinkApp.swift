@@ -546,6 +546,7 @@ private struct OnboardingPanel: View {
     @Binding var appearancePreference: AppearancePreference
     @Binding var globalPQCAlgorithm: PQCAlgorithm
     @Binding var onboardingTabVisible: Bool
+    @State private var selectedDytallixIdentityMode: DiscoveryIdentityMode = .off
     let configuration: TunnelConfiguration
     let status: TunnelStatus
 
@@ -1800,6 +1801,32 @@ private struct ConfigurationPanel: View {
                         }
                     }
 
+                    ConfigurationCard(title: "Dytallix Identity", systemImage: "person.badge.key") {
+                        Picker("Identity", selection: $selectedDytallixIdentityMode) {
+                            ForEach(DiscoveryIdentityMode.allCases, id: \.self) { mode in
+                                Text(mode.title)
+                                    .tag(mode)
+                                    .disabled(mode == .off && configuration.dytallixIdentity?.trustPolicy == .publicRequired)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .onAppear {
+                            let configured = configuration.dytallixIdentity?.mode ?? .off
+                            selectedDytallixIdentityMode =
+                                configured == .off && configuration.dytallixIdentity?.trustPolicy == .publicRequired
+                                ? .verified
+                                : configured
+                        }
+                        .onChange(of: selectedDytallixIdentityMode) { _, newValue in
+                            if newValue == .off && configuration.dytallixIdentity?.trustPolicy == .publicRequired {
+                                selectedDytallixIdentityMode = .verified
+                            }
+                        }
+
+                        InfoRow(label: "Policy", value: configuration.dytallixIdentity?.trustPolicy.title ?? "Development Optional")
+                        InfoRow(label: "Registry", value: configuration.dytallixIdentity?.registry?.endpoint ?? "Not configured")
+                    }
+
                     ConfigurationCard(title: "Routing", systemImage: "arrow.triangle.branch") {
                         InfoRow(label: "Route Mode", value: configuration.routeMode.label)
                         InfoRow(label: "DNS Mode", value: configuration.dnsMode.label)
@@ -2573,6 +2600,26 @@ private extension DiscoveryMode {
         case .rendezvous: "Rendezvous"
         case .privateDHT: "Private DHT"
         case .localMDNS: "Local mDNS"
+        }
+    }
+}
+
+private extension MeshTrustPolicy {
+    var title: String {
+        switch self {
+        case .publicRequired: "Public Required"
+        case .privatePreferred: "Private Preferred"
+        case .developmentOptional: "Development Optional"
+        }
+    }
+}
+
+private extension DiscoveryIdentityMode {
+    var title: String {
+        switch self {
+        case .off: "Off"
+        case .verified: "Verified"
+        case .publicWallet: "Public Wallet"
         }
     }
 }

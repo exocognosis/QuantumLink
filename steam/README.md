@@ -13,6 +13,10 @@ client deliberately does not have.
 
 - [`qlink-core`](../qlink-core) — the one shared Rust protocol/crypto
   core (same crate the macOS and Windows silos build against).
+- Shared Dytallix identity policy from `qlink-core`: the Steam edition
+  forwards `dytallixIdentity` config and reports registry status, but
+  it does not bind trust to Steam accounts, hardware IDs, or launcher
+  state.
 - The **Windows silo's** privileged-service architecture as a
   reference: Wintun adapter, WFP, DPAPI secrets, named-pipe IPC. The
   Steam desktop edition is expected to build on that service rather than
@@ -48,6 +52,12 @@ steam/
 
 The Steam-routing policy will live in its own Rust crate added to the
 root Cargo workspace, depending on `qlink-core` like the other silos.
+
+Linux/SteamOS daemon builds use `/etc/quantumlink` for operator config
+and `/var/lib/quantumlink` for state/cache. `qlinkctl identity status`
+is the CLI surface for registry state; the same public/private/dev
+Dytallix policy decisions remain in shared Rust before dialing or
+accepting peers.
 
 ## Status / next steps
 

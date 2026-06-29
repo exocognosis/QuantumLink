@@ -118,6 +118,7 @@ pub fn default_tunnel_configuration() -> crate::models::TunnelConfiguration {
         mtu: 1280,
         crypto: crate::models::CryptoPolicy::default(),
         kill_switch: crate::models::KillSwitchPolicy::FailClosed,
+        dytallix_identity: None,
     }
 }
 

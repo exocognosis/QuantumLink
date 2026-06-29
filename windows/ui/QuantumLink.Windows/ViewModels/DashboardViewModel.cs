@@ -19,6 +19,7 @@ public partial class DashboardViewModel : ObservableObject
     [ObservableProperty] private string _pathType = "unavailable";
     [ObservableProperty] private string _overlayAddress = "";
     [ObservableProperty] private string _routeSummary = "";
+    [ObservableProperty] private string _identitySummary = "Dytallix identity off";
     [ObservableProperty] private bool _killSwitchEngaged;
     [ObservableProperty] private string? _lastError;
     [ObservableProperty] private string _serviceState = "Connecting to service…";
@@ -99,6 +100,9 @@ public partial class DashboardViewModel : ObservableObject
         PathType = status.PathType;
         OverlayAddress = status.OverlayIPv4Address;
         RouteSummary = string.Join(", ", status.ProtectedRoutes);
+        IdentitySummary = status.DytallixIdentity is { } identity
+            ? $"{identity.Mode} / {identity.TrustPolicy}"
+            : "Dytallix identity off";
         KillSwitchEngaged = status.KillSwitchEngaged ?? false;
         LastError = status.LastError;
         IsConnected = status.Phase is "connected" or "degraded" or "reconnecting";

@@ -58,6 +58,68 @@ pub enum DiscoveryMode {
     LocalMdns,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MeshTrustPolicy {
+    #[serde(
+        rename = "publicRequired",
+        alias = "PublicRequired",
+        alias = "public_required"
+    )]
+    PublicRequired,
+    #[serde(
+        rename = "privatePreferred",
+        alias = "PrivatePreferred",
+        alias = "private_preferred"
+    )]
+    PrivatePreferred,
+    #[serde(
+        rename = "developmentOptional",
+        alias = "DevelopmentOptional",
+        alias = "development_optional"
+    )]
+    DevelopmentOptional,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DiscoveryIdentityMode {
+    #[serde(rename = "off", alias = "Off")]
+    Off,
+    #[serde(rename = "verified", alias = "Verified")]
+    Verified,
+    #[serde(
+        rename = "publicWallet",
+        alias = "PublicWallet",
+        alias = "public_wallet"
+    )]
+    PublicWallet,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DytallixRegistryConfiguration {
+    pub endpoint: String,
+    pub contract_address: String,
+    #[serde(default)]
+    pub keystore_path: Option<String>,
+    #[serde(default)]
+    pub wallet_name: Option<String>,
+    #[serde(default)]
+    pub network_id: Option<String>,
+    #[serde(default)]
+    pub chain_id: Option<String>,
+    #[serde(default)]
+    pub allowed_rpc_endpoints: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DytallixIdentityConfiguration {
+    pub trust_policy: MeshTrustPolicy,
+    pub mode: DiscoveryIdentityMode,
+    #[serde(default)]
+    pub registry: Option<DytallixRegistryConfiguration>,
+}
+
 /// Defines how the tunnel behaves when the data plane cannot protect a
 /// packet.
 ///
@@ -181,6 +243,8 @@ pub struct TunnelStatus {
     #[serde(default)]
     pub kill_switch_engaged: Option<bool>,
     #[serde(default)]
+    pub dytallix_identity: Option<DytallixIdentityConfiguration>,
+    #[serde(default)]
     pub last_error: Option<String>,
 }
 
@@ -198,6 +262,7 @@ impl TunnelStatus {
             transport: None,
             pump: None,
             kill_switch_engaged: None,
+            dytallix_identity: None,
             last_error: None,
         }
     }
@@ -252,6 +317,8 @@ pub struct TunnelConfiguration {
     pub crypto: CryptoPolicy,
     #[serde(default)]
     pub kill_switch: KillSwitchPolicy,
+    #[serde(default)]
+    pub dytallix_identity: Option<DytallixIdentityConfiguration>,
 }
 
 fn default_discovery_modes() -> Vec<DiscoveryMode> {
@@ -319,5 +386,34 @@ mod tests {
         let core_config = config.packet_core_config_json();
         assert_eq!(core_config["routeMode"], "splitTunnel");
         assert_eq!(core_config["mtu"], 1280);
+    }
+
+    #[test]
+    fn dytallix_identity_configuration_round_trips() {
+        let json = r#"{
+            "meshID": "mesh-test",
+            "deviceAlias": "device-test",
+            "overlayIPv4Address": "100.64.0.2",
+            "tunnelRemoteAddress": "100.64.0.1",
+            "protectedRoutes": ["100.64.0.0/10"],
+            "dnsServers": ["100.64.0.1"],
+            "dytallixIdentity": {
+                "trustPolicy": "publicRequired",
+                "mode": "verified",
+                "registry": {
+                    "endpoint": "https://dytallix.com",
+                    "contractAddress": "0x9a9671441249ee2c364f9b4bc8049e61b082449a"
+                }
+            }
+        }"#;
+        let config: TunnelConfiguration = serde_json::from_str(json).unwrap();
+
+        let identity = config.dytallix_identity.unwrap();
+        assert_eq!(identity.trust_policy, MeshTrustPolicy::PublicRequired);
+        assert_eq!(identity.mode, DiscoveryIdentityMode::Verified);
+        assert_eq!(
+            identity.registry.unwrap().contract_address,
+            "0x9a9671441249ee2c364f9b4bc8049e61b082449a"
+        );
     }
 }

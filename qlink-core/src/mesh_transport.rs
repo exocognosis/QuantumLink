@@ -28,6 +28,10 @@
 use crate::{
     crypto::DeviceKeypair,
     discovery::{CandidateEndpoint, CandidateType, PeerRecord, UnsignedPeerRecord},
+    dytallix_identity::{
+        registry_unavailable_decision, verify_inbound_registry_assertion, DiscoveryIdentityMode,
+        DytallixIdentityRegistry, DytallixRegistryConfig, IdentityRegistryLookup, MeshTrustPolicy,
+    },
     error::{QlinkError, Result},
     ice::IceCredentials,
     inbound_identity::{
@@ -271,6 +275,20 @@ pub struct MeshTransportConfig {
     /// can leave this `None` and rely on file mode 0o600.
     #[serde(default)]
     pub peer_store_key_b64: Option<String>,
+    /// Optional Dytallix registry policy/config. Platform adapters may
+    /// configure, store, and forward this, but the shared Rust connector
+    /// owns the actual trust decision.
+    #[serde(default, alias = "dytallix")]
+    pub dytallix_identity: Option<MeshTransportDytallixIdentityConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MeshTransportDytallixIdentityConfig {
+    pub trust_policy: MeshTrustPolicy,
+    pub mode: DiscoveryIdentityMode,
+    #[serde(default)]
+    pub registry: Option<DytallixRegistryConfig>,
 }
 
 fn default_overall_deadline_ms() -> u64 {
@@ -287,6 +305,53 @@ fn default_reconnect_initial_backoff_ms() -> u64 {
 }
 fn default_reconnect_max_backoff_ms() -> u64 {
     30_000
+}
+
+fn connector_config_from_transport_config(
+    config: &MeshTransportConfig,
+    local_device_keypair: Option<Arc<DeviceKeypair>>,
+) -> Result<MeshConnectorConfig> {
+    let mut connector_config =
+        MeshConnectorConfig::new(config.mesh_id.clone(), config.local_peer_id.clone())
+            .with_overall_deadline(Duration::from_millis(config.overall_deadline_ms))
+            .with_direct_probe_timeout(Duration::from_millis(config.direct_probe_timeout_ms))
+            .with_probe_pacing(Duration::from_millis(config.probe_pacing_ms));
+    if let Some(relay) = config.relay_url.clone() {
+        connector_config = connector_config.with_relay_server(relay);
+    }
+    if config.enable_ice {
+        connector_config = connector_config.with_local_ice_credentials(IceCredentials::generate()?);
+    }
+    if let Some(keypair) = local_device_keypair {
+        let keypair_peer_id = keypair.public_key().peer_id();
+        if keypair_peer_id != config.local_peer_id {
+            return Err(QlinkError::Protocol(format!(
+                "MeshTransportHandle local_device_keypair peer_id {keypair_peer_id} \
+                 does not match config.local_peer_id {}",
+                config.local_peer_id
+            )));
+        }
+        connector_config = connector_config.with_local_device_keypair(keypair);
+    }
+    if let Some(identity) = config.dytallix_identity.as_ref() {
+        if identity.trust_policy == MeshTrustPolicy::PublicRequired
+            && identity.mode == DiscoveryIdentityMode::Off
+        {
+            return Err(QlinkError::Protocol(
+                "public meshes must not use dytallix identity mode off".into(),
+            ));
+        }
+        if identity.mode != DiscoveryIdentityMode::Off {
+            connector_config = match identity.registry.clone() {
+                Some(registry_config) => connector_config.with_dytallix_registry(
+                    identity.trust_policy,
+                    Arc::new(DytallixIdentityRegistry::new(registry_config)?),
+                ),
+                None => connector_config.with_dytallix_trust_policy(identity.trust_policy),
+            };
+        }
+    }
+    Ok(connector_config)
 }
 
 /// A frame received from a specific remote peer. Multi-peer transports
@@ -438,34 +503,10 @@ impl MeshTransportHandle {
         let quic_endpoint = QuicEndpoint::client(client_bind_addr, &[])?;
 
         let rendezvous_client = RendezvousClient::new(config.rendezvous_url.clone());
-        let local_credentials = IceCredentials::generate()?;
-
-        let mut connector_config =
-            MeshConnectorConfig::new(config.mesh_id.clone(), config.local_peer_id.clone())
-                .with_overall_deadline(Duration::from_millis(config.overall_deadline_ms))
-                .with_direct_probe_timeout(Duration::from_millis(config.direct_probe_timeout_ms))
-                .with_probe_pacing(Duration::from_millis(config.probe_pacing_ms));
-        if let Some(relay) = config.relay_url.clone() {
-            connector_config = connector_config.with_relay_server(relay);
-        }
-        if config.enable_ice {
-            connector_config = connector_config.with_local_ice_credentials(local_credentials);
-        }
-        if let Some(keypair) = local_device_keypair {
-            // Sanity check the keypair matches the configured peer_id
-            // up front — otherwise we'd happily dial out under the
-            // wrong identity, and the remote responder would just close
-            // the connection with no actionable error.
-            let keypair_peer_id = keypair.public_key().peer_id();
-            if keypair_peer_id != config.local_peer_id {
-                return Err(QlinkError::Protocol(format!(
-                    "MeshTransportHandle local_device_keypair peer_id {keypair_peer_id} \
-                     does not match config.local_peer_id {}",
-                    config.local_peer_id
-                )));
-            }
-            connector_config = connector_config.with_local_device_keypair(keypair);
-        }
+        let connector_config =
+            connector_config_from_transport_config(&config, local_device_keypair)?;
+        let inbound_dytallix_trust_policy = connector_config.dytallix_trust_policy;
+        let inbound_dytallix_registry = connector_config.dytallix_registry.clone();
 
         // Resolve the configured persistence path, if any, into a
         // `FilePeerStore`. Construction errors (missing parent dir,
@@ -545,6 +586,8 @@ impl MeshTransportHandle {
                     endpoint,
                     mesh_id,
                     inbound_acl,
+                    inbound_dytallix_trust_policy,
+                    inbound_dytallix_registry,
                     inbound_tx_responder,
                 ));
                 Some(task)
@@ -1033,6 +1076,8 @@ async fn run_responder_loop(
     server: QuicEndpoint,
     expected_mesh_id: String,
     inbound_acl: Option<Arc<PeerAcl>>,
+    dytallix_trust_policy: Option<MeshTrustPolicy>,
+    dytallix_registry: Option<Arc<dyn IdentityRegistryLookup>>,
     inbound_tx: mpsc::UnboundedSender<InboundFrame>,
 ) {
     loop {
@@ -1042,6 +1087,7 @@ async fn run_responder_loop(
         };
         let mesh_id = expected_mesh_id.clone();
         let acl = inbound_acl.clone();
+        let dytallix_registry = dytallix_registry.clone();
         let inbound_tx = inbound_tx.clone();
         tokio::spawn(async move {
             let acl_ref = acl.as_deref();
@@ -1054,6 +1100,47 @@ async fn run_responder_loop(
             .await;
             match evaluation {
                 Ok((InboundDecision::Accepted, assertion)) => {
+                    if let Some(policy) = dytallix_trust_policy {
+                        let decision = if let Some(registry) = dytallix_registry.as_ref() {
+                            match registry.lookup_record(&assertion.peer_id).await {
+                                Ok(record) => verify_inbound_registry_assertion(
+                                    &assertion,
+                                    record.as_ref(),
+                                    policy,
+                                ),
+                                Err(error) => {
+                                    tracing::warn!(
+                                        peer_id = %assertion.peer_id,
+                                        error = %error,
+                                        "dytallix inbound registry lookup failed"
+                                    );
+                                    registry_unavailable_decision(policy)
+                                }
+                            }
+                        } else {
+                            verify_inbound_registry_assertion(&assertion, None, policy)
+                        };
+
+                        match decision {
+                            Ok(decision) => {
+                                tracing::debug!(
+                                    peer_id = %assertion.peer_id,
+                                    ?policy,
+                                    ?decision,
+                                    "dytallix inbound registry policy accepted assertion"
+                                );
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    peer_id = %assertion.peer_id,
+                                    reason = %error.reason.as_str(),
+                                    "dytallix inbound registry policy rejected assertion"
+                                );
+                                session.close(b"");
+                                return;
+                            }
+                        }
+                    }
                     let peer_id = assertion.peer_id;
                     while let Ok(frame) = session.receive_frame().await {
                         let inbound_frame = InboundFrame {
@@ -1458,6 +1545,59 @@ mod tests {
         assert_eq!(cfg.delay_for(u32::MAX), Duration::from_secs(60));
     }
 
+    #[test]
+    fn mesh_transport_json_accepts_dytallix_identity_policy_and_registry_config() {
+        let json = br#"{
+            "meshId": "devmesh",
+            "localPeerId": "qlink_local",
+            "remotePeerId": "qlink_remote",
+            "rendezvousUrl": "127.0.0.1:9471",
+            "bindAddr": "127.0.0.1:0",
+            "disableInboundResponder": true,
+            "dytallixIdentity": {
+                "trustPolicy": "publicRequired",
+                "mode": "verified",
+                "registry": {
+                    "endpoint": "https://dytallix.com",
+                    "contractAddress": "0x9a9671441249ee2c364f9b4bc8049e61b082449a"
+                }
+            }
+        }"#;
+
+        let config: MeshTransportConfig = serde_json::from_slice(json).unwrap();
+        let connector =
+            connector_config_from_transport_config(&config, None).expect("dytallix config valid");
+
+        assert_eq!(
+            connector.dytallix_trust_policy,
+            Some(crate::dytallix_identity::MeshTrustPolicy::PublicRequired)
+        );
+        assert!(connector.dytallix_registry.is_some());
+    }
+
+    #[test]
+    fn public_dytallix_policy_rejects_off_identity_mode_in_transport_config() {
+        let json = br#"{
+            "meshId": "devmesh",
+            "localPeerId": "qlink_local",
+            "remotePeerId": "qlink_remote",
+            "rendezvousUrl": "127.0.0.1:9471",
+            "bindAddr": "127.0.0.1:0",
+            "disableInboundResponder": true,
+            "dytallixIdentity": {
+                "trustPolicy": "publicRequired",
+                "mode": "off"
+            }
+        }"#;
+
+        let config: MeshTransportConfig = serde_json::from_slice(json).unwrap();
+        let error = connector_config_from_transport_config(&config, None).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("public meshes must not use dytallix identity mode off"));
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn mesh_transport_connects_and_round_trips_a_frame() {
         // Stand up a dev rendezvous + a "remote peer" QUIC server.
@@ -1530,6 +1670,7 @@ mod tests {
                 disable_inbound_responder: true,
                 peer_store_path: None,
                 peer_store_key_b64: None,
+                dytallix_identity: None,
             })
             .expect("transport construction must succeed")
         })
@@ -1600,6 +1741,7 @@ mod tests {
                 disable_inbound_responder: true,
                 peer_store_path: None,
                 peer_store_key_b64: None,
+                dytallix_identity: None,
             })
             .unwrap()
         })
@@ -1649,6 +1791,7 @@ mod tests {
                 disable_inbound_responder: true,
                 peer_store_path: None,
                 peer_store_key_b64: None,
+                dytallix_identity: None,
             })
             .unwrap()
         })
@@ -1738,6 +1881,7 @@ mod tests {
                 disable_inbound_responder: true,
                 peer_store_path: None,
                 peer_store_key_b64: None,
+                dytallix_identity: None,
             })
             .expect("transport construction with metrics endpoint must succeed")
         })
@@ -1849,6 +1993,7 @@ mod tests {
                 disable_inbound_responder: true,
                 peer_store_path: None,
                 peer_store_key_b64: None,
+                dytallix_identity: None,
             })
             .unwrap()
         })
@@ -2002,6 +2147,7 @@ mod tests {
                 disable_inbound_responder: true,
                 peer_store_path: None,
                 peer_store_key_b64: None,
+                dytallix_identity: None,
             })
             .expect("transport new")
         })
@@ -2146,6 +2292,7 @@ mod tests {
                 disable_inbound_responder: true,
                 peer_store_path: None,
                 peer_store_key_b64: None,
+                dytallix_identity: None,
             })
             .expect("transport new")
         })
@@ -2204,6 +2351,7 @@ mod tests {
                 disable_inbound_responder: true,
                 peer_store_path: None,
                 peer_store_key_b64: None,
+                dytallix_identity: None,
             })
             .expect("transport new")
         })
@@ -2298,6 +2446,7 @@ mod tests {
                     disable_inbound_responder: true,
                     peer_store_path: None,
                     peer_store_key_b64: None,
+                    dytallix_identity: None,
                 })
                 .unwrap()
             })
@@ -2340,6 +2489,7 @@ mod tests {
         mesh_id: &str,
         inbound_acl: Option<PeerAcl>,
         local_device_keypair: Option<Arc<DeviceKeypair>>,
+        dytallix_identity: Option<MeshTransportDytallixIdentityConfig>,
     ) -> MeshTransportHandle {
         let mesh_id = mesh_id.to_string();
         tokio::task::spawn_blocking(move || {
@@ -2362,6 +2512,7 @@ mod tests {
                     disable_inbound_responder: false,
                     peer_store_path: None,
                     peer_store_key_b64: None,
+                    dytallix_identity,
                 },
                 local_device_keypair,
             )
@@ -2408,6 +2559,7 @@ mod tests {
             "devmesh",
             Some(acl),
             None,
+            None,
         )
         .await;
 
@@ -2451,6 +2603,7 @@ mod tests {
             "devmesh",
             Some(acl),
             None,
+            None,
         )
         .await;
 
@@ -2468,6 +2621,88 @@ mod tests {
             handle.try_receive_frame_from_any().is_none(),
             "denied peer should never reach the inbound queue"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn responder_rejects_missing_dytallix_registry_on_public_mesh() {
+        let rendezvous = spawn_dev_rendezvous().await.unwrap();
+
+        let dialer_key = DeviceKeypair::generate().unwrap();
+        let local_key = DeviceKeypair::generate().unwrap();
+        let local_peer_id = local_key.public_key().peer_id();
+
+        let handle = build_handle_with_responder(
+            rendezvous.local_addr().to_string(),
+            local_peer_id,
+            "devmesh",
+            None,
+            None,
+            Some(MeshTransportDytallixIdentityConfig {
+                trust_policy: MeshTrustPolicy::PublicRequired,
+                mode: DiscoveryIdentityMode::Verified,
+                registry: None,
+            }),
+        )
+        .await;
+
+        let session = dial_responder(&handle).await;
+        let _ = send_inbound_assertion(&session, &dialer_key, "devmesh").await;
+        let _ = session
+            .send_frame(b"public mesh requires registry".to_vec())
+            .await;
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            handle.try_receive_frame_from_any().is_none(),
+            "public Dytallix policy must reject inbound peers with no registry record"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn responder_accepts_missing_dytallix_registry_on_private_mesh() {
+        let rendezvous = spawn_dev_rendezvous().await.unwrap();
+
+        let dialer_key = DeviceKeypair::generate().unwrap();
+        let dialer_peer_id = dialer_key.public_key().peer_id();
+        let local_key = DeviceKeypair::generate().unwrap();
+        let local_peer_id = local_key.public_key().peer_id();
+
+        let handle = build_handle_with_responder(
+            rendezvous.local_addr().to_string(),
+            local_peer_id,
+            "devmesh",
+            None,
+            None,
+            Some(MeshTransportDytallixIdentityConfig {
+                trust_policy: MeshTrustPolicy::PrivatePreferred,
+                mode: DiscoveryIdentityMode::Verified,
+                registry: None,
+            }),
+        )
+        .await;
+
+        let session = dial_responder(&handle).await;
+        send_inbound_assertion(&session, &dialer_key, "devmesh")
+            .await
+            .unwrap();
+        session
+            .send_frame(b"private mesh may warn and accept".to_vec())
+            .await
+            .unwrap();
+
+        let mut waited = 0_u64;
+        let inbound = loop {
+            if let Some(frame) = handle.try_receive_frame_from_any() {
+                break frame;
+            }
+            if waited > 2_000 {
+                panic!("private Dytallix inbound frame never reached the responder queue");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            waited += 20;
+        };
+        assert_eq!(inbound.peer_id, dialer_peer_id);
+        assert_eq!(inbound.frame, b"private mesh may warn and accept".to_vec());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2499,6 +2734,7 @@ mod tests {
             "devmesh",
             Some(acl_a),
             Some(key_a.clone()),
+            None,
         )
         .await;
         let handle_b = build_handle_with_responder(
@@ -2507,6 +2743,7 @@ mod tests {
             "devmesh",
             Some(acl_b),
             Some(key_b.clone()),
+            None,
         )
         .await;
 
@@ -2593,6 +2830,7 @@ mod tests {
             "devmesh",
             None,
             None,
+            None,
         )
         .await;
 
@@ -2633,6 +2871,7 @@ mod tests {
             local_peer_id,
             "devmesh",
             Some(acl),
+            None,
             None,
         )
         .await;

@@ -36,6 +36,84 @@ public enum DiscoveryMode: String, Codable, CaseIterable, Sendable {
     case localMDNS
 }
 
+public enum MeshTrustPolicy: String, Codable, CaseIterable, Sendable {
+    case publicRequired
+    case privatePreferred
+    case developmentOptional
+}
+
+public enum DiscoveryIdentityMode: String, Codable, CaseIterable, Sendable {
+    case off
+    case verified
+    case publicWallet
+}
+
+public struct DytallixRegistryConfiguration: Codable, Equatable, Sendable {
+    public let endpoint: String
+    public let contractAddress: String
+    public let keystorePath: String?
+    public let walletName: String?
+    public let networkID: String?
+    public let chainID: String?
+    public let allowedRPCEndpoints: [String]
+
+    public init(
+        endpoint: String,
+        contractAddress: String,
+        keystorePath: String? = nil,
+        walletName: String? = nil,
+        networkID: String? = nil,
+        chainID: String? = nil,
+        allowedRPCEndpoints: [String] = []
+    ) {
+        self.endpoint = endpoint
+        self.contractAddress = contractAddress
+        self.keystorePath = keystorePath
+        self.walletName = walletName
+        self.networkID = networkID
+        self.chainID = chainID
+        self.allowedRPCEndpoints = allowedRPCEndpoints
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case endpoint
+        case contractAddress
+        case keystorePath
+        case walletName
+        case networkID = "networkId"
+        case chainID = "chainId"
+        case allowedRPCEndpoints = "allowedRpcEndpoints"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.endpoint = try container.decode(String.self, forKey: .endpoint)
+        self.contractAddress = try container.decode(String.self, forKey: .contractAddress)
+        self.keystorePath = try container.decodeIfPresent(String.self, forKey: .keystorePath)
+        self.walletName = try container.decodeIfPresent(String.self, forKey: .walletName)
+        self.networkID = try container.decodeIfPresent(String.self, forKey: .networkID)
+        self.chainID = try container.decodeIfPresent(String.self, forKey: .chainID)
+        self.allowedRPCEndpoints =
+            try container.decodeIfPresent([String].self, forKey: .allowedRPCEndpoints) ?? []
+    }
+}
+
+public struct DytallixIdentityConfiguration: Codable, Equatable, Sendable {
+    public let trustPolicy: MeshTrustPolicy
+    public let mode: DiscoveryIdentityMode
+    public let registry: DytallixRegistryConfiguration?
+
+    public init(
+        trustPolicy: MeshTrustPolicy,
+        mode: DiscoveryIdentityMode,
+        registry: DytallixRegistryConfiguration? = nil
+    ) {
+        self.trustPolicy = trustPolicy
+        self.mode = mode
+        self.registry = registry
+    }
+}
+
 /// Defines how the tunnel behaves when the data plane cannot protect a packet.
 ///
 /// `failClosed` (default): traffic for protected prefixes is dropped at the
@@ -148,6 +226,7 @@ public struct TunnelStatus: Codable, Equatable, Sendable {
     public let peers: [PeerStatus]
     public let metrics: MeshMetrics
     public let transport: TunnelTransportMetrics?
+    public let dytallixIdentity: DytallixIdentityConfiguration?
     public let lastError: String?
 
     public init(
@@ -160,6 +239,7 @@ public struct TunnelStatus: Codable, Equatable, Sendable {
         peers: [PeerStatus],
         metrics: MeshMetrics,
         transport: TunnelTransportMetrics? = nil,
+        dytallixIdentity: DytallixIdentityConfiguration? = nil,
         lastError: String? = nil
     ) {
         self.phase = phase
@@ -171,6 +251,7 @@ public struct TunnelStatus: Codable, Equatable, Sendable {
         self.peers = peers
         self.metrics = metrics
         self.transport = transport
+        self.dytallixIdentity = dytallixIdentity
         self.lastError = lastError
     }
 
@@ -224,6 +305,7 @@ public struct TunnelConfiguration: Codable, Equatable, Sendable {
     public let mtu: Int
     public let crypto: CryptoPolicy
     public let killSwitch: KillSwitchPolicy
+    public let dytallixIdentity: DytallixIdentityConfiguration?
 
     public init(
         meshID: String,
@@ -241,7 +323,8 @@ public struct TunnelConfiguration: Codable, Equatable, Sendable {
         relayServers: [String] = [],
         mtu: Int = 1280,
         crypto: CryptoPolicy = CryptoPolicy(),
-        killSwitch: KillSwitchPolicy = .failClosed
+        killSwitch: KillSwitchPolicy = .failClosed,
+        dytallixIdentity: DytallixIdentityConfiguration? = nil
     ) {
         self.meshID = meshID
         self.deviceAlias = deviceAlias
@@ -259,6 +342,7 @@ public struct TunnelConfiguration: Codable, Equatable, Sendable {
         self.mtu = mtu
         self.crypto = crypto
         self.killSwitch = killSwitch
+        self.dytallixIdentity = dytallixIdentity
     }
 
     public init(from decoder: Decoder) throws {
@@ -279,6 +363,7 @@ public struct TunnelConfiguration: Codable, Equatable, Sendable {
         self.mtu = try container.decodeIfPresent(Int.self, forKey: .mtu) ?? 1280
         self.crypto = try container.decodeIfPresent(CryptoPolicy.self, forKey: .crypto) ?? CryptoPolicy()
         self.killSwitch = try container.decodeIfPresent(KillSwitchPolicy.self, forKey: .killSwitch) ?? .failClosed
+        self.dytallixIdentity = try container.decodeIfPresent(DytallixIdentityConfiguration.self, forKey: .dytallixIdentity)
     }
 
     public static let defaultDevelopment = PrivacyDefaults.defaultTunnelConfiguration()

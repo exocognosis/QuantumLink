@@ -12,6 +12,14 @@
   "discoveryModes": ["rendezvous"],
   "rendezvousServers": ["127.0.0.1:9471"],
   "relayServers": ["127.0.0.1:9472"],
+  "dytallixIdentity": {
+    "trustPolicy": "privatePreferred",
+    "mode": "verified",
+    "registry": {
+      "endpoint": "https://dytallix.com",
+      "contractAddress": "0x9a9671441249ee2c364f9b4bc8049e61b082449a"
+    }
+  },
   "mtu": 1280,
   "crypto": {
     "suite": "QLINK-FIPS203-MLKEM768-HKDFSHA256-v1",

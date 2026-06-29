@@ -368,6 +368,7 @@ impl TunnelEngine {
             "bindAddr": "0.0.0.0:0",
             "peerStorePath": peer_store_path.to_string_lossy(),
             "peerStoreKeyB64": base64::engine::general_purpose::STANDARD.encode(peer_store_key),
+            "dytallixIdentity": config.dytallix_identity,
         }))
         .map_err(|error| EngineError::Config(format!("mesh config: {error}")))?;
 
@@ -455,6 +456,7 @@ impl TunnelEngine {
             status.dns_mode = session.config.dns_mode;
             status.overlay_ipv4_address = session.config.overlay_ipv4_address.clone();
             status.protected_routes = session.config.protected_routes.clone();
+            status.dytallix_identity = session.config.dytallix_identity.clone();
             status.pump = Some(session.pump.lock().unwrap().counters().as_proto());
             if let Some(error) = session.last_error.lock().unwrap().clone() {
                 status.last_error = Some(error);

@@ -1,7 +1,10 @@
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use qlink_core::{
     crypto::{answer_handshake, start_handshake, DeviceKeypair},
     discovery::{CandidateEndpoint, CandidateType, PeerRecord, UnsignedPeerRecord},
+    dytallix_identity::{
+        ensure_dytallix_enrollment_wallet, DytallixIdentityRegistry, DytallixRegistryConfig,
+    },
     ice::{perform_ice_check, spawn_dev_ice_responder, IceCheckRequest, IceCredentials},
     local_loopback::{run_local_mesh_loopback, run_relay_loopback},
     mesh_connection::{ConnectionOutcome, MeshConnector, MeshConnectorConfig, PathKind},
@@ -16,6 +19,7 @@ use qlink_core::{
 use serde::Serialize;
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -121,6 +125,72 @@ enum Command {
         #[arg(long)]
         keyfile: Option<String>,
     },
+    Identity {
+        #[command(subcommand)]
+        command: IdentityCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum IdentityCommand {
+    Register(IdentityRecordArgs),
+    Update(IdentityRecordArgs),
+    Revoke(IdentityRevokeArgs),
+    Status(IdentityStatusArgs),
+}
+
+#[derive(Debug, Args)]
+struct IdentityCommonArgs {
+    #[arg(long, default_value = "https://dytallix.com")]
+    endpoint: String,
+    #[arg(long)]
+    contract_address: String,
+    #[arg(long)]
+    keystore_path: Option<PathBuf>,
+    #[arg(long)]
+    wallet_name: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct IdentityRecordArgs {
+    #[command(flatten)]
+    common: IdentityCommonArgs,
+    #[arg(long)]
+    keyfile: String,
+    #[arg(long, default_value = "devmesh")]
+    mesh_id: String,
+    #[arg(long, default_value = "qlink")]
+    alias: String,
+    #[arg(long, default_value = "127.0.0.1")]
+    host: String,
+    #[arg(long, default_value_t = 4433)]
+    port: u16,
+    #[arg(long, default_value = "100.127.0.2/32")]
+    route: String,
+    #[arg(long, default_value_t = 300)]
+    ttl_seconds: u64,
+    #[arg(long, default_value_t = 1)]
+    sequence: u64,
+    #[arg(long)]
+    device_cert_der_b64: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct IdentityRevokeArgs {
+    #[command(flatten)]
+    common: IdentityCommonArgs,
+    #[arg(long)]
+    peer_id: String,
+}
+
+#[derive(Debug, Args)]
+struct IdentityStatusArgs {
+    #[arg(long, default_value = "https://dytallix.com")]
+    endpoint: String,
+    #[arg(long)]
+    contract_address: String,
+    #[arg(long)]
+    peer_id: String,
 }
 
 #[tokio::main]
@@ -362,8 +432,158 @@ async fn main() -> qlink_core::Result<()> {
             );
             println!("total_elapsed_ms={}", outcome.total_elapsed.as_millis());
         }
+        Command::Identity { command } => match command {
+            IdentityCommand::Register(args) => {
+                let (registry, peer_record, keypair) = identity_registry_and_record(&args)?;
+                let wallet = ensure_dytallix_enrollment_wallet(registry.config())?;
+                let submission = registry
+                    .register(&peer_record, &keypair, qlink_core::discovery::now_unix())
+                    .await?;
+                print_identity_submission(
+                    "register",
+                    &peer_record,
+                    &wallet.wallet_address,
+                    submission,
+                )?;
+            }
+            IdentityCommand::Update(args) => {
+                let (registry, peer_record, keypair) = identity_registry_and_record(&args)?;
+                let wallet = ensure_dytallix_enrollment_wallet(registry.config())?;
+                let submission = registry
+                    .update(&peer_record, &keypair, qlink_core::discovery::now_unix())
+                    .await?;
+                print_identity_submission(
+                    "update",
+                    &peer_record,
+                    &wallet.wallet_address,
+                    submission,
+                )?;
+            }
+            IdentityCommand::Revoke(args) => {
+                let registry = identity_registry_from_common(&args.common, true)?;
+                let submission = registry
+                    .revoke(&args.peer_id, qlink_core::discovery::now_unix())
+                    .await?;
+                println!("identity_action=revoke");
+                println!("peer_id={}", args.peer_id);
+                if let Some(tx_hash) = submission.tx_hash {
+                    println!("tx_hash={tx_hash}");
+                }
+            }
+            IdentityCommand::Status(args) => {
+                let config =
+                    DytallixRegistryConfig::lookup_only(args.endpoint, args.contract_address)?;
+                let registry = DytallixIdentityRegistry::new(config)?;
+                match registry.status(&args.peer_id).await? {
+                    Some(record) => {
+                        println!("identity_action=status");
+                        println!("peer_id={}", record.peer_id);
+                        println!("status={:?}", record.status);
+                        println!("owner_daddr={}", record.owner_daddr);
+                        println!("updated_at={}", record.updated_at);
+                        if let Some(expires_at) = record.expires_at {
+                            println!("expires_at={expires_at}");
+                        }
+                        println!(
+                            "device_public_key_hash={}",
+                            hex(&record.device_public_key_hash)
+                        );
+                        println!(
+                            "latest_peer_record_hash={}",
+                            hex(&record.latest_peer_record_hash)
+                        );
+                    }
+                    None => {
+                        println!("identity_action=status");
+                        println!("peer_id={}", args.peer_id);
+                        println!("status=missing");
+                    }
+                }
+            }
+        },
     }
 
+    Ok(())
+}
+
+fn identity_registry_from_common(
+    common: &IdentityCommonArgs,
+    require_wallet: bool,
+) -> qlink_core::Result<DytallixIdentityRegistry> {
+    let keystore_path = if require_wallet {
+        Some(
+            common
+                .keystore_path
+                .clone()
+                .unwrap_or_else(dytallix_sdk::keystore::Keystore::default_path),
+        )
+    } else {
+        common.keystore_path.clone()
+    };
+    let config = DytallixRegistryConfig::new(
+        common.endpoint.clone(),
+        common.contract_address.clone(),
+        keystore_path,
+        common.wallet_name.clone(),
+    )?;
+    DytallixIdentityRegistry::new(config)
+}
+
+fn identity_registry_and_record(
+    args: &IdentityRecordArgs,
+) -> qlink_core::Result<(DytallixIdentityRegistry, PeerRecord, DeviceKeypair)> {
+    let registry = identity_registry_from_common(&args.common, true)?;
+    let keypair = load_or_generate_keypair(Some(&args.keyfile))?;
+    let record = build_identity_peer_record(args, &keypair)?;
+    Ok((registry, record, keypair))
+}
+
+fn build_identity_peer_record(
+    args: &IdentityRecordArgs,
+    keypair: &DeviceKeypair,
+) -> qlink_core::Result<PeerRecord> {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+
+    let certificate_der = match args.device_cert_der_b64.as_deref() {
+        Some(raw) => B64.decode(raw).map_err(|err| {
+            qlink_core::QlinkError::Protocol(format!("device_cert_der_b64 is invalid: {err}"))
+        })?,
+        None => Vec::new(),
+    };
+    let body = UnsignedPeerRecord::new(
+        args.mesh_id.clone(),
+        args.alias.clone(),
+        keypair.public_key(),
+        vec![CandidateEndpoint {
+            candidate_type: CandidateType::Host,
+            address: args.host.clone(),
+            port: args.port,
+            priority: 120,
+        }],
+        vec![args.route.clone()],
+        args.ttl_seconds,
+        args.sequence,
+    )
+    .with_device_certificate(certificate_der);
+    PeerRecord::signed(body, keypair)
+}
+
+fn print_identity_submission(
+    action: &str,
+    peer_record: &PeerRecord,
+    wallet_address: &str,
+    submission: qlink_core::dytallix_identity::RegistrySubmission,
+) -> qlink_core::Result<()> {
+    println!("identity_action={action}");
+    println!("peer_id={}", peer_record.body.peer_id);
+    println!("owner_daddr={wallet_address}");
+    println!(
+        "latest_peer_record_hash={}",
+        hex(&peer_record.record_hash()?)
+    );
+    if let Some(tx_hash) = submission.tx_hash {
+        println!("tx_hash={tx_hash}");
+    }
     Ok(())
 }
 
@@ -517,6 +737,7 @@ async fn run_publish_self(
                 disable_inbound_responder: false,
                 peer_store_path: peer_store_for_handle,
                 peer_store_key_b64: None,
+                dytallix_identity: None,
             },
             Some(keypair_for_handle),
         )
@@ -926,6 +1147,7 @@ mod tests {
                         disable_inbound_responder: false,
                         peer_store_path: None,
                         peer_store_key_b64: None,
+                        dytallix_identity: None,
                     },
                     Some(remote_key),
                 )

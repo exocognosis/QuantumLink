@@ -26,6 +26,7 @@ public struct MeshTransportConfiguration: Codable, Equatable, Sendable {
     public let directProbeTimeoutMs: UInt64
     public let probePacingMs: UInt64
     public let enableICE: Bool
+    public let dytallixIdentity: DytallixIdentityConfiguration?
     /// Filesystem path of the persistent peer-record cache.
     /// Mirrors the Rust `peer_store_path`; `nil` keeps the
     /// connector's in-memory-only store. The parent directory must
@@ -50,6 +51,7 @@ public struct MeshTransportConfiguration: Codable, Equatable, Sendable {
         directProbeTimeoutMs: UInt64 = 750,
         probePacingMs: UInt64 = 50,
         enableICE: Bool = false,
+        dytallixIdentity: DytallixIdentityConfiguration? = nil,
         peerStorePath: String? = nil,
         peerStoreKeyB64: String? = nil
     ) {
@@ -63,6 +65,7 @@ public struct MeshTransportConfiguration: Codable, Equatable, Sendable {
         self.directProbeTimeoutMs = directProbeTimeoutMs
         self.probePacingMs = probePacingMs
         self.enableICE = enableICE
+        self.dytallixIdentity = dytallixIdentity
         self.peerStorePath = peerStorePath
         self.peerStoreKeyB64 = peerStoreKeyB64
     }
@@ -78,6 +81,7 @@ public struct MeshTransportConfiguration: Codable, Equatable, Sendable {
         case directProbeTimeoutMs
         case probePacingMs
         case enableICE = "enableIce"
+        case dytallixIdentity
         case peerStorePath = "peerStorePath"
         case peerStoreKeyB64 = "peerStoreKeyB64"
     }
@@ -651,6 +655,7 @@ public enum TunnelTransportFactory {
             rendezvousURL: rendezvousURL ?? "127.0.0.1:9471",
             relayURL: relayURL,
             bindAddress: bindAddress,
+            dytallixIdentity: configuration.dytallixIdentity,
             peerStorePath: peerStorePath,
             peerStoreKeyB64: peerStoreKeyB64
         )
