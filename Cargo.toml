@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "qlink-core",
+    "dytallix/quantumlink-node-registry",
     "windows/rust/quantumlink-proto",
     "windows/rust/quantumlink-service",
     "steam/steamos/rust/qlink-game",

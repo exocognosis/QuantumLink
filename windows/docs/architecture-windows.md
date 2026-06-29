@@ -62,6 +62,12 @@ exportDiagnostics | peerState`. One response per request, matching
 | `secrets\*.dpapi` | device seed, peer-store key | DPAPI machine scope + entropy + dir ACL |
 | `logs\` | service tracing output | dir ACL |
 
+`dytallixIdentity` in `config.json` is service configuration only. The
+service stores local secrets with DPAPI/ProgramData, forwards the shared
+registry config to `qlink-core`, and surfaces status through the named
+pipe. It does not create Windows-specific identity semantics from SIDs,
+accounts, hardware IDs, or installer state.
+
 ## Lifecycle
 
 - SCM `Stop`/`Shutdown` → engine.disconnect() → routes removed →

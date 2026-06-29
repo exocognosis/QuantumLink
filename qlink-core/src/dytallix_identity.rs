@@ -1,6 +1,8 @@
 use crate::{
+    crypto::DevicePublicKey,
     discovery::{now_unix, PeerRecord},
     error::{QlinkError, Result},
+    inbound_identity::InboundIdentityAssertion,
 };
 use dytallix_core::{address::DAddr, keypair::DytallixKeypair};
 use dytallix_sdk::{
@@ -326,8 +328,67 @@ pub fn verify_registry_binding(
     Ok(RegistryDecision::Accepted)
 }
 
+pub fn verify_inbound_registry_assertion(
+    assertion: &InboundIdentityAssertion,
+    registry_record: Option<&RegistryNodeRecord>,
+    policy: MeshTrustPolicy,
+) -> Result<RegistryDecision> {
+    let Some(registry_record) = registry_record else {
+        return match policy {
+            MeshTrustPolicy::PublicRequired => Err(QlinkError::Protocol(
+                "registry record required by public mesh trust policy".into(),
+            )),
+            MeshTrustPolicy::PrivatePreferred => {
+                Ok(RegistryDecision::AcceptedWithoutRegistryPrivate)
+            }
+            MeshTrustPolicy::DevelopmentOptional => {
+                Ok(RegistryDecision::AcceptedWithoutRegistryDevelopment)
+            }
+        };
+    };
+
+    if registry_record.status != RegistryNodeStatus::Active {
+        let status = match registry_record.status {
+            RegistryNodeStatus::Active => "active",
+            RegistryNodeStatus::Revoked => "revoked",
+            RegistryNodeStatus::Suspended => "suspended",
+        };
+        return Err(QlinkError::Protocol(format!("registry record is {status}")));
+    }
+    if registry_record
+        .expires_at
+        .is_some_and(|expires_at| expires_at <= now_unix())
+    {
+        return Err(QlinkError::Protocol(
+            "registry record has expired".to_string(),
+        ));
+    }
+
+    require_match("peer_id", &registry_record.peer_id, &assertion.peer_id)?;
+    let assertion_key_hash =
+        device_public_key_hash_hex_from_public_key(&assertion.device_public_key)?;
+    require_match(
+        "device_public_key_hash_hex",
+        &registry_record.device_public_key_hash_hex,
+        &assertion_key_hash,
+    )?;
+    require_match(
+        "node_signing_public_key_hash_hex",
+        &registry_record.node_signing_public_key_hash_hex,
+        &assertion_key_hash,
+    )?;
+
+    Ok(RegistryDecision::Accepted)
+}
+
 pub fn device_public_key_hash_hex(peer_record: &PeerRecord) -> Result<String> {
-    let bytes = serde_json::to_vec(&peer_record.body.device_public_key)?;
+    device_public_key_hash_hex_from_public_key(&peer_record.body.device_public_key)
+}
+
+pub fn device_public_key_hash_hex_from_public_key(
+    device_public_key: &DevicePublicKey,
+) -> Result<String> {
+    let bytes = serde_json::to_vec(device_public_key)?;
     Ok(sha256_hex(&bytes))
 }
 
@@ -1721,6 +1782,54 @@ mod tests {
         assert!(err
             .to_string()
             .contains("latest_peer_record_hash_hex mismatch"));
+    }
+
+    #[test]
+    fn inbound_registry_policy_accepts_matching_assertion() {
+        let keypair = DeviceKeypair::generate().unwrap();
+        let body = UnsignedPeerRecord::new(
+            "dytallix-mesh",
+            "registry-test-node",
+            keypair.public_key(),
+            vec![CandidateEndpoint {
+                candidate_type: CandidateType::Host,
+                address: "192.0.2.10".to_string(),
+                port: 4433,
+                priority: 100,
+            }],
+            vec!["100.64.10.7/32".to_string()],
+            300,
+            42,
+        )
+        .with_device_certificate(b"test-quic-certificate-der".to_vec());
+        let peer_record = PeerRecord::signed(body, &keypair).unwrap();
+        let registry_record = active_registry_record(&peer_record);
+        let assertion =
+            crate::inbound_identity::InboundIdentityAssertion::sign(&keypair, "dytallix-mesh")
+                .unwrap();
+
+        let decision = verify_inbound_registry_assertion(
+            &assertion,
+            Some(&registry_record),
+            MeshTrustPolicy::PublicRequired,
+        )
+        .unwrap();
+
+        assert_eq!(decision, RegistryDecision::Accepted);
+    }
+
+    #[test]
+    fn inbound_public_policy_rejects_missing_registry_record() {
+        let keypair = DeviceKeypair::generate().unwrap();
+        let assertion =
+            crate::inbound_identity::InboundIdentityAssertion::sign(&keypair, "dytallix-mesh")
+                .unwrap();
+
+        let err =
+            verify_inbound_registry_assertion(&assertion, None, MeshTrustPolicy::PublicRequired)
+                .unwrap_err();
+
+        assert!(err.to_string().contains("registry record required"));
     }
 
     #[test]

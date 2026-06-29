@@ -598,7 +598,7 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 [[package]]
 name = "dytallix-core"
 version = "0.1.0"
-source = "git+https://github.com/DytallixHQ/dytallix-sdk.git#657d0db4794904f7c25192c9d0c1039c5b9fe5f0"
+source = "git+https://github.com/DytallixHQ/dytallix-sdk?rev=657d0db4794904f7c25192c9d0c1039c5b9fe5f0#657d0db4794904f7c25192c9d0c1039c5b9fe5f0"
 dependencies = [
  "bech32",
  "blake3",
@@ -612,7 +612,7 @@ dependencies = [
 [[package]]
 name = "dytallix-sdk"
 version = "0.1.0"
-source = "git+https://github.com/DytallixHQ/dytallix-sdk.git#657d0db4794904f7c25192c9d0c1039c5b9fe5f0"
+source = "git+https://github.com/DytallixHQ/dytallix-sdk?rev=657d0db4794904f7c25192c9d0c1039c5b9fe5f0#657d0db4794904f7c25192c9d0c1039c5b9fe5f0"
 dependencies = [
  "base64",
  "dytallix-core",
@@ -1800,6 +1800,23 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "quantumlink-node-registry"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "bech32",
+ "blake3",
+ "dytallix-core",
+ "fips204",
+ "ml-dsa",
+ "qlink-core",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 1.0.69",
 ]
 
 [[package]]

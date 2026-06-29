@@ -1,0 +1,25 @@
+[package]
+name = "quantumlink-node-registry"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+base64 = "0.22"
+bech32 = "0.11"
+blake3 = "1"
+fips204 = { version = "0.4", default-features = false, features = ["ml-dsa-65"] }
+ml-dsa = { version = "=0.1.0-rc.8", features = ["zeroize"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "1"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+dytallix-core = { git = "https://github.com/DytallixHQ/dytallix-sdk", rev = "657d0db4794904f7c25192c9d0c1039c5b9fe5f0", package = "dytallix-core" }
+
+[dev-dependencies]
+qlink-core = { path = "../../qlink-core" }

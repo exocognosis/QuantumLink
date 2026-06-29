@@ -34,7 +34,8 @@ use crate::{
     crypto::DeviceKeypair,
     discovery::{now_unix, CandidateEndpoint, CandidateType, PeerRecord, UnsignedPeerRecord},
     dytallix_identity::{
-        DytallixIdentityRegistry, DytallixRegistryLookupConfig, MeshTrustPolicy, RegistryDecision,
+        verify_inbound_registry_assertion, DytallixIdentityRegistry, DytallixRegistryLookupConfig,
+        MeshTrustPolicy, RegistryDecision,
     },
     error::{QlinkError, Result},
     ice::IceCredentials,
@@ -42,8 +43,8 @@ use crate::{
         receive_and_evaluate_inbound, InboundDecision, DEFAULT_INBOUND_ASSERTION_MAX_AGE_SECONDS,
     },
     mesh_connection::{
-        MeshConnector, MeshConnectorConfig, NetworkEvent, NetworkEventResponse, PathKind,
-        PeerRecordSource,
+        IdentityRegistryLookup, MeshConnector, MeshConnectorConfig, NetworkEvent,
+        NetworkEventResponse, PathKind, PeerRecordSource,
     },
     metrics_endpoint::{spawn_metrics_endpoint, MetricsEndpoint, MetricsSnapshot},
     peer_acl::PeerAcl,
@@ -711,6 +712,8 @@ impl MeshTransportHandle {
             let registry = DytallixIdentityRegistry::from_lookup_config(registry_config)?;
             connector_config = connector_config.with_identity_registry_lookup(Arc::new(registry));
         }
+        let inbound_mesh_trust_policy = connector_config.mesh_trust_policy;
+        let inbound_identity_registry_lookup = connector_config.identity_registry_lookup.clone();
 
         // Resolve the configured persistence path, if any, into a
         // `FilePeerStore`. Construction errors (missing parent dir,
@@ -802,6 +805,8 @@ impl MeshTransportHandle {
                     local_keypair,
                     server_cert_der,
                     inbound_acl,
+                    inbound_mesh_trust_policy,
+                    inbound_identity_registry_lookup,
                     inbound_tx_responder,
                     blocked_peer_history_responder,
                 ));
@@ -1312,6 +1317,8 @@ async fn run_responder_loop(
     local_device_keypair: Arc<DeviceKeypair>,
     local_server_certificate_der: Vec<u8>,
     inbound_acl: Option<Arc<PeerAcl>>,
+    mesh_trust_policy: MeshTrustPolicy,
+    identity_registry_lookup: Option<Arc<dyn IdentityRegistryLookup>>,
     inbound_tx: mpsc::UnboundedSender<InboundFrame>,
     _blocked_peer_history: Arc<BlockedPeerHistory>,
 ) {
@@ -1326,6 +1333,7 @@ async fn run_responder_loop(
         let local_device_keypair = local_device_keypair.clone();
         let carrier_binding = local_server_certificate_der.clone();
         let acl = inbound_acl.clone();
+        let identity_registry_lookup = identity_registry_lookup.clone();
         let inbound_tx = inbound_tx.clone();
         tokio::spawn(async move {
             let acl_ref = acl.as_deref();
@@ -1338,6 +1346,47 @@ async fn run_responder_loop(
             .await;
             match evaluation {
                 Ok((InboundDecision::Accepted, assertion)) => {
+                    let registry_record = match identity_registry_lookup.as_ref() {
+                        Some(registry) => match registry.lookup(&assertion.peer_id).await {
+                            Ok(record) => record,
+                            Err(error) => match mesh_trust_policy {
+                                MeshTrustPolicy::PublicRequired => {
+                                    tracing::warn!(
+                                        peer_id = %assertion.peer_id,
+                                        error = %error,
+                                        "inbound identity registry lookup failed"
+                                    );
+                                    session.close(b"");
+                                    return;
+                                }
+                                MeshTrustPolicy::PrivatePreferred
+                                | MeshTrustPolicy::DevelopmentOptional => {
+                                    tracing::warn!(
+                                        peer_id = %assertion.peer_id,
+                                        error = %error,
+                                        policy = ?mesh_trust_policy,
+                                        "inbound identity registry lookup failed; continuing without registry verification"
+                                    );
+                                    None
+                                }
+                            },
+                        },
+                        None => None,
+                    };
+                    if let Err(error) = verify_inbound_registry_assertion(
+                        &assertion,
+                        registry_record.as_ref(),
+                        mesh_trust_policy,
+                    ) {
+                        tracing::warn!(
+                            peer_id = %assertion.peer_id,
+                            error = %error,
+                            "inbound identity registry policy rejected assertion"
+                        );
+                        session.close(b"");
+                        return;
+                    }
+
                     let peer_id = assertion.peer_id;
                     let pqc_context = PqcSessionContext::new(
                         mesh_id,

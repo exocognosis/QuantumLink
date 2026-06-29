@@ -916,7 +916,11 @@ mod wasm_contract {
         let response = match read_host_request::<RevokeNodeRequest>() {
             Ok(request) => {
                 let ptr = with_peer_state(&request.peer_id.clone(), |registry| {
-                    registry.revoke_node(&request.peer_id, request.block_time, request.authorization)
+                    registry.revoke_node(
+                        &request.peer_id,
+                        request.block_time,
+                        request.authorization,
+                    )
                 });
                 read_response_pointer(ptr)
             }
@@ -955,7 +959,9 @@ mod wasm_contract {
         }
         let len = len as usize;
         if len > MAX_INPUT_BYTES {
-            return Err(format!("read_input returned oversized payload: {len} bytes"));
+            return Err(format!(
+                "read_input returned oversized payload: {len} bytes"
+            ));
         }
         input.truncate(len);
         serde_json::from_slice(&input).map_err(|error| error.to_string())
