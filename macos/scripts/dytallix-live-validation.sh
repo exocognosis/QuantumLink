@@ -4,6 +4,9 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENDPOINT="${QL_DYTALLIX_ENDPOINT:-https://dytallix.com}"
+NETWORK_ID="${QL_DYTALLIX_NETWORK_ID:-dytallix-testnet}"
+CHAIN_ID="${QL_DYTALLIX_CHAIN_ID:-dytallix-testnet-1}"
+ALLOWED_RPC_ENDPOINTS="${QL_DYTALLIX_ALLOWED_RPC_ENDPOINTS:-$ENDPOINT}"
 WORKDIR="${QL_DYTALLIX_WORKDIR:-$ROOT/build/dytallix-live-validation}"
 CLI="${QL_DYTALLIX_CLI:-dytallix}"
 INSTALL_CLI="${QL_DYTALLIX_INSTALL_CLI:-0}"
@@ -71,15 +74,19 @@ write_summary() {
   if [[ -f "$LOGDIR/faucet-status.status" ]]; then
     faucet_cli_status="failed_without_wallet"
   fi
-  python3 - "$SUMMARY" "$ENDPOINT" "$REGISTRY_CONTRACT" "$MUTATE" "$TRANSFER" "$RECIPIENT_DADDR" "$QUANTUMLINK_PEER_ID" "$faucet_cli_status" <<'PY'
+  python3 - "$SUMMARY" "$ENDPOINT" "$NETWORK_ID" "$CHAIN_ID" "$ALLOWED_RPC_ENDPOINTS" "$REGISTRY_CONTRACT" "$MUTATE" "$TRANSFER" "$RECIPIENT_DADDR" "$QUANTUMLINK_PEER_ID" "$faucet_cli_status" <<'PY'
 import json
 import sys
 from datetime import datetime, timezone
 
-summary_path, endpoint, registry_contract, mutate, transfer, recipient, peer_id, faucet_cli_status = sys.argv[1:]
+summary_path, endpoint, network_id, chain_id, allowed_rpc_endpoints, registry_contract, mutate, transfer, recipient, peer_id, faucet_cli_status = sys.argv[1:]
+rpc_allowlist = [item.strip() for item in allowed_rpc_endpoints.split(",") if item.strip()]
 summary = {
     "generatedAt": datetime.now(timezone.utc).isoformat(),
     "endpoint": endpoint,
+    "networkId": network_id,
+    "chainId": chain_id,
+    "allowedRpcEndpoints": rpc_allowlist,
     "readOnlyChecks": [
         "cli-help",
         "chain-status",
@@ -99,11 +106,12 @@ PY
 }
 
 write_quantumlink_config() {
-  python3 - "$QL_CONFIG" "$ENDPOINT" "$REGISTRY_CONTRACT" "$QUANTUMLINK_PEER_ID" <<'PY'
+  python3 - "$QL_CONFIG" "$ENDPOINT" "$NETWORK_ID" "$CHAIN_ID" "$ALLOWED_RPC_ENDPOINTS" "$REGISTRY_CONTRACT" "$QUANTUMLINK_PEER_ID" <<'PY'
 import json
 import sys
 
-path, endpoint, registry_contract, peer_id = sys.argv[1:]
+path, endpoint, network_id, chain_id, allowed_rpc_endpoints, registry_contract, peer_id = sys.argv[1:]
+rpc_allowlist = [item.strip() for item in allowed_rpc_endpoints.split(",") if item.strip()]
 payload = {
     "meshTrustPolicy": "public_required",
     "discoveryIdentityMode": "verified",
@@ -111,6 +119,9 @@ payload = {
         "endpoint": endpoint,
         "contractAddress": registry_contract,
         "publishWalletAddress": False,
+        "networkId": network_id,
+        "chainId": chain_id,
+        "allowedRpcEndpoints": rpc_allowlist,
     },
     "quantumLinkPeerID": peer_id or None,
     "notes": [
