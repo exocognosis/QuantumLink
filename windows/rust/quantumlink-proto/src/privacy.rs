@@ -94,6 +94,142 @@ pub fn redact_peer_identifiers(value: &str) -> String {
     output
 }
 
+/// Redacts sensitive values that can appear in support-facing diagnostic
+/// strings, including peer IDs, IP routes, URLs, Windows paths, and on-chain
+/// address-like hex values.
+pub fn redact_diagnostics_text(value: &str) -> String {
+    let peer_redacted = redact_peer_identifiers(value);
+    let mut output = String::with_capacity(peer_redacted.len());
+    let bytes = peer_redacted.as_bytes();
+    let mut index = 0;
+
+    while index < bytes.len() {
+        let remaining = &peer_redacted[index..];
+        if remaining.starts_with("http://") || remaining.starts_with("https://") {
+            let end = index + token_len(remaining);
+            output.push_str("[redacted-url]");
+            index = end;
+            continue;
+        }
+        if let Some(end) = parse_windows_path(&peer_redacted, index) {
+            output.push_str("[redacted-path]");
+            index = end;
+            continue;
+        }
+        if let Some(end) = parse_hex_address(&peer_redacted, index) {
+            output.push_str("[redacted-hex]");
+            index = end;
+            continue;
+        }
+        if let Some((end, is_cidr)) = parse_ipv4_or_cidr(&peer_redacted, index) {
+            output.push_str(if is_cidr {
+                "[redacted-cidr]"
+            } else {
+                "[redacted-ip]"
+            });
+            index = end;
+            continue;
+        }
+
+        let ch = remaining.chars().next().unwrap();
+        output.push(ch);
+        index += ch.len_utf8();
+    }
+
+    output
+}
+
+fn token_len(value: &str) -> usize {
+    value
+        .char_indices()
+        .find_map(|(index, ch)| {
+            (ch.is_whitespace() || matches!(ch, '"' | '\'' | ',' | ']' | '}')).then_some(index)
+        })
+        .unwrap_or(value.len())
+}
+
+fn parse_windows_path(value: &str, index: usize) -> Option<usize> {
+    let bytes = value.as_bytes();
+    if index + 3 > bytes.len()
+        || !bytes[index].is_ascii_alphabetic()
+        || bytes[index + 1] != b':'
+        || !matches!(bytes[index + 2], b'\\' | b'/')
+    {
+        return None;
+    }
+    Some(index + token_len(&value[index..]))
+}
+
+fn parse_hex_address(value: &str, index: usize) -> Option<usize> {
+    let bytes = value.as_bytes();
+    if index + 10 > bytes.len() || &value[index..index + 2] != "0x" {
+        return None;
+    }
+    let hex_len = value[index + 2..]
+        .bytes()
+        .take_while(u8::is_ascii_hexdigit)
+        .count();
+    (hex_len >= 8).then_some(index + 2 + hex_len)
+}
+
+fn parse_ipv4_or_cidr(value: &str, index: usize) -> Option<(usize, bool)> {
+    if index > 0 {
+        let previous = value[..index].chars().next_back()?;
+        if previous.is_ascii_alphanumeric() || previous == '.' {
+            return None;
+        }
+    }
+
+    let bytes = value.as_bytes();
+    let mut cursor = index;
+    for part_index in 0..4 {
+        let start = cursor;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
+            cursor += 1;
+        }
+        if cursor == start || cursor - start > 3 {
+            return None;
+        }
+        let octet = value[start..cursor].parse::<u8>().ok()?;
+        if octet.to_string().len() != cursor - start && cursor - start > 1 {
+            return None;
+        }
+        if part_index < 3 {
+            if bytes.get(cursor) != Some(&b'.') {
+                return None;
+            }
+            cursor += 1;
+        }
+    }
+
+    let mut is_cidr = false;
+    if bytes.get(cursor) == Some(&b'/') {
+        let prefix_start = cursor + 1;
+        let mut prefix_end = prefix_start;
+        while prefix_end < bytes.len() && bytes[prefix_end].is_ascii_digit() {
+            prefix_end += 1;
+        }
+        if prefix_end == prefix_start {
+            return None;
+        }
+        let prefix = value[prefix_start..prefix_end].parse::<u8>().ok()?;
+        if prefix > 32 {
+            return None;
+        }
+        cursor = prefix_end;
+        is_cidr = true;
+    }
+
+    if cursor < bytes.len() {
+        let next = value[cursor..].chars().next()?;
+        if next.is_ascii_alphanumeric() || next == '.' {
+            return None;
+        }
+    }
+
+    Some((cursor, is_cidr))
+}
+
 /// Default development configuration, mirroring
 /// `PrivacyDefaults.defaultTunnelConfiguration()`.
 pub fn default_tunnel_configuration() -> crate::models::TunnelConfiguration {
@@ -118,6 +254,9 @@ pub fn default_tunnel_configuration() -> crate::models::TunnelConfiguration {
         mtu: 1280,
         crypto: crate::models::CryptoPolicy::default(),
         kill_switch: crate::models::KillSwitchPolicy::FailClosed,
+        mesh_trust_policy: crate::models::MeshTrustPolicy::DevelopmentOptional,
+        discovery_identity_mode: crate::models::DiscoveryIdentityMode::Off,
+        dytallix_identity: None,
     }
 }
 
@@ -150,6 +289,25 @@ mod tests {
         let output = redact_peer_identifiers(input);
         assert_eq!(output, "peer qlink_[redacted] connected");
         assert_eq!(redact_peer_identifiers("qlink_short"), "qlink_short");
+    }
+
+    #[test]
+    fn diagnostic_redactor_removes_network_paths_and_chain_identifiers() {
+        let input = r#"netsh route 10.0.0.0/8 via 100.64.0.1 failed for https://rpc.private.example and C:\ProgramData\QuantumLink\wallet.key owner 0xabc1230000000000000000000000000000000000 peer qlink_abcdefghijklmnopqrstuv"#;
+        let output = redact_diagnostics_text(input);
+
+        assert!(!output.contains("10.0.0.0/8"));
+        assert!(!output.contains("100.64.0.1"));
+        assert!(!output.contains("rpc.private.example"));
+        assert!(!output.contains(r"C:\ProgramData"));
+        assert!(!output.contains("0xabc123"));
+        assert!(!output.contains("qlink_abcdefghijklmnopqrstuv"));
+        assert!(output.contains("[redacted-cidr]"));
+        assert!(output.contains("[redacted-ip]"));
+        assert!(output.contains("[redacted-url]"));
+        assert!(output.contains("[redacted-path]"));
+        assert!(output.contains("[redacted-hex]"));
+        assert!(output.contains("qlink_[redacted]"));
     }
 
     #[test]

@@ -26,6 +26,7 @@
 use crate::engine::EngineError;
 use std::ffi::c_void;
 use std::net::Ipv4Addr;
+use std::sync::OnceLock;
 use windows::core::GUID;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::NetworkManagement::WindowsFilteringPlatform::{
@@ -223,13 +224,27 @@ impl Drop for KillSwitchGuard {
 fn display_data(
     name: &'static str,
 ) -> windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_DISPLAY_DATA0 {
-    // Leaked once per static name — bounded set, lives for process life.
-    let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
-    let leaked = Box::leak(wide.into_boxed_slice());
+    let wide = display_name_ptr(name);
     windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_DISPLAY_DATA0 {
-        name: windows::core::PWSTR(leaked.as_mut_ptr()),
+        name: windows::core::PWSTR(wide),
         description: windows::core::PWSTR::null(),
     }
+}
+
+fn display_name_ptr(name: &'static str) -> *mut u16 {
+    static KILL_SWITCH: OnceLock<Box<[u16]>> = OnceLock::new();
+    static BLOCK_PREFIX: OnceLock<Box<[u16]>> = OnceLock::new();
+    static PERMIT_TUNNEL: OnceLock<Box<[u16]>> = OnceLock::new();
+    static UNKNOWN: OnceLock<Box<[u16]>> = OnceLock::new();
+
+    let cell = match name {
+        "QuantumLink kill switch" => &KILL_SWITCH,
+        "QuantumLink block protected prefix" => &BLOCK_PREFIX,
+        "QuantumLink permit tunnel interface" => &PERMIT_TUNNEL,
+        _ => &UNKNOWN,
+    };
+    cell.get_or_init(|| name.encode_utf16().chain(std::iter::once(0)).collect())
+        .as_ptr() as *mut u16
 }
 
 fn parse_v4_cidr(route: &str) -> Result<(Ipv4Addr, u8), EngineError> {
@@ -256,6 +271,25 @@ fn prefix_to_mask(prefix: u8) -> u32 {
         0
     } else {
         u32::MAX << (32 - prefix as u32)
+    }
+}
+
+pub(crate) fn probe_dynamic_filter_attach() -> Result<(), EngineError> {
+    let routes = vec!["198.51.100.0/24".to_string()];
+    let guard = KillSwitchGuard::engage(&routes, 0)?;
+    drop(guard);
+    Ok(())
+}
+
+pub(crate) fn looks_like_admin_required(error: &EngineError) -> bool {
+    match error {
+        EngineError::Platform(message) => {
+            message.contains("0x00000005")
+                || message.contains("0x80070005")
+                || message.contains("0x80320005")
+                || message.to_ascii_lowercase().contains("access denied")
+        }
+        _ => false,
     }
 }
 

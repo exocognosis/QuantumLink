@@ -21,7 +21,7 @@ use quantumlink_proto::ipc::{
 };
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
 const MAX_LINE_BYTES: usize = 1_048_576;
 
@@ -37,25 +37,28 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let (read_half, mut write_half) = tokio::io::split(stream);
-    let mut lines = BufReader::new(read_half).lines();
+    let mut reader = BufReader::new(read_half);
     let mut handshaken = false;
 
-    while let Some(line) = lines.next_line().await? {
-        if line.len() > MAX_LINE_BYTES {
-            break;
-        }
+    while let Some(line) = read_bounded_line(&mut reader, MAX_LINE_BYTES).await? {
         if line.trim().is_empty() {
             continue;
         }
         let response = match serde_json::from_str::<PipeRequest>(&line) {
             Ok(request) => {
-                if !handshaken && !matches!(request.command, TunnelCommand::Hello { .. }) {
+                if request.id == 0 {
+                    PipeResponse::error(0, "request id must be greater than zero")
+                } else if !handshaken && !matches!(request.command, TunnelCommand::Hello { .. }) {
                     PipeResponse::error(request.id, "hello required before other commands")
                 } else {
-                    if matches!(request.command, TunnelCommand::Hello { .. }) {
+                    let is_hello = matches!(request.command, TunnelCommand::Hello { .. });
+                    let response = dispatch(request, &context).await;
+                    if is_hello
+                        && matches!(response.message, TunnelProviderMessage::HelloAck { .. })
+                    {
                         handshaken = true;
                     }
-                    dispatch(request, &context).await
+                    response
                 }
             }
             Err(error) => PipeResponse::error(0, format!("malformed request: {error}")),
@@ -92,8 +95,17 @@ async fn dispatch(request: PipeRequest, context: &IpcContext) -> PipeResponse {
                 }
             }
             TunnelCommand::Connect { configuration } => {
-                let config = configuration
-                    .unwrap_or_else(|| crate::config::load_or_default(&state_dir));
+                let config = match configuration {
+                    Some(configuration) => configuration,
+                    None => match crate::config::load_for_connect(&state_dir) {
+                        Ok(configuration) => configuration,
+                        Err(error) => {
+                            return TunnelProviderMessage::Error {
+                                message: format!("configuration load failed: {error}"),
+                            };
+                        }
+                    },
+                };
                 match engine.connect(config.clone()) {
                     Ok(status) => {
                         if let Err(error) = crate::config::save_configuration(&state_dir, &config)
@@ -113,6 +125,11 @@ async fn dispatch(request: PipeRequest, context: &IpcContext) -> PipeResponse {
             TunnelCommand::ReloadConfiguration { configuration } => {
                 match crate::config::save_configuration(&state_dir, &configuration) {
                     Ok(()) => TunnelProviderMessage::Ok,
+                    Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
+                        TunnelProviderMessage::Error {
+                            message: format!("configuration invalid: {error}"),
+                        }
+                    }
                     Err(error) => TunnelProviderMessage::Error {
                         message: format!("configuration persist failed: {error}"),
                     },
@@ -140,6 +157,65 @@ async fn dispatch(request: PipeRequest, context: &IpcContext) -> PipeResponse {
     });
 
     PipeResponse { id, message }
+}
+
+async fn read_bounded_line<R>(reader: &mut R, max_len: usize) -> std::io::Result<Option<String>>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let mut line = Vec::new();
+    loop {
+        let (consume_len, done) = {
+            let buffer = reader.fill_buf().await?;
+            if buffer.is_empty() {
+                if line.is_empty() {
+                    return Ok(None);
+                }
+                break;
+            }
+
+            let newline = buffer.iter().position(|byte| *byte == b'\n');
+            let payload_len = newline.map_or(buffer.len(), |index| {
+                buffer[..index]
+                    .strip_suffix(b"\r")
+                    .map_or(index, |payload| payload.len())
+            });
+            if line
+                .len()
+                .checked_add(payload_len)
+                .is_none_or(|line_len| line_len > max_len)
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "IPC request line exceeds maximum length",
+                ));
+            }
+
+            match newline {
+                Some(index) => {
+                    line.extend_from_slice(&buffer[..index]);
+                    if line.ends_with(b"\r") {
+                        line.pop();
+                    }
+                    (index + 1, true)
+                }
+                None => {
+                    let consume_len = buffer.len();
+                    line.extend_from_slice(buffer);
+                    (consume_len, false)
+                }
+            }
+        };
+
+        reader.consume(consume_len);
+        if done {
+            break;
+        }
+    }
+
+    String::from_utf8(line)
+        .map(Some)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
 #[cfg(test)]
@@ -248,5 +324,207 @@ mod tests {
             responses[2].message,
             TunnelProviderMessage::Status { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn zero_request_id_is_rejected_before_dispatch_or_handshake() {
+        let responses = roundtrip(&[
+            r#"{"id":0,"command":"hello","schemaVersion":1}"#,
+            r#"{"id":2,"command":"status"}"#,
+        ])
+        .await;
+
+        let TunnelProviderMessage::Error { message } = &responses[0].message else {
+            panic!("expected id validation error");
+        };
+        assert!(message.contains("greater than zero"));
+        let TunnelProviderMessage::Error { message } = &responses[1].message else {
+            panic!("expected hello gate to remain closed");
+        };
+        assert!(message.contains("hello required"));
+    }
+
+    #[tokio::test]
+    async fn unknown_command_and_bad_configuration_shape_do_not_close_pipe() {
+        let responses = roundtrip(&[
+            r#"{"id":1,"command":"hello","schemaVersion":1}"#,
+            r#"{"id":2,"command":"notACommand"}"#,
+            r#"{"id":3,"command":"reloadConfiguration","configuration":{"protectedRoutes":"not-an-array"}}"#,
+            r#"{"id":4,"command":"status"}"#,
+        ])
+        .await;
+
+        assert!(matches!(
+            responses[1].message,
+            TunnelProviderMessage::Error { .. }
+        ));
+        assert!(matches!(
+            responses[2].message,
+            TunnelProviderMessage::Error { .. }
+        ));
+        assert!(matches!(
+            responses[3].message,
+            TunnelProviderMessage::Status { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn crlf_request_line_is_accepted() {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let context = test_context();
+        let server_task = tokio::spawn(serve_connection(server, context));
+
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        client_write
+            .write_all(br#"{"id":1,"command":"hello","schemaVersion":1}"#)
+            .await
+            .unwrap();
+        client_write.write_all(b"\r\n").await.unwrap();
+        client_write.shutdown().await.unwrap();
+
+        let mut raw = String::new();
+        client_read.read_to_string(&mut raw).await.unwrap();
+        server_task.await.unwrap().unwrap();
+        let response: PipeResponse = serde_json::from_str(raw.trim()).unwrap();
+        assert!(matches!(
+            response.message,
+            TunnelProviderMessage::HelloAck { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn invalid_utf8_request_line_is_rejected() {
+        let bytes = [0xff, b'\n'];
+        let mut reader = BufReader::new(&bytes[..]);
+        let error = read_bounded_line(&mut reader, MAX_LINE_BYTES)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn oversized_request_line_is_rejected_before_dispatch() {
+        let oversized = vec![b'a'; MAX_LINE_BYTES + 1];
+        let mut reader = BufReader::new(&oversized[..]);
+        let error = read_bounded_line(&mut reader, MAX_LINE_BYTES)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn exact_limit_request_payload_is_accepted_with_newline() {
+        let mut request = vec![b'a'; MAX_LINE_BYTES];
+        request.push(b'\n');
+        let mut reader = BufReader::new(&request[..]);
+        let line = read_bounded_line(&mut reader, MAX_LINE_BYTES)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(line.len(), MAX_LINE_BYTES);
+    }
+
+    #[tokio::test]
+    async fn reload_configuration_rejects_invalid_config_without_persisting() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = IpcContext {
+            engine: Arc::new(TunnelEngine::new(
+                Arc::new(InMemorySecretStore::default()),
+                Arc::new(DevPlatform::default()),
+                dir.path().to_path_buf(),
+            )),
+            state_dir: dir.path().to_path_buf(),
+        };
+        let mut configuration = quantumlink_proto::privacy::default_tunnel_configuration();
+        configuration.protected_routes.clear();
+
+        let response = dispatch(
+            PipeRequest {
+                id: 42,
+                command: TunnelCommand::ReloadConfiguration { configuration },
+            },
+            &context,
+        )
+        .await;
+
+        let TunnelProviderMessage::Error { message } = response.message else {
+            panic!("expected configuration error");
+        };
+        assert!(message.contains("configuration invalid"));
+        assert!(!dir.path().join(crate::config::CONFIG_FILE).exists());
+    }
+
+    #[tokio::test]
+    async fn invalid_reload_preserves_existing_config_and_tempfile_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::config::ensure_state_dirs(dir.path()).unwrap();
+        let existing = quantumlink_proto::privacy::default_tunnel_configuration();
+        crate::config::save_configuration(dir.path(), &existing).unwrap();
+        let context = IpcContext {
+            engine: Arc::new(TunnelEngine::new(
+                Arc::new(InMemorySecretStore::default()),
+                Arc::new(DevPlatform::default()),
+                dir.path().to_path_buf(),
+            )),
+            state_dir: dir.path().to_path_buf(),
+        };
+        let mut invalid = existing.clone();
+        invalid.protected_routes.clear();
+
+        let response = dispatch(
+            PipeRequest {
+                id: 42,
+                command: TunnelCommand::ReloadConfiguration {
+                    configuration: invalid,
+                },
+            },
+            &context,
+        )
+        .await;
+
+        assert!(matches!(
+            response.message,
+            TunnelProviderMessage::Error { .. }
+        ));
+        let loaded = crate::config::load_configuration(dir.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded, existing);
+        assert!(!dir
+            .path()
+            .join(format!("{}.tmp", crate::config::CONFIG_FILE))
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn connect_without_configuration_rejects_malformed_persisted_config() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::config::ensure_state_dirs(dir.path()).unwrap();
+        std::fs::write(dir.path().join(crate::config::CONFIG_FILE), b"{bad json").unwrap();
+        let context = IpcContext {
+            engine: Arc::new(TunnelEngine::new(
+                Arc::new(InMemorySecretStore::default()),
+                Arc::new(DevPlatform::default()),
+                dir.path().to_path_buf(),
+            )),
+            state_dir: dir.path().to_path_buf(),
+        };
+
+        let response = dispatch(
+            PipeRequest {
+                id: 43,
+                command: TunnelCommand::Connect {
+                    configuration: None,
+                },
+            },
+            &context,
+        )
+        .await;
+
+        let TunnelProviderMessage::Error { message } = response.message else {
+            panic!("expected configuration load error");
+        };
+        assert!(message.contains("configuration load failed"));
+        assert_eq!(context.engine.status().phase, ConnectionPhase::Idle);
     }
 }

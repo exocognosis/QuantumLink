@@ -53,6 +53,48 @@ function Invoke-NativeCommand {
     }
 }
 
+function Assert-Command {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+
+        [Parameter(Mandatory = $true)]
+        [string]$InstallHint
+    )
+
+    if (-not (Get-Command $Name -ErrorAction SilentlyContinue)) {
+        throw "$Name is missing. $InstallHint"
+    }
+}
+
+function Assert-WindowsPrerequisites {
+    if (-not [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Windows)) {
+        throw "Windows build requires a Windows host with MSVC; current OS is $([System.Runtime.InteropServices.RuntimeInformation]::OSDescription)."
+    }
+
+    Assert-Command "cargo" "Install Rust from https://rustup.rs/."
+    Assert-Command "rustc" "Install Rust from https://rustup.rs/."
+    Assert-Command "rustup" "Install Rust from https://rustup.rs/."
+    Assert-Command "dotnet" "Install the .NET 8 SDK."
+
+    $installedTargets = rustup target list --installed
+    if ($installedTargets -notcontains $rustTarget) {
+        throw "Rust target $rustTarget is missing. Run: rustup target add $rustTarget"
+    }
+
+    Assert-Command "cl.exe" "Install MSVC Build Tools and run this script from a Developer PowerShell."
+    Assert-Command "link.exe" "Install MSVC Build Tools and run this script from a Developer PowerShell."
+
+    $sdkLibRoot = Join-Path ${env:ProgramFiles(x86)} "Windows Kits\10\Lib"
+    if (-not (Test-Path -LiteralPath $sdkLibRoot -PathType Container)) {
+        throw "Windows SDK libraries not found at '$sdkLibRoot'. Install the Windows 10/11 SDK with MSVC."
+    }
+    $sdkVersions = Get-ChildItem -LiteralPath $sdkLibRoot -Directory | Sort-Object Name -Descending
+    if (-not $sdkVersions) {
+        throw "Windows SDK library root exists but has no versioned SDK directories: $sdkLibRoot."
+    }
+}
+
 function Get-DotNetToolManifestRoot {
     param(
         [Parameter(Mandatory = $true)]
@@ -125,6 +167,9 @@ $uiProject = Resolve-FilePath "ui\QuantumLink.Windows" $root
 $uiPublishDir = Resolve-FilePath "ui\publish" $root
 $installerSource = Resolve-FilePath "installer\QuantumLink.wxs" $root
 $defaultWintunDll = Resolve-FilePath "wintun\bin\amd64\wintun.dll" $root
+$protoPackage = "quantumlink-proto"
+$servicePackage = "quantumlink-service"
+$corePackage = "qlink-core"
 $wixVersion = if ([string]::IsNullOrWhiteSpace($env:WIX_VERSION)) { "6.0.2" } else { $env:WIX_VERSION.Trim() }
 $wixUtilExtension = "WixToolset.Util.wixext/$wixVersion"
 
@@ -134,18 +179,30 @@ if ([string]::IsNullOrWhiteSpace($MsiOutputPath)) {
     $resolvedMsiOutputPath = Resolve-FilePath $MsiOutputPath $repoRoot
 }
 
+Write-Host "==> Windows prerequisites" -ForegroundColor Cyan
+Assert-WindowsPrerequisites
+
+Write-Host "==> Rust: verify locked Cargo graph" -ForegroundColor Cyan
+Invoke-NativeCommand "cargo" @("metadata", "--manifest-path", $cargoManifest, "--locked", "--format-version", "1", "--no-deps")
+
+Write-Host "==> Rust: fetch locked dependencies for $rustTarget" -ForegroundColor Cyan
+Invoke-NativeCommand "cargo" @("fetch", "--manifest-path", $cargoManifest, "--locked", "--target", $rustTarget)
+
+Write-Host "==> Rust: check Windows core + service + protocol crates" -ForegroundColor Cyan
+Invoke-NativeCommand "cargo" @("check", "--manifest-path", $cargoManifest, "--locked", "--target", $rustTarget, "-p", $corePackage, "-p", $protoPackage, "-p", $servicePackage, "--all-targets")
+
 if ($SkipTests) {
     Write-Host "==> Rust: tests and smoke skipped" -ForegroundColor Yellow
 } else {
-    Write-Host "==> Rust: test workspace" -ForegroundColor Cyan
-    Invoke-NativeCommand "cargo" @("test", "--manifest-path", $cargoManifest, "--workspace", "--target", $rustTarget)
+    Write-Host "==> Rust: test Windows core + service + protocol crates" -ForegroundColor Cyan
+    Invoke-NativeCommand "cargo" @("test", "--manifest-path", $cargoManifest, "--locked", "--target", $rustTarget, "-p", $corePackage, "-p", $protoPackage, "-p", $servicePackage)
 
     Write-Host "==> Rust: data-plane smoke" -ForegroundColor Cyan
-    Invoke-NativeCommand "cargo" @("run", "--manifest-path", $cargoManifest, "-p", "quantumlink-service", "--target", $rustTarget, "--", "smoke")
+    Invoke-NativeCommand "cargo" @("run", "--manifest-path", $cargoManifest, "--locked", "-p", $servicePackage, "--target", $rustTarget, "--", "smoke")
 }
 
 Write-Host "==> Rust: release build (service + core DLL)" -ForegroundColor Cyan
-Invoke-NativeCommand "cargo" @("build", "--manifest-path", $cargoManifest, "--release", "--target", $rustTarget, "-p", "quantumlink-service", "-p", "qlink-core")
+Invoke-NativeCommand "cargo" @("build", "--manifest-path", $cargoManifest, "--locked", "--release", "--target", $rustTarget, "-p", $servicePackage, "-p", "qlink-core")
 
 Write-Host "==> UI: publish" -ForegroundColor Cyan
 Invoke-NativeCommand "dotnet" @("publish", $uiProject, "-c", "Release", "-r", "win-x64", "-p:Platform=x64", "-o", $uiPublishDir)

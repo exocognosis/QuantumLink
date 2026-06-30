@@ -17,7 +17,9 @@
 //!    depth, not a hard boundary).
 
 use crate::secret_store::{SecretStore, SecretStoreError};
+use std::ffi::c_void;
 use std::path::PathBuf;
+use std::ptr;
 use windows::core::PWSTR;
 use windows::Win32::Foundation::{LocalFree, HLOCAL};
 use windows::Win32::Security::Cryptography::{
@@ -106,12 +108,7 @@ fn protect(data: &[u8]) -> Result<Vec<u8>, SecretStoreError> {
         )
         .map_err(|error| SecretStoreError::Crypto(format!("CryptProtectData: {error}")))?;
     }
-    let bytes =
-        unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() };
-    unsafe {
-        LocalFree(Some(HLOCAL(output.pbData as *mut core::ffi::c_void)));
-    }
-    Ok(bytes)
+    copy_and_free_blob(&mut output, false)
 }
 
 fn unprotect(blob: &[u8]) -> Result<Vec<u8>, SecretStoreError> {
@@ -136,12 +133,69 @@ fn unprotect(blob: &[u8]) -> Result<Vec<u8>, SecretStoreError> {
         )
         .map_err(|error| SecretStoreError::Crypto(format!("CryptUnprotectData: {error}")))?;
     }
-    let bytes =
-        unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() };
-    unsafe {
-        LocalFree(Some(HLOCAL(output.pbData as *mut core::ffi::c_void)));
+    copy_and_free_blob(&mut output, true)
+}
+
+pub(crate) fn probe_roundtrip() -> Result<(), SecretStoreError> {
+    let payload = b"quantumlink-dpapi-runtime-proof";
+    let protected = protect(payload)?;
+    if protected
+        .windows(payload.len())
+        .any(|window| window == payload)
+    {
+        return Err(SecretStoreError::Crypto(
+            "DPAPI protected blob contains plaintext probe payload".into(),
+        ));
     }
+    let unprotected = unprotect(&protected)?;
+    if unprotected != payload {
+        return Err(SecretStoreError::Crypto(
+            "DPAPI unprotected payload did not match probe input".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn copy_and_free_blob(
+    output: &mut CRYPT_INTEGER_BLOB,
+    zero_before_free: bool,
+) -> Result<Vec<u8>, SecretStoreError> {
+    let len = output.cbData as usize;
+    if len == 0 {
+        free_blob(output, false, 0);
+        return Ok(Vec::new());
+    }
+    if output.pbData.is_null() {
+        return Err(SecretStoreError::Crypto(
+            "DPAPI returned a null data pointer".into(),
+        ));
+    }
+
+    let bytes = unsafe { std::slice::from_raw_parts(output.pbData, len).to_vec() };
+    free_blob(output, zero_before_free, len);
     Ok(bytes)
+}
+
+fn free_blob(output: &mut CRYPT_INTEGER_BLOB, zero_before_free: bool, len: usize) {
+    if output.pbData.is_null() {
+        return;
+    }
+    if zero_before_free && len > 0 {
+        secure_zero(output.pbData, len);
+    }
+    unsafe {
+        let _ = LocalFree(Some(HLOCAL(output.pbData as *mut c_void)));
+    }
+    output.pbData = ptr::null_mut();
+    output.cbData = 0;
+}
+
+fn secure_zero(ptr: *mut u8, len: usize) {
+    for offset in 0..len {
+        unsafe {
+            ptr.add(offset).write_volatile(0);
+        }
+    }
 }
 
 #[cfg(test)]

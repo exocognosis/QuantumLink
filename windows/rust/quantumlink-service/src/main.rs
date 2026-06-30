@@ -9,6 +9,8 @@
 //!                (Windows only, requires elevation).
 //! - `smoke`      local data-plane smoke test (the Windows analog of
 //!                `qlinkctl quic-loopback`); exits non-zero on failure.
+//! - `security-probe` bounded Windows runtime proof hooks for Wintun,
+//!                DPAPI, WFP, and network monitor lifecycle safety.
 
 use clap::{Parser, Subcommand};
 use std::sync::Arc;
@@ -36,6 +38,9 @@ enum Commands {
     Stop,
     /// Run the local loopback data-plane smoke test and print JSON.
     Smoke,
+    /// Run bounded Windows-native security proof hooks and print JSON.
+    #[cfg(windows)]
+    SecurityProbe,
 }
 
 fn init_tracing() {
@@ -119,6 +124,20 @@ fn main() -> std::process::ExitCode {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&report.summary).unwrap_or_default()
+            );
+            if report.passed {
+                std::process::ExitCode::SUCCESS
+            } else {
+                std::process::ExitCode::FAILURE
+            }
+        }
+        #[cfg(windows)]
+        Commands::SecurityProbe => {
+            init_tracing();
+            let report = quantumlink_service::win::probe::run_runtime_probe();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report).unwrap_or_default()
             );
             if report.passed {
                 std::process::ExitCode::SUCCESS

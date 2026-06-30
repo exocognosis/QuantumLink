@@ -32,8 +32,9 @@ use qlink_core::mesh_connection::NetworkEvent;
 use qlink_core::mesh_transport::{MeshTransportConfig, MeshTransportHandle};
 use qlink_core::packet_core::PacketTunnelCore;
 use quantumlink_proto::models::{
-    ConnectionPhase, KillSwitchPolicy, MeshMetrics, PathType, PeerIdentity, PeerStatus,
-    TunnelConfiguration, TunnelStatus, TunnelTransportMetrics,
+    ConnectionPhase, DiscoveryIdentityMode, DytallixPeerTrustSummary, KillSwitchPolicy,
+    MeshMetrics, MeshTrustPolicy, PathType, PeerIdentity, PeerStatus, TunnelConfiguration,
+    TunnelStatus, TunnelTransportMetrics,
 };
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -199,6 +200,58 @@ struct ActiveSession {
     last_error: Arc<Mutex<Option<String>>>,
 }
 
+struct StartupRollback {
+    platform: Arc<dyn PlatformNetwork>,
+    config: TunnelConfiguration,
+    adapter: Option<Arc<dyn TunnelAdapter>>,
+    kill_switch_engaged: bool,
+    committed: bool,
+}
+
+impl StartupRollback {
+    fn new(platform: Arc<dyn PlatformNetwork>, config: &TunnelConfiguration) -> Self {
+        Self {
+            platform,
+            config: config.clone(),
+            adapter: None,
+            kill_switch_engaged: false,
+            committed: false,
+        }
+    }
+
+    fn mark_kill_switch_engaged(&mut self) {
+        self.kill_switch_engaged = true;
+    }
+
+    fn set_adapter(&mut self, adapter: &Arc<dyn TunnelAdapter>) {
+        self.adapter = Some(Arc::clone(adapter));
+    }
+
+    fn commit(&mut self) {
+        self.committed = true;
+        self.adapter = None;
+        self.kill_switch_engaged = false;
+    }
+}
+
+impl Drop for StartupRollback {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        if let Some(adapter) = self.adapter.take() {
+            if let Err(error) = self.platform.teardown(&adapter, &self.config) {
+                tracing::warn!(%error, "startup rollback teardown failed");
+            }
+        }
+        if self.kill_switch_engaged {
+            if let Err(error) = self.platform.disengage_kill_switch() {
+                tracing::warn!(%error, "startup rollback kill switch disengage failed");
+            }
+        }
+    }
+}
+
 pub struct TunnelEngine {
     secret_store: Arc<dyn SecretStore>,
     platform: Arc<dyn PlatformNetwork>,
@@ -245,11 +298,8 @@ impl TunnelEngine {
     }
 
     fn connect_inner(&self, config: TunnelConfiguration) -> Result<(), EngineError> {
-        if config.protected_routes.is_empty() {
-            return Err(EngineError::Config(
-                "at least one protected route is required".into(),
-            ));
-        }
+        crate::config::validate_configuration(&config).map_err(EngineError::Config)?;
+        let mut rollback = StartupRollback::new(Arc::clone(&self.platform), &config);
 
         // 1. Stable identity + peer-store key.
         let keypair = load_or_generate_device_keypair(self.secret_store.as_ref())?;
@@ -273,11 +323,14 @@ impl TunnelEngine {
                     tracing::warn!(%error, "kill switch engagement failed; pump-level fail-closed still applies");
                 }
             }
+        } else {
+            rollback.mark_kill_switch_engaged();
         }
 
         // 4. Adapter + network configuration.
         self.set_phase(ConnectionPhase::Connecting);
         let adapter = self.platform.create_adapter(&config)?;
+        rollback.set_adapter(&adapter);
         self.platform.apply_network_config(&adapter, &config)?;
 
         // 5. Transport.
@@ -301,7 +354,6 @@ impl TunnelEngine {
             let deadline = std::time::Instant::now() + DEFAULT_DEADLINE;
             while !transport.is_ready() {
                 if std::time::Instant::now() >= deadline {
-                    let _ = self.platform.teardown(&adapter, &config);
                     return Err(EngineError::KillSwitchStrict(
                         "transport did not become ready during start".into(),
                     ));
@@ -345,6 +397,7 @@ impl TunnelEngine {
             threads,
             last_error,
         });
+        rollback.commit();
         *self.last_error.lock().unwrap() = None;
         Ok(())
     }
@@ -455,6 +508,14 @@ impl TunnelEngine {
             status.dns_mode = session.config.dns_mode;
             status.overlay_ipv4_address = session.config.overlay_ipv4_address.clone();
             status.protected_routes = session.config.protected_routes.clone();
+            status.peer_trust = DytallixPeerTrustSummary {
+                required: session.config.mesh_trust_policy == MeshTrustPolicy::PublicRequired
+                    || session.config.discovery_identity_mode != DiscoveryIdentityMode::Off,
+                policy: session.config.mesh_trust_policy,
+                identity_mode: session.config.discovery_identity_mode,
+                registry_configured: session.config.dytallix_identity.is_some(),
+                ..DytallixPeerTrustSummary::default()
+            };
             status.pump = Some(session.pump.lock().unwrap().counters().as_proto());
             if let Some(error) = session.last_error.lock().unwrap().clone() {
                 status.last_error = Some(error);
@@ -536,9 +597,9 @@ impl TunnelEngine {
         let json = serde_json::json!({
             "service": env!("CARGO_PKG_VERSION"),
             "qlinkCoreSuite": "QLINK-FIPS203-MLKEM768-SHAKE256-v1",
-            "status": status,
+            "status": diagnostics_status(&status),
         });
-        quantumlink_proto::privacy::redact_peer_identifiers(
+        quantumlink_proto::privacy::redact_diagnostics_text(
             &serde_json::to_string_pretty(&json).unwrap_or_else(|_| "{}".to_string()),
         )
     }
@@ -546,6 +607,60 @@ impl TunnelEngine {
     fn set_phase(&self, phase: ConnectionPhase) {
         *self.phase.lock().unwrap() = phase;
     }
+}
+
+fn diagnostics_status(status: &TunnelStatus) -> serde_json::Value {
+    let peers: Vec<_> = status
+        .peers
+        .iter()
+        .map(|peer| {
+            serde_json::json!({
+                "identity": {
+                    "peerID": quantumlink_proto::privacy::redact_peer_identifiers(
+                        &peer.identity.peer_id,
+                    ),
+                    "aliasPresent": !peer.identity.alias.is_empty(),
+                    "publicKeyFingerprintPresent": !peer.identity.public_key_fingerprint.is_empty(),
+                },
+                "pathType": peer.path_type,
+                "endpointCount": peer.endpoints.len(),
+                "overlayAddressPresent": !peer.overlay_address.is_empty(),
+                "rttMilliseconds": peer.rtt_milliseconds,
+                "lastRekeyUnix": peer.last_rekey_unix,
+                "bytesIn": peer.bytes_in,
+                "bytesOut": peer.bytes_out,
+            })
+        })
+        .collect();
+
+    serde_json::json!({
+        "phase": status.phase,
+        "pathType": status.path_type,
+        "routeMode": status.route_mode,
+        "dnsMode": status.dns_mode,
+        "overlayAddressPresent": !status.overlay_ipv4_address.is_empty(),
+        "protectedRouteCount": status.protected_routes.len(),
+        "peers": peers,
+        "metrics": status.metrics,
+        "transport": status.transport,
+        "pump": status.pump,
+        "killSwitchEngaged": status.kill_switch_engaged,
+        "peerTrust": {
+            "required": status.peer_trust.required,
+            "trustPolicy": status.peer_trust.policy,
+            "identityMode": status.peer_trust.identity_mode,
+            "registryConfigured": status.peer_trust.registry_configured,
+            "verifiedPeerCount": status.peer_trust.verified_peer_count,
+            "unverifiedPeerCount": status.peer_trust.unverified_peer_count,
+            "pendingPeerCount": status.peer_trust.pending_peer_count,
+            "failedPeerCount": status.peer_trust.failed_peer_count,
+            "lastCheckedAtUnix": status.peer_trust.last_checked_at_unix,
+        },
+        "lastError": status
+            .last_error
+            .as_ref()
+            .map(|error| quantumlink_proto::privacy::redact_diagnostics_text(error)),
+    })
 }
 
 impl Drop for TunnelEngine {
@@ -658,9 +773,11 @@ fn spawn_watchdog_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapter::LoopbackAdapter;
+    use crate::adapter::{AdapterError, LoopbackAdapter};
     use crate::secret_store::InMemorySecretStore;
+    use quantumlink_proto::models::DytallixIdentityConfiguration;
     use quantumlink_proto::privacy;
+    use std::sync::atomic::AtomicUsize;
 
     fn test_engine() -> (Arc<DevPlatform>, TunnelEngine) {
         let platform = Arc::new(DevPlatform::default());
@@ -687,6 +804,70 @@ mod tests {
         packet[12..16].copy_from_slice(&[100, 127, 0, 2]);
         packet[16..20].copy_from_slice(&destination);
         packet
+    }
+
+    #[derive(Default)]
+    struct StartupFailurePlatform {
+        adapter: Mutex<Option<Arc<LoopbackAdapter>>>,
+        fail_create_adapter: AtomicBool,
+        fail_apply_network_config: AtomicBool,
+        engaged: AtomicBool,
+        teardown_count: AtomicUsize,
+        disengage_count: AtomicUsize,
+    }
+
+    impl PlatformNetwork for StartupFailurePlatform {
+        fn create_adapter(
+            &self,
+            _config: &TunnelConfiguration,
+        ) -> Result<Arc<dyn TunnelAdapter>, EngineError> {
+            if self.fail_create_adapter.load(Ordering::SeqCst) {
+                return Err(EngineError::Platform(
+                    "forced adapter creation failure".into(),
+                ));
+            }
+            let adapter = Arc::new(LoopbackAdapter::default());
+            *self.adapter.lock().unwrap() = Some(Arc::clone(&adapter));
+            Ok(adapter)
+        }
+
+        fn apply_network_config(
+            &self,
+            _adapter: &Arc<dyn TunnelAdapter>,
+            _config: &TunnelConfiguration,
+        ) -> Result<(), EngineError> {
+            if self.fail_apply_network_config.load(Ordering::SeqCst) {
+                return Err(EngineError::Platform(
+                    "forced network configuration failure".into(),
+                ));
+            }
+            Ok(())
+        }
+
+        fn engage_kill_switch(&self, _config: &TunnelConfiguration) -> Result<(), EngineError> {
+            self.engaged.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn disengage_kill_switch(&self) -> Result<(), EngineError> {
+            self.disengage_count.fetch_add(1, Ordering::SeqCst);
+            self.engaged.store(false, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn kill_switch_engaged(&self) -> bool {
+            self.engaged.load(Ordering::SeqCst)
+        }
+
+        fn teardown(
+            &self,
+            adapter: &Arc<dyn TunnelAdapter>,
+            _config: &TunnelConfiguration,
+        ) -> Result<(), EngineError> {
+            self.teardown_count.fetch_add(1, Ordering::SeqCst);
+            adapter.shutdown();
+            Ok(())
+        }
     }
 
     #[test]
@@ -723,6 +904,52 @@ mod tests {
     }
 
     #[test]
+    fn startup_failure_before_adapter_create_disengages_kill_switch() {
+        let platform = Arc::new(StartupFailurePlatform::default());
+        platform.fail_create_adapter.store(true, Ordering::SeqCst);
+        let engine = TunnelEngine::new(
+            Arc::new(InMemorySecretStore::default()),
+            Arc::clone(&platform) as Arc<dyn PlatformNetwork>,
+            std::env::temp_dir(),
+        );
+
+        assert!(matches!(
+            engine.connect(dev_config()),
+            Err(EngineError::Platform(_))
+        ));
+        assert!(!platform.kill_switch_engaged());
+        assert_eq!(platform.disengage_count.load(Ordering::SeqCst), 1);
+        assert_eq!(platform.teardown_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn startup_failure_after_adapter_create_rolls_back_adapter_and_kill_switch() {
+        let platform = Arc::new(StartupFailurePlatform::default());
+        platform
+            .fail_apply_network_config
+            .store(true, Ordering::SeqCst);
+        let engine = TunnelEngine::new(
+            Arc::new(InMemorySecretStore::default()),
+            Arc::clone(&platform) as Arc<dyn PlatformNetwork>,
+            std::env::temp_dir(),
+        );
+
+        assert!(matches!(
+            engine.connect(dev_config()),
+            Err(EngineError::Platform(_))
+        ));
+        assert!(!platform.kill_switch_engaged());
+        assert_eq!(platform.disengage_count.load(Ordering::SeqCst), 1);
+        assert_eq!(platform.teardown_count.load(Ordering::SeqCst), 1);
+
+        let adapter = platform.adapter.lock().unwrap().clone().unwrap();
+        assert!(matches!(
+            adapter.receive(Duration::from_millis(1)),
+            Err(AdapterError::ShutDown)
+        ));
+    }
+
+    #[test]
     fn second_connect_is_rejected() {
         let (_platform, engine) = test_engine();
         engine.connect(dev_config()).unwrap();
@@ -740,6 +967,53 @@ mod tests {
         let diagnostics = engine.diagnostics();
         assert!(!diagnostics.contains("qlink_") || diagnostics.contains("qlink_[redacted]"));
         engine.disconnect();
+    }
+
+    #[test]
+    fn diagnostics_export_summarizes_sensitive_network_and_registry_values() {
+        let (_platform, engine) = test_engine();
+        let mut config = dev_config();
+        config.overlay_ipv4_address = "100.127.10.20".to_string();
+        config.protected_routes = vec!["10.0.0.0/8".to_string(), "100.127.0.0/16".to_string()];
+        config.mesh_trust_policy = MeshTrustPolicy::PublicRequired;
+        config.discovery_identity_mode = DiscoveryIdentityMode::Verified;
+        config.dytallix_identity = Some(DytallixIdentityConfiguration {
+            endpoint: "https://registry.private.example".to_string(),
+            contract_address: "0xabc1230000000000000000000000000000000000".to_string(),
+            publish_wallet_address: false,
+            network_id: Some("private-net".to_string()),
+            chain_id: Some("private-chain".to_string()),
+            allowed_rpc_endpoints: vec!["https://rpc.private.example".to_string()],
+            keystore_path: Some(r"C:\QuantumLink\wallet.secret".to_string()),
+            wallet_name: Some("operator-wallet".to_string()),
+        });
+
+        engine.connect(config).unwrap();
+        let diagnostics = engine.diagnostics();
+
+        assert!(!diagnostics.contains("10.0.0.0/8"));
+        assert!(!diagnostics.contains("100.127.0.0/16"));
+        assert!(!diagnostics.contains("100.127.10.20"));
+        assert!(!diagnostics.contains("registry.private.example"));
+        assert!(!diagnostics.contains("0xabc123"));
+        assert!(!diagnostics.contains("wallet.secret"));
+        assert!(!diagnostics.contains("operator-wallet"));
+        assert!(diagnostics.contains(r#""protectedRouteCount": 2"#));
+        assert!(diagnostics.contains(r#""registryConfigured": true"#));
+        engine.disconnect();
+    }
+
+    #[test]
+    fn diagnostics_export_redacts_failed_start_error_details() {
+        let (_platform, engine) = test_engine();
+        let mut config = dev_config();
+        config.dns_servers = vec!["https://dns.private.example".to_string()];
+
+        assert!(engine.connect(config).is_err());
+        let diagnostics = engine.diagnostics();
+
+        assert!(!diagnostics.contains("dns.private.example"));
+        assert!(diagnostics.contains("[redacted-url]"));
     }
 
     #[test]
