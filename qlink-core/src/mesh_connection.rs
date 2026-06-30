@@ -1722,7 +1722,11 @@ fn order_direct_candidates(
         .cloned()
         .collect();
 
-    direct.sort_by(|a, b| b.priority.cmp(&a.priority));
+    direct.sort_by(|a, b| {
+        direct_candidate_rank(&a.candidate_type)
+            .cmp(&direct_candidate_rank(&b.candidate_type))
+            .then_with(|| b.priority.cmp(&a.priority))
+    });
 
     if let Some(target) = cached_addr {
         if let Some(position) = direct
@@ -1735,6 +1739,14 @@ fn order_direct_candidates(
     }
 
     direct
+}
+
+fn direct_candidate_rank(candidate_type: &CandidateType) -> u8 {
+    match candidate_type {
+        CandidateType::Host => 0,
+        CandidateType::ServerReflexive => 1,
+        CandidateType::Relay => 2,
+    }
 }
 
 fn direct_keypair_required_attempts(candidates: &[CandidateEndpoint]) -> Vec<ProbeAttempt> {
@@ -1891,6 +1903,37 @@ mod native_udp_live_mesh_tests {
         link.send_frame(b"native-udp-ping".to_vec()).await.unwrap();
         let opened = responder_task.await.unwrap();
         assert_eq!(opened, b"native-udp-ping");
+    }
+
+    #[test]
+    fn direct_candidate_order_prefers_native_host_before_server_reflexive() {
+        let ordered = order_direct_candidates(
+            &[
+                CandidateEndpoint {
+                    candidate_type: CandidateType::Relay,
+                    address: "203.0.113.10".to_string(),
+                    port: 9472,
+                    priority: u32::MAX,
+                },
+                CandidateEndpoint {
+                    candidate_type: CandidateType::ServerReflexive,
+                    address: "198.51.100.20".to_string(),
+                    port: 40000,
+                    priority: 9_000,
+                },
+                CandidateEndpoint {
+                    candidate_type: CandidateType::Host,
+                    address: "10.0.0.20".to_string(),
+                    port: 40000,
+                    priority: 100,
+                },
+            ],
+            None,
+        );
+
+        assert_eq!(ordered.len(), 2);
+        assert_eq!(ordered[0].candidate_type, CandidateType::Host);
+        assert_eq!(ordered[1].candidate_type, CandidateType::ServerReflexive);
     }
 
     fn signed_record(

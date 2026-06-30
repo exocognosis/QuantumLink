@@ -18,6 +18,12 @@ public enum PathType: String, Codable, CaseIterable, Sendable {
   case unavailable
 }
 
+public enum RelayTLSPolicy: String, Codable, CaseIterable, Sendable {
+  case required
+  case opportunistic
+  case disabled
+}
+
 public enum RouteMode: String, Codable, CaseIterable, Sendable {
   case splitTunnel
   case protectedPrefixesOnly
@@ -478,6 +484,10 @@ public struct TunnelConfiguration: Codable, Equatable, Sendable {
   public let discoveryModes: [DiscoveryMode]
   public let rendezvousServers: [String]
   public let relayServers: [String]
+  public let allowedRelayEndpoints: [String]
+  public let relayTLSPolicy: RelayTLSPolicy
+  public let maximumCandidateAgeSeconds: UInt64
+  public let failClosedOnNoCandidate: Bool
   public let mtu: Int
   public let crypto: CryptoPolicy
   public let killSwitch: KillSwitchPolicy
@@ -499,6 +509,10 @@ public struct TunnelConfiguration: Codable, Equatable, Sendable {
     discoveryModes: [DiscoveryMode] = [.rendezvous],
     rendezvousServers: [String] = [],
     relayServers: [String] = [],
+    allowedRelayEndpoints: [String] = [],
+    relayTLSPolicy: RelayTLSPolicy = .required,
+    maximumCandidateAgeSeconds: UInt64 = 120,
+    failClosedOnNoCandidate: Bool = true,
     mtu: Int = 1280,
     crypto: CryptoPolicy = CryptoPolicy(),
     killSwitch: KillSwitchPolicy = .failClosed,
@@ -519,6 +533,10 @@ public struct TunnelConfiguration: Codable, Equatable, Sendable {
     self.discoveryModes = discoveryModes
     self.rendezvousServers = rendezvousServers
     self.relayServers = relayServers
+    self.allowedRelayEndpoints = allowedRelayEndpoints
+    self.relayTLSPolicy = relayTLSPolicy
+    self.maximumCandidateAgeSeconds = maximumCandidateAgeSeconds
+    self.failClosedOnNoCandidate = failClosedOnNoCandidate
     self.mtu = mtu
     self.crypto = crypto
     self.killSwitch = killSwitch
@@ -547,6 +565,14 @@ public struct TunnelConfiguration: Codable, Equatable, Sendable {
     self.rendezvousServers =
       try container.decodeIfPresent([String].self, forKey: .rendezvousServers) ?? []
     self.relayServers = try container.decodeIfPresent([String].self, forKey: .relayServers) ?? []
+    self.allowedRelayEndpoints =
+      try container.decodeIfPresent([String].self, forKey: .allowedRelayEndpoints) ?? []
+    self.relayTLSPolicy =
+      try container.decodeIfPresent(RelayTLSPolicy.self, forKey: .relayTLSPolicy) ?? .required
+    self.maximumCandidateAgeSeconds =
+      try container.decodeIfPresent(UInt64.self, forKey: .maximumCandidateAgeSeconds) ?? 120
+    self.failClosedOnNoCandidate =
+      try container.decodeIfPresent(Bool.self, forKey: .failClosedOnNoCandidate) ?? true
     self.mtu = try container.decodeIfPresent(Int.self, forKey: .mtu) ?? 1280
     self.crypto =
       try container.decodeIfPresent(CryptoPolicy.self, forKey: .crypto) ?? CryptoPolicy()
