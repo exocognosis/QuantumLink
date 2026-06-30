@@ -12,6 +12,7 @@ CONFIG_DIR="${CONFIG_DIR:-/etc/quantumlink}"
 STATE_DIR="${STATE_DIR:-/var/lib/quantumlink}"
 UNIT_NAME="qlinkd.service"
 ACTIVATED_SAMPLE_NAME="activate-network.conf.sample"
+CONTROL_GROUP_NAME="quantumlink"
 UNIT_TMP=""
 ACTIVATED_SAMPLE_TMP=""
 
@@ -219,12 +220,31 @@ validate_installation() {
     validate_exact_line "$installed_unit" "ExecStart=$BINDIR/qlinkd"
     validate_exact_line "$installed_unit" "ExecStop=$BINDIR/qlinkd --deactivate-network"
     validate_exact_line "$installed_unit" "ExecStopPost=$BINDIR/qlinkd --deactivate-network"
+    validate_exact_line "$installed_unit" "Group=$CONTROL_GROUP_NAME"
+    validate_exact_line "$installed_unit" "UMask=0007"
     if [ ! -f "$installed_sample" ]; then
         echo "validation failed: activated-mode sample is missing: $installed_sample" >&2
         exit 1
     fi
     validate_exact_line "$installed_sample" "ExecStart="
     validate_exact_line "$installed_sample" "ExecStart=$BINDIR/qlinkd --activate-network"
+}
+
+ensure_live_control_group() {
+    if [ -n "$DESTDIR" ]; then
+        return
+    fi
+
+    if getent group "$CONTROL_GROUP_NAME" >/dev/null 2>&1; then
+        return
+    fi
+
+    if ! command -v groupadd >/dev/null 2>&1; then
+        echo "missing groupadd; create system group '$CONTROL_GROUP_NAME' before live install" >&2
+        exit 1
+    fi
+
+    groupadd --system "$CONTROL_GROUP_NAME"
 }
 
 validate_paths
@@ -247,6 +267,8 @@ echo "Installing QuantumLink SteamOS assets"
 echo "  qlinkd:   $QLINKD_SRC"
 echo "  qlinkctl: $QLINKCTL_SRC"
 echo "  bindir:   $DESTDIR$BINDIR"
+
+ensure_live_control_group
 
 guarded_mkdir "BINDIR target" "$DESTDIR$BINDIR" 0755
 guarded_install_file "BINDIR target" "$QLINKD_SRC" "$DESTDIR$BINDIR/qlinkd" 0755
@@ -272,6 +294,8 @@ fi
 cat <<EOF
 
 QuantumLink SteamOS install complete.
+
+Add SteamOS users who may run qlinkctl status/doctor to the quantumlink group.
 
 Next commands:
   sudoedit $CONFIG_DIR/config.json

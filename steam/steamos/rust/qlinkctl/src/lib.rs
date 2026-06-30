@@ -4,10 +4,11 @@ use qlink_proto::{
 
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::{
     io::{BufRead, BufReader, Write},
-    path::Path,
+    process::{Command, Stdio},
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -24,6 +25,40 @@ pub enum ControlError {
     Json(#[from] serde_json::Error),
     #[error("qlinkd returned an error: {0}")]
     Daemon(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupportBundleReleaseInfo {
+    pub product: String,
+    pub version: String,
+    pub platform: String,
+}
+
+impl SupportBundleReleaseInfo {
+    pub fn current() -> Self {
+        Self {
+            product: "QuantumLink SteamOS".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            platform: std::env::consts::OS.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SupportBundleOptions {
+    pub output: PathBuf,
+    pub status: DaemonStatus,
+    pub release_info: SupportBundleReleaseInfo,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RedactionReport {
+    pub private_key_material: usize,
+    pub wallet_seed_material: usize,
+    pub entitlement_tokens: usize,
+    pub exact_peer_endpoints: usize,
+    pub raw_packet_payloads: usize,
 }
 
 #[cfg(unix)]
@@ -170,6 +205,263 @@ pub fn format_doctor(status: &DaemonStatus) -> String {
         transport_errors = data_plane.metrics.transport_errors,
         data_plane_error = data_plane.error.as_deref().unwrap_or("none"),
     )
+}
+
+#[cfg(unix)]
+pub fn write_support_bundle(options: SupportBundleOptions) -> std::io::Result<()> {
+    let staging_dir = unique_support_bundle_staging_dir();
+    std::fs::create_dir_all(&staging_dir)?;
+
+    let result = (|| {
+        let mut report = RedactionReport::default();
+        let status_json = serde_json::to_string_pretty(&options.status).map_err(json_to_io)?;
+        write_bundle_file(
+            &staging_dir,
+            "status.json",
+            &redact_diagnostic_text(&status_json, &mut report),
+        )?;
+        write_bundle_file(
+            &staging_dir,
+            "doctor.txt",
+            &redact_diagnostic_text(&format_doctor(&options.status), &mut report),
+        )?;
+        write_bundle_file(
+            &staging_dir,
+            "network-plan.txt",
+            &redact_diagnostic_text(&plan_text(&options.status.network.commands), &mut report),
+        )?;
+        write_bundle_file(
+            &staging_dir,
+            "nftables-plan.txt",
+            &redact_diagnostic_text(
+                &plan_text(&options.status.network.nftables_rules),
+                &mut report,
+            ),
+        )?;
+        let release_info = serde_json::json!({
+            "product": options.release_info.product,
+            "version": options.release_info.version,
+            "platform": options.release_info.platform,
+        });
+        write_bundle_file(
+            &staging_dir,
+            "release-info.json",
+            &redact_diagnostic_text(
+                &serde_json::to_string_pretty(&release_info).map_err(json_to_io)?,
+                &mut report,
+            ),
+        )?;
+        write_bundle_file(
+            &staging_dir,
+            "redaction-report.json",
+            &serde_json::to_string_pretty(&report).map_err(json_to_io)?,
+        )?;
+
+        if let Some(parent) = options.output.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        archive_staging_dir(&staging_dir, &options.output)
+    })();
+
+    let cleanup = std::fs::remove_dir_all(&staging_dir);
+    match (result, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+    }
+}
+
+#[cfg(not(unix))]
+pub fn write_support_bundle(_options: SupportBundleOptions) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "support bundles are only supported on Unix-like SteamOS hosts",
+    ))
+}
+
+fn json_to_io(error: serde_json::Error) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+}
+
+fn write_bundle_file(staging_dir: &Path, name: &str, contents: &str) -> std::io::Result<()> {
+    std::fs::write(staging_dir.join(name), contents)
+}
+
+fn plan_text(lines: &[String]) -> String {
+    if lines.is_empty() {
+        "none\n".to_string()
+    } else {
+        format!("{}\n", lines.join("\n"))
+    }
+}
+
+#[cfg(unix)]
+fn unique_support_bundle_staging_dir() -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "qlinkctl-support-bundle-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ))
+}
+
+#[cfg(unix)]
+fn archive_staging_dir(staging_dir: &Path, output: &Path) -> std::io::Result<()> {
+    let entries = [
+        "status.json",
+        "doctor.txt",
+        "network-plan.txt",
+        "nftables-plan.txt",
+        "release-info.json",
+        "redaction-report.json",
+    ];
+    let mut tar = Command::new("tar")
+        .arg("-C")
+        .arg(staging_dir)
+        .arg("-cf")
+        .arg("-")
+        .args(entries)
+        .stdout(Stdio::piped())
+        .spawn()?;
+    let tar_stdout = tar
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("failed to capture tar stdout"))?;
+    let mut zstd = Command::new("zstd")
+        .arg("-q")
+        .arg("-f")
+        .arg("-o")
+        .arg(output)
+        .arg("-")
+        .stdin(Stdio::from(tar_stdout))
+        .spawn()?;
+    let zstd_status = zstd.wait()?;
+    let tar_status = tar.wait()?;
+
+    if !tar_status.success() {
+        return Err(std::io::Error::other(format!(
+            "tar failed with status {tar_status}"
+        )));
+    }
+    if !zstd_status.success() {
+        return Err(std::io::Error::other(format!(
+            "zstd failed with status {zstd_status}"
+        )));
+    }
+    Ok(())
+}
+
+fn redact_diagnostic_text(input: &str, report: &mut RedactionReport) -> String {
+    let mut redacted = input.to_string();
+    redacted = replace_counted(
+        &redacted,
+        "PRIVATE_KEY_MATERIAL",
+        "[REDACTED-SECRET]",
+        &mut report.private_key_material,
+    );
+    redacted = replace_counted(
+        &redacted,
+        "private key",
+        "[REDACTED-SECRET]",
+        &mut report.private_key_material,
+    );
+    redacted = replace_counted(
+        &redacted,
+        "wallet seed phrase",
+        "[REDACTED-SECRET]",
+        &mut report.wallet_seed_material,
+    );
+    redacted = replace_counted(
+        &redacted,
+        "wallet seed",
+        "[REDACTED-SECRET]",
+        &mut report.wallet_seed_material,
+    );
+    redacted = replace_counted(
+        &redacted,
+        "entitlement_token=secret",
+        "entitlement_token=[REDACTED-SECRET]",
+        &mut report.entitlement_tokens,
+    );
+    redacted = replace_counted(
+        &redacted,
+        "raw_packet_payload",
+        "[REDACTED-RAW-PACKET-PAYLOAD]",
+        &mut report.raw_packet_payloads,
+    );
+    redact_ipv4_socket_endpoints(&redacted, report)
+}
+
+fn replace_counted(input: &str, needle: &str, replacement: &str, count: &mut usize) -> String {
+    let matches = input.matches(needle).count();
+    *count += matches;
+    input.replace(needle, replacement)
+}
+
+fn redact_ipv4_socket_endpoints(input: &str, report: &mut RedactionReport) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut index = 0;
+    while index < input.len() {
+        if let Some(end) = ipv4_socket_endpoint_end(input, index) {
+            output.push_str("[REDACTED-ENDPOINT]");
+            report.exact_peer_endpoints += 1;
+            index = end;
+        } else {
+            let ch = input[index..]
+                .chars()
+                .next()
+                .expect("index is on a char boundary");
+            output.push(ch);
+            index += ch.len_utf8();
+        }
+    }
+    output
+}
+
+fn ipv4_socket_endpoint_end(input: &str, start: usize) -> Option<usize> {
+    let bytes = input.as_bytes();
+    if start > 0 && bytes[start - 1].is_ascii_digit() {
+        return None;
+    }
+
+    let mut index = start;
+    for octet_index in 0..4 {
+        let octet_start = index;
+        while index < bytes.len() && bytes[index].is_ascii_digit() {
+            index += 1;
+        }
+        if octet_start == index || index - octet_start > 3 {
+            return None;
+        }
+        let octet = input[octet_start..index].parse::<u16>().ok()?;
+        if octet > 255 {
+            return None;
+        }
+        if octet_index < 3 {
+            if bytes.get(index).copied() != Some(b'.') {
+                return None;
+            }
+            index += 1;
+        }
+    }
+
+    if bytes.get(index).copied() != Some(b':') {
+        return None;
+    }
+    index += 1;
+    let port_start = index;
+    while index < bytes.len() && bytes[index].is_ascii_digit() {
+        index += 1;
+    }
+    if port_start == index {
+        return None;
+    }
+    if index < bytes.len() && bytes[index].is_ascii_digit() {
+        return None;
+    }
+    Some(index)
 }
 
 fn phase_label(phase: ConnectionPhase) -> &'static str {
