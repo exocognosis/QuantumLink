@@ -136,6 +136,67 @@ Manual Windows validation must still prove:
       reload - check diagnostics export before/after
       `Restart-Service QuantumLinkService`).
 
+## 1A. Phase 8 Windows-native security proof
+
+Run from an elevated PowerShell session after install and first-run
+identity creation:
+
+```powershell
+.\windows\scripts\validate-windows-security.ps1 `
+    -MsiPath .\QuantumLink.msi `
+    -CheckPipeAcl
+```
+
+- [ ] Script exits 0 on the installed host.
+- [ ] Output confirms `QuantumLinkService` is LocalSystem, auto-start,
+      running, and launched from `quantumlink-service.exe service`.
+- [ ] Output confirms installed binary placement for
+      `quantumlink-service.exe`, `qlink_core.dll`, `wintun.dll`, and
+      `QuantumLink.Windows.exe`.
+- [ ] Output confirms ACL sanity for
+      `C:\Program Files\QuantumLink`, `C:\ProgramData\QuantumLink`,
+      `C:\ProgramData\QuantumLink\logs`, and
+      `C:\ProgramData\QuantumLink\secrets`.
+- [ ] Output confirms the named pipe `\\.\pipe\QuantumLinkService`
+      exists. If the host cannot expose pipe ACLs through PowerShell,
+      capture the warning and keep the pipe-presence evidence.
+- [ ] Output confirms `wintun.dll` placement and Authenticode signature.
+- [ ] Output confirms DPAPI service-context prerequisite evidence under
+      `C:\ProgramData\QuantumLink\secrets\*.dpapi`.
+- [ ] Output confirms the runtime `security-probe` checks pass for
+      service-directory Wintun resolution, DPAPI protect/unprotect, WFP
+      dynamic attach/remove, and network-monitor restart safety. Capture
+      any admin-rights skip as a blocker unless the probe was run outside
+      an elevated/LocalSystem context by mistake.
+
+Collect MSI repair evidence without uninstalling:
+
+```powershell
+.\windows\scripts\validate-windows-security.ps1 `
+    -MsiPath .\QuantumLink.msi `
+    -RepairMsi
+```
+
+- [ ] Repair exits 0 and the verbose repair log path is captured from
+      the script output.
+- [ ] Run the main validation command again after repair; it still exits
+      0.
+
+Collect uninstall evidence only in a disposable VM:
+
+```powershell
+.\windows\scripts\validate-windows-security.ps1 `
+    -MsiPath .\QuantumLink.msi `
+    -UninstallMsi
+```
+
+- [ ] Uninstall exits 0 and the verbose uninstall log path is captured.
+- [ ] `Get-Service QuantumLinkService -ErrorAction SilentlyContinue`
+      returns no service.
+- [ ] `Test-Path 'C:\ProgramData\QuantumLink'` is false.
+- [ ] `Test-Path 'C:\Program Files\QuantumLink'` is false or contains
+      only externally retained investigation artifacts.
+
 ## 2. Kill switch / leak tests
 
 With `killSwitch: failClosed` (default):

@@ -373,6 +373,61 @@ mod tests {
     }
 
     #[test]
+    fn malformed_transport_frames_are_rejected_without_queueing_packets() {
+        let packet = test_ipv4_packet([100, 127, 0, 10]);
+        let mut sender = test_core(SUITE_FIPS203);
+        sender.submit_tunnel_packet(2, &packet).unwrap();
+        let valid = sender.pop_transport_frame().unwrap();
+
+        let mut bad_magic = valid.clone();
+        bad_magic[0] ^= 0xff;
+
+        let mut trailing_byte = valid.clone();
+        trailing_byte.push(0);
+
+        let mut truncated_packet = valid.clone();
+        truncated_packet.pop();
+
+        let mut length_too_large = valid.clone();
+        length_too_large[FRAME_HEADER_LEN - 4..FRAME_HEADER_LEN]
+            .copy_from_slice(&u32::MAX.to_be_bytes());
+
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            ("empty", Vec::new()),
+            (
+                "short header",
+                valid[..FRAME_HEADER_LEN.saturating_sub(1)].to_vec(),
+            ),
+            ("bad magic", bad_magic),
+            ("trailing byte", trailing_byte),
+            ("truncated packet", truncated_packet),
+            ("length too large", length_too_large),
+        ];
+
+        for (name, frame) in cases {
+            let mut receiver = test_core(SUITE_FIPS203);
+            assert!(
+                receiver.accept_transport_frame(&frame).is_err(),
+                "{name} frame should be rejected"
+            );
+            assert!(
+                receiver.pop_tunnel_packet().is_none(),
+                "{name} frame must not queue a packet"
+            );
+            assert_eq!(
+                receiver.metrics().transport_frames_in,
+                0,
+                "{name} frame must not count as accepted"
+            );
+            assert_eq!(
+                receiver.metrics().dropped_malformed,
+                1,
+                "{name} frame should increment malformed drops"
+            );
+        }
+    }
+
+    #[test]
     fn selected_pqc_suite_does_not_change_packet_frame_codec() {
         let packet = test_ipv4_packet([100, 127, 0, 10]);
         let mut fips203 = test_core(SUITE_FIPS203);

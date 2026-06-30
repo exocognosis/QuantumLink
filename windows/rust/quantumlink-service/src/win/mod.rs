@@ -17,6 +17,7 @@ pub mod dpapi;
 pub mod netmon;
 pub mod pipe_server;
 pub mod platform;
+pub mod probe;
 pub mod routes;
 pub mod service;
 pub mod wfp;

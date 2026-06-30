@@ -13,7 +13,7 @@
 use crate::netmon::{EventHandler, NetworkEventSource};
 use qlink_core::mesh_connection::NetworkEvent;
 use std::ffi::c_void;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::NetworkManagement::IpHelper::{
     CancelMibChangeNotify2, NotifyIpInterfaceChange, NotifyNetworkConnectivityHintChange,
@@ -32,6 +32,25 @@ struct Registration {
 // The handles are only used for cancellation from the owning thread.
 unsafe impl Send for Registration {}
 
+impl Registration {
+    fn cancel(&self) {
+        unsafe {
+            if !self.interface_handle.is_invalid() {
+                let _ = CancelMibChangeNotify2(self.interface_handle);
+            }
+            if !self.connectivity_handle.is_invalid() {
+                let _ = CancelMibChangeNotify2(self.connectivity_handle);
+            }
+        }
+    }
+}
+
+impl Drop for Registration {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
 struct CallbackContext {
     handler: EventHandler,
     last_reachable: Mutex<Option<bool>>,
@@ -44,6 +63,8 @@ pub struct WindowsNetworkEventSource {
 
 impl NetworkEventSource for WindowsNetworkEventSource {
     fn start(&self, handler: EventHandler) {
+        self.stop();
+
         let context = Box::new(CallbackContext {
             handler,
             last_reachable: Mutex::new(None),
@@ -85,16 +106,7 @@ impl NetworkEventSource for WindowsNetworkEventSource {
     }
 
     fn stop(&self) {
-        if let Some(registration) = self.registration.lock().unwrap().take() {
-            unsafe {
-                if !registration.interface_handle.is_invalid() {
-                    let _ = CancelMibChangeNotify2(registration.interface_handle);
-                }
-                if !registration.connectivity_handle.is_invalid() {
-                    let _ = CancelMibChangeNotify2(registration.connectivity_handle);
-                }
-            }
-        }
+        drop(self.registration.lock().unwrap().take());
     }
 }
 
@@ -102,6 +114,25 @@ impl Drop for WindowsNetworkEventSource {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+pub(crate) fn probe_start_stop_restart() -> Result<(), String> {
+    let source = WindowsNetworkEventSource::default();
+    let callback_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    let first_count = Arc::clone(&callback_count);
+    source.start(Box::new(move |_| {
+        first_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }));
+    source.stop();
+
+    let second_count = Arc::clone(&callback_count);
+    source.start(Box::new(move |_| {
+        second_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }));
+    source.stop();
+
+    Ok(())
 }
 
 unsafe extern "system" fn on_interface_change(

@@ -9,6 +9,12 @@ jobs:
   rust-windows:
     name: Rust (x86_64-pc-windows-msvc)
     runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_TARGET: x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v7
 
@@ -19,26 +25,76 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Check workspace
-        run: cargo check --workspace --all-targets
+      - name: Check Windows host prerequisites
+        shell: pwsh
+        run: |
+          if (-not [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Windows)) {
+            throw "windows-ci must run on a Windows runner; got $([System.Runtime.InteropServices.RuntimeInformation]::OSDescription)"
+          }
 
-      - name: Test workspace
-        run: cargo test --workspace
+          foreach ($tool in @("cargo", "rustc", "rustup")) {
+            if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
+              throw "$tool is missing; install the Rust toolchain before running Windows CI."
+            }
+          }
+
+          $installedTargets = rustup target list --installed
+          if ($installedTargets -notcontains $env:RUST_TARGET) {
+            throw "Rust target $env:RUST_TARGET is not installed; run rustup target add $env:RUST_TARGET."
+          }
+
+          foreach ($tool in @("cl.exe", "link.exe")) {
+            if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
+              throw "$tool is missing from PATH; install MSVC Build Tools and run from a Developer PowerShell."
+            }
+          }
+
+          $sdkLibRoot = Join-Path ${env:ProgramFiles(x86)} "Windows Kits\10\Lib"
+          if (-not (Test-Path $sdkLibRoot)) {
+            throw "Windows SDK libraries not found at $sdkLibRoot; install the Windows 10/11 SDK with MSVC."
+          }
+          $sdkVersions = Get-ChildItem $sdkLibRoot -Directory | Sort-Object Name -Descending
+          if (-not $sdkVersions) {
+            throw "Windows SDK library root exists but has no versioned SDK directories: $sdkLibRoot."
+          }
+
+          $wintunPath = Join-Path $pwd "windows\wintun\bin\amd64\wintun.dll"
+          if (Test-Path $wintunPath) {
+            Write-Host "wintun.dll present for installer packaging: $wintunPath"
+          } else {
+            Write-Warning "wintun.dll is not present at $wintunPath. Rust compile/test/smoke do not load it; MSI packaging must provide this file and should fail before packaging if it is missing."
+          }
+
+          rustc -vV
+          cargo -V
+          cl.exe /Bv
+
+      - name: Verify locked Cargo graph
+        run: cargo metadata --locked --format-version 1 --no-deps
+
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked --target $env:RUST_TARGET
+
+      - name: Check Windows Rust crates
+        run: cargo check --locked --target $env:RUST_TARGET -p qlink-core -p quantumlink-proto -p quantumlink-service --all-targets
+
+      - name: Test Windows Rust crates
+        run: cargo test --locked --target $env:RUST_TARGET -p qlink-core -p quantumlink-proto -p quantumlink-service
 
       - name: Data-plane smoke (pump fail-closed invariants)
-        run: cargo run -p quantumlink-service -- smoke
+        run: cargo run --locked --target $env:RUST_TARGET -p quantumlink-service -- smoke
 
       - name: Build release artifacts (service + core DLL)
-        run: cargo build --release -p quantumlink-service -p qlink-core
+        run: cargo build --locked --release --target $env:RUST_TARGET -p quantumlink-service -p qlink-core
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
         with:
           name: quantumlink-windows-rust
           path: |
-            target/release/quantumlink-service.exe
-            target/release/qlink_core.dll
-            target/release/qlink_core.dll.lib
+            target/x86_64-pc-windows-msvc/release/quantumlink-service.exe
+            target/x86_64-pc-windows-msvc/release/qlink_core.dll
+            target/x86_64-pc-windows-msvc/release/qlink_core.dll.lib
 
   ui:
     name: WinUI 3 app

@@ -58,6 +58,43 @@ pub enum DiscoveryMode {
     LocalMdns,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MeshTrustPolicy {
+    PublicRequired,
+    PrivatePreferred,
+    #[default]
+    DevelopmentOptional,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscoveryIdentityMode {
+    #[default]
+    Off,
+    Verified,
+    PublicWallet,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DytallixIdentityConfiguration {
+    pub endpoint: String,
+    pub contract_address: String,
+    #[serde(default)]
+    pub publish_wallet_address: bool,
+    #[serde(rename = "networkID", default)]
+    pub network_id: Option<String>,
+    #[serde(rename = "chainID", default)]
+    pub chain_id: Option<String>,
+    #[serde(rename = "allowedRPCEndpoints", default)]
+    pub allowed_rpc_endpoints: Vec<String>,
+    #[serde(default)]
+    pub keystore_path: Option<String>,
+    #[serde(default)]
+    pub wallet_name: Option<String>,
+}
+
 /// Defines how the tunnel behaves when the data plane cannot protect a
 /// packet.
 ///
@@ -126,6 +163,37 @@ pub struct MeshMetrics {
     pub last_path_probe_unix: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DytallixPeerTrustSummary {
+    pub required: bool,
+    pub policy: MeshTrustPolicy,
+    pub identity_mode: DiscoveryIdentityMode,
+    pub registry_configured: bool,
+    pub verified_peer_count: u32,
+    pub unverified_peer_count: u32,
+    pub pending_peer_count: u32,
+    pub failed_peer_count: u32,
+    #[serde(default)]
+    pub last_checked_at_unix: Option<u64>,
+}
+
+impl Default for DytallixPeerTrustSummary {
+    fn default() -> Self {
+        Self {
+            required: false,
+            policy: MeshTrustPolicy::DevelopmentOptional,
+            identity_mode: DiscoveryIdentityMode::Off,
+            registry_configured: false,
+            verified_peer_count: 0,
+            unverified_peer_count: 0,
+            pending_peer_count: 0,
+            failed_peer_count: 0,
+            last_checked_at_unix: None,
+        }
+    }
+}
+
 /// Transport-level counters mirrored from the Rust core's
 /// `QlinkMeshTransportMetrics` FFI struct.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -173,6 +241,8 @@ pub struct TunnelStatus {
     pub peers: Vec<PeerStatus>,
     pub metrics: MeshMetrics,
     #[serde(default)]
+    pub peer_trust: DytallixPeerTrustSummary,
+    #[serde(default)]
     pub transport: Option<TunnelTransportMetrics>,
     #[serde(default)]
     pub pump: Option<PacketPumpMetrics>,
@@ -195,6 +265,7 @@ impl TunnelStatus {
             protected_routes: vec![crate::privacy::OVERLAY_CIDR.to_string()],
             peers: Vec::new(),
             metrics: MeshMetrics::default(),
+            peer_trust: DytallixPeerTrustSummary::default(),
             transport: None,
             pump: None,
             kill_switch_engaged: None,
@@ -252,6 +323,12 @@ pub struct TunnelConfiguration {
     pub crypto: CryptoPolicy,
     #[serde(default)]
     pub kill_switch: KillSwitchPolicy,
+    #[serde(default)]
+    pub mesh_trust_policy: MeshTrustPolicy,
+    #[serde(default)]
+    pub discovery_identity_mode: DiscoveryIdentityMode,
+    #[serde(default)]
+    pub dytallix_identity: Option<DytallixIdentityConfiguration>,
 }
 
 fn default_discovery_modes() -> Vec<DiscoveryMode> {
@@ -315,9 +392,41 @@ mod tests {
         assert_eq!(config.route_mode, RouteMode::SplitTunnel);
         assert_eq!(config.kill_switch, KillSwitchPolicy::FailClosed);
         assert_eq!(config.discovery_modes, vec![DiscoveryMode::Rendezvous]);
+        assert_eq!(
+            config.mesh_trust_policy,
+            MeshTrustPolicy::DevelopmentOptional
+        );
+        assert_eq!(config.discovery_identity_mode, DiscoveryIdentityMode::Off);
+        assert!(config.dytallix_identity.is_none());
 
         let core_config = config.packet_core_config_json();
         assert_eq!(core_config["routeMode"], "splitTunnel");
         assert_eq!(core_config["mtu"], 1280);
+    }
+
+    #[test]
+    fn dytallix_identity_matches_swift_json_keys() {
+        let json = r#"{
+            "endpoint": "https://registry.example",
+            "contractAddress": "0xabc1230000000000000000000000000000000000",
+            "publishWalletAddress": true,
+            "networkID": "network",
+            "chainID": "chain",
+            "allowedRPCEndpoints": ["https://rpc.example"]
+        }"#;
+        let config: DytallixIdentityConfiguration = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            config.contract_address,
+            "0xabc1230000000000000000000000000000000000"
+        );
+        assert!(config.publish_wallet_address);
+        assert_eq!(config.network_id.as_deref(), Some("network"));
+        assert_eq!(config.chain_id.as_deref(), Some("chain"));
+        assert_eq!(config.allowed_rpc_endpoints, vec!["https://rpc.example"]);
+
+        let serialized = serde_json::to_value(config).unwrap();
+        assert_eq!(serialized["networkID"], "network");
+        assert_eq!(serialized["chainID"], "chain");
+        assert_eq!(serialized["allowedRPCEndpoints"][0], "https://rpc.example");
     }
 }

@@ -7,6 +7,7 @@
 //! accumulating ghost network profiles across reconnects.
 
 use crate::adapter::{AdapterError, TunnelAdapter};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -30,8 +31,13 @@ impl WintunAdapter {
     /// Loads `wintun.dll` from the service directory and creates the
     /// adapter. Requires the service to run elevated (LocalSystem).
     pub fn create() -> Result<Self, AdapterError> {
-        let wintun = unsafe { wintun::load() }
-            .map_err(|error| AdapterError::Platform(format!("wintun.dll load failed: {error}")))?;
+        let dll_path = service_directory_wintun_path()?;
+        let wintun = unsafe { wintun::load_from_path(&dll_path) }.map_err(|error| {
+            AdapterError::Platform(format!(
+                "wintun.dll load failed from {}: {error}",
+                dll_path.display()
+            ))
+        })?;
         let adapter =
             wintun::Adapter::create(&wintun, ADAPTER_NAME, TUNNEL_TYPE, Some(ADAPTER_GUID))
                 .map_err(|error| {
@@ -59,6 +65,26 @@ impl WintunAdapter {
     pub fn luid(&self) -> u64 {
         self.luid
     }
+}
+
+fn service_directory_wintun_path() -> Result<PathBuf, AdapterError> {
+    let executable = std::env::current_exe()
+        .map_err(|error| AdapterError::Platform(format!("current_exe failed: {error}")))?;
+    let directory = executable.parent().ok_or_else(|| {
+        AdapterError::Platform("service executable has no parent directory".into())
+    })?;
+    Ok(directory.join("wintun.dll"))
+}
+
+pub(crate) fn probe_service_directory_wintun() -> Result<PathBuf, String> {
+    let path = service_directory_wintun_path().map_err(|error| error.to_string())?;
+    if !path.is_file() {
+        return Err(format!(
+            "service-local wintun.dll was not found at {}",
+            path.display()
+        ));
+    }
+    Ok(path)
 }
 
 impl TunnelAdapter for WintunAdapter {
@@ -92,9 +118,15 @@ impl TunnelAdapter for WintunAdapter {
         if self.shut_down.load(Ordering::SeqCst) {
             return Err(AdapterError::ShutDown);
         }
+        let packet_len = u16::try_from(packet.len()).map_err(|_| {
+            AdapterError::Platform(format!(
+                "Wintun packet length {} exceeds u16 adapter limit",
+                packet.len()
+            ))
+        })?;
         let mut send_packet = self
             .session
-            .allocate_send_packet(packet.len() as u16)
+            .allocate_send_packet(packet_len)
             .map_err(|error| {
                 AdapterError::Platform(format!("Wintun allocate_send_packet failed: {error}"))
             })?;

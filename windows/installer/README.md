@@ -229,6 +229,57 @@ Windows hardware or VMs.
 - The Wintun *driver* is reference-counted by Windows and removed when
   the last Wintun-using product uninstalls - no action needed.
 
+## Phase 8 security validation
+
+After installing the signed MSI on a clean Windows test host, run the
+Windows-native validation script from an elevated PowerShell session:
+
+```powershell
+.\windows\scripts\validate-windows-security.ps1 `
+    -MsiPath .\QuantumLink.msi `
+    -CheckPipeAcl
+```
+
+The script fails when required proof evidence is missing:
+
+- `QuantumLinkService` is installed, running, auto-start, LocalSystem,
+  and launched from the expected service binary with the `service`
+  argument.
+- `quantumlink-service.exe`, `qlink_core.dll`, `wintun.dll`, and
+  `QuantumLink.Windows.exe` are present under
+  `C:\Program Files\QuantumLink\`.
+- Binary, config, log, and DPAPI store directories have conservative
+  ACLs: SYSTEM and Administrators retain full control, and broad
+  identities do not get write access. ProgramData stores must not be
+  broadly readable.
+- The named pipe `\\.\pipe\QuantumLinkService` is present while the
+  service is running. Pipe ACL inspection is attempted with
+  `-CheckPipeAcl` because support varies by host and PowerShell
+  provider.
+- `wintun.dll` and the MSI have valid Authenticode signatures.
+- DPAPI prerequisite evidence exists under
+  `C:\ProgramData\QuantumLink\secrets\*.dpapi`, which means the service
+  has completed first-run identity creation under its service context.
+- `quantumlink-service.exe security-probe` exits 0 and reports runtime
+  proof for service-directory Wintun resolution, DPAPI protect/unprotect,
+  WFP dynamic filter attach/remove, and network-monitor restart safety.
+  Skipped probe checks fail validation because they do not produce
+  Phase 7/8 runtime proof.
+
+To collect non-destructive MSI repair evidence, add `-RepairMsi`; it
+runs `msiexec /fa` and writes a verbose repair log to `%TEMP%`.
+
+Uninstall evidence is destructive and is intentionally opt-in:
+
+```powershell
+.\windows\scripts\validate-windows-security.ps1 `
+    -MsiPath .\QuantumLink.msi `
+    -UninstallMsi
+```
+
+Run the uninstall hook only in a disposable VM after install/repair
+proof has been captured.
+
 ## Distribution channels
 
 - Direct MSI download (signed).
