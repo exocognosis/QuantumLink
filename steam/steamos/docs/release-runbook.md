@@ -70,3 +70,17 @@ bash steam/steamos/scripts/verify-steamos-release.sh dist/steamos/quantumlink-st
 The verifier checks expected files, executable bits, checksums, manifest artifact hashes and sizes, production signature status, secret-like paths/content, and installer shell syntax.
 
 Dev signatures are valid for development inspection only. A report with `"notProductionReady":true` must block production publication.
+
+## 2026-06-30 Closeout Result
+
+Codex local automation built `dist/steamos/quantumlink-steamos-0.1.0.tar.zst` and ran the standalone verifier. The package report was structurally valid with matching checksums, manifest hashes, SBOM, executable payloads, and secret-path checks, but it reported `"notProductionReady":true` because only the dev-classical signature path was used.
+
+Release decision: No-Go for production publication.
+
+Before tagging or attaching public SteamOS artifacts:
+
+- Run packaging with `QLINK_STEAMOS_SIGNING_MODE=production`.
+- Provide `QLINK_STEAMOS_SIGNATURE_FILE` or `QLINK_STEAMOS_RELEASE_PRIVATE_KEY`.
+- Verify with `QLINK_STEAMOS_RELEASE_PUBLIC_KEY`.
+- Set `QLINK_STEAMOS_REQUIRE_PRODUCTION_READY=1` in publication gates.
+- Link active rendezvous/relay endpoint evidence and real Steam Deck validation evidence from `production-readiness.md`.

@@ -7,6 +7,11 @@ Status: Pre-production daemon scaffold. Production readiness is tracked in
 until live transport, signed release, Steam-safe routing, and Deck validation
 gates pass.
 
+2026-06-30 closeout status: local Rust, shell, installer, and dev-package
+verification gates pass, but production publication is a No-Go until production
+signing, active rendezvous/relay evidence, public Dytallix registry evidence,
+and real Steam Deck validation are linked from the readiness ledger.
+
 ## Components
 
 - `steam/steamos/rust/qlinkd`: SteamOS/Linux daemon scaffold for config loading, local status, mesh state, profile lifecycle, explicit network activation, and the local TUN packet-pump boundary.
@@ -72,7 +77,7 @@ transport ready: no
 packet counters: observed=0 queued=0 dropped=0 emitted=0 accepted=0 rejected=0 transportErrors=0
 ```
 
-`data-plane state: starting` with `transport ready: no` is expected until the SteamOS daemon is wired to the live peer transport/rendezvous session. It means the local TUN packet I/O runtime initialized, not that protected traffic is already flowing to remote peers.
+`data-plane state: starting` with `transport ready: no` is expected until an authenticated peer session is installed on a live peer transport/rendezvous path. It means the local TUN packet I/O runtime initialized, not that protected traffic is already flowing to remote peers.
 
 ## Runtime Modes
 
@@ -134,7 +139,7 @@ bash -n steam/steamos/scripts/install-steamos.sh
 
 ## Production Boundaries
 
-The SteamOS runtime is still pre-production. This slice adds the local TUN packet I/O and packet-pump boundary, but production readiness still requires live peer transport wiring in `qlinkd`, Deck-host validation of the activated data plane, robust nftables rollback hardening, non-root local control, hardened rendezvous/relay operations, signed release artifacts, update-channel design, and game compatibility validation for Steam launch options, LAN-discovery-heavy titles, voice chat, and anti-cheat behavior.
+The SteamOS runtime is still pre-production. The closeout slice adds local TUN packet I/O, packet-pump transport bridging, fail-closed packet-session tests, Steam-safe route/profile policy, nftables rollback tests, non-root local control, invite peer lifecycle, redacted diagnostics, and dev-package verification. Production readiness still requires real two-Deck transport validation, active public Dytallix registry evidence for public mesh mode, hardened rendezvous/relay endpoint evidence, production-signed release artifacts, and game compatibility validation for Steam launch options, LAN-discovery-heavy titles, voice chat, and anti-cheat behavior.
 
 The blocking release ledger lives at
 `steam/steamos/docs/production-readiness.md`.

@@ -73,3 +73,8 @@ Status: Pre-production daemon scaffold
 Production readiness is tracked in `steam/steamos/docs/production-readiness.md`.
 SteamOS remains pre-production until live transport, signed release, Steam-safe
 routing, and Deck validation gates pass.
+
+2026-06-30 closeout result: local format, test, clippy, installer, and
+dev-package verification gates pass. Production publication remains No-Go until
+production signing, active rendezvous/relay evidence, public Dytallix registry
+evidence, and real Steam Deck validation are linked from the readiness ledger.
