@@ -1,5 +1,7 @@
 use qlink_proto::{
-    ConnectionPhase, DaemonStatus, DataPlaneState, NetworkPlanState, PathKind, RouteMode,
+    load_peer_store_at, peer_store_path_from_state_dir, store_peer_store_at, ConnectionPhase,
+    DaemonStatus, DataPlaneState, InviteCode, MeshTrustMode, NetworkPlanState, PathKind, PeerStore,
+    RouteMode, StoredPeer,
 };
 
 #[cfg(unix)]
@@ -25,6 +27,153 @@ pub enum ControlError {
     Json(#[from] serde_json::Error),
     #[error("qlinkd returned an error: {0}")]
     Daemon(String),
+}
+
+pub const DEFAULT_STATE_DIR: &str = "/var/lib/quantumlink";
+
+#[derive(Debug, thiserror::Error)]
+pub enum PeerCommandError {
+    #[error("{0}")]
+    InviteDecode(#[from] qlink_proto::InviteDecodeError),
+    #[error("invite expired at {expires_at_unix}; current time is {now_unix}")]
+    ExpiredInvite { expires_at_unix: u64, now_unix: u64 },
+    #[error("unknown peer {0}")]
+    UnknownPeer(String),
+    #[error("{0}")]
+    Io(#[from] std::io::Error),
+    #[error("{0}")]
+    Json(#[from] serde_json::Error),
+}
+
+pub fn import_invite_to_store(
+    state_dir: &Path,
+    encoded_invite: &str,
+    now_unix: u64,
+) -> Result<StoredPeer, PeerCommandError> {
+    let invite = InviteCode::decode(encoded_invite)?;
+    if invite.expires_at_unix <= now_unix {
+        return Err(PeerCommandError::ExpiredInvite {
+            expires_at_unix: invite.expires_at_unix,
+            now_unix,
+        });
+    }
+
+    let peer = invite.stored_peer();
+    let mut store = load_peer_store_for_state_dir(state_dir)?;
+    store.upsert(peer.clone());
+    store_peer_store_at(state_dir, &store)?;
+    Ok(peer)
+}
+
+pub fn load_peer_store_for_state_dir(state_dir: &Path) -> Result<PeerStore, PeerCommandError> {
+    load_peer_store_at(peer_store_path_from_state_dir(state_dir)).map_err(Into::into)
+}
+
+pub fn remove_peer_from_store(state_dir: &Path, peer_id: &str) -> Result<(), PeerCommandError> {
+    let mut store = load_peer_store_for_state_dir(state_dir)?;
+    if !store.remove(peer_id) {
+        return Err(PeerCommandError::UnknownPeer(peer_id.to_string()));
+    }
+    store_peer_store_at(state_dir, &store)?;
+    Ok(())
+}
+
+pub fn revoke_peer_in_store(state_dir: &Path, peer_id: &str) -> Result<(), PeerCommandError> {
+    let mut store = load_peer_store_for_state_dir(state_dir)?;
+    if !store.revoke(peer_id) {
+        return Err(PeerCommandError::UnknownPeer(peer_id.to_string()));
+    }
+    store_peer_store_at(state_dir, &store)?;
+    Ok(())
+}
+
+pub fn peer_from_store(state_dir: &Path, peer_id: &str) -> Result<StoredPeer, PeerCommandError> {
+    load_peer_store_for_state_dir(state_dir)?
+        .peers
+        .into_iter()
+        .find(|peer| peer.peer_id == peer_id)
+        .ok_or_else(|| PeerCommandError::UnknownPeer(peer_id.to_string()))
+}
+
+pub fn format_peer_list(store: &PeerStore) -> Result<String, serde_json::Error> {
+    serde_json::to_string_pretty(&store.peers)
+}
+
+pub fn format_peer_trust(peer: &StoredPeer) -> String {
+    format!(
+        "peer: {peer_id}\n\
+         mesh: {mesh}\n\
+         mesh id: {mesh_id}\n\
+         trust source: {trust_source}\n\
+         dytallix: {dytallix}\n\
+         revoked: {revoked}\n\
+         expires: {expires}",
+        peer_id = peer.peer_id,
+        mesh = mesh_trust_mode_label(peer.trust_mode),
+        mesh_id = peer.mesh_id,
+        trust_source = peer.trust_source,
+        dytallix = dytallix_label(peer.trust_mode),
+        revoked = yes_no(peer.revoked),
+        expires = format_unix_utc(peer.expires_at_unix),
+    )
+}
+
+fn dytallix_label(mode: MeshTrustMode) -> &'static str {
+    match mode {
+        MeshTrustMode::PrivateFriends => "not required",
+        MeshTrustMode::PublicDytallixRequired => "required (not checked)",
+        MeshTrustMode::DevelopmentOptional => "optional development (not checked)",
+    }
+}
+
+fn mesh_trust_mode_label(mode: MeshTrustMode) -> &'static str {
+    match mode {
+        MeshTrustMode::PrivateFriends => "privateFriends",
+        MeshTrustMode::PublicDytallixRequired => "publicDytallixRequired",
+        MeshTrustMode::DevelopmentOptional => "developmentOptional",
+    }
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
+fn format_unix_utc(seconds: u64) -> String {
+    const SECONDS_PER_DAY: u64 = 86_400;
+    let days = (seconds / SECONDS_PER_DAY).min(i64::MAX as u64) as i64;
+    let seconds_of_day = seconds % SECONDS_PER_DAY;
+    let (year, month, day) = civil_from_unix_days(days);
+    let hour = seconds_of_day / 3_600;
+    let minute = (seconds_of_day % 3_600) / 60;
+    let second = seconds_of_day % 60;
+
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+fn civil_from_unix_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + if month <= 2 { 1 } else { 0 };
+
+    (year, month as u32, day as u32)
+}
+
+pub fn current_unix_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -540,10 +689,9 @@ fn parse_status_response(line: &str) -> Result<DaemonStatus, ControlError> {
 mod tests {
     use super::*;
     use qlink_proto::{
-        DataPlaneState, DataPlaneStatus, NetworkPlanState, NetworkStatus, PacketPumpMetrics,
-        RouteMode,
+        DataPlaneState, DataPlaneStatus, InviteCode, MeshTrustMode, NetworkPlanState,
+        NetworkStatus, PacketPumpMetrics, RouteMode, StoredPeer,
     };
-    #[cfg(unix)]
     use std::path::PathBuf;
 
     fn status_with_network(
@@ -602,6 +750,93 @@ mod tests {
             error: error.map(str::to_string),
         };
         status
+    }
+
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos()
+        ))
+    }
+
+    fn peer_fixture() -> StoredPeer {
+        StoredPeer {
+            peer_id: "peer-host-deck".to_string(),
+            alias: "Host Deck".to_string(),
+            mesh_id: "mesh-steam-squad".to_string(),
+            party_id: "party-nightly".to_string(),
+            trust_mode: MeshTrustMode::PublicDytallixRequired,
+            trust_source: "invite".to_string(),
+            revoked: false,
+            expires_at_unix: 4_102_444_800,
+        }
+    }
+
+    #[test]
+    fn import_invite_to_store_persists_peer_metadata() {
+        let state_dir = unique_temp_dir("qlinkctl-peer-import");
+        let invite = InviteCode {
+            mesh_id: "mesh-steam-squad".to_string(),
+            party_id: "party-nightly".to_string(),
+            rendezvous: vec!["203.0.113.10:9471".to_string()],
+            relay: vec!["198.51.100.15:9472".to_string()],
+            host_peer_id: "peer-host-deck".to_string(),
+            host_alias: "Host Deck".to_string(),
+            trust_mode: MeshTrustMode::PublicDytallixRequired,
+            trust_source: "invite".to_string(),
+            expires_at_unix: 4_102_444_800,
+        }
+        .encode()
+        .unwrap();
+
+        let peer = import_invite_to_store(&state_dir, &invite, 1_767_139_200).unwrap();
+
+        assert_eq!(peer.peer_id, "peer-host-deck");
+        assert_eq!(peer.trust_mode, MeshTrustMode::PublicDytallixRequired);
+        let store = load_peer_store_for_state_dir(&state_dir).unwrap();
+        assert_eq!(store.peers.len(), 1);
+        let raw = std::fs::read_to_string(peer_store_path_from_state_dir(&state_dir)).unwrap();
+        assert!(!raw.contains("203.0.113.10"));
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn peer_trust_output_has_required_shape() {
+        let output = format_peer_trust(&peer_fixture());
+
+        assert!(output.contains("peer: peer-host-deck"));
+        assert!(output.contains("mesh: publicDytallixRequired"));
+        assert!(output.contains("mesh id: mesh-steam-squad"));
+        assert!(output.contains("trust source: invite"));
+        assert!(output.contains("dytallix: required (not checked)"));
+        assert!(output.contains("revoked: no"));
+        assert!(output.contains("expires: 2100-01-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn peer_store_remove_and_revoke_commands_mutate_store() {
+        let state_dir = unique_temp_dir("qlinkctl-peer-mutate");
+        let mut store = PeerStore::default();
+        store.upsert(peer_fixture());
+        store_peer_store_at(&state_dir, &store).unwrap();
+
+        revoke_peer_in_store(&state_dir, "peer-host-deck").unwrap();
+        assert!(
+            peer_from_store(&state_dir, "peer-host-deck")
+                .unwrap()
+                .revoked
+        );
+
+        remove_peer_from_store(&state_dir, "peer-host-deck").unwrap();
+        assert!(matches!(
+            peer_from_store(&state_dir, "peer-host-deck").unwrap_err(),
+            PeerCommandError::UnknownPeer(_)
+        ));
+        let _ = std::fs::remove_dir_all(state_dir);
     }
 
     #[cfg(unix)]

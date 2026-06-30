@@ -1,6 +1,12 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
+use std::io::{ErrorKind, Read, Write};
 use std::net::Ipv4Addr;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+
+pub const PEER_STORE_FILE: &str = "peers.json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -380,6 +386,206 @@ impl DaemonStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MeshTrustMode {
+    PrivateFriends,
+    PublicDytallixRequired,
+    DevelopmentOptional,
+}
+
+impl Default for MeshTrustMode {
+    fn default() -> Self {
+        Self::PrivateFriends
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoredPeer {
+    pub peer_id: String,
+    pub alias: String,
+    pub mesh_id: String,
+    pub party_id: String,
+    pub trust_mode: MeshTrustMode,
+    pub trust_source: String,
+    pub revoked: bool,
+    pub expires_at_unix: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerStore {
+    pub peers: Vec<StoredPeer>,
+}
+
+impl PeerStore {
+    pub fn upsert(&mut self, peer: StoredPeer) {
+        if let Some(existing) = self
+            .peers
+            .iter_mut()
+            .find(|existing| existing.peer_id == peer.peer_id)
+        {
+            *existing = peer;
+        } else {
+            self.peers.push(peer);
+        }
+        self.peers
+            .sort_by(|left, right| left.peer_id.cmp(&right.peer_id));
+    }
+
+    pub fn remove(&mut self, peer_id: &str) -> bool {
+        let original_len = self.peers.len();
+        self.peers.retain(|peer| peer.peer_id != peer_id);
+        self.peers.len() != original_len
+    }
+
+    pub fn revoke(&mut self, peer_id: &str) -> bool {
+        if let Some(peer) = self.peers.iter_mut().find(|peer| peer.peer_id == peer_id) {
+            peer.revoked = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn dial_candidates(&self, now_unix: u64) -> Vec<StoredPeer> {
+        self.peers
+            .iter()
+            .filter(|peer| !peer.revoked && peer.expires_at_unix > now_unix)
+            .cloned()
+            .collect()
+    }
+}
+
+pub fn peer_store_path_from_state_dir(state_dir: impl AsRef<Path>) -> PathBuf {
+    state_dir.as_ref().join(PEER_STORE_FILE)
+}
+
+pub fn load_peer_store_at(path: impl AsRef<Path>) -> std::io::Result<PeerStore> {
+    let path = path.as_ref();
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.is_file() {
+                return Err(std::io::Error::new(
+                    ErrorKind::AlreadyExists,
+                    format!("peer store path {} is not a regular file", path.display()),
+                ));
+            }
+            let mut file = open_peer_store_for_read(path)?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            serde_json::from_slice(&bytes).map_err(|error| {
+                std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    format!("failed to parse peer store: {error}"),
+                )
+            })
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(PeerStore::default()),
+        Err(error) => Err(error),
+    }
+}
+
+pub fn store_peer_store_at(
+    state_dir: impl AsRef<Path>,
+    store: &PeerStore,
+) -> std::io::Result<PathBuf> {
+    let state_dir = state_dir.as_ref();
+    std::fs::create_dir_all(state_dir)?;
+    let path = peer_store_path_from_state_dir(state_dir);
+    let bytes = serde_json::to_vec_pretty(store).map_err(|error| {
+        std::io::Error::new(
+            ErrorKind::InvalidData,
+            format!("failed to serialize peer store: {error}"),
+        )
+    })?;
+    write_peer_store_atomically(state_dir, &path, &bytes)?;
+    Ok(path)
+}
+
+fn write_peer_store_atomically(state_dir: &Path, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let temp_path = peer_store_temp_path(state_dir);
+    let write_result = (|| {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            options.mode(0o600);
+        }
+        let mut file = open_peer_store_no_follow(&mut options, &temp_path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        #[cfg(unix)]
+        std::fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::rename(&temp_path, path)
+    })();
+
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+
+    write_result
+}
+
+fn peer_store_temp_path(state_dir: &Path) -> PathBuf {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    state_dir.join(format!(
+        ".{PEER_STORE_FILE}.{}.{}.tmp",
+        std::process::id(),
+        nonce
+    ))
+}
+
+fn open_peer_store_for_read(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    open_peer_store_no_follow(&mut options, path)
+}
+
+#[cfg(unix)]
+fn open_peer_store_no_follow(
+    options: &mut std::fs::OpenOptions,
+    path: &Path,
+) -> std::io::Result<std::fs::File> {
+    let before = match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Some((metadata.dev(), metadata.ino())),
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                ErrorKind::AlreadyExists,
+                format!("peer store path {} is not a regular file", path.display()),
+            ))
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+
+    let file = options.open(path)?;
+    if let Some((expected_dev, expected_ino)) = before {
+        let after = file.metadata()?;
+        if after.dev() != expected_dev || after.ino() != expected_ino {
+            return Err(std::io::Error::new(
+                ErrorKind::PermissionDenied,
+                format!("peer store path {} changed during open", path.display()),
+            ));
+        }
+    }
+
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_peer_store_no_follow(
+    options: &mut std::fs::OpenOptions,
+    path: &Path,
+) -> std::io::Result<std::fs::File> {
+    options.open(path)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InviteCode {
@@ -388,6 +594,12 @@ pub struct InviteCode {
     pub rendezvous: Vec<String>,
     pub relay: Vec<String>,
     pub host_peer_id: String,
+    #[serde(default)]
+    pub host_alias: String,
+    #[serde(default)]
+    pub trust_mode: MeshTrustMode,
+    #[serde(default = "default_invite_trust_source")]
+    pub trust_source: String,
     pub expires_at_unix: u64,
 }
 
@@ -403,6 +615,27 @@ impl InviteCode {
             .map_err(|error| InviteDecodeError::Base64(error.to_string()))?;
         serde_json::from_slice(&bytes).map_err(InviteDecodeError::Json)
     }
+
+    pub fn stored_peer(&self) -> StoredPeer {
+        StoredPeer {
+            peer_id: self.host_peer_id.clone(),
+            alias: if self.host_alias.trim().is_empty() {
+                self.host_peer_id.clone()
+            } else {
+                self.host_alias.clone()
+            },
+            mesh_id: self.mesh_id.clone(),
+            party_id: self.party_id.clone(),
+            trust_mode: self.trust_mode,
+            trust_source: self.trust_source.clone(),
+            revoked: false,
+            expires_at_unix: self.expires_at_unix,
+        }
+    }
+}
+
+fn default_invite_trust_source() -> String {
+    "invite".to_string()
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -786,6 +1019,9 @@ mod tests {
             rendezvous: vec!["rv.example:9471".to_string()],
             relay: vec!["relay.example:9472".to_string()],
             host_peer_id: "peer-host".to_string(),
+            host_alias: "Host Deck".to_string(),
+            trust_mode: MeshTrustMode::PrivateFriends,
+            trust_source: "invite".to_string(),
             expires_at_unix: 1_900_000_000,
         };
 
@@ -795,5 +1031,68 @@ mod tests {
         assert_eq!(decoded.mesh_id, invite.mesh_id);
         assert_eq!(decoded.relay, invite.relay);
         assert!(!encoded.contains("192.168."));
+    }
+
+    fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos()
+        ))
+    }
+
+    fn stored_peer_fixture() -> StoredPeer {
+        StoredPeer {
+            peer_id: "peer-host-deck".to_string(),
+            alias: "Host Deck".to_string(),
+            mesh_id: "mesh-steam-squad".to_string(),
+            party_id: "party-nightly".to_string(),
+            trust_mode: MeshTrustMode::PrivateFriends,
+            trust_source: "invite".to_string(),
+            revoked: false,
+            expires_at_unix: 4_102_444_800,
+        }
+    }
+
+    #[test]
+    fn peer_store_round_trips_with_private_permissions() {
+        let state_dir = unique_temp_dir("qlink-proto-peer-store");
+        let mut store = PeerStore::default();
+        store.upsert(stored_peer_fixture());
+
+        let path = store_peer_store_at(&state_dir, &store).unwrap();
+        let loaded = load_peer_store_at(&path).unwrap();
+
+        assert_eq!(loaded, store);
+        #[cfg(unix)]
+        {
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn peer_store_rejects_symlink_path() {
+        use std::os::unix::fs::symlink;
+
+        let state_dir = unique_temp_dir("qlink-proto-peer-store-symlink");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let target = state_dir.join("target.json");
+        std::fs::write(&target, r#"{"peers":[]}"#).unwrap();
+        let link = peer_store_path_from_state_dir(&state_dir);
+        symlink(&target, &link).unwrap();
+
+        let error = load_peer_store_at(&link).unwrap_err();
+
+        assert!(
+            error.to_string().contains("not a regular file"),
+            "unexpected error: {error}"
+        );
+        let _ = std::fs::remove_dir_all(state_dir);
     }
 }

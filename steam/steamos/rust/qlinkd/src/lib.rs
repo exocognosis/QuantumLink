@@ -1,6 +1,9 @@
 pub mod data_plane;
 
 use data_plane::{packet_core_from_parts, BoxedTunDevice, DataPlaneError, DataPlaneRuntime};
+use qlink_core::dytallix_identity::{
+    evaluate_dytallix_policy_status, DytallixPolicyStatus, MeshTrustPolicy,
+};
 use qlink_core::packet_core::{FfiRouteMode, PacketTunnelCore};
 use qlink_linux::{
     LinuxNetworkPlan, LinuxRuntimePlan, NetworkApplyError, NetworkExecutor, NetworkOperation,
@@ -8,8 +11,9 @@ use qlink_linux::{
     TunPacketIo,
 };
 use qlink_proto::{
-    ConnectionPhase, DaemonConfig, DaemonStatus, DataPlaneState, DataPlaneStatus, NetworkPlanState,
-    NetworkStatus, PeerStatus, RouteMode,
+    load_peer_store_at, peer_store_path_from_state_dir, store_peer_store_at, ConnectionPhase,
+    DaemonConfig, DaemonStatus, DataPlaneState, DataPlaneStatus, InviteCode, MeshTrustMode,
+    NetworkPlanState, NetworkStatus, PeerStatus, PeerStore, RouteMode, StoredPeer,
 };
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
@@ -98,6 +102,161 @@ impl Default for DaemonPaths {
             socket: PathBuf::from("/run/quantumlink/qlinkd.sock"),
         }
     }
+}
+
+#[derive(Debug)]
+pub enum PeerLifecycleError {
+    InviteDecode(qlink_proto::InviteDecodeError),
+    ExpiredInvite { expires_at_unix: u64, now_unix: u64 },
+    UnknownPeer { peer_id: String },
+    Io(std::io::Error),
+    DytallixPolicy(qlink_core::QlinkError),
+}
+
+impl std::fmt::Display for PeerLifecycleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InviteDecode(error) => write!(f, "{error}"),
+            Self::ExpiredInvite {
+                expires_at_unix,
+                now_unix,
+            } => write!(
+                f,
+                "invite expired at {expires_at_unix}; current time is {now_unix}"
+            ),
+            Self::UnknownPeer { peer_id } => write!(f, "unknown peer {peer_id}"),
+            Self::Io(error) => write!(f, "{error}"),
+            Self::DytallixPolicy(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for PeerLifecycleError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InviteDecode(error) => Some(error),
+            Self::Io(error) => Some(error),
+            Self::DytallixPolicy(error) => Some(error),
+            Self::ExpiredInvite { .. } | Self::UnknownPeer { .. } => None,
+        }
+    }
+}
+
+impl From<qlink_proto::InviteDecodeError> for PeerLifecycleError {
+    fn from(error: qlink_proto::InviteDecodeError) -> Self {
+        Self::InviteDecode(error)
+    }
+}
+
+impl From<std::io::Error> for PeerLifecycleError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl From<qlink_core::QlinkError> for PeerLifecycleError {
+    fn from(error: qlink_core::QlinkError) -> Self {
+        Self::DytallixPolicy(error)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerDytallixPolicyDecision {
+    pub accepted: bool,
+    pub warning: Option<String>,
+}
+
+pub fn peer_store_path(paths: &DaemonPaths) -> PathBuf {
+    peer_store_path_from_state_dir(&paths.state_dir)
+}
+
+pub fn load_peer_store(paths: &DaemonPaths) -> Result<PeerStore, PeerLifecycleError> {
+    load_peer_store_at(peer_store_path(paths)).map_err(Into::into)
+}
+
+pub fn store_peer_store(
+    paths: &DaemonPaths,
+    store: &PeerStore,
+) -> Result<PathBuf, PeerLifecycleError> {
+    store_peer_store_at(&paths.state_dir, store).map_err(Into::into)
+}
+
+pub fn import_invite(
+    paths: &DaemonPaths,
+    encoded_invite: &str,
+    now_unix: u64,
+) -> Result<StoredPeer, PeerLifecycleError> {
+    let invite = InviteCode::decode(encoded_invite)?;
+    if invite.expires_at_unix <= now_unix {
+        return Err(PeerLifecycleError::ExpiredInvite {
+            expires_at_unix: invite.expires_at_unix,
+            now_unix,
+        });
+    }
+
+    let peer = invite.stored_peer();
+    let mut store = load_peer_store(paths)?;
+    store.upsert(peer.clone());
+    store_peer_store(paths, &store)?;
+    Ok(peer)
+}
+
+pub fn dial_candidates(
+    paths: &DaemonPaths,
+    now_unix: u64,
+) -> Result<Vec<StoredPeer>, PeerLifecycleError> {
+    Ok(load_peer_store(paths)?.dial_candidates(now_unix))
+}
+
+pub fn remove_peer(paths: &DaemonPaths, peer_id: &str) -> Result<(), PeerLifecycleError> {
+    let mut store = load_peer_store(paths)?;
+    if !store.remove(peer_id) {
+        return Err(PeerLifecycleError::UnknownPeer {
+            peer_id: peer_id.to_string(),
+        });
+    }
+    store_peer_store(paths, &store)?;
+    Ok(())
+}
+
+pub fn revoke_peer(paths: &DaemonPaths, peer_id: &str) -> Result<(), PeerLifecycleError> {
+    let mut store = load_peer_store(paths)?;
+    if !store.revoke(peer_id) {
+        return Err(PeerLifecycleError::UnknownPeer {
+            peer_id: peer_id.to_string(),
+        });
+    }
+    store_peer_store(paths, &store)?;
+    Ok(())
+}
+
+pub fn validate_peer_dytallix_policy(
+    peer: &StoredPeer,
+    status: DytallixPolicyStatus,
+) -> Result<PeerDytallixPolicyDecision, PeerLifecycleError> {
+    let policy = mesh_trust_policy(peer.trust_mode);
+    let decision =
+        evaluate_dytallix_policy_status(policy, status, peer_explicitly_requires_dytallix(peer))?;
+    Ok(PeerDytallixPolicyDecision {
+        accepted: decision.accepted,
+        warning: decision.warning,
+    })
+}
+
+fn mesh_trust_policy(mode: MeshTrustMode) -> MeshTrustPolicy {
+    match mode {
+        MeshTrustMode::PrivateFriends => MeshTrustPolicy::PrivatePreferred,
+        MeshTrustMode::PublicDytallixRequired => MeshTrustPolicy::PublicRequired,
+        MeshTrustMode::DevelopmentOptional => MeshTrustPolicy::DevelopmentOptional,
+    }
+}
+
+fn peer_explicitly_requires_dytallix(peer: &StoredPeer) -> bool {
+    peer.trust_mode == MeshTrustMode::PublicDytallixRequired
+        || matches!(
+            peer.trust_source.as_str(),
+            "dytallix-required" | "verified-dytallix" | "public-dytallix"
+        )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
