@@ -321,6 +321,12 @@ pub struct DataPlaneStatus {
     #[serde(default)]
     pub transport_ready: bool,
     #[serde(default)]
+    pub transport_path: Option<PathKind>,
+    #[serde(default)]
+    pub peer_session_ready: bool,
+    #[serde(default)]
+    pub last_transport_error: Option<String>,
+    #[serde(default)]
     pub metrics: PacketPumpMetrics,
     #[serde(default)]
     pub error: Option<String>,
@@ -333,6 +339,9 @@ impl DataPlaneStatus {
             state: DataPlaneState::NotStarted,
             packet_io_available: false,
             transport_ready: false,
+            transport_path: None,
+            peer_session_ready: false,
+            last_transport_error: None,
             metrics: PacketPumpMetrics::default(),
             error: None,
         }
@@ -623,6 +632,9 @@ mod tests {
         assert!(status.data_plane.interface_name.is_none());
         assert!(!status.data_plane.packet_io_available);
         assert!(!status.data_plane.transport_ready);
+        assert!(status.data_plane.transport_path.is_none());
+        assert!(!status.data_plane.peer_session_ready);
+        assert!(status.data_plane.last_transport_error.is_none());
         assert_eq!(status.data_plane.metrics, PacketPumpMetrics::default());
         assert!(status.data_plane.error.is_none());
     }
@@ -661,6 +673,9 @@ mod tests {
             state: DataPlaneState::Ready,
             packet_io_available: true,
             transport_ready: true,
+            transport_path: Some(PathKind::Direct),
+            peer_session_ready: true,
+            last_transport_error: None,
             metrics: PacketPumpMetrics {
                 observed_packets: 10,
                 queued_packets: 9,
@@ -680,6 +695,8 @@ mod tests {
         assert!(json.contains(r#""state":"ready""#));
         assert!(json.contains(r#""packetIoAvailable":true"#));
         assert!(json.contains(r#""transportReady":true"#));
+        assert!(json.contains(r#""transportPath":"direct""#));
+        assert!(json.contains(r#""peerSessionReady":true"#));
         assert!(json.contains(r#""observedPackets":10"#));
         assert!(json.contains(r#""queuedPackets":9"#));
         assert!(json.contains(r#""droppedPackets":1"#));
@@ -687,6 +704,31 @@ mod tests {
         assert!(json.contains(r#""acceptedPackets":7"#));
         assert!(json.contains(r#""rejectedPackets":2"#));
         assert!(json.contains(r#""transportErrors":1"#));
+    }
+
+    #[test]
+    fn status_serializes_live_transport_readiness() {
+        let mut status = DaemonStatus::idle(true);
+        status.data_plane = DataPlaneStatus {
+            interface_name: Some("qlink0".to_string()),
+            state: DataPlaneState::Ready,
+            packet_io_available: true,
+            transport_ready: true,
+            transport_path: Some(PathKind::Direct),
+            peer_session_ready: true,
+            last_transport_error: None,
+            metrics: PacketPumpMetrics::default(),
+            error: None,
+        };
+
+        let value = serde_json::to_value(&status).unwrap();
+        let data_plane = value.get("dataPlane").unwrap();
+
+        assert_eq!(data_plane.get("state").unwrap(), "ready");
+        assert_eq!(data_plane.get("packetIoAvailable").unwrap(), true);
+        assert_eq!(data_plane.get("transportReady").unwrap(), true);
+        assert_eq!(data_plane.get("transportPath").unwrap(), "direct");
+        assert_eq!(data_plane.get("peerSessionReady").unwrap(), true);
     }
 
     #[test]

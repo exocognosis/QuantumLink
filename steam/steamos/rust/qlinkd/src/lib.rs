@@ -381,6 +381,9 @@ impl DaemonEngine {
                 state: DataPlaneState::Failed,
                 packet_io_available: false,
                 transport_ready: false,
+                transport_path: None,
+                peer_session_ready: false,
+                last_transport_error: Some(error.to_string()),
                 metrics: Default::default(),
                 error: Some(error.to_string()),
             };
@@ -392,6 +395,9 @@ impl DaemonEngine {
             state: DataPlaneState::Starting,
             packet_io_available: false,
             transport_ready: false,
+            transport_path: None,
+            peer_session_ready: false,
+            last_transport_error: None,
             metrics: Default::default(),
             error: None,
         };
@@ -473,6 +479,9 @@ impl DaemonEngine {
             state: DataPlaneState::Failed,
             packet_io_available: false,
             transport_ready: false,
+            transport_path: None,
+            peer_session_ready: false,
+            last_transport_error: Some(error.to_string()),
             metrics: Default::default(),
             error: Some(error.to_string()),
         };

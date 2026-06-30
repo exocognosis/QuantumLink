@@ -1,4 +1,6 @@
-use qlink_proto::{ConnectionPhase, DaemonStatus, DataPlaneState, NetworkPlanState, RouteMode};
+use qlink_proto::{
+    ConnectionPhase, DaemonStatus, DataPlaneState, NetworkPlanState, PathKind, RouteMode,
+};
 
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
@@ -119,6 +121,9 @@ pub fn format_doctor(status: &DaemonStatus) -> String {
          data-plane interface: {data_plane_interface}\n\
          packet I/O: {packet_io}\n\
          transport ready: {transport_ready}\n\
+         transport path: {transport_path}\n\
+         peer session: {peer_session}\n\
+         last transport error: {last_transport_error}\n\
          packet counters: observed={observed_packets} queued={queued_packets} dropped={dropped_packets} emitted={emitted_packets} accepted={accepted_packets} rejected={rejected_packets} transportErrors={transport_errors}\n\
          data-plane error: {data_plane_error}",
         kill_switch = if status.kill_switch {
@@ -143,6 +148,19 @@ pub fn format_doctor(status: &DaemonStatus) -> String {
         } else {
             "no"
         },
+        transport_path = data_plane
+            .transport_path
+            .map(path_kind_label)
+            .unwrap_or("unknown"),
+        peer_session = if data_plane.peer_session_ready {
+            "ready"
+        } else {
+            "not ready"
+        },
+        last_transport_error = data_plane
+            .last_transport_error
+            .as_deref()
+            .unwrap_or("none"),
         observed_packets = data_plane.metrics.observed_packets,
         queued_packets = data_plane.metrics.queued_packets,
         dropped_packets = data_plane.metrics.dropped_packets,
@@ -201,6 +219,15 @@ fn route_mode_label(route_mode: RouteMode) -> &'static str {
         RouteMode::GameOnly => "gameOnly",
         RouteMode::ProtectedPrefixesOnly => "protectedPrefixesOnly",
         RouteMode::FullTunnel => "fullTunnel",
+    }
+}
+
+fn path_kind_label(path: PathKind) -> &'static str {
+    match path {
+        PathKind::Direct => "direct",
+        PathKind::Relay => "relay",
+        PathKind::Probing => "probing",
+        PathKind::Unavailable => "unavailable",
     }
 }
 
@@ -272,6 +299,13 @@ mod tests {
             state,
             packet_io_available,
             transport_ready,
+            transport_path: if transport_ready {
+                Some(PathKind::Direct)
+            } else {
+                Some(PathKind::Unavailable)
+            },
+            peer_session_ready: transport_ready,
+            last_transport_error: None,
             metrics: packet_pump_metrics(),
             error: error.map(str::to_string),
         };
@@ -330,6 +364,9 @@ mod tests {
              data-plane interface: unknown\n\
              packet I/O: unavailable\n\
              transport ready: no\n\
+             transport path: unknown\n\
+             peer session: not ready\n\
+             last transport error: none\n\
              packet counters: observed=0 queued=0 dropped=0 emitted=0 accepted=0 rejected=0 transportErrors=0\n\
              data-plane error: none"
         );
@@ -434,6 +471,8 @@ mod tests {
         assert!(doctor.contains("data-plane state: notStarted"));
         assert!(doctor.contains("packet I/O: unavailable"));
         assert!(doctor.contains("transport ready: no"));
+        assert!(doctor.contains("transport path: unknown"));
+        assert!(doctor.contains("peer session: not ready"));
         assert!(doctor.contains("packet counters: observed=0 queued=0 dropped=0 emitted=0 accepted=0 rejected=0 transportErrors=0"));
     }
 
@@ -447,6 +486,8 @@ mod tests {
         assert!(doctor.contains("data-plane interface: qlink0"));
         assert!(doctor.contains("packet I/O: available"));
         assert!(doctor.contains("transport ready: no"));
+        assert!(doctor.contains("transport path: unavailable"));
+        assert!(doctor.contains("peer session: not ready"));
         assert!(doctor.contains("packet counters: observed=18 queued=17 dropped=1 emitted=16 accepted=15 rejected=2 transportErrors=1"));
         assert!(!doctor.contains("peer transport ready"));
     }
@@ -464,6 +505,7 @@ mod tests {
         assert!(doctor.contains("verdict: FAIL - data plane failed: packet pump stopped"));
         assert!(doctor.contains("data-plane state: failed"));
         assert!(doctor.contains("data-plane error: packet pump stopped"));
+        assert!(doctor.contains("last transport error: none"));
     }
 
     #[test]
@@ -479,6 +521,7 @@ mod tests {
         assert!(doctor.contains("verdict: WARN - data plane degraded: transport backpressure"));
         assert!(doctor.contains("data-plane state: degraded"));
         assert!(doctor.contains("transport ready: no"));
+        assert!(doctor.contains("transport path: unavailable"));
     }
 
     #[test]

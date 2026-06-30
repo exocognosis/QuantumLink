@@ -3,7 +3,7 @@ use qlink_core::packet_core::{
     PacketDisposition, PacketTunnelCore, PacketTunnelCoreConfig, TunnelPacket,
 };
 use qlink_linux::{protocol_family_for_packet, TunDeviceConfig, TunPacketIo, TunPacketIoError};
-use qlink_proto::{DataPlaneState, DataPlaneStatus, PacketPumpMetrics};
+use qlink_proto::{DataPlaneState, DataPlaneStatus, PacketPumpMetrics, PathKind};
 use std::{collections::VecDeque, error::Error, fmt, io::ErrorKind};
 
 #[derive(Debug)]
@@ -80,12 +80,99 @@ impl TunnelCoreAdapting for PacketTunnelCore {
 
 pub trait TransportFrameSink {
     fn is_ready(&self) -> bool;
+    fn path_kind(&self) -> PathKind {
+        if self.is_ready() {
+            PathKind::Probing
+        } else {
+            PathKind::Unavailable
+        }
+    }
+    fn peer_session_ready(&self) -> bool {
+        self.is_ready()
+    }
+    fn last_transport_error(&self) -> Option<&str> {
+        None
+    }
     fn send_transport_frame(&mut self, frame: Vec<u8>) -> Result<(), DataPlaneError>;
 }
 
 pub trait TransportFrameSource {
     fn is_ready(&self) -> bool;
+    fn path_kind(&self) -> PathKind {
+        if self.is_ready() {
+            PathKind::Probing
+        } else {
+            PathKind::Unavailable
+        }
+    }
+    fn peer_session_ready(&self) -> bool {
+        self.is_ready()
+    }
+    fn last_transport_error(&self) -> Option<&str> {
+        None
+    }
     fn try_receive_frame(&mut self) -> Option<Vec<u8>>;
+}
+
+pub trait MeshFrameTransport {
+    fn is_ready(&self) -> bool;
+    fn path_kind(&self) -> PathKind;
+    fn peer_session_ready(&self) -> bool;
+    fn send_frame(&mut self, frame: Vec<u8>) -> Result<(), DataPlaneError>;
+    fn try_receive_frame(&mut self) -> Option<Vec<u8>>;
+    fn last_transport_error(&self) -> Option<&str> {
+        None
+    }
+}
+
+impl<T> TransportFrameSink for T
+where
+    T: MeshFrameTransport + ?Sized,
+{
+    fn is_ready(&self) -> bool {
+        MeshFrameTransport::is_ready(self)
+    }
+
+    fn path_kind(&self) -> PathKind {
+        MeshFrameTransport::path_kind(self)
+    }
+
+    fn peer_session_ready(&self) -> bool {
+        MeshFrameTransport::peer_session_ready(self)
+    }
+
+    fn last_transport_error(&self) -> Option<&str> {
+        MeshFrameTransport::last_transport_error(self)
+    }
+
+    fn send_transport_frame(&mut self, frame: Vec<u8>) -> Result<(), DataPlaneError> {
+        self.send_frame(frame)
+    }
+}
+
+impl<T> TransportFrameSource for T
+where
+    T: MeshFrameTransport + ?Sized,
+{
+    fn is_ready(&self) -> bool {
+        MeshFrameTransport::is_ready(self)
+    }
+
+    fn path_kind(&self) -> PathKind {
+        MeshFrameTransport::path_kind(self)
+    }
+
+    fn peer_session_ready(&self) -> bool {
+        MeshFrameTransport::peer_session_ready(self)
+    }
+
+    fn last_transport_error(&self) -> Option<&str> {
+        MeshFrameTransport::last_transport_error(self)
+    }
+
+    fn try_receive_frame(&mut self) -> Option<Vec<u8>> {
+        MeshFrameTransport::try_receive_frame(self)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -281,6 +368,9 @@ pub struct DataPlaneRuntime<T: TunPacketIo, C: TunnelCoreAdapting> {
     pump: TunnelPacketPump<C>,
     last_error: Option<String>,
     transport_ready: bool,
+    transport_path: Option<PathKind>,
+    peer_session_ready: bool,
+    last_transport_error: Option<String>,
 }
 
 impl<T, C> DataPlaneRuntime<T, C>
@@ -294,6 +384,9 @@ where
             pump: TunnelPacketPump::new(core),
             last_error: None,
             transport_ready: false,
+            transport_path: None,
+            peer_session_ready: false,
+            last_transport_error: None,
         }
     }
 
@@ -309,6 +402,9 @@ where
             },
             packet_io_available: true,
             transport_ready: self.transport_ready,
+            transport_path: self.transport_path,
+            peer_session_ready: self.peer_session_ready,
+            last_transport_error: self.last_transport_error.clone(),
             metrics: self.pump.counters().as_proto(),
             error: self.last_error.clone(),
         }
@@ -319,7 +415,7 @@ where
         sink: &mut dyn TransportFrameSink,
         buffer: &mut [u8],
     ) -> Result<PacketPumpBatchResult, DataPlaneError> {
-        self.transport_ready = sink.is_ready();
+        self.record_transport_status_from_sink(sink);
         let packet_len = match self.tun.read_packet(buffer) {
             Ok(packet_len) => packet_len,
             Err(TunPacketIoError::Io(error)) if error.kind() == ErrorKind::WouldBlock => {
@@ -338,6 +434,7 @@ where
                 "transport send failed for {} frame(s)",
                 result.transport_errors
             ));
+            self.last_transport_error = Some(error.to_string());
             self.last_error = Some(error.to_string());
             return Err(error);
         }
@@ -348,7 +445,7 @@ where
         &mut self,
         source: &mut dyn TransportFrameSource,
     ) -> Result<PacketPumpBatchResult, DataPlaneError> {
-        self.transport_ready = source.is_ready();
+        self.record_transport_status_from_source(source);
         let Some(frame) = source.try_receive_frame() else {
             return Ok(PacketPumpBatchResult::default());
         };
@@ -358,6 +455,7 @@ where
             if let Err(error) = self.tun.write_packet(&packet.bytes) {
                 let error = DataPlaneError::from(error);
                 self.pump.record_transport_error();
+                self.last_transport_error = Some(error.to_string());
                 self.last_error = Some(error.to_string());
                 return Err(error);
             }
@@ -373,6 +471,20 @@ where
 
     pub fn counters(&self) -> &PacketPumpCounters {
         self.pump.counters()
+    }
+
+    fn record_transport_status_from_sink(&mut self, sink: &dyn TransportFrameSink) {
+        self.peer_session_ready = sink.peer_session_ready();
+        self.transport_ready = sink.is_ready() && self.peer_session_ready;
+        self.transport_path = Some(sink.path_kind());
+        self.last_transport_error = sink.last_transport_error().map(str::to_string);
+    }
+
+    fn record_transport_status_from_source(&mut self, source: &dyn TransportFrameSource) {
+        self.peer_session_ready = source.peer_session_ready();
+        self.transport_ready = source.is_ready() && self.peer_session_ready;
+        self.transport_path = Some(source.path_kind());
+        self.last_transport_error = source.last_transport_error().map(str::to_string);
     }
 }
 
