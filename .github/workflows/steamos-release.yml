@@ -1,0 +1,213 @@
+name: SteamOS Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Optional SteamOS package version override."
+        type: string
+        default: ""
+      signing_mode:
+        description: "Use dev-classical for dry-run artifacts or production for signed publication."
+        type: choice
+        default: dev-classical
+        options:
+          - dev-classical
+          - production
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: Test SteamOS Release Inputs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install release tooling
+        run: sudo apt-get update && sudo apt-get install -y zstd jq
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Shell syntax
+        run: |
+          bash -n steam/steamos/scripts/package-steamos.sh
+          bash -n steam/steamos/scripts/verify-steamos-release.sh
+
+      - name: SteamOS install/package smoke test
+        run: bash steam/steamos/tests/install-steamos-test.sh
+
+      - name: Rust tests
+        run: cargo test -p qlinkd -p qlinkctl -p qlink-linux -p qlink-proto -p qlink-game
+
+  build-release:
+    name: Build SteamOS Binaries
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binaries
+        run: cargo build --release -p qlinkd -p qlinkctl
+
+      - name: Upload release binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: steamos-release-binaries
+          path: |
+            target/release/qlinkd
+            target/release/qlinkctl
+          if-no-files-found: error
+
+  package:
+    name: Package SteamOS Release
+    runs-on: ubuntu-latest
+    needs: build-release
+    env:
+      QLINK_STEAMOS_VERSION: ${{ inputs.version }}
+      QLINK_STEAMOS_SIGNING_MODE: ${{ startsWith(github.ref, 'refs/tags/v') && 'production' || inputs.signing_mode || 'dev-classical' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install release tooling
+        run: sudo apt-get update && sudo apt-get install -y zstd jq
+
+      - name: Download release binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: steamos-release-binaries
+          path: target/release
+
+      - name: Restore executable bits
+        run: chmod 0755 target/release/qlinkd target/release/qlinkctl
+
+      - name: Import production signing key
+        if: env.QLINK_STEAMOS_SIGNING_MODE == 'production'
+        env:
+          STEAMOS_RELEASE_PRIVATE_KEY_PEM: ${{ secrets.STEAMOS_RELEASE_PRIVATE_KEY_PEM }}
+        run: |
+          set -euo pipefail
+          if [ -z "${STEAMOS_RELEASE_PRIVATE_KEY_PEM:-}" ]; then
+            echo "STEAMOS_RELEASE_PRIVATE_KEY_PEM is required for production SteamOS signing." >&2
+            exit 1
+          fi
+          key_path="$RUNNER_TEMP/steamos-release-private-key.pem"
+          printf '%s\n' "$STEAMOS_RELEASE_PRIVATE_KEY_PEM" > "$key_path"
+          chmod 0600 "$key_path"
+          echo "QLINK_STEAMOS_RELEASE_PRIVATE_KEY=$key_path" >> "$GITHUB_ENV"
+
+      - name: Package SteamOS release
+        env:
+          QLINK_STEAMOS_BIN_DIR: target/release
+          QLINK_STEAMOS_SKIP_BUILD: "1"
+        run: bash steam/steamos/scripts/package-steamos.sh
+
+      - name: Upload package output
+        uses: actions/upload-artifact@v4
+        with:
+          name: steamos-release-package
+          path: dist/steamos
+          if-no-files-found: error
+
+  verify-release:
+    name: Verify SteamOS Release
+    runs-on: ubuntu-latest
+    needs: package
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install release tooling
+        run: sudo apt-get update && sudo apt-get install -y zstd jq
+
+      - name: Download package output
+        uses: actions/download-artifact@v4
+        with:
+          name: steamos-release-package
+          path: dist/steamos
+
+      - name: Import production verification key
+        env:
+          STEAMOS_RELEASE_PUBLIC_KEY_PEM: ${{ secrets.STEAMOS_RELEASE_PUBLIC_KEY_PEM }}
+        run: |
+          set -euo pipefail
+          if [ -n "${STEAMOS_RELEASE_PUBLIC_KEY_PEM:-}" ]; then
+            key_path="$RUNNER_TEMP/steamos-release-public-key.pem"
+            printf '%s\n' "$STEAMOS_RELEASE_PUBLIC_KEY_PEM" > "$key_path"
+            chmod 0644 "$key_path"
+            echo "QLINK_STEAMOS_RELEASE_PUBLIC_KEY=$key_path" >> "$GITHUB_ENV"
+          fi
+
+      - name: Verify release artifact
+        env:
+          QLINK_STEAMOS_REQUIRE_PRODUCTION_READY: ${{ startsWith(github.ref, 'refs/tags/v') && '1' || '0' }}
+        run: |
+          set -euo pipefail
+          archive="$(find dist/steamos -maxdepth 1 -name 'quantumlink-steamos-*.tar.zst' | sort | head -n 1)"
+          if [ -z "$archive" ]; then
+            echo "SteamOS release archive not found." >&2
+            exit 1
+          fi
+          bash steam/steamos/scripts/verify-steamos-release.sh "$archive" | tee dist/steamos/verify-release-output.json
+          report="${archive%.tar.zst}/verify-report.json"
+          jq -e '.valid == true' "$report"
+          if [ "${QLINK_STEAMOS_REQUIRE_PRODUCTION_READY}" = "1" ]; then
+            jq -e '.notProductionReady == false' "$report"
+          fi
+
+      - name: Upload verification report
+        uses: actions/upload-artifact@v4
+        with:
+          name: steamos-release-verification
+          path: |
+            dist/steamos/verify-release-output.json
+            dist/steamos/quantumlink-steamos-*/verify-report.json
+          if-no-files-found: error
+
+  upload-artifacts:
+    name: Upload SteamOS Artifacts
+    runs-on: ubuntu-latest
+    needs: verify-release
+    steps:
+      - name: Download package output
+        uses: actions/download-artifact@v4
+        with:
+          name: steamos-release-package
+          path: dist/steamos
+
+      - name: Upload verified artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: QuantumLink-steamos-${{ github.ref_name || github.run_number }}
+          path: |
+            dist/steamos/quantumlink-steamos-*.tar.zst
+            dist/steamos/quantumlink-steamos-*/SHA256SUMS.txt
+            dist/steamos/quantumlink-steamos-*/SBOM.spdx.json
+            dist/steamos/quantumlink-steamos-*/release-manifest.json
+            dist/steamos/quantumlink-steamos-*/*.sig
+            dist/steamos/quantumlink-steamos-*/verify-report.json
+          if-no-files-found: error
+
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/steamos/quantumlink-steamos-*.tar.zst
+            dist/steamos/quantumlink-steamos-*/SHA256SUMS.txt
+            dist/steamos/quantumlink-steamos-*/SBOM.spdx.json
+            dist/steamos/quantumlink-steamos-*/release-manifest.json
+            dist/steamos/quantumlink-steamos-*/*.sig
+            dist/steamos/quantumlink-steamos-*/verify-report.json
+          fail_on_unmatched_files: true

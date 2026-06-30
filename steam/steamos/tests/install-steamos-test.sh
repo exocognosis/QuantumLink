@@ -4,6 +4,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STEAMOS_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 INSTALLER="$STEAMOS_ROOT/scripts/install-steamos.sh"
+PACKAGER="$STEAMOS_ROOT/scripts/package-steamos.sh"
+VERIFIER="$STEAMOS_ROOT/scripts/verify-steamos-release.sh"
 
 TMP_ROOT="$(mktemp -d)"
 TMP_ROOT="$(cd "$TMP_ROOT" && pwd -P)"
@@ -509,5 +511,31 @@ if PATH="$FAKEBIN:$PATH" PREFIX="$PREFIX" BINDIR="$BINDIR" bash "$INSTALLER" >"$
     fail "expected live non-root install without DESTDIR to be rejected"
 fi
 assert_contains "$TMP_ROOT/live.err" "must run as root"
+
+PACKAGE_DIST="$TMP_ROOT/package-dist"
+QLINK_STEAMOS_VERSION="9.9.9-test" \
+QLINK_STEAMOS_OUTPUT_DIR="$PACKAGE_DIST" \
+QLINK_STEAMOS_BIN_DIR="$PREFIX/bin" \
+QLINK_STEAMOS_SKIP_BUILD=1 \
+    bash "$PACKAGER" >"$TMP_ROOT/package.out" 2>"$TMP_ROOT/package.err"
+
+PACKAGE_ROOT="$PACKAGE_DIST/quantumlink-steamos-9.9.9-test"
+PACKAGE_ARCHIVE="$PACKAGE_DIST/quantumlink-steamos-9.9.9-test.tar.zst"
+assert_file "$PACKAGE_ARCHIVE"
+assert_file "$PACKAGE_ROOT/SHA256SUMS.txt"
+assert_file "$PACKAGE_ROOT/SBOM.spdx.json"
+assert_file "$PACKAGE_ROOT/release-manifest.json"
+assert_file "$PACKAGE_ROOT/verify-report.json"
+
+assert_contains "$PACKAGE_ROOT/SHA256SUMS.txt" "quantumlink-steamos-9.9.9-test.tar.zst"
+assert_contains "$PACKAGE_ROOT/release-manifest.json" '"product":"QuantumLink SteamOS"'
+assert_contains "$PACKAGE_ROOT/release-manifest.json" '"platform":"steamos"'
+assert_contains "$PACKAGE_ROOT/release-manifest.json" '"mode":"dev-classical"'
+assert_contains "$PACKAGE_ROOT/verify-report.json" '"notProductionReady":true'
+
+VERIFY_REPORT="$TMP_ROOT/standalone-verify-report.json" \
+    bash "$VERIFIER" "$PACKAGE_ARCHIVE" >"$TMP_ROOT/verify.out" 2>"$TMP_ROOT/verify.err"
+assert_file "$TMP_ROOT/standalone-verify-report.json"
+assert_contains "$TMP_ROOT/standalone-verify-report.json" '"notProductionReady":true'
 
 echo "install-steamos-test: ok"
