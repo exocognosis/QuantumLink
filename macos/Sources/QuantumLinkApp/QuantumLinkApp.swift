@@ -3716,6 +3716,7 @@ extension TunnelTransportKind {
     switch self {
     case .developmentDrop: "Development Drop"
     case .devQuicLoopback: "Dev QUIC Loopback"
+    case .nativeUdpMesh: "Native UDP Mesh"
     case .meshQuic: "Mesh QUIC"
     }
   }

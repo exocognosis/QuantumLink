@@ -3,7 +3,7 @@
 #[cfg(feature = "dev-quic-carrier")]
 use crate::quic_transport::{QuicCertificate, QuicEndpoint};
 use crate::{
-    carrier_transport::CarrierSession,
+    carrier_transport::{CarrierSession, NativeUdpSession},
     crypto::{DeviceKeypair, SessionKeys},
     discovery::{CandidateEndpoint, CandidateType},
     dytallix_identity::{
@@ -38,6 +38,14 @@ const DEFAULT_OVERALL_DEADLINE: Duration = Duration::from_secs(3);
 /// We deliberately stay close to the spec default so behavior is predictable
 /// for operators familiar with ICE.
 const DEFAULT_PROBE_PACING: Duration = Duration::from_millis(50);
+
+pub(crate) fn native_udp_carrier_binding(
+    mesh_id: &str,
+    remote_peer_id: &str,
+    address: SocketAddr,
+) -> Vec<u8> {
+    format!("native-udp-carrier-v1:{mesh_id}:{remote_peer_id}:{address}").into_bytes()
+}
 
 pub trait IdentityRegistryLookup: Send + Sync {
     fn lookup<'a>(
@@ -657,11 +665,285 @@ impl MeshConnector {
     }
 
     #[cfg(not(feature = "dev-quic-carrier"))]
-    pub async fn connect(&self, _remote_peer_id: &str) -> Result<(MeshLink, ConnectionOutcome)> {
-        Err(QlinkError::Protocol(
-            "native UDP live mesh carrier is not wired yet; enable dev-quic-carrier for legacy Quinn development carrier"
-                .into(),
-        ))
+    pub async fn connect(&self, remote_peer_id: &str) -> Result<(MeshLink, ConnectionOutcome)> {
+        let started = Instant::now();
+
+        if let Some(acl) = self.config.peer_acl.as_ref() {
+            let decision = acl.evaluate(remote_peer_id);
+            if !decision.is_allowed() {
+                return Err(QlinkError::Protocol(format!(
+                    "peer {remote_peer_id} rejected by ACL: {}",
+                    decision.reason()
+                )));
+            }
+        }
+
+        let (record, peer_record_source) = match self
+            .rendezvous
+            .lookup(&self.config.mesh_id, remote_peer_id)
+            .await
+        {
+            Ok(Some(fresh)) => {
+                if fresh.verify(&self.config.mesh_id).is_ok() {
+                    self.peer_store.store(&self.config.mesh_id, &fresh);
+                }
+                (fresh, PeerRecordSource::RendezvousLive)
+            }
+            Ok(None) => match self.peer_store.load(&self.config.mesh_id, remote_peer_id) {
+                Some(cached) => (cached, PeerRecordSource::PeerStoreCache),
+                None => {
+                    return Err(QlinkError::Protocol(format!(
+                        "peer {remote_peer_id} not found in rendezvous {}",
+                        self.config.mesh_id
+                    )));
+                }
+            },
+            Err(rendezvous_error) => {
+                match self.peer_store.load(&self.config.mesh_id, remote_peer_id) {
+                    Some(cached) => {
+                        tracing::warn!(
+                            peer_id = %remote_peer_id,
+                            error = %rendezvous_error,
+                            "rendezvous lookup failed; falling back to cached record"
+                        );
+                        (cached, PeerRecordSource::PeerStoreCache)
+                    }
+                    None => return Err(rendezvous_error),
+                }
+            }
+        };
+        record.verify(&self.config.mesh_id)?;
+
+        let registry_record = match self.config.identity_registry_lookup.as_ref() {
+            Some(registry) => match registry.lookup(remote_peer_id).await {
+                Ok(record) => record,
+                Err(error) => match self.config.mesh_trust_policy {
+                    MeshTrustPolicy::PublicRequired => {
+                        return Err(QlinkError::Protocol(format!(
+                            "identity registry lookup failed: {error}"
+                        )));
+                    }
+                    MeshTrustPolicy::PrivatePreferred | MeshTrustPolicy::DevelopmentOptional => {
+                        tracing::warn!(
+                            peer_id = %remote_peer_id,
+                            error = %error,
+                            policy = ?self.config.mesh_trust_policy,
+                            "identity registry lookup failed; continuing without registry verification"
+                        );
+                        None
+                    }
+                },
+            },
+            None => None,
+        };
+        let registry_decision = verify_registry_binding(
+            &record,
+            registry_record.as_ref(),
+            self.config.mesh_trust_policy,
+        )?;
+
+        let mut all_endpoints: Vec<CandidateEndpoint> = record.body.endpoints.clone();
+        let expected_fingerprint = compute_public_key_fingerprint(&record.body.device_public_key);
+        for observation in self.mdns_cache.observations_for(remote_peer_id) {
+            if observation.announcement.public_key_fingerprint != expected_fingerprint {
+                tracing::debug!(
+                    peer_id = %remote_peer_id,
+                    "discarding mDNS observation: fingerprint mismatch"
+                );
+                continue;
+            }
+            for address in &observation.addresses {
+                let already_listed = all_endpoints.iter().any(|existing| {
+                    existing.port == address.port() && existing.address == address.ip().to_string()
+                });
+                if already_listed {
+                    continue;
+                }
+                all_endpoints.push(CandidateEndpoint {
+                    candidate_type: CandidateType::Host,
+                    address: address.ip().to_string(),
+                    port: address.port(),
+                    priority: HOST_PRIORITY,
+                });
+            }
+        }
+
+        let cached_addr = self.cache.lookup(remote_peer_id);
+        let direct_candidates = order_direct_candidates(&all_endpoints, cached_addr);
+        let used_cached_path = cached_addr.is_some();
+        let had_direct_candidates = !direct_candidates.is_empty();
+
+        let probe_outcome = self
+            .race_native_udp_direct_probes(&direct_candidates, started, remote_peer_id)
+            .await;
+
+        match probe_outcome {
+            DirectProbeResult::Established {
+                address,
+                session,
+                session_keys,
+                attempts,
+            } => {
+                self.cache.record(remote_peer_id, address);
+                let outcome = ConnectionOutcome {
+                    remote_peer_id: remote_peer_id.to_string(),
+                    path_kind: PathKind::Direct,
+                    remote_addr: Some(address),
+                    attempts,
+                    total_elapsed: started.elapsed(),
+                    used_cached_path,
+                    registry_decision,
+                    peer_record_source,
+                };
+                let link = MeshLink::direct(DirectLink {
+                    remote_addr: address,
+                    session,
+                    frame_protector: PqcFrameProtector::new(session_keys),
+                });
+                Ok((link, outcome))
+            }
+            DirectProbeResult::Exhausted { attempts } => {
+                if had_direct_candidates {
+                    self.cache.invalidate(remote_peer_id);
+                }
+
+                let detail = latest_probe_failure_summary(&attempts)
+                    .map(|summary| format!("; last direct failure: {summary}"))
+                    .unwrap_or_default();
+                let Some(server) = self.config.relay_server.as_ref() else {
+                    return Err(QlinkError::Protocol(format!(
+                        "no direct candidate for peer {remote_peer_id} succeeded{detail} and no relay server is configured"
+                    )));
+                };
+
+                Err(QlinkError::Protocol(format!(
+                    "relay PQC session is required for peer {remote_peer_id}; \
+                     raw relay fallback via {server} is disabled{detail}"
+                )))
+            }
+        }
+    }
+
+    #[cfg(not(feature = "dev-quic-carrier"))]
+    async fn race_native_udp_direct_probes(
+        &self,
+        candidates: &[CandidateEndpoint],
+        started: Instant,
+        remote_peer_id: &str,
+    ) -> DirectProbeResult {
+        if candidates.is_empty() {
+            return DirectProbeResult::Exhausted { attempts: vec![] };
+        }
+        let Some(local_keypair) = self.config.local_device_keypair.clone() else {
+            return DirectProbeResult::Exhausted {
+                attempts: direct_keypair_required_attempts(candidates),
+            };
+        };
+
+        let mut attempts = Vec::new();
+        for (index, candidate) in candidates.iter().enumerate() {
+            if index > 0 {
+                tokio::time::sleep(self.config.probe_pacing).await;
+            }
+            if started.elapsed() >= self.config.overall_deadline {
+                break;
+            }
+
+            let address = match candidate_socket_addr(candidate) {
+                Ok(address) => address,
+                Err(_) => continue,
+            };
+            let probe_started = Instant::now();
+            let remaining = remaining_probe_budget(
+                Instant::now(),
+                started,
+                probe_started,
+                self.config.direct_probe_timeout,
+                self.config.overall_deadline,
+            );
+            if remaining.is_zero() {
+                attempts.push(ProbeAttempt {
+                    candidate_type: candidate.candidate_type.clone(),
+                    address,
+                    elapsed: probe_started.elapsed(),
+                    outcome: ProbeOutcome::TimedOut,
+                    quic_connect_elapsed: None,
+                    identity_assertion_elapsed: None,
+                    ice_round_trip: None,
+                    peer_reflexive_address: None,
+                });
+                continue;
+            }
+
+            let bind_addr = match address.ip() {
+                IpAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+                IpAddr::V6(_) => SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 0),
+            };
+            let candidate_type = candidate.candidate_type.clone();
+            let mesh_id = self.config.mesh_id.clone();
+            let local_peer_id = self.config.local_peer_id.clone();
+            let remote_peer_id = remote_peer_id.to_string();
+            let local_keypair = local_keypair.clone();
+            let binding = native_udp_carrier_binding(&mesh_id, &remote_peer_id, address);
+
+            let probe_result = tokio::time::timeout(remaining, async move {
+                let session = NativeUdpSession::connect(bind_addr, address).await?;
+                let session = CarrierSession::from(session);
+                let assertion_started = Instant::now();
+                send_inbound_assertion(&session, local_keypair.as_ref(), &mesh_id).await?;
+                let identity_assertion_elapsed = assertion_started.elapsed();
+                let pqc_context =
+                    PqcSessionContext::new(mesh_id, local_peer_id, remote_peer_id, binding);
+                let session_keys =
+                    run_pqc_session_initiator(&session, pqc_context, local_keypair.as_ref())
+                        .await?;
+                Result::<_>::Ok((session, session_keys, identity_assertion_elapsed))
+            })
+            .await;
+
+            match probe_result {
+                Ok(Ok((session, session_keys, identity_assertion_elapsed))) => {
+                    attempts.push(ProbeAttempt {
+                        candidate_type,
+                        address,
+                        elapsed: probe_started.elapsed(),
+                        outcome: ProbeOutcome::Established,
+                        quic_connect_elapsed: None,
+                        identity_assertion_elapsed: Some(identity_assertion_elapsed),
+                        ice_round_trip: None,
+                        peer_reflexive_address: None,
+                    });
+                    return DirectProbeResult::Established {
+                        address,
+                        session,
+                        session_keys,
+                        attempts,
+                    };
+                }
+                Ok(Err(error)) => attempts.push(ProbeAttempt {
+                    candidate_type,
+                    address,
+                    elapsed: probe_started.elapsed(),
+                    outcome: ProbeOutcome::Failed(error.to_string()),
+                    quic_connect_elapsed: None,
+                    identity_assertion_elapsed: None,
+                    ice_round_trip: None,
+                    peer_reflexive_address: None,
+                }),
+                Err(_) => attempts.push(ProbeAttempt {
+                    candidate_type,
+                    address,
+                    elapsed: probe_started.elapsed(),
+                    outcome: ProbeOutcome::TimedOut,
+                    quic_connect_elapsed: None,
+                    identity_assertion_elapsed: None,
+                    ice_round_trip: None,
+                    peer_reflexive_address: None,
+                }),
+            }
+        }
+
+        DirectProbeResult::Exhausted { attempts }
     }
 
     #[cfg(feature = "dev-quic-carrier")]
@@ -1514,6 +1796,119 @@ fn candidate_matches_addr(candidate: &CandidateEndpoint, addr: SocketAddr) -> bo
         .map(|ip| ip == addr.ip())
         .unwrap_or(false)
         && candidate.port == addr.port()
+}
+
+#[cfg(all(test, not(feature = "dev-quic-carrier")))]
+mod native_udp_live_mesh_tests {
+    use super::*;
+    use crate::{
+        carrier_transport::NativeUdpSession,
+        crypto::DeviceKeypair,
+        discovery::{PeerRecord, UnsignedPeerRecord},
+        inbound_identity::{
+            receive_and_evaluate_inbound, InboundDecision,
+            DEFAULT_INBOUND_ASSERTION_MAX_AGE_SECONDS,
+        },
+        pqc_session_wire::run_pqc_session_responder,
+        rendezvous::spawn_dev_rendezvous,
+    };
+    use std::net::Ipv4Addr;
+
+    const MESH_ID: &str = "native-udp-live-mesh";
+
+    #[tokio::test]
+    async fn native_udp_live_mesh_direct_path_establishes_from_rendezvous_candidate() {
+        let rendezvous = spawn_dev_rendezvous().await.unwrap();
+        let rendezvous_client = RendezvousClient::new(rendezvous.local_addr().to_string());
+
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let server_socket = UdpSocket::bind(bind).await.unwrap();
+        let server_addr = server_socket.local_addr().unwrap();
+
+        let local_key = Arc::new(DeviceKeypair::generate().unwrap());
+        let remote_key = Arc::new(DeviceKeypair::generate().unwrap());
+        let remote_peer_id = remote_key.public_key().peer_id();
+        let responder_peer_id = remote_peer_id.clone();
+        let responder_key = remote_key.clone();
+        let responder_task = tokio::spawn(async move {
+            let (session, _initiator_addr) =
+                NativeUdpSession::accept_on(server_socket).await.unwrap();
+            let session = CarrierSession::from(session);
+            let (decision, assertion) = receive_and_evaluate_inbound(
+                &session,
+                MESH_ID,
+                DEFAULT_INBOUND_ASSERTION_MAX_AGE_SECONDS,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(decision, InboundDecision::Accepted);
+
+            let context = PqcSessionContext::new(
+                MESH_ID,
+                assertion.peer_id,
+                responder_peer_id.clone(),
+                native_udp_carrier_binding(MESH_ID, &responder_peer_id, server_addr),
+            );
+            let session_keys = run_pqc_session_responder(&session, context, responder_key.as_ref())
+                .await
+                .unwrap();
+            let mut frame_protector = PqcFrameProtector::new(session_keys);
+            let protected = session.receive_frame().await.unwrap();
+            frame_protector.open(&protected).unwrap()
+        });
+
+        let remote_record = signed_record(
+            remote_key.as_ref(),
+            vec![CandidateEndpoint {
+                candidate_type: CandidateType::Host,
+                address: server_addr.ip().to_string(),
+                port: server_addr.port(),
+                priority: 120,
+            }],
+            1,
+        );
+        rendezvous_client
+            .publish(MESH_ID, remote_record)
+            .await
+            .unwrap();
+
+        let connector = MeshConnector::new(
+            MeshConnectorConfig::new(MESH_ID, local_key.public_key().peer_id())
+                .with_direct_probe_timeout(Duration::from_millis(500))
+                .with_overall_deadline(Duration::from_secs(2))
+                .with_local_device_keypair(local_key.clone()),
+            rendezvous_client,
+        );
+
+        let (mut link, outcome) = connector.connect(&remote_peer_id).await.unwrap();
+        assert_eq!(link.path_kind(), PathKind::Direct);
+        assert_eq!(outcome.path_kind, PathKind::Direct);
+        assert_eq!(outcome.remote_addr, Some(server_addr));
+        assert_eq!(outcome.attempts.len(), 1);
+        assert_eq!(outcome.attempts[0].outcome, ProbeOutcome::Established);
+
+        link.send_frame(b"native-udp-ping".to_vec()).await.unwrap();
+        let opened = responder_task.await.unwrap();
+        assert_eq!(opened, b"native-udp-ping");
+    }
+
+    fn signed_record(
+        keypair: &DeviceKeypair,
+        endpoints: Vec<CandidateEndpoint>,
+        sequence: u64,
+    ) -> PeerRecord {
+        let body = UnsignedPeerRecord::new(
+            MESH_ID,
+            "native-udp-test-peer",
+            keypair.public_key(),
+            endpoints,
+            vec!["100.127.0.10/32".to_string()],
+            60,
+            sequence,
+        );
+        PeerRecord::signed(body, keypair).unwrap()
+    }
 }
 
 #[cfg(all(test, feature = "dev-quic-carrier"))]
