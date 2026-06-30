@@ -1,9 +1,11 @@
 #![cfg_attr(not(feature = "dev-quic-carrier"), allow(dead_code, unused_imports))]
 
+#[cfg(not(feature = "dev-quic-carrier"))]
+use crate::carrier_transport::NativeUdpSession;
 #[cfg(feature = "dev-quic-carrier")]
 use crate::quic_transport::{QuicCertificate, QuicEndpoint};
 use crate::{
-    carrier_transport::{CarrierSession, NativeUdpSession},
+    carrier_transport::CarrierSession,
     crypto::{DeviceKeypair, SessionKeys},
     discovery::{CandidateEndpoint, CandidateType},
     dytallix_identity::{
@@ -39,6 +41,7 @@ const DEFAULT_OVERALL_DEADLINE: Duration = Duration::from_secs(3);
 /// for operators familiar with ICE.
 const DEFAULT_PROBE_PACING: Duration = Duration::from_millis(50);
 
+#[cfg(not(feature = "dev-quic-carrier"))]
 pub(crate) fn native_udp_carrier_binding(
     mesh_id: &str,
     remote_peer_id: &str,

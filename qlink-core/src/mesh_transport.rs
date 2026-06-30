@@ -30,7 +30,7 @@
 #[cfg(feature = "dev-quic-carrier")]
 use crate::quic_transport::QuicEndpoint;
 use crate::{
-    carrier_transport::{CarrierSession, NativeUdpSession},
+    carrier_transport::CarrierSession,
     crypto::DeviceKeypair,
     discovery::{now_unix, CandidateEndpoint, CandidateType, PeerRecord, UnsignedPeerRecord},
     dytallix_identity::{
@@ -43,8 +43,8 @@ use crate::{
         receive_and_evaluate_inbound, InboundDecision, DEFAULT_INBOUND_ASSERTION_MAX_AGE_SECONDS,
     },
     mesh_connection::{
-        native_udp_carrier_binding, IdentityRegistryLookup, MeshConnector, MeshConnectorConfig,
-        NetworkEvent, NetworkEventResponse, PathKind, PeerRecordSource,
+        IdentityRegistryLookup, MeshConnector, MeshConnectorConfig, NetworkEvent,
+        NetworkEventResponse, PathKind, PeerRecordSource,
     },
     metrics_endpoint::{spawn_metrics_endpoint, MetricsEndpoint, MetricsSnapshot},
     peer_acl::PeerAcl,
@@ -57,6 +57,8 @@ use crate::{
     session_crypto::PqcSessionContext,
     traversal::HOST_PRIORITY,
 };
+#[cfg(not(feature = "dev-quic-carrier"))]
+use crate::{carrier_transport::NativeUdpSession, mesh_connection::native_udp_carrier_binding};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -67,8 +69,9 @@ use std::{
     },
     time::Duration,
 };
+#[cfg(not(feature = "dev-quic-carrier"))]
+use tokio::net::UdpSocket;
 use tokio::{
-    net::UdpSocket,
     runtime::Runtime,
     sync::{mpsc, Mutex as TokioMutex},
     task::JoinHandle,
@@ -493,6 +496,44 @@ fn default_mesh_trust_policy() -> MeshTrustPolicy {
     MeshTrustPolicy::DevelopmentOptional
 }
 
+fn validate_public_dytallix_registry_pins(
+    policy: MeshTrustPolicy,
+    config: Option<&DytallixRegistryLookupConfig>,
+) -> Result<()> {
+    if policy != MeshTrustPolicy::PublicRequired {
+        return Ok(());
+    }
+    let Some(config) = config else {
+        return Err(QlinkError::Protocol(
+            "public Dytallix registry trust requires dytallixIdentity config".into(),
+        ));
+    };
+    if config
+        .network_id
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        return Err(QlinkError::Protocol(
+            "public Dytallix registry trust requires networkId".into(),
+        ));
+    }
+    if config
+        .chain_id
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        return Err(QlinkError::Protocol(
+            "public Dytallix registry trust requires chainId".into(),
+        ));
+    }
+    if config.allowed_rpc_endpoints.is_empty() {
+        return Err(QlinkError::Protocol(
+            "public Dytallix registry trust requires allowedRpcEndpoints".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// A frame received from a specific remote peer. Multi-peer transports
 /// preserve the source peer ID so callers can route inbound traffic.
 #[derive(Debug, Clone)]
@@ -625,6 +666,10 @@ impl MeshTransportHandle {
                 ));
             }
         }
+        validate_public_dytallix_registry_pins(
+            config.mesh_trust_policy,
+            config.dytallix_identity.as_ref(),
+        )?;
 
         let runtime = Runtime::new().map_err(|err| {
             QlinkError::Protocol(format!("failed to create mesh transport runtime: {err}"))
@@ -806,6 +851,10 @@ impl MeshTransportHandle {
                 ));
             }
         }
+        validate_public_dytallix_registry_pins(
+            config.mesh_trust_policy,
+            config.dytallix_identity.as_ref(),
+        )?;
 
         let runtime = Runtime::new().map_err(|err| {
             QlinkError::Protocol(format!("failed to create mesh transport runtime: {err}"))
@@ -2140,6 +2189,35 @@ mod native_udp_tests {
         assert_eq!(handle_a.peer_path_kind_code(&peer_b), Some(1));
     }
 
+    #[test]
+    fn default_native_udp_public_mesh_rejects_unpinned_dytallix_registry_config() {
+        let local_key = Arc::new(DeviceKeypair::generate().unwrap());
+        let local_peer_id = local_key.public_key().peer_id();
+        let config: MeshTransportConfig = serde_json::from_value(serde_json::json!({
+            "meshId": "public-mesh",
+            "localPeerId": local_peer_id,
+            "remotePeerId": "qlink_remote",
+            "rendezvousUrl": "127.0.0.1:1",
+            "bindAddr": "127.0.0.1:0",
+            "disableInboundResponder": true,
+            "meshTrustPolicy": "public_required",
+            "dytallixIdentity": {
+                "endpoint": "https://dytallix.example",
+                "contractAddress": "1111111111111111111111111111111111111111"
+            }
+        }))
+        .unwrap();
+
+        let err = match MeshTransportHandle::new_with_keypair(config, Some(local_key)) {
+            Ok(_) => panic!("public mesh accepted unpinned Dytallix registry config"),
+            Err(error) => error,
+        };
+
+        assert!(err
+            .to_string()
+            .contains("public Dytallix registry trust requires networkId"));
+    }
+
     fn test_config(
         local_peer_id: &str,
         remote_peer_id: &str,
@@ -2558,6 +2636,35 @@ mod tests {
             crate::dytallix_identity::MeshTrustPolicy::PublicRequired
         );
         assert!(handle.connector.config().identity_registry_lookup.is_some());
+    }
+
+    #[test]
+    fn public_mesh_rejects_unpinned_dytallix_registry_config() {
+        let local_key = Arc::new(DeviceKeypair::generate().unwrap());
+        let local_peer_id = local_key.public_key().peer_id();
+        let config: MeshTransportConfig = serde_json::from_value(serde_json::json!({
+            "meshId": "public-mesh",
+            "localPeerId": local_peer_id,
+            "remotePeerId": "qlink_remote",
+            "rendezvousUrl": "127.0.0.1:1",
+            "bindAddr": "127.0.0.1:0",
+            "disableInboundResponder": true,
+            "meshTrustPolicy": "public_required",
+            "dytallixIdentity": {
+                "endpoint": "https://dytallix.example",
+                "contractAddress": "1111111111111111111111111111111111111111"
+            }
+        }))
+        .unwrap();
+
+        let err = match MeshTransportHandle::new_with_keypair(config, Some(local_key)) {
+            Ok(_) => panic!("public mesh accepted unpinned Dytallix registry config"),
+            Err(error) => error,
+        };
+
+        assert!(err
+            .to_string()
+            .contains("public Dytallix registry trust requires networkId"));
     }
 
     #[test]

@@ -163,9 +163,9 @@ Implemented or scaffolded behavior includes:
 - App-layer PQC frame protection with replay rejection for direct mesh links.
 - Packet core framing and metadata normalization; the packet core is not a
   classical encryption boundary.
-- Native UDP carrier session-wire test coverage; default live mesh dialing
-  fails closed until rendezvous publication and direct probing are wired to the
-  native UDP carrier.
+- Native UDP carrier session-wire test coverage; default live mesh direct
+  dialing and inbound response use the native UDP carrier with app-layer PQC
+  session establishment.
 - Optional dev-only QUIC DATAGRAM carrier transport behind `dev-quic-carrier`,
   rendezvous lookup, direct probes, optional ICE, relay fallback, peer-store
   persistence, per-peer state, and network-event reconnect behavior.
@@ -180,8 +180,6 @@ Production gaps include:
 
 - Apple-granted Network Extension entitlements and production provisioning.
 - Developer ID signing, notarization, stapling, and Gatekeeper validation.
-- Wiring live rendezvous publication and direct probing to the native UDP
-  carrier.
 - Full ICE/STUN/TURN candidate gathering and nomination for direct and relay
   path selection.
 - Hardened public rendezvous and relay infrastructure.

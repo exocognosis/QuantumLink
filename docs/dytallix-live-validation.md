@@ -166,6 +166,8 @@ Required behavior:
 
 - `meshTrustPolicy` is `public_required`.
 - `discoveryIdentityMode` is `verified` or `public_wallet`.
+- Runtime `dytallixIdentity` includes pinned `networkId`, `chainId`, and
+  `allowedRpcEndpoints`.
 - Missing registry record is rejected.
 - Revoked registry record is rejected.
 - Expired registry record is rejected.
