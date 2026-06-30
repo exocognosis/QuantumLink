@@ -72,7 +72,8 @@ jobs:
 
           rustc -vV
           cargo -V
-          cl.exe /Bv
+          Write-Host "cl.exe: $((Get-Command cl.exe).Source)"
+          Write-Host "link.exe: $((Get-Command link.exe).Source)"
 
       - name: Verify locked Cargo graph
         run: cargo metadata --locked --format-version 1 --no-deps
