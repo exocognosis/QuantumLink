@@ -22,8 +22,8 @@
 | Rendezvous/relay production profile | Blocked | Hardened endpoint runbook required |
 | Non-root local control | Blocked | Socket ACL and qlinkctl status proof required |
 | Signed release artifacts | Blocked | Signatures, checksums, manifest, SBOM required |
-| Deck validation | Blocked | Hardware validation report required |
-| Game compatibility | Blocked | Representative titles and anti-cheat notes required |
+| Deck validation | Blocked | Hardware validation report required; runbook: [`deck-validation.md`](deck-validation.md), harness: [`../tests/deck-validation.sh`](../tests/deck-validation.sh), evidence placeholder: `../validation/deck/<timestamp>/validation-report.json` |
+| Game compatibility | Blocked | Representative titles and anti-cheat notes required; matrix placeholder: [`deck-validation.md`](deck-validation.md), profiles: `../config/games/factorio.toml`, `../config/games/minecraft.toml`, `../config/games/steam-remote-play.toml` |
 | Diagnostics redaction | Blocked | Support bundle redaction report required |
 
 ## Go / No-Go Rule
