@@ -65,3 +65,11 @@ Games that already use Steam Datagram Relay should default to bypass or observe-
 - Anti-cheat-safe process detection.
 - Game profile database.
 - Windows packaging, signing, and update flow.
+
+## SteamOS Release Readiness
+
+Status: Pre-production daemon scaffold
+
+Production readiness is tracked in `steam/steamos/docs/production-readiness.md`.
+SteamOS remains pre-production until live transport, signed release, Steam-safe
+routing, and Deck validation gates pass.

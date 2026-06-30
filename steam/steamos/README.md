@@ -2,6 +2,11 @@
 
 QuantumLink on SteamOS is a Linux daemon deployment inside the Steam silo. The runtime shape is `qlinkd` under systemd, with `qlinkctl` as the local control and diagnostics surface.
 
+Status: Pre-production daemon scaffold. Production readiness is tracked in
+`steam/steamos/docs/production-readiness.md`. SteamOS remains pre-production
+until live transport, signed release, Steam-safe routing, and Deck validation
+gates pass.
+
 ## Components
 
 - `steam/steamos/rust/qlinkd`: SteamOS/Linux daemon scaffold for config loading, local status, mesh state, profile lifecycle, explicit network activation, and the local TUN packet-pump boundary.
@@ -130,3 +135,6 @@ bash -n steam/steamos/scripts/install-steamos.sh
 ## Production Boundaries
 
 The SteamOS runtime is still pre-production. This slice adds the local TUN packet I/O and packet-pump boundary, but production readiness still requires live peer transport wiring in `qlinkd`, Deck-host validation of the activated data plane, robust nftables rollback hardening, non-root local control, hardened rendezvous/relay operations, signed release artifacts, update-channel design, and game compatibility validation for Steam launch options, LAN-discovery-heavy titles, voice chat, and anti-cheat behavior.
+
+The blocking release ledger lives at
+`steam/steamos/docs/production-readiness.md`.
