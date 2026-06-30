@@ -21,6 +21,8 @@ const NFT_FILTER_OUTPUT_CHAIN: &str = "filter_output";
 const FULL_TUNNEL_CIDR: &str = "0.0.0.0/0";
 const IP_COMMAND: &str = "/usr/bin/ip";
 const NFT_COMMAND: &str = "/usr/bin/nft";
+const FULL_TUNNEL_EXEMPTION_ERROR: &str =
+    "full tunnel requires explicit underlay exemptions before activation";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinuxRuntimePlan {
@@ -32,6 +34,9 @@ pub struct LinuxRuntimePlan {
 impl LinuxRuntimePlan {
     pub fn from_config(config: &DaemonConfig) -> Result<Self, NetworkPlanError> {
         config.validate().map_err(NetworkPlanError::InvalidConfig)?;
+        if config.route_mode == RouteMode::FullTunnel {
+            return Err(NetworkPlanError::FullTunnelRequiresExplicitUnderlayExemptions);
+        }
 
         let protected_cidr = protected_cidr_for_route_mode(config).to_string();
         let overlay_address = format!("{}/32", config.overlay_ipv4_address);
@@ -158,12 +163,16 @@ impl LinuxRuntimePlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetworkPlanError {
     InvalidConfig(ConfigValidationError),
+    FullTunnelRequiresExplicitUnderlayExemptions,
 }
 
 impl fmt::Display for NetworkPlanError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidConfig(error) => write!(f, "invalid daemon config: {error}"),
+            Self::FullTunnelRequiresExplicitUnderlayExemptions => {
+                f.write_str(FULL_TUNNEL_EXEMPTION_ERROR)
+            }
         }
     }
 }
@@ -172,6 +181,7 @@ impl Error for NetworkPlanError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::InvalidConfig(error) => Some(error),
+            Self::FullTunnelRequiresExplicitUnderlayExemptions => None,
         }
     }
 }
@@ -416,6 +426,41 @@ impl NetworkOperation {
 pub struct LinuxNetworkPlan {
     pub operations: Vec<NetworkOperation>,
     pub commands: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedRuntimePlanStore {
+    record: std::cell::RefCell<Option<LinuxRuntimePlan>>,
+}
+
+impl OwnedRuntimePlanStore {
+    pub fn from_plan(plan: LinuxRuntimePlan) -> Self {
+        Self {
+            record: std::cell::RefCell::new(Some(plan)),
+        }
+    }
+
+    pub fn has_record(&self) -> bool {
+        self.record.borrow().is_some()
+    }
+
+    pub fn deactivate_owned<N, T>(
+        &self,
+        network_executor: &mut N,
+        nftables_executor: &mut T,
+    ) -> Result<(), NetworkApplyError>
+    where
+        N: NetworkExecutor,
+        T: NftablesExecutor,
+    {
+        let Some(plan) = self.record.borrow().clone() else {
+            return Ok(());
+        };
+
+        plan.deactivate(network_executor, nftables_executor)?;
+        *self.record.borrow_mut() = None;
+        Ok(())
+    }
 }
 
 impl LinuxNetworkPlan {
@@ -1066,25 +1111,18 @@ mod tests {
     }
 
     #[test]
-    fn runtime_plan_full_tunnel_routes_default_ipv4_cidr() {
+    fn runtime_plan_full_tunnel_fails_closed_without_underlay_exemptions() {
         let config = DaemonConfig {
             route_mode: RouteMode::FullTunnel,
             ..DaemonConfig::default()
         };
 
-        let plan = LinuxRuntimePlan::from_config(&config).expect("full tunnel config should plan");
+        let error = LinuxRuntimePlan::from_config(&config).unwrap_err();
 
-        assert_eq!(plan.protected_cidr, "0.0.0.0/0");
-        assert!(plan
-            .network
-            .commands
-            .iter()
-            .any(|command| command == "ip route add 0.0.0.0/0 dev qlink0 table 51820"));
-        assert!(plan
-            .nftables
-            .rules
-            .iter()
-            .any(|rule| rule.contains("ip daddr 0.0.0.0/0")));
+        assert_eq!(
+            error.to_string(),
+            "full tunnel requires explicit underlay exemptions before activation"
+        );
     }
 
     #[test]

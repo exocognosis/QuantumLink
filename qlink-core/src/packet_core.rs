@@ -1,10 +1,15 @@
 use crate::{
     crypto::{validate_suite_name, SUITE_FIPS203},
     error::{QlinkError, Result},
+    replay::ReplayWindow,
     routing::{RouteMode, RoutePolicy},
 };
 use serde::Deserialize;
-use std::{collections::VecDeque, net::Ipv4Addr};
+use std::{
+    collections::VecDeque,
+    net::Ipv4Addr,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 const FRAME_MAGIC: &[u8; 6] = b"QLPKT1";
 const FRAME_HEADER_LEN: usize = 6 + 8 + 2 + 4;
@@ -13,6 +18,7 @@ const FRAME_HEADER_LEN: usize = 6 + 8 + 2 + 4;
 pub enum PacketDisposition {
     QueuedForTransport,
     DroppedUnprotected,
+    DroppedPeerSessionUnavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,12 +35,25 @@ pub struct PacketCoreMetrics {
     pub transport_frames_in: u64,
     pub dropped_unprotected: u64,
     pub dropped_malformed: u64,
+    pub dropped_peer_session_unavailable: u64,
+    pub dropped_replay: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledPeerSession {
+    pub peer_id: String,
+    pub expires_at_unix: u64,
+    pub rekey_after_packets: u64,
 }
 
 #[derive(Debug)]
 pub struct PacketTunnelCore {
     policy: RoutePolicy,
     frame_codec: PacketFrameCodec,
+    require_peer_session: bool,
+    peer_session: Option<InstalledPeerSession>,
+    peer_session_packets: u64,
+    replay_window: ReplayWindow,
     next_packet_number: u64,
     transport_outbox: VecDeque<Vec<u8>>,
     tunnel_outbox: VecDeque<TunnelPacket>,
@@ -53,6 +72,8 @@ pub struct PacketTunnelCoreConfig {
     pub mtu: usize,
     #[serde(default)]
     pub crypto: Option<FfiCryptoPolicy>,
+    #[serde(default)]
+    pub require_peer_session: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -109,6 +130,10 @@ impl PacketTunnelCore {
         Ok(Self {
             policy,
             frame_codec,
+            require_peer_session: config.require_peer_session,
+            peer_session: None,
+            peer_session_packets: 0,
+            replay_window: ReplayWindow::new(),
             next_packet_number: 1,
             transport_outbox: VecDeque::new(),
             tunnel_outbox: VecDeque::new(),
@@ -119,6 +144,27 @@ impl PacketTunnelCore {
     pub fn from_json(bytes: &[u8]) -> Result<Self> {
         let config = serde_json::from_slice(bytes)?;
         Self::new(config)
+    }
+
+    pub fn install_peer_session(&mut self, session: InstalledPeerSession) {
+        if self.peer_session.as_ref() == Some(&session) {
+            return;
+        }
+        self.peer_session = Some(session);
+        self.peer_session_packets = 0;
+    }
+
+    pub fn clear_peer_session(&mut self) {
+        self.peer_session = None;
+        self.peer_session_packets = 0;
+    }
+
+    pub fn peer_session_ready(&self) -> bool {
+        self.peer_session_block_reason().is_none()
+    }
+
+    pub fn peer_session_error(&self) -> Option<String> {
+        self.peer_session_block_reason()
     }
 
     pub fn submit_tunnel_packet(
@@ -140,6 +186,13 @@ impl PacketTunnelCore {
             return Ok(PacketDisposition::DroppedUnprotected);
         }
 
+        if self.require_peer_session {
+            if self.peer_session_block_reason().is_some() {
+                self.metrics.dropped_peer_session_unavailable += 1;
+                return Ok(PacketDisposition::DroppedPeerSessionUnavailable);
+            }
+        }
+
         let mut normalized_packet = packet.to_vec();
         normalize_ipv4_packet(&mut normalized_packet)?;
 
@@ -149,6 +202,9 @@ impl PacketTunnelCore {
             &normalized_packet,
         )?;
         self.next_packet_number += 1;
+        if self.require_peer_session {
+            self.peer_session_packets += 1;
+        }
         self.metrics.transport_frames_out += 1;
         self.transport_outbox.push_back(frame);
         Ok(PacketDisposition::QueuedForTransport)
@@ -159,7 +215,14 @@ impl PacketTunnelCore {
     }
 
     pub fn accept_transport_frame(&mut self, frame: &[u8]) -> Result<()> {
-        let (_packet_number, protocol_family, packet) =
+        if self.require_peer_session {
+            if let Some(reason) = self.peer_session_block_reason() {
+                self.metrics.dropped_peer_session_unavailable += 1;
+                return Err(QlinkError::Protocol(reason));
+            }
+        }
+
+        let (packet_number, protocol_family, packet) =
             match self.frame_codec.decode_transport_frame(frame) {
                 Ok(decoded) => decoded,
                 Err(error) => {
@@ -167,6 +230,12 @@ impl PacketTunnelCore {
                     return Err(error);
                 }
             };
+        if !self.replay_window.observe(packet_number) {
+            self.metrics.dropped_replay += 1;
+            return Err(QlinkError::Protocol(
+                "replayed transport frame rejected".into(),
+            ));
+        }
         self.metrics.transport_frames_in += 1;
         self.metrics.packets_to_tunnel += 1;
         self.tunnel_outbox.push_back(TunnelPacket {
@@ -183,6 +252,35 @@ impl PacketTunnelCore {
     pub fn metrics(&self) -> PacketCoreMetrics {
         self.metrics.clone()
     }
+
+    fn peer_session_block_reason(&self) -> Option<String> {
+        if !self.require_peer_session {
+            return None;
+        }
+        let Some(session) = self.peer_session.as_ref() else {
+            return Some("authenticated peer session keys are not installed".to_string());
+        };
+        let now = now_unix_seconds();
+        if session.expires_at_unix <= now {
+            return Some(format!("peer session for {} is expired", session.peer_id));
+        }
+        if session.rekey_after_packets > 0
+            && self.peer_session_packets >= session.rekey_after_packets
+        {
+            return Some(format!(
+                "peer session for {} requires rekey",
+                session.peer_id
+            ));
+        }
+        None
+    }
+}
+
+fn now_unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
 }
 
 fn default_route_mode() -> FfiRouteMode {
@@ -476,9 +574,73 @@ mod tests {
             crypto: Some(FfiCryptoPolicy {
                 suite: "QLINK-UNKNOWN-v1".to_string(),
             }),
+            require_peer_session: false,
         };
 
         assert!(PacketTunnelCore::new(config).is_err());
+    }
+
+    #[test]
+    fn protected_packet_drops_when_peer_session_is_required_but_missing() {
+        let mut core = test_core_requiring_peer_session();
+        let packet = test_ipv4_packet([100, 127, 0, 10]);
+
+        assert_eq!(
+            core.submit_tunnel_packet(2, &packet).unwrap(),
+            PacketDisposition::DroppedPeerSessionUnavailable
+        );
+
+        assert!(core.pop_transport_frame().is_none());
+        assert!(!core.peer_session_ready());
+        assert!(core
+            .peer_session_error()
+            .unwrap()
+            .contains("peer session keys are not installed"));
+        assert_eq!(core.metrics().dropped_peer_session_unavailable, 1);
+    }
+
+    #[test]
+    fn installed_peer_session_allows_packet_until_rekey_boundary() {
+        let mut core = test_core_requiring_peer_session();
+        core.install_peer_session(InstalledPeerSession {
+            peer_id: "peer-a".to_string(),
+            expires_at_unix: now_unix_seconds() + 60,
+            rekey_after_packets: 1,
+        });
+        let packet = test_ipv4_packet([100, 127, 0, 10]);
+
+        assert_eq!(
+            core.submit_tunnel_packet(2, &packet).unwrap(),
+            PacketDisposition::QueuedForTransport
+        );
+        assert!(core.pop_transport_frame().is_some());
+        assert_eq!(
+            core.submit_tunnel_packet(2, &packet).unwrap(),
+            PacketDisposition::DroppedPeerSessionUnavailable
+        );
+
+        assert!(core
+            .peer_session_error()
+            .unwrap()
+            .contains("requires rekey"));
+        assert_eq!(core.metrics().transport_frames_out, 1);
+        assert_eq!(core.metrics().dropped_peer_session_unavailable, 1);
+    }
+
+    #[test]
+    fn replayed_transport_frame_is_rejected() {
+        let packet = test_ipv4_packet([100, 127, 0, 10]);
+        let mut sender = test_core(SUITE_FIPS203);
+        sender.submit_tunnel_packet(2, &packet).unwrap();
+        let frame = sender.pop_transport_frame().unwrap();
+        let mut receiver = test_core(SUITE_FIPS203);
+
+        receiver.accept_transport_frame(&frame).unwrap();
+        let error = receiver.accept_transport_frame(&frame).unwrap_err();
+
+        assert!(error.to_string().contains("replayed transport frame"));
+        assert_eq!(receiver.metrics().transport_frames_in, 1);
+        assert_eq!(receiver.metrics().dropped_replay, 1);
     }
 
     fn test_core(suite: &str) -> PacketTunnelCore {
@@ -490,6 +652,21 @@ mod tests {
             crypto: Some(FfiCryptoPolicy {
                 suite: suite.to_string(),
             }),
+            require_peer_session: false,
+        })
+        .unwrap()
+    }
+
+    fn test_core_requiring_peer_session() -> PacketTunnelCore {
+        PacketTunnelCore::new(PacketTunnelCoreConfig {
+            protected_routes: vec!["100.127.0.0/16".to_string()],
+            excluded_routes: vec![],
+            route_mode: FfiRouteMode::SplitTunnel,
+            mtu: 1280,
+            crypto: Some(FfiCryptoPolicy {
+                suite: SUITE_FIPS203.to_string(),
+            }),
+            require_peer_session: true,
         })
         .unwrap()
     }

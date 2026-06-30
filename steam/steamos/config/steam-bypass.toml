@@ -1,0 +1,8 @@
+[policy]
+default_action = "bypass"
+protect_overlay_cidr = "100.64.0.0/10"
+protect_game_profile_routes = true
+full_tunnel_requires_explicit_underlay_exemptions = true
+
+[steam]
+bypass_categories = ["account", "store", "wallet", "checkout", "inventory", "marketplace", "launcher", "embedded_browser", "updates", "login"]

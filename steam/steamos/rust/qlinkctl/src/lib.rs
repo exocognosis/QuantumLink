@@ -1,11 +1,16 @@
-use qlink_proto::{ConnectionPhase, DaemonStatus, DataPlaneState, NetworkPlanState, RouteMode};
+use qlink_proto::{
+    load_peer_store_at, peer_store_path_from_state_dir, store_peer_store_at, ConnectionPhase,
+    DaemonStatus, DataPlaneState, InviteCode, MeshTrustMode, NetworkPlanState, PathKind, PeerStore,
+    RouteMode, StoredPeer,
+};
 
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::{
     io::{BufRead, BufReader, Write},
-    path::Path,
+    process::{Command, Stdio},
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -22,6 +27,187 @@ pub enum ControlError {
     Json(#[from] serde_json::Error),
     #[error("qlinkd returned an error: {0}")]
     Daemon(String),
+}
+
+pub const DEFAULT_STATE_DIR: &str = "/var/lib/quantumlink";
+
+#[derive(Debug, thiserror::Error)]
+pub enum PeerCommandError {
+    #[error("{0}")]
+    InviteDecode(#[from] qlink_proto::InviteDecodeError),
+    #[error("invite expired at {expires_at_unix}; current time is {now_unix}")]
+    ExpiredInvite { expires_at_unix: u64, now_unix: u64 },
+    #[error("unknown peer {0}")]
+    UnknownPeer(String),
+    #[error("{0}")]
+    Io(#[from] std::io::Error),
+    #[error("{0}")]
+    Json(#[from] serde_json::Error),
+}
+
+pub fn import_invite_to_store(
+    state_dir: &Path,
+    encoded_invite: &str,
+    now_unix: u64,
+) -> Result<StoredPeer, PeerCommandError> {
+    let invite = InviteCode::decode(encoded_invite)?;
+    if invite.expires_at_unix <= now_unix {
+        return Err(PeerCommandError::ExpiredInvite {
+            expires_at_unix: invite.expires_at_unix,
+            now_unix,
+        });
+    }
+
+    let peer = invite.stored_peer();
+    let mut store = load_peer_store_for_state_dir(state_dir)?;
+    store.upsert(peer.clone());
+    store_peer_store_at(state_dir, &store)?;
+    Ok(peer)
+}
+
+pub fn load_peer_store_for_state_dir(state_dir: &Path) -> Result<PeerStore, PeerCommandError> {
+    load_peer_store_at(peer_store_path_from_state_dir(state_dir)).map_err(Into::into)
+}
+
+pub fn remove_peer_from_store(state_dir: &Path, peer_id: &str) -> Result<(), PeerCommandError> {
+    let mut store = load_peer_store_for_state_dir(state_dir)?;
+    if !store.remove(peer_id) {
+        return Err(PeerCommandError::UnknownPeer(peer_id.to_string()));
+    }
+    store_peer_store_at(state_dir, &store)?;
+    Ok(())
+}
+
+pub fn revoke_peer_in_store(state_dir: &Path, peer_id: &str) -> Result<(), PeerCommandError> {
+    let mut store = load_peer_store_for_state_dir(state_dir)?;
+    if !store.revoke(peer_id) {
+        return Err(PeerCommandError::UnknownPeer(peer_id.to_string()));
+    }
+    store_peer_store_at(state_dir, &store)?;
+    Ok(())
+}
+
+pub fn peer_from_store(state_dir: &Path, peer_id: &str) -> Result<StoredPeer, PeerCommandError> {
+    load_peer_store_for_state_dir(state_dir)?
+        .peers
+        .into_iter()
+        .find(|peer| peer.peer_id == peer_id)
+        .ok_or_else(|| PeerCommandError::UnknownPeer(peer_id.to_string()))
+}
+
+pub fn format_peer_list(store: &PeerStore) -> Result<String, serde_json::Error> {
+    serde_json::to_string_pretty(&store.peers)
+}
+
+pub fn format_peer_trust(peer: &StoredPeer) -> String {
+    format!(
+        "peer: {peer_id}\n\
+         mesh: {mesh}\n\
+         mesh id: {mesh_id}\n\
+         trust source: {trust_source}\n\
+         dytallix: {dytallix}\n\
+         revoked: {revoked}\n\
+         expires: {expires}",
+        peer_id = peer.peer_id,
+        mesh = mesh_trust_mode_label(peer.trust_mode),
+        mesh_id = peer.mesh_id,
+        trust_source = peer.trust_source,
+        dytallix = dytallix_label(peer.trust_mode),
+        revoked = yes_no(peer.revoked),
+        expires = format_unix_utc(peer.expires_at_unix),
+    )
+}
+
+fn dytallix_label(mode: MeshTrustMode) -> &'static str {
+    match mode {
+        MeshTrustMode::PrivateFriends => "not required",
+        MeshTrustMode::PublicDytallixRequired => "required (not checked)",
+        MeshTrustMode::DevelopmentOptional => "optional development (not checked)",
+    }
+}
+
+fn mesh_trust_mode_label(mode: MeshTrustMode) -> &'static str {
+    match mode {
+        MeshTrustMode::PrivateFriends => "privateFriends",
+        MeshTrustMode::PublicDytallixRequired => "publicDytallixRequired",
+        MeshTrustMode::DevelopmentOptional => "developmentOptional",
+    }
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
+fn format_unix_utc(seconds: u64) -> String {
+    const SECONDS_PER_DAY: u64 = 86_400;
+    let days = (seconds / SECONDS_PER_DAY).min(i64::MAX as u64) as i64;
+    let seconds_of_day = seconds % SECONDS_PER_DAY;
+    let (year, month, day) = civil_from_unix_days(days);
+    let hour = seconds_of_day / 3_600;
+    let minute = (seconds_of_day % 3_600) / 60;
+    let second = seconds_of_day % 60;
+
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+fn civil_from_unix_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + if month <= 2 { 1 } else { 0 };
+
+    (year, month as u32, day as u32)
+}
+
+pub fn current_unix_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupportBundleReleaseInfo {
+    pub product: String,
+    pub version: String,
+    pub platform: String,
+}
+
+impl SupportBundleReleaseInfo {
+    pub fn current() -> Self {
+        Self {
+            product: "QuantumLink SteamOS".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            platform: std::env::consts::OS.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SupportBundleOptions {
+    pub output: PathBuf,
+    pub status: DaemonStatus,
+    pub release_info: SupportBundleReleaseInfo,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RedactionReport {
+    pub private_key_material: usize,
+    pub wallet_seed_material: usize,
+    pub entitlement_tokens: usize,
+    pub exact_peer_endpoints: usize,
+    pub raw_packet_payloads: usize,
 }
 
 #[cfg(unix)]
@@ -119,6 +305,9 @@ pub fn format_doctor(status: &DaemonStatus) -> String {
          data-plane interface: {data_plane_interface}\n\
          packet I/O: {packet_io}\n\
          transport ready: {transport_ready}\n\
+         transport path: {transport_path}\n\
+         peer session: {peer_session}\n\
+         last transport error: {last_transport_error}\n\
          packet counters: observed={observed_packets} queued={queued_packets} dropped={dropped_packets} emitted={emitted_packets} accepted={accepted_packets} rejected={rejected_packets} transportErrors={transport_errors}\n\
          data-plane error: {data_plane_error}",
         kill_switch = if status.kill_switch {
@@ -143,6 +332,19 @@ pub fn format_doctor(status: &DaemonStatus) -> String {
         } else {
             "no"
         },
+        transport_path = data_plane
+            .transport_path
+            .map(path_kind_label)
+            .unwrap_or("unknown"),
+        peer_session = if data_plane.peer_session_ready {
+            "ready"
+        } else {
+            "not ready"
+        },
+        last_transport_error = data_plane
+            .last_transport_error
+            .as_deref()
+            .unwrap_or("none"),
         observed_packets = data_plane.metrics.observed_packets,
         queued_packets = data_plane.metrics.queued_packets,
         dropped_packets = data_plane.metrics.dropped_packets,
@@ -152,6 +354,263 @@ pub fn format_doctor(status: &DaemonStatus) -> String {
         transport_errors = data_plane.metrics.transport_errors,
         data_plane_error = data_plane.error.as_deref().unwrap_or("none"),
     )
+}
+
+#[cfg(unix)]
+pub fn write_support_bundle(options: SupportBundleOptions) -> std::io::Result<()> {
+    let staging_dir = unique_support_bundle_staging_dir();
+    std::fs::create_dir_all(&staging_dir)?;
+
+    let result = (|| {
+        let mut report = RedactionReport::default();
+        let status_json = serde_json::to_string_pretty(&options.status).map_err(json_to_io)?;
+        write_bundle_file(
+            &staging_dir,
+            "status.json",
+            &redact_diagnostic_text(&status_json, &mut report),
+        )?;
+        write_bundle_file(
+            &staging_dir,
+            "doctor.txt",
+            &redact_diagnostic_text(&format_doctor(&options.status), &mut report),
+        )?;
+        write_bundle_file(
+            &staging_dir,
+            "network-plan.txt",
+            &redact_diagnostic_text(&plan_text(&options.status.network.commands), &mut report),
+        )?;
+        write_bundle_file(
+            &staging_dir,
+            "nftables-plan.txt",
+            &redact_diagnostic_text(
+                &plan_text(&options.status.network.nftables_rules),
+                &mut report,
+            ),
+        )?;
+        let release_info = serde_json::json!({
+            "product": options.release_info.product,
+            "version": options.release_info.version,
+            "platform": options.release_info.platform,
+        });
+        write_bundle_file(
+            &staging_dir,
+            "release-info.json",
+            &redact_diagnostic_text(
+                &serde_json::to_string_pretty(&release_info).map_err(json_to_io)?,
+                &mut report,
+            ),
+        )?;
+        write_bundle_file(
+            &staging_dir,
+            "redaction-report.json",
+            &serde_json::to_string_pretty(&report).map_err(json_to_io)?,
+        )?;
+
+        if let Some(parent) = options.output.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        archive_staging_dir(&staging_dir, &options.output)
+    })();
+
+    let cleanup = std::fs::remove_dir_all(&staging_dir);
+    match (result, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+    }
+}
+
+#[cfg(not(unix))]
+pub fn write_support_bundle(_options: SupportBundleOptions) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "support bundles are only supported on Unix-like SteamOS hosts",
+    ))
+}
+
+fn json_to_io(error: serde_json::Error) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+}
+
+fn write_bundle_file(staging_dir: &Path, name: &str, contents: &str) -> std::io::Result<()> {
+    std::fs::write(staging_dir.join(name), contents)
+}
+
+fn plan_text(lines: &[String]) -> String {
+    if lines.is_empty() {
+        "none\n".to_string()
+    } else {
+        format!("{}\n", lines.join("\n"))
+    }
+}
+
+#[cfg(unix)]
+fn unique_support_bundle_staging_dir() -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "qlinkctl-support-bundle-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ))
+}
+
+#[cfg(unix)]
+fn archive_staging_dir(staging_dir: &Path, output: &Path) -> std::io::Result<()> {
+    let entries = [
+        "status.json",
+        "doctor.txt",
+        "network-plan.txt",
+        "nftables-plan.txt",
+        "release-info.json",
+        "redaction-report.json",
+    ];
+    let mut tar = Command::new("tar")
+        .arg("-C")
+        .arg(staging_dir)
+        .arg("-cf")
+        .arg("-")
+        .args(entries)
+        .stdout(Stdio::piped())
+        .spawn()?;
+    let tar_stdout = tar
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("failed to capture tar stdout"))?;
+    let mut zstd = Command::new("zstd")
+        .arg("-q")
+        .arg("-f")
+        .arg("-o")
+        .arg(output)
+        .arg("-")
+        .stdin(Stdio::from(tar_stdout))
+        .spawn()?;
+    let zstd_status = zstd.wait()?;
+    let tar_status = tar.wait()?;
+
+    if !tar_status.success() {
+        return Err(std::io::Error::other(format!(
+            "tar failed with status {tar_status}"
+        )));
+    }
+    if !zstd_status.success() {
+        return Err(std::io::Error::other(format!(
+            "zstd failed with status {zstd_status}"
+        )));
+    }
+    Ok(())
+}
+
+fn redact_diagnostic_text(input: &str, report: &mut RedactionReport) -> String {
+    let mut redacted = input.to_string();
+    redacted = replace_counted(
+        &redacted,
+        "PRIVATE_KEY_MATERIAL",
+        "[REDACTED-SECRET]",
+        &mut report.private_key_material,
+    );
+    redacted = replace_counted(
+        &redacted,
+        "private key",
+        "[REDACTED-SECRET]",
+        &mut report.private_key_material,
+    );
+    redacted = replace_counted(
+        &redacted,
+        "wallet seed phrase",
+        "[REDACTED-SECRET]",
+        &mut report.wallet_seed_material,
+    );
+    redacted = replace_counted(
+        &redacted,
+        "wallet seed",
+        "[REDACTED-SECRET]",
+        &mut report.wallet_seed_material,
+    );
+    redacted = replace_counted(
+        &redacted,
+        "entitlement_token=secret",
+        "entitlement_token=[REDACTED-SECRET]",
+        &mut report.entitlement_tokens,
+    );
+    redacted = replace_counted(
+        &redacted,
+        "raw_packet_payload",
+        "[REDACTED-RAW-PACKET-PAYLOAD]",
+        &mut report.raw_packet_payloads,
+    );
+    redact_ipv4_socket_endpoints(&redacted, report)
+}
+
+fn replace_counted(input: &str, needle: &str, replacement: &str, count: &mut usize) -> String {
+    let matches = input.matches(needle).count();
+    *count += matches;
+    input.replace(needle, replacement)
+}
+
+fn redact_ipv4_socket_endpoints(input: &str, report: &mut RedactionReport) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut index = 0;
+    while index < input.len() {
+        if let Some(end) = ipv4_socket_endpoint_end(input, index) {
+            output.push_str("[REDACTED-ENDPOINT]");
+            report.exact_peer_endpoints += 1;
+            index = end;
+        } else {
+            let ch = input[index..]
+                .chars()
+                .next()
+                .expect("index is on a char boundary");
+            output.push(ch);
+            index += ch.len_utf8();
+        }
+    }
+    output
+}
+
+fn ipv4_socket_endpoint_end(input: &str, start: usize) -> Option<usize> {
+    let bytes = input.as_bytes();
+    if start > 0 && bytes[start - 1].is_ascii_digit() {
+        return None;
+    }
+
+    let mut index = start;
+    for octet_index in 0..4 {
+        let octet_start = index;
+        while index < bytes.len() && bytes[index].is_ascii_digit() {
+            index += 1;
+        }
+        if octet_start == index || index - octet_start > 3 {
+            return None;
+        }
+        let octet = input[octet_start..index].parse::<u16>().ok()?;
+        if octet > 255 {
+            return None;
+        }
+        if octet_index < 3 {
+            if bytes.get(index).copied() != Some(b'.') {
+                return None;
+            }
+            index += 1;
+        }
+    }
+
+    if bytes.get(index).copied() != Some(b':') {
+        return None;
+    }
+    index += 1;
+    let port_start = index;
+    while index < bytes.len() && bytes[index].is_ascii_digit() {
+        index += 1;
+    }
+    if port_start == index {
+        return None;
+    }
+    if index < bytes.len() && bytes[index].is_ascii_digit() {
+        return None;
+    }
+    Some(index)
 }
 
 fn phase_label(phase: ConnectionPhase) -> &'static str {
@@ -204,6 +663,15 @@ fn route_mode_label(route_mode: RouteMode) -> &'static str {
     }
 }
 
+fn path_kind_label(path: PathKind) -> &'static str {
+    match path {
+        PathKind::Direct => "direct",
+        PathKind::Relay => "relay",
+        PathKind::Probing => "probing",
+        PathKind::Unavailable => "unavailable",
+    }
+}
+
 fn parse_status_response(line: &str) -> Result<DaemonStatus, ControlError> {
     let value = serde_json::from_str::<serde_json::Value>(line)?;
     if value.get("type").and_then(serde_json::Value::as_str) == Some("error") {
@@ -221,10 +689,9 @@ fn parse_status_response(line: &str) -> Result<DaemonStatus, ControlError> {
 mod tests {
     use super::*;
     use qlink_proto::{
-        DataPlaneState, DataPlaneStatus, NetworkPlanState, NetworkStatus, PacketPumpMetrics,
-        RouteMode,
+        DataPlaneState, DataPlaneStatus, InviteCode, MeshTrustMode, NetworkPlanState,
+        NetworkStatus, PacketPumpMetrics, RouteMode, StoredPeer,
     };
-    #[cfg(unix)]
     use std::path::PathBuf;
 
     fn status_with_network(
@@ -272,10 +739,104 @@ mod tests {
             state,
             packet_io_available,
             transport_ready,
+            transport_path: if transport_ready {
+                Some(PathKind::Direct)
+            } else {
+                Some(PathKind::Unavailable)
+            },
+            peer_session_ready: transport_ready,
+            last_transport_error: None,
             metrics: packet_pump_metrics(),
             error: error.map(str::to_string),
         };
         status
+    }
+
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos()
+        ))
+    }
+
+    fn peer_fixture() -> StoredPeer {
+        StoredPeer {
+            peer_id: "peer-host-deck".to_string(),
+            alias: "Host Deck".to_string(),
+            mesh_id: "mesh-steam-squad".to_string(),
+            party_id: "party-nightly".to_string(),
+            trust_mode: MeshTrustMode::PublicDytallixRequired,
+            trust_source: "invite".to_string(),
+            revoked: false,
+            expires_at_unix: 4_102_444_800,
+        }
+    }
+
+    #[test]
+    fn import_invite_to_store_persists_peer_metadata() {
+        let state_dir = unique_temp_dir("qlinkctl-peer-import");
+        let invite = InviteCode {
+            mesh_id: "mesh-steam-squad".to_string(),
+            party_id: "party-nightly".to_string(),
+            rendezvous: vec!["203.0.113.10:9471".to_string()],
+            relay: vec!["198.51.100.15:9472".to_string()],
+            host_peer_id: "peer-host-deck".to_string(),
+            host_alias: "Host Deck".to_string(),
+            trust_mode: MeshTrustMode::PublicDytallixRequired,
+            trust_source: "invite".to_string(),
+            expires_at_unix: 4_102_444_800,
+        }
+        .encode()
+        .unwrap();
+
+        let peer = import_invite_to_store(&state_dir, &invite, 1_767_139_200).unwrap();
+
+        assert_eq!(peer.peer_id, "peer-host-deck");
+        assert_eq!(peer.trust_mode, MeshTrustMode::PublicDytallixRequired);
+        let store = load_peer_store_for_state_dir(&state_dir).unwrap();
+        assert_eq!(store.peers.len(), 1);
+        let raw = std::fs::read_to_string(peer_store_path_from_state_dir(&state_dir)).unwrap();
+        assert!(!raw.contains("203.0.113.10"));
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn peer_trust_output_has_required_shape() {
+        let output = format_peer_trust(&peer_fixture());
+
+        assert!(output.contains("peer: peer-host-deck"));
+        assert!(output.contains("mesh: publicDytallixRequired"));
+        assert!(output.contains("mesh id: mesh-steam-squad"));
+        assert!(output.contains("trust source: invite"));
+        assert!(output.contains("dytallix: required (not checked)"));
+        assert!(output.contains("revoked: no"));
+        assert!(output.contains("expires: 2100-01-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn peer_store_remove_and_revoke_commands_mutate_store() {
+        let state_dir = unique_temp_dir("qlinkctl-peer-mutate");
+        let mut store = PeerStore::default();
+        store.upsert(peer_fixture());
+        store_peer_store_at(&state_dir, &store).unwrap();
+
+        revoke_peer_in_store(&state_dir, "peer-host-deck").unwrap();
+        assert!(
+            peer_from_store(&state_dir, "peer-host-deck")
+                .unwrap()
+                .revoked
+        );
+
+        remove_peer_from_store(&state_dir, "peer-host-deck").unwrap();
+        assert!(matches!(
+            peer_from_store(&state_dir, "peer-host-deck").unwrap_err(),
+            PeerCommandError::UnknownPeer(_)
+        ));
+        let _ = std::fs::remove_dir_all(state_dir);
     }
 
     #[cfg(unix)]
@@ -330,6 +891,9 @@ mod tests {
              data-plane interface: unknown\n\
              packet I/O: unavailable\n\
              transport ready: no\n\
+             transport path: unknown\n\
+             peer session: not ready\n\
+             last transport error: none\n\
              packet counters: observed=0 queued=0 dropped=0 emitted=0 accepted=0 rejected=0 transportErrors=0\n\
              data-plane error: none"
         );
@@ -434,6 +998,8 @@ mod tests {
         assert!(doctor.contains("data-plane state: notStarted"));
         assert!(doctor.contains("packet I/O: unavailable"));
         assert!(doctor.contains("transport ready: no"));
+        assert!(doctor.contains("transport path: unknown"));
+        assert!(doctor.contains("peer session: not ready"));
         assert!(doctor.contains("packet counters: observed=0 queued=0 dropped=0 emitted=0 accepted=0 rejected=0 transportErrors=0"));
     }
 
@@ -447,6 +1013,8 @@ mod tests {
         assert!(doctor.contains("data-plane interface: qlink0"));
         assert!(doctor.contains("packet I/O: available"));
         assert!(doctor.contains("transport ready: no"));
+        assert!(doctor.contains("transport path: unavailable"));
+        assert!(doctor.contains("peer session: not ready"));
         assert!(doctor.contains("packet counters: observed=18 queued=17 dropped=1 emitted=16 accepted=15 rejected=2 transportErrors=1"));
         assert!(!doctor.contains("peer transport ready"));
     }
@@ -464,6 +1032,7 @@ mod tests {
         assert!(doctor.contains("verdict: FAIL - data plane failed: packet pump stopped"));
         assert!(doctor.contains("data-plane state: failed"));
         assert!(doctor.contains("data-plane error: packet pump stopped"));
+        assert!(doctor.contains("last transport error: none"));
     }
 
     #[test]
@@ -479,6 +1048,7 @@ mod tests {
         assert!(doctor.contains("verdict: WARN - data plane degraded: transport backpressure"));
         assert!(doctor.contains("data-plane state: degraded"));
         assert!(doctor.contains("transport ready: no"));
+        assert!(doctor.contains("transport path: unavailable"));
     }
 
     #[test]

@@ -59,6 +59,23 @@ pub enum RegistryDecision {
     AcceptedWithoutRegistryDevelopment,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DytallixPolicyStatus {
+    Active,
+    Missing,
+    Revoked,
+    Suspended,
+    Mismatched,
+    Stale,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DytallixPolicyDecision {
+    pub accepted: bool,
+    pub warning: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct DytallixRegistryLookupConfig {
@@ -328,6 +345,38 @@ pub fn verify_registry_binding(
     Ok(RegistryDecision::Accepted)
 }
 
+pub fn evaluate_dytallix_policy_status(
+    policy: MeshTrustPolicy,
+    status: DytallixPolicyStatus,
+    explicitly_requires_verification: bool,
+) -> Result<DytallixPolicyDecision> {
+    if status == DytallixPolicyStatus::Active {
+        return Ok(DytallixPolicyDecision {
+            accepted: true,
+            warning: None,
+        });
+    }
+
+    if status == DytallixPolicyStatus::Unavailable
+        && !explicitly_requires_verification
+        && policy != MeshTrustPolicy::PublicRequired
+    {
+        return Ok(DytallixPolicyDecision {
+            accepted: true,
+            warning: Some(
+                "Dytallix registry unavailable; continuing under private/development trust policy"
+                    .to_string(),
+            ),
+        });
+    }
+
+    Err(QlinkError::Protocol(format!(
+        "active Dytallix registry record required by {}: {}",
+        mesh_trust_policy_label(policy),
+        dytallix_policy_status_label(status)
+    )))
+}
+
 pub fn verify_inbound_registry_assertion(
     assertion: &InboundIdentityAssertion,
     registry_record: Option<&RegistryNodeRecord>,
@@ -379,6 +428,26 @@ pub fn verify_inbound_registry_assertion(
     )?;
 
     Ok(RegistryDecision::Accepted)
+}
+
+fn mesh_trust_policy_label(policy: MeshTrustPolicy) -> &'static str {
+    match policy {
+        MeshTrustPolicy::PublicRequired => "public mesh policy",
+        MeshTrustPolicy::PrivatePreferred => "private mesh policy",
+        MeshTrustPolicy::DevelopmentOptional => "development mesh policy",
+    }
+}
+
+fn dytallix_policy_status_label(status: DytallixPolicyStatus) -> &'static str {
+    match status {
+        DytallixPolicyStatus::Active => "active",
+        DytallixPolicyStatus::Missing => "missing",
+        DytallixPolicyStatus::Revoked => "revoked",
+        DytallixPolicyStatus::Suspended => "suspended",
+        DytallixPolicyStatus::Mismatched => "mismatched",
+        DytallixPolicyStatus::Stale => "stale",
+        DytallixPolicyStatus::Unavailable => "registry unavailable",
+    }
 }
 
 pub fn device_public_key_hash_hex(peer_record: &PeerRecord) -> Result<String> {
@@ -1647,6 +1716,74 @@ mod tests {
         .unwrap();
 
         assert_eq!(decision, RegistryDecision::Accepted);
+    }
+
+    #[test]
+    fn policy_status_helper_accepts_active_registry_status() {
+        let decision = evaluate_dytallix_policy_status(
+            MeshTrustPolicy::PublicRequired,
+            DytallixPolicyStatus::Active,
+            false,
+        )
+        .unwrap();
+
+        assert!(decision.accepted);
+        assert!(decision.warning.is_none());
+    }
+
+    #[test]
+    fn policy_status_helper_warns_for_private_registry_unavailable() {
+        let decision = evaluate_dytallix_policy_status(
+            MeshTrustPolicy::PrivatePreferred,
+            DytallixPolicyStatus::Unavailable,
+            false,
+        )
+        .unwrap();
+
+        assert!(decision.accepted);
+        assert!(decision.warning.unwrap().contains("registry unavailable"));
+    }
+
+    #[test]
+    fn policy_status_helper_rejects_public_or_explicit_verification_gaps() {
+        let public_missing = evaluate_dytallix_policy_status(
+            MeshTrustPolicy::PublicRequired,
+            DytallixPolicyStatus::Missing,
+            false,
+        )
+        .unwrap_err();
+        assert!(public_missing.to_string().contains("public mesh policy"));
+        assert!(public_missing.to_string().contains("missing"));
+
+        let private_unavailable_required = evaluate_dytallix_policy_status(
+            MeshTrustPolicy::PrivatePreferred,
+            DytallixPolicyStatus::Unavailable,
+            true,
+        )
+        .unwrap_err();
+        assert!(private_unavailable_required
+            .to_string()
+            .contains("private mesh policy"));
+        assert!(private_unavailable_required
+            .to_string()
+            .contains("registry unavailable"));
+    }
+
+    #[test]
+    fn policy_status_helper_rejects_non_active_registry_results() {
+        for status in [
+            DytallixPolicyStatus::Missing,
+            DytallixPolicyStatus::Revoked,
+            DytallixPolicyStatus::Suspended,
+            DytallixPolicyStatus::Mismatched,
+            DytallixPolicyStatus::Stale,
+        ] {
+            let err =
+                evaluate_dytallix_policy_status(MeshTrustPolicy::PrivatePreferred, status, false)
+                    .unwrap_err();
+
+            assert!(err.to_string().contains("active Dytallix"));
+        }
     }
 
     #[test]

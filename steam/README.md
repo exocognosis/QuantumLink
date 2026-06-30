@@ -8,7 +8,7 @@ Steam-specific work belongs here. The shared handshake, packet framing, peer rec
 
 | Runtime | Path | Status | Notes |
 | --- | --- | --- | --- |
-| SteamOS/Linux | `steam/steamos` | Daemon scaffold | `qlinkd`, `qlinkctl`, Linux route/nftables planning, systemd packaging, game profiles. |
+| SteamOS/Linux | `steam/steamos` | Pre-production daemon scaffold | `qlinkd`, `qlinkctl`, Linux route/nftables planning, systemd packaging, game profiles. |
 | Steam desktop | `steam/desktop` | Planned | Steam-safe desktop policy and game-aware routing on the desktop tunnel runtime. |
 | Mobile companion | `steam/mobile` | Planned | Pairing, status, diagnostics, and remote control concepts for party sessions. |
 
@@ -22,3 +22,7 @@ sudo ./steam/steamos/scripts/install-steamos.sh
 ```
 
 See `steam/steamos/README.md` for installation details and `steam/steamos/docs/architecture.md` for the daemon architecture.
+
+Production readiness is tracked in `steam/steamos/docs/production-readiness.md`.
+SteamOS remains pre-production until live transport, signed release, Steam-safe
+routing, and Deck validation gates pass.
