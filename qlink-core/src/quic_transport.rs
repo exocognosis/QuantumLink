@@ -322,6 +322,7 @@ mod tests {
             route_mode: FfiRouteMode::SplitTunnel,
             mtu: 1280,
             crypto: None,
+            require_peer_session: false,
         })
         .unwrap()
     }
