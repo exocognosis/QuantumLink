@@ -25,6 +25,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Enter MSVC developer environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
       - name: Check Windows host prerequisites
         shell: pwsh
         run: |
