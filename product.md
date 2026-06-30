@@ -182,9 +182,13 @@ Production gaps include:
 - Developer ID signing, notarization, stapling, and Gatekeeper validation.
 - Wiring live rendezvous publication and direct probing to the native UDP
   carrier.
+- Full ICE/STUN/TURN candidate gathering and nomination for direct and relay
+  path selection.
 - Hardened public rendezvous and relay infrastructure.
-- Signed update pipeline with a post-quantum manifest layer.
-- Real Dytallix contract/client integration for public identity enforcement.
+- Signed Sparkle/platform update pipeline paired with a post-quantum release
+  manifest layer.
+- Production Dytallix mainnet or hardened registry trust root for public
+  identity enforcement.
 - Real-hardware, multi-platform release validation.
 
 ## On-chain identity verification
