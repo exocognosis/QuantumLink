@@ -111,6 +111,7 @@ install_payload_file "$STEAMOS_ROOT/packaging/systemd/qlinkd.service.d/activate-
     "$PAYLOAD_ROOT/packaging/systemd/qlinkd.service.d/activate-network.conf.sample" 0644
 
 install -d -m 0755 "$PAYLOAD_ROOT/config/games" "$PAYLOAD_ROOT/docs"
+install_payload_file "$STEAMOS_ROOT/config/steam-bypass.toml" "$PAYLOAD_ROOT/config/steam-bypass.toml" 0644
 for profile in "$STEAMOS_ROOT"/config/games/*.toml; do
     install_payload_file "$profile" "$PAYLOAD_ROOT/config/games/$(basename "$profile")" 0644
 done
@@ -133,7 +134,7 @@ cat > "$PAYLOAD_ROOT/config/config.example.json" <<'JSON'
 }
 JSON
 
-for doc in README.md docs/production-readiness.md docs/rendezvous-relay-production.md docs/release-runbook.md; do
+for doc in README.md docs/deck-validation.md docs/production-readiness.md docs/rendezvous-relay-production.md docs/release-runbook.md; do
     if [ -f "$STEAMOS_ROOT/$doc" ]; then
         install_payload_file "$STEAMOS_ROOT/$doc" "$PAYLOAD_ROOT/$doc" 0644
     fi
@@ -186,7 +187,6 @@ PY
 
 SIG_ARTIFACT=""
 SIG_ALGORITHM="sha256-dev-attestation"
-SIG_PRODUCTION_READY="false"
 if [ "$SIGNING_MODE" = "production" ]; then
     SIG_ALGORITHM="openssl-ed25519-raw"
     SIG_ARTIFACT="$PACKAGE_NAME.tar.zst.sig"
@@ -199,7 +199,6 @@ if [ "$SIGNING_MODE" = "production" ]; then
         echo "production signing requested but no QLINK_STEAMOS_SIGNATURE_FILE or QLINK_STEAMOS_RELEASE_PRIVATE_KEY was provided" >&2
         exit 1
     fi
-    SIG_PRODUCTION_READY="true"
 else
     SIG_ARTIFACT="$PACKAGE_NAME.tar.zst.dev.sig"
     {
@@ -219,7 +218,6 @@ PLATFORM="$PLATFORM" \
 SIGNING_MODE="$SIGNING_MODE" \
 SIG_ARTIFACT="$SIG_ARTIFACT" \
 SIG_ALGORITHM="$SIG_ALGORITHM" \
-SIG_PRODUCTION_READY="$SIG_PRODUCTION_READY" \
 SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
 python3 - <<'PY'
 import json
@@ -260,7 +258,9 @@ manifest = {
         "mode": os.environ["SIGNING_MODE"],
         "algorithm": os.environ["SIG_ALGORITHM"],
         "artifact": os.environ["SIG_ARTIFACT"],
-        "productionReady": os.environ["SIG_PRODUCTION_READY"] == "true",
+        "productionMode": os.environ["SIGNING_MODE"] == "production",
+        "signatureProvided": True,
+        "covers": [os.path.basename(archive_path)],
         "validatedBy": "steam/steamos/scripts/verify-steamos-release.sh",
     },
 }

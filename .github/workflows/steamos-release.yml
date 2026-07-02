@@ -40,9 +40,16 @@ jobs:
         run: |
           bash -n steam/steamos/scripts/package-steamos.sh
           bash -n steam/steamos/scripts/verify-steamos-release.sh
+          bash -n steam/steamos/tests/deck-validation.sh
+          bash -n steam/steamos/tests/deck-validation-test.sh
+          bash -n steam/steamos/tests/verify-deck-evidence.sh
+          bash -n steam/steamos/tests/verify-steamos-release-test.sh
 
       - name: SteamOS install/package smoke test
-        run: bash steam/steamos/tests/install-steamos-test.sh
+        run: |
+          bash steam/steamos/tests/deck-validation-test.sh
+          bash steam/steamos/tests/verify-steamos-release-test.sh
+          bash steam/steamos/tests/install-steamos-test.sh
 
       - name: Rust tests
         run: cargo test -p qlinkd -p qlinkctl -p qlink-linux -p qlink-proto -p qlink-game
@@ -151,7 +158,7 @@ jobs:
 
       - name: Verify release artifact
         env:
-          QLINK_STEAMOS_REQUIRE_PRODUCTION_READY: ${{ startsWith(github.ref, 'refs/tags/v') && '1' || '0' }}
+          QLINK_STEAMOS_REQUIRE_PRODUCTION_READY: ${{ (startsWith(github.ref, 'refs/tags/v') || inputs.signing_mode == 'production') && '1' || '0' }}
         run: |
           set -euo pipefail
           archive="$(find dist/steamos -maxdepth 1 -name 'quantumlink-steamos-*.tar.zst' | sort | head -n 1)"
@@ -163,7 +170,7 @@ jobs:
           report="${archive%.tar.zst}/verify-report.json"
           jq -e '.valid == true' "$report"
           if [ "${QLINK_STEAMOS_REQUIRE_PRODUCTION_READY}" = "1" ]; then
-            jq -e '.notProductionReady == false' "$report"
+            jq -e '.productionReady == true and .notProductionReady == false and .signatureValidated == true' "$report"
           fi
 
       - name: Upload verification report
@@ -185,6 +192,23 @@ jobs:
         with:
           name: steamos-release-package
           path: dist/steamos
+
+      - name: Download final verification report
+        uses: actions/download-artifact@v4
+        with:
+          name: steamos-release-verification
+          path: final-verification
+
+      - name: Replace package report with final verification report
+        run: |
+          set -euo pipefail
+          final_report="$(find final-verification -name verify-report.json | sort | head -n 1)"
+          package_report="$(find dist/steamos -path '*/verify-report.json' | sort | head -n 1)"
+          if [ -z "$final_report" ] || [ -z "$package_report" ]; then
+            echo "final or package verify-report.json not found" >&2
+            exit 1
+          fi
+          cp "$final_report" "$package_report"
 
       - name: Upload verified artifacts
         uses: actions/upload-artifact@v4
