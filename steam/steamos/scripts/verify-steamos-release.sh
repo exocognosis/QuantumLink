@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ARCHIVE="${1:-}"
 VERIFY_REPORT="${VERIFY_REPORT:-}"
 REQUIRE_PRODUCTION_READY="${QLINK_STEAMOS_REQUIRE_PRODUCTION_READY:-0}"
 PUBLIC_KEY_FILE="${QLINK_STEAMOS_RELEASE_PUBLIC_KEY:-}"
+PRODUCTION_EVIDENCE_MANIFEST="${QLINK_STEAMOS_PRODUCTION_EVIDENCE_MANIFEST:-${QLINK_STEAMOS_PRODUCTION_EVIDENCE:-}}"
 
 failures=""
 warnings=""
@@ -14,6 +16,10 @@ SIGNATURE_ALGORITHM=""
 SIGNATURE_ARTIFACT=""
 SIGNATURE_COVERS_ARCHIVE="false"
 SIGNATURE_VALIDATED=0
+NON_HARDWARE_PRODUCTION_READY=0
+PRODUCTION_EVIDENCE_VALIDATED=0
+PRODUCTION_EVIDENCE_REQUIRED=0
+PRODUCTION_EVIDENCE_MANIFEST_SHA256=""
 MANIFEST_SHA256=""
 CHECKSUM_ENTRIES=""
 MANIFEST_ARTIFACTS=""
@@ -64,6 +70,11 @@ json_report() {
     SIGNATURE_ALGORITHM="$SIGNATURE_ALGORITHM" \
     SIGNATURE_ARTIFACT="$SIGNATURE_ARTIFACT" \
     SIGNATURE_VALIDATED="$SIGNATURE_VALIDATED" \
+    NON_HARDWARE_PRODUCTION_READY="$NON_HARDWARE_PRODUCTION_READY" \
+    PRODUCTION_EVIDENCE_MANIFEST="$PRODUCTION_EVIDENCE_MANIFEST" \
+    PRODUCTION_EVIDENCE_VALIDATED="$PRODUCTION_EVIDENCE_VALIDATED" \
+    PRODUCTION_EVIDENCE_REQUIRED="$PRODUCTION_EVIDENCE_REQUIRED" \
+    PRODUCTION_EVIDENCE_MANIFEST_SHA256="$PRODUCTION_EVIDENCE_MANIFEST_SHA256" \
     MANIFEST_SHA256="$MANIFEST_SHA256" \
     ARCHIVE="$ARCHIVE" \
     python3 - <<'PY'
@@ -76,16 +87,25 @@ def lines(value):
 failures = lines(os.environ["FAILURES"])
 warnings = lines(os.environ["WARNINGS"])
 not_ready = os.environ["NOT_PRODUCTION_READY"] == "1"
+non_hardware_ready = os.environ["NON_HARDWARE_PRODUCTION_READY"] == "1"
 report = {
     "archive": os.environ["ARCHIVE"],
     "valid": not failures,
-    "productionReady": not failures and not not_ready,
-    "notProductionReady": bool(failures) or not_ready,
+    "productionReady": False,
+    "notProductionReady": True,
+    "nonHardwareProductionReady": not failures and non_hardware_ready,
     "requireProductionReady": os.environ["REQUIRE_PRODUCTION_READY"] == "1",
     "signatureMode": os.environ["SIGNATURE_MODE"],
     "signatureAlgorithm": os.environ["SIGNATURE_ALGORITHM"],
     "signatureArtifact": os.environ["SIGNATURE_ARTIFACT"],
     "signatureValidated": os.environ["SIGNATURE_VALIDATED"] == "1",
+    "productionEvidenceManifest": os.environ["PRODUCTION_EVIDENCE_MANIFEST"],
+    "productionEvidenceManifestSha256": os.environ["PRODUCTION_EVIDENCE_MANIFEST_SHA256"],
+    "productionEvidenceValidated": os.environ["PRODUCTION_EVIDENCE_VALIDATED"] == "1",
+    "nonHardwareProductionEvidenceManifest": os.environ["PRODUCTION_EVIDENCE_MANIFEST"],
+    "nonHardwareProductionEvidenceManifestSha256": os.environ["PRODUCTION_EVIDENCE_MANIFEST_SHA256"],
+    "nonHardwareProductionEvidenceRequired": os.environ["PRODUCTION_EVIDENCE_REQUIRED"] == "1",
+    "nonHardwareProductionEvidenceValidated": os.environ["PRODUCTION_EVIDENCE_VALIDATED"] == "1",
     "manifestSha256": os.environ["MANIFEST_SHA256"],
     "failures": failures,
     "warnings": warnings,
@@ -106,8 +126,15 @@ ARCHIVE="$(cd "$(dirname "$ARCHIVE")" && pwd -P)/$(basename "$ARCHIVE")"
 ARCHIVE_BASENAME="$(basename "$ARCHIVE")"
 PACKAGE_NAME="${ARCHIVE_BASENAME%.tar.zst}"
 SIDECAR_DIR="$(dirname "$ARCHIVE")/$PACKAGE_NAME"
+PACKAGED_PRODUCTION_EVIDENCE_MANIFEST="$SIDECAR_DIR/production-evidence-manifest.json"
 if [ -z "$VERIFY_REPORT" ]; then
     VERIFY_REPORT="$SIDECAR_DIR/verify-report.json"
+fi
+if [ -f "$PACKAGED_PRODUCTION_EVIDENCE_MANIFEST" ]; then
+    PRODUCTION_EVIDENCE_MANIFEST="$PACKAGED_PRODUCTION_EVIDENCE_MANIFEST"
+fi
+if [ "$REQUIRE_PRODUCTION_READY" = "1" ]; then
+    PRODUCTION_EVIDENCE_REQUIRED=1
 fi
 
 need_cmd tar || true
@@ -312,6 +339,10 @@ if [ -n "$SIGNATURE_ARTIFACT" ]; then
     required_checksum_entries="${required_checksum_entries}
 $SIGNATURE_ARTIFACT"
 fi
+if [ -f "$PACKAGED_PRODUCTION_EVIDENCE_MANIFEST" ] || [ "$SIGNATURE_MODE" = "production" ] || [ "$REQUIRE_PRODUCTION_READY" = "1" ]; then
+    required_checksum_entries="${required_checksum_entries}
+production-evidence-manifest.json"
+fi
 while IFS= read -r required_name; do
     [ -n "$required_name" ] || continue
     if ! line_has_name "$CHECKSUM_ENTRIES" "$required_name"; then
@@ -326,6 +357,10 @@ SBOM.spdx.json"
 if [ -n "$SIGNATURE_ARTIFACT" ]; then
     required_manifest_artifacts="${required_manifest_artifacts}
 $SIGNATURE_ARTIFACT"
+fi
+if [ -f "$PACKAGED_PRODUCTION_EVIDENCE_MANIFEST" ] || [ "$SIGNATURE_MODE" = "production" ] || [ "$REQUIRE_PRODUCTION_READY" = "1" ]; then
+    required_manifest_artifacts="${required_manifest_artifacts}
+production-evidence-manifest.json"
 fi
 while IFS= read -r required_name; do
     [ -n "$required_name" ] || continue
@@ -355,6 +390,86 @@ else
     else
         SIGNATURE_VALIDATED=1
     fi
+fi
+
+if [ "$SIGNATURE_MODE" = "production" ] || [ "$REQUIRE_PRODUCTION_READY" = "1" ]; then
+    PRODUCTION_EVIDENCE_REQUIRED=1
+fi
+
+if [ -n "$PRODUCTION_EVIDENCE_MANIFEST" ]; then
+    if [ "$PRODUCTION_EVIDENCE_REQUIRED" = "1" ] && [ "$PRODUCTION_EVIDENCE_MANIFEST" != "$PACKAGED_PRODUCTION_EVIDENCE_MANIFEST" ]; then
+        add_failure "production evidence manifest must be packaged as production-evidence-manifest.json"
+    fi
+    evidence_input="$PRODUCTION_EVIDENCE_MANIFEST"
+    evidence_report="$TMP_ROOT/production-evidence-report.json"
+    evidence_errors="$TMP_ROOT/production-evidence.err"
+    if [ ! -f "$evidence_input" ]; then
+        add_failure "production evidence manifest is missing: $evidence_input"
+    else
+        PRODUCTION_EVIDENCE_MANIFEST="$(cd "$(dirname "$evidence_input")" && pwd -P)/$(basename "$evidence_input")"
+        PRODUCTION_EVIDENCE_MANIFEST_SHA256="$(sha256_file "$PRODUCTION_EVIDENCE_MANIFEST")"
+    fi
+    if [ -f "$PRODUCTION_EVIDENCE_MANIFEST" ] && bash "$SCRIPT_DIR/verify-production-evidence.sh" "$PRODUCTION_EVIDENCE_MANIFEST" > "$evidence_report" 2> "$evidence_errors"; then
+        evidence_ready="$(python3 - "$evidence_report" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    report = json.load(handle)
+print("true" if report.get("productionEvidenceReady") is True else "false")
+PY
+)"
+        if [ "$evidence_ready" = "true" ]; then
+            PRODUCTION_EVIDENCE_VALIDATED=1
+        else
+            not_production_ready=1
+            while IFS= read -r evidence_blocker; do
+                [ -n "$evidence_blocker" ] && add_warning "production evidence: $evidence_blocker"
+            done <<EOF
+$(python3 - "$evidence_report" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    report = json.load(handle)
+for blocker in report.get("blockers", []):
+    print(blocker)
+PY
+)
+EOF
+        fi
+    elif [ -f "$PRODUCTION_EVIDENCE_MANIFEST" ]; then
+        add_failure "production evidence validation failed"
+        if [ -s "$evidence_report" ]; then
+            while IFS= read -r evidence_failure; do
+                [ -n "$evidence_failure" ] && add_failure "production evidence: $evidence_failure"
+            done <<EOF
+$(python3 - "$evidence_report" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    report = json.load(handle)
+for failure in report.get("failures", []):
+    print(failure)
+PY
+)
+EOF
+        elif [ -s "$evidence_errors" ]; then
+            while IFS= read -r evidence_failure; do
+                [ -n "$evidence_failure" ] && add_failure "production evidence: $evidence_failure"
+            done < "$evidence_errors"
+        fi
+    fi
+elif [ "$PRODUCTION_EVIDENCE_REQUIRED" = "1" ]; then
+    not_production_ready=1
+    add_warning "production evidence manifest not provided"
+fi
+
+if [ -z "$failures" ] && [ "$SIGNATURE_VALIDATED" = "1" ] && [ "$PRODUCTION_EVIDENCE_VALIDATED" = "1" ]; then
+    NON_HARDWARE_PRODUCTION_READY=1
+    not_production_ready=1
+    add_warning "physical Steam Deck validation evidence is not verified by this non-hardware release gate"
 fi
 
 if [ -d "$PAYLOAD_ROOT" ]; then

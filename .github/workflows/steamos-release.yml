@@ -17,6 +17,10 @@ on:
         options:
           - dev-classical
           - production
+      production_evidence_path:
+        description: "Repo-relative SteamOS production evidence manifest required for production signing."
+        type: string
+        default: ""
 
 permissions:
   contents: write
@@ -39,15 +43,18 @@ jobs:
       - name: Shell syntax
         run: |
           bash -n steam/steamos/scripts/package-steamos.sh
+          bash -n steam/steamos/scripts/verify-production-evidence.sh
           bash -n steam/steamos/scripts/verify-steamos-release.sh
           bash -n steam/steamos/tests/deck-validation.sh
           bash -n steam/steamos/tests/deck-validation-test.sh
+          bash -n steam/steamos/tests/production-evidence-test.sh
           bash -n steam/steamos/tests/verify-deck-evidence.sh
           bash -n steam/steamos/tests/verify-steamos-release-test.sh
 
       - name: SteamOS install/package smoke test
         run: |
           bash steam/steamos/tests/deck-validation-test.sh
+          bash steam/steamos/tests/production-evidence-test.sh
           bash steam/steamos/tests/verify-steamos-release-test.sh
           bash steam/steamos/tests/install-steamos-test.sh
 
@@ -115,6 +122,34 @@ jobs:
           chmod 0600 "$key_path"
           echo "QLINK_STEAMOS_RELEASE_PRIVATE_KEY=$key_path" >> "$GITHUB_ENV"
 
+      - name: Import production evidence manifest
+        if: env.QLINK_STEAMOS_SIGNING_MODE == 'production'
+        env:
+          STEAMOS_PRODUCTION_EVIDENCE_MANIFEST_JSON: ${{ secrets.STEAMOS_PRODUCTION_EVIDENCE_MANIFEST_JSON }}
+          QLINK_STEAMOS_PRODUCTION_EVIDENCE_INPUT: ${{ inputs.production_evidence_path }}
+        run: |
+          set -euo pipefail
+          if [ -n "${QLINK_STEAMOS_PRODUCTION_EVIDENCE_INPUT:-}" ]; then
+            case "${QLINK_STEAMOS_PRODUCTION_EVIDENCE_INPUT}" in
+              /*|*..*|*$'\n'*|*$'\r'*)
+                echo "production_evidence_path must be a repo-relative file path without parent traversal or newlines." >&2
+                exit 1
+                ;;
+            esac
+            if [ ! -f "${QLINK_STEAMOS_PRODUCTION_EVIDENCE_INPUT}" ]; then
+              echo "production evidence manifest not found: ${QLINK_STEAMOS_PRODUCTION_EVIDENCE_INPUT}" >&2
+              exit 1
+            fi
+            echo "QLINK_STEAMOS_PRODUCTION_EVIDENCE_MANIFEST=${QLINK_STEAMOS_PRODUCTION_EVIDENCE_INPUT}" >> "$GITHUB_ENV"
+          elif [ -n "${STEAMOS_PRODUCTION_EVIDENCE_MANIFEST_JSON:-}" ]; then
+            evidence_path="$RUNNER_TEMP/steamos-production-evidence-manifest.json"
+            printf '%s\n' "$STEAMOS_PRODUCTION_EVIDENCE_MANIFEST_JSON" > "$evidence_path"
+            chmod 0644 "$evidence_path"
+            echo "QLINK_STEAMOS_PRODUCTION_EVIDENCE_MANIFEST=$evidence_path" >> "$GITHUB_ENV"
+          else
+            echo "No SteamOS production evidence manifest was provided; production verification will fail." >&2
+          fi
+
       - name: Package SteamOS release
         env:
           QLINK_STEAMOS_BIN_DIR: target/release
@@ -170,7 +205,7 @@ jobs:
           report="${archive%.tar.zst}/verify-report.json"
           jq -e '.valid == true' "$report"
           if [ "${QLINK_STEAMOS_REQUIRE_PRODUCTION_READY}" = "1" ]; then
-            jq -e '.productionReady == true and .notProductionReady == false and .signatureValidated == true' "$report"
+            jq -e '.productionReady == true and .notProductionReady == false and .signatureValidated == true and .nonHardwareProductionEvidenceValidated == true' "$report"
           fi
 
       - name: Upload verification report
@@ -180,6 +215,7 @@ jobs:
           path: |
             dist/steamos/verify-release-output.json
             dist/steamos/quantumlink-steamos-*/verify-report.json
+            dist/steamos/quantumlink-steamos-*/production-evidence-manifest.json
           if-no-files-found: error
 
   upload-artifacts:
@@ -220,6 +256,7 @@ jobs:
             dist/steamos/quantumlink-steamos-*/SBOM.spdx.json
             dist/steamos/quantumlink-steamos-*/release-manifest.json
             dist/steamos/quantumlink-steamos-*/*.sig
+            dist/steamos/quantumlink-steamos-*/production-evidence-manifest.json
             dist/steamos/quantumlink-steamos-*/verify-report.json
           if-no-files-found: error
 
@@ -233,5 +270,6 @@ jobs:
             dist/steamos/quantumlink-steamos-*/SBOM.spdx.json
             dist/steamos/quantumlink-steamos-*/release-manifest.json
             dist/steamos/quantumlink-steamos-*/*.sig
+            dist/steamos/quantumlink-steamos-*/production-evidence-manifest.json
             dist/steamos/quantumlink-steamos-*/verify-report.json
           fail_on_unmatched_files: true

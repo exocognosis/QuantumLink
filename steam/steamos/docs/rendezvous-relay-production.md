@@ -16,7 +16,7 @@ This is the production gate for QuantumLink SteamOS rendezvous and relay service
 
 ## Production Evidence Gate
 
-Before the SteamOS release can move out of blocked state, `production-readiness.md` must link evidence for:
+Before the SteamOS release can move out of blocked state, `production-readiness.md` must link evidence for the controls below. Non-hardware endpoint evidence must also be summarized in `production-evidence-manifest.json` and pass `steam/steamos/scripts/verify-production-evidence.sh`.
 
 - Active rendezvous and relay endpoint hostnames.
 - TLS configuration and certificate rotation procedure.
