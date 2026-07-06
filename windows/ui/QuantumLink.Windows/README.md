@@ -7,10 +7,14 @@ admin network operations itself.
 ## Surface (parity targets with the macOS dashboard)
 
 - [x] Connect / Disconnect
+- [x] Platform readiness badge and Windows alpha summary
+- [x] Onboarding checklist for service, tunnel, Wintun/WFP policy, and diagnostics export
 - [x] Phase, path type, overlay address, protected routes
 - [x] Kill-switch indicator
+- [x] Identity and route-policy summaries
 - [x] Peer list (id, path, overlay address)
-- [x] Diagnostics export (peer-id-redacted JSON)
+- [x] Grouped diagnostics export and peer-id-redacted JSON display
+- [x] Help topics for onboarding, peers, diagnostics, crypto, routing, identity, privacy, and troubleshooting
 - [ ] Configuration editor (route mode, DNS mode, rendezvous/relay
       servers) — sends `reloadConfiguration`; form pending
 - [ ] Live status pushes (schema supports `id: 0` notifications; UI

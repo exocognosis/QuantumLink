@@ -40,6 +40,32 @@ public partial class DashboardViewModel : ObservableObject
     public Microsoft.UI.Xaml.Visibility DisconnectButtonVisibility =>
         IsConnected ? Microsoft.UI.Xaml.Visibility.Visible : Microsoft.UI.Xaml.Visibility.Collapsed;
 
+    public string PlatformBadge => "Windows alpha";
+    public string ReadinessSummary => "WinUI dashboard with privileged Rust service; production signing and full Windows validation remain gated.";
+    public string IdentitySummary => "Dytallix identity follows shared qlink-core policy; wallet addresses stay hidden unless Public Wallet mode is explicitly selected.";
+    public string PolicySummary => "Routes, DNS, Wintun, and WFP kill-switch state are owned by the service, not this unprivileged UI.";
+    public string HelpSummary => "Use support exports with redaction enabled. Security reports should follow SECURITY.md.";
+
+    public ObservableCollection<string> OnboardingItems { get; } =
+    [
+        "Service pipe reachable",
+        "Connect through the LocalSystem tunnel service",
+        "Verify Wintun/WFP route policy from service status",
+        "Export redacted diagnostics before sharing logs"
+    ];
+
+    public ObservableCollection<string> HelpTopics { get; } =
+    [
+        "Getting Started",
+        "Connecting Peers",
+        "Activity & Diagnostics",
+        "Cryptography",
+        "Routing & Profiles",
+        "Dytallix Identity & Trust",
+        "Privacy & Security",
+        "Troubleshooting"
+    ];
+
     public ObservableCollection<PeerStatus> Peers { get; } = [];
 
     public async Task InitializeAsync()
