@@ -65,7 +65,13 @@ Typical next steps:
 sudoedit /etc/quantumlink/config.json
 sudo systemctl enable --now qlinkd
 sudo qlinkctl status
+sudo qlinkctl guide
 ```
+
+`qlinkctl guide` is the first operator-facing guided UX for SteamOS until a
+native SteamOS UI exists. It summarizes onboarding, runtime modes, peer and
+invite commands, diagnostics, Steam-safe routing, and the remaining production
+gates.
 
 `qlinkctl doctor` includes both network ownership and data-plane readiness:
 
