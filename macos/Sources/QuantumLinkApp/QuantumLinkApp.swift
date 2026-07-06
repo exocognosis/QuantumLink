@@ -90,8 +90,10 @@ private struct DashboardView: View {
         }
 
         Section("Manage") {
-          SidebarItem(tab: .configuration)
-            .tag(SidebarTab.configuration)
+          ForEach([SidebarTab.configuration, .help]) { tab in
+            SidebarItem(tab: tab)
+              .tag(tab)
+          }
         }
       }
       .listStyle(.sidebar)
@@ -527,6 +529,7 @@ private enum SidebarTab: CaseIterable, Hashable, Identifiable {
   case security
   case diagnostics
   case configuration
+  case help
 
   var id: Self { self }
 
@@ -542,6 +545,7 @@ private enum SidebarTab: CaseIterable, Hashable, Identifiable {
     case .security: "Security"
     case .diagnostics: "Diagnostics"
     case .configuration: "Configuration"
+    case .help: "Help"
     }
   }
 
@@ -557,6 +561,7 @@ private enum SidebarTab: CaseIterable, Hashable, Identifiable {
     case .security: "lock.shield"
     case .diagnostics: "waveform.path.ecg"
     case .configuration: "slider.horizontal.3"
+    case .help: "questionmark.circle"
     }
   }
 }
@@ -995,6 +1000,8 @@ private struct DashboardDetailView: View {
           onRevokeDytallixIdentity: onRevokeDytallixIdentity,
           onRotateDytallixDeviceIdentity: onRotateDytallixDeviceIdentity
         )
+      case .help:
+        HelpPanel()
       }
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -2663,6 +2670,198 @@ private struct ConfigurationPanel: View {
   }
 }
 
+private struct HelpPanel: View {
+  @State private var searchText = ""
+  @State private var selectedPlatform: HelpPlatform?
+
+  private var filteredTopics: [HelpTopic] {
+    HelpKnowledgeBase.topics.filter { topic in
+      let matchesPlatform =
+        selectedPlatform.map { topic.platforms.contains($0) } ?? true
+      let normalizedSearch = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased()
+      let matchesSearch =
+        normalizedSearch.isEmpty || topic.searchableText.lowercased().contains(normalizedSearch)
+      return matchesPlatform && matchesSearch
+    }
+  }
+
+  var body: some View {
+    PanelChrome {
+      PanelHeader(
+        tab: .help,
+        subtitle:
+          "Search setup, routing, privacy, diagnostics, platform readiness, and support guidance."
+      )
+
+      ConfigurationCard(title: "Knowledge Base", systemImage: "books.vertical") {
+        VStack(alignment: .leading, spacing: 12) {
+          TextField("Search help topics", text: $searchText)
+            .textFieldStyle(.roundedBorder)
+
+          Picker("Platform", selection: $selectedPlatform) {
+            Text("All")
+              .tag(Optional<HelpPlatform>.none)
+            ForEach(HelpPlatform.allCases, id: \.self) { platform in
+              Text(platform.label)
+                .tag(Optional(platform))
+            }
+          }
+          .pickerStyle(.segmented)
+
+          Text("Help content is shared with the product model so macOS, Windows, SteamOS, and enterprise guidance stay aligned while platform readiness remains explicit.")
+            .font(.callout)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+      }
+
+      PanelGrid {
+        ConfigurationCard(title: "First-Run Path", systemImage: "sparkles") {
+          KnowledgeRow(
+            title: "Set identity",
+            detail: "Choose private, verified, or public-wallet Dytallix discovery before accepting peers."
+          )
+          KnowledgeRow(
+            title: "Confirm service",
+            detail: "Check daemon or tunnel readiness before applying DNS, route, or peer changes."
+          )
+          KnowledgeRow(
+            title: "Export safely",
+            detail: "Share redacted support bundles instead of raw logs, packet captures, routes, wallet addresses, or peer IDs."
+          )
+        }
+
+        ConfigurationCard(title: "Platform Boundary", systemImage: "square.stack.3d.up") {
+          HelpPlatformSummaryRow(
+            platform: .macOS,
+            detail: "SwiftUI client over Network Extension, Keychain, managed profiles, signing, and notarization gates."
+          )
+          HelpPlatformSummaryRow(
+            platform: .windows,
+            detail: "WinUI client over the privileged Rust service, Wintun, WFP policy, DPAPI, named-pipe IPC, and MSI gates."
+          )
+          HelpPlatformSummaryRow(
+            platform: .steamOS,
+            detail: "Pre-production operator flow for qlinkd and qlinkctl with Steam-safe routing boundaries."
+          )
+        }
+      }
+
+      if filteredTopics.isEmpty {
+        ContentUnavailableView(
+          "No Help Topics",
+          systemImage: "magnifyingglass",
+          description: Text("Clear the search field or choose All platforms.")
+        )
+      } else {
+        PanelGrid {
+          ForEach(filteredTopics, id: \.id) { topic in
+            HelpTopicCard(topic: topic)
+          }
+        }
+      }
+    }
+  }
+}
+
+private struct HelpTopicCard: View {
+  let topic: HelpTopic
+
+  var body: some View {
+    ConfigurationCard(title: topic.title, systemImage: topic.id.systemImage) {
+      VStack(alignment: .leading, spacing: 12) {
+        Text(topic.summary)
+          .font(.callout)
+          .foregroundStyle(.secondary)
+          .fixedSize(horizontal: false, vertical: true)
+
+        FlowLayout(spacing: 8) {
+          ForEach(topic.platforms, id: \.self) { platform in
+            HelpPlatformChip(platform: platform)
+          }
+        }
+
+        Divider()
+
+        ForEach(topic.sections, id: \.title) { section in
+          HelpSectionBlock(section: section)
+        }
+      }
+    }
+  }
+}
+
+private struct HelpSectionBlock: View {
+  let section: HelpSection
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 8) {
+      Text(section.title)
+        .font(.callout.weight(.semibold))
+      Text(section.body)
+        .font(.callout)
+        .foregroundStyle(.secondary)
+        .fixedSize(horizontal: false, vertical: true)
+
+      if !section.bullets.isEmpty {
+        VStack(alignment: .leading, spacing: 6) {
+          ForEach(section.bullets, id: \.self) { bullet in
+            HStack(alignment: .top, spacing: 8) {
+              Image(systemName: "checkmark.circle.fill")
+                .font(.caption)
+                .foregroundStyle(.green)
+                .frame(width: 14)
+              Text(bullet)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            }
+          }
+        }
+      }
+    }
+    .frame(maxWidth: .infinity, alignment: .leading)
+  }
+}
+
+private struct HelpPlatformSummaryRow: View {
+  let platform: HelpPlatform
+  let detail: String
+
+  var body: some View {
+    HStack(alignment: .top, spacing: 12) {
+      Image(systemName: platform.systemImage)
+        .font(.title3)
+        .foregroundStyle(platform.tint)
+        .frame(width: 28)
+
+      VStack(alignment: .leading, spacing: 4) {
+        Text(platform.label)
+          .font(.callout.weight(.semibold))
+        Text(detail)
+          .font(.callout)
+          .foregroundStyle(.secondary)
+          .fixedSize(horizontal: false, vertical: true)
+      }
+    }
+    .frame(maxWidth: .infinity, alignment: .leading)
+  }
+}
+
+private struct HelpPlatformChip: View {
+  let platform: HelpPlatform
+
+  var body: some View {
+    Label(platform.label, systemImage: platform.systemImage)
+      .font(.caption.weight(.semibold))
+      .foregroundStyle(platform.tint)
+      .padding(.horizontal, 10)
+      .padding(.vertical, 6)
+      .background(platform.tint.opacity(0.12), in: Capsule())
+  }
+}
+
 private struct ConfigurationCard<Content: View>: View {
   let title: String
   let systemImage: String
@@ -3454,6 +3653,44 @@ private struct FlowLayout: Layout {
       subview.place(at: CGPoint(x: x, y: y), proposal: ProposedViewSize(size))
       x += size.width + spacing
       lineHeight = max(lineHeight, size.height)
+    }
+  }
+}
+
+extension HelpTopicID {
+  fileprivate var systemImage: String {
+    switch self {
+    case .gettingStarted: "sparkles"
+    case .connectingPeers: "point.3.connected.trianglepath.dotted"
+    case .activityDiagnostics: "waveform.path.ecg"
+    case .cryptography: "lock.shield"
+    case .routingProfiles: "arrow.triangle.branch"
+    case .dytallixIdentityTrust: "person.badge.shield.checkmark"
+    case .mdmEnterprise: "building.2"
+    case .steamOSGameRouting: "gamecontroller"
+    case .privacySecurity: "hand.raised"
+    case .troubleshooting: "wrench.and.screwdriver"
+    case .supportTicket: "envelope.badge"
+    }
+  }
+}
+
+extension HelpPlatform {
+  fileprivate var systemImage: String {
+    switch self {
+    case .macOS: "macwindow"
+    case .windows: "rectangle.grid.2x2"
+    case .steamOS: "gamecontroller"
+    case .enterprise: "building.2"
+    }
+  }
+
+  fileprivate var tint: Color {
+    switch self {
+    case .macOS: .blue
+    case .windows: .cyan
+    case .steamOS: .green
+    case .enterprise: .orange
     }
   }
 }
