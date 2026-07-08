@@ -10,7 +10,7 @@ Steam-specific work belongs here. The shared handshake, packet framing, peer rec
 | --- | --- | --- | --- |
 | SteamOS/Linux | `steam/steamos` | Pre-production daemon scaffold | `qlinkd`, `qlinkctl`, Linux route/nftables planning, systemd packaging, game profiles. |
 | Steam desktop | `steam/desktop` | Planned | Steam-safe desktop policy and game-aware routing on the desktop tunnel runtime. |
-| Mobile companion | `steam/mobile` | Planned | Pairing, status, diagnostics, and remote control concepts for party sessions. |
+| Steam Mobile | `steam/mobile` | Planning scaffold | Companion silo: `qlink-mobile-proto` model crate plus docs for pairing, redacted status/diagnostics, profile sync, and remote control. See [`steam/mobile/README.md`](mobile/README.md). |
 
 ## Current SteamOS Work
 
