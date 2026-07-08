@@ -3,6 +3,8 @@ import Foundation
 public enum TunnelTransportKind: String, Codable, Equatable, Sendable {
     case developmentDrop
     case devQuicLoopback
+    case nativeUdpMesh
+    /// Legacy decode/display alias retained for older status payloads.
     case meshQuic
 }
 
@@ -129,6 +131,19 @@ public struct TunnelTransportMetrics: Codable, Equatable, Sendable {
         self.sendFailures = sendFailures
         self.receiveFailures = receiveFailures
         self.lastError = lastError
+    }
+
+    public var smokeOutcome: String {
+        switch pathType {
+        case .direct:
+            kind == .nativeUdpMesh || kind == .meshQuic ? "native-udp-direct" : "direct"
+        case .relay:
+            "relay"
+        case .unavailable:
+            "fail-closed"
+        case .probing:
+            "probing"
+        }
     }
 }
 
@@ -263,7 +278,7 @@ public final class RustMeshTransport: TunnelTransporting {
     private let keypair: RustDeviceKeypair?
     private var handle: UnsafeMutableRawPointer?
     public private(set) var metrics = TunnelTransportMetrics(
-        kind: .meshQuic,
+        kind: .nativeUdpMesh,
         state: .stopped,
         pathType: .unavailable
     )
@@ -555,6 +570,8 @@ public enum TunnelTransportFactory {
         let mode = environment["QLINK_TRANSPORT_MODE"]?.lowercased()
 
         switch mode {
+        case "native-udp-mesh":
+            return makeMeshQuicTransport(environment: environment)
         case "mesh-quic":
             return makeMeshQuicTransport(environment: environment)
         case "dev-quic-loopback":

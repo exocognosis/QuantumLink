@@ -210,6 +210,48 @@ impl NativeUdpSession {
         Ok((Self::from_socket(left), Self::from_socket(right)))
     }
 
+    pub async fn connect(bind_addr: SocketAddr, remote_addr: SocketAddr) -> Result<Self> {
+        let socket = UdpSocket::bind(bind_addr).await.map_err(|err| {
+            QlinkError::Protocol(format!("failed to bind native UDP socket: {err}"))
+        })?;
+        socket.connect(remote_addr).await.map_err(|err| {
+            QlinkError::Protocol(format!(
+                "failed to connect native UDP socket to {remote_addr}: {err}"
+            ))
+        })?;
+        Ok(Self::from_socket(socket))
+    }
+
+    pub async fn accept_on(socket: UdpSocket) -> Result<(Self, SocketAddr)> {
+        let mut buf = vec![0_u8; MAX_UDP_DATAGRAM_LEN + 1];
+        let (len, peer_addr) = socket.recv_from(&mut buf).await.map_err(|err| {
+            QlinkError::Protocol(format!("failed to accept native UDP datagram: {err}"))
+        })?;
+        if len > MAX_UDP_DATAGRAM_LEN {
+            return Err(QlinkError::Protocol(format!(
+                "native UDP carrier datagram exceeds {MAX_UDP_DATAGRAM_LEN} bytes"
+            )));
+        }
+        let datagram = decode_datagram(&buf[..len])?;
+        socket.connect(peer_addr).await.map_err(|err| {
+            QlinkError::Protocol(format!(
+                "failed to connect native UDP accepted socket to {peer_addr}: {err}"
+            ))
+        })?;
+
+        let session = Self::from_socket(socket);
+        if let Some((kind, payload)) = session
+            .accept_datagram(
+                datagram,
+                ReceiveLimits::new(MAX_PENDING_AUTHENTICATED_MESSAGE_LEN),
+            )
+            .await?
+        {
+            session.push_pending(kind, payload).await?;
+        }
+        Ok((session, peer_addr))
+    }
+
     fn from_socket(socket: UdpSocket) -> Self {
         Self {
             socket: Arc::new(socket),

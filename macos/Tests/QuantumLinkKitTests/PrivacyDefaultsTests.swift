@@ -118,6 +118,18 @@ final class PrivacyDefaultsTests: XCTestCase {
         XCTAssertFalse(redacted.contains(":9472"))
     }
 
+    func testRedactsDNSNamesURLsAndDytallixAddresses() {
+        let wallet = "0x1111111111111111111111111111111111111111"
+        let raw = "endpoint=https://dytallix.example:443/rpc relay=relay.quantumlink.example:9472 dns=corp.acme.example wallet=\(wallet)"
+        let redacted = PrivacyDefaults.redactNetworkIdentifiers(in: raw)
+
+        XCTAssertFalse(redacted.contains("dytallix.example"))
+        XCTAssertFalse(redacted.contains("relay.quantumlink.example"))
+        XCTAssertFalse(redacted.contains("corp.acme.example"))
+        XCTAssertFalse(redacted.contains(wallet))
+        XCTAssertTrue(redacted.contains("[redacted-ip]"))
+    }
+
     func testRedactionPreservesNonAddressNumbers() {
         // Things that look like decimal numbers but aren't IP addresses
         // must not be redacted: version strings, byte counts, frame counts.

@@ -8,10 +8,14 @@ import Foundation
 /// Supported keys (all optional):
 ///   - `meshID`, `deviceAlias`, `tunnelRemoteAddress`: strings
 ///   - `protectedRoutes`, `excludedRoutes`, `dnsServers`, `dnsSearchDomains`,
-///     `rendezvousServers`, `relayServers`: arrays of strings
+///     `rendezvousServers`, `relayServers`, `allowedRelayEndpoints`: arrays
+///     of strings
 ///   - `routeMode`: `splitTunnel` | `protectedPrefixesOnly` | `fullTunnel`
 ///   - `dnsMode`: `tunnelProvided` | `system` | `disabled`
 ///   - `killSwitch`: `failClosed` | `strict`
+///   - `relayTLSPolicy`: `required` | `opportunistic` | `disabled`
+///   - `maximumCandidateAgeSeconds`: integer
+///   - `failClosedOnNoCandidate`: boolean
 ///   - `mtu`: integer
 ///   - `dytallixEndpoint`, `dytallixContractAddress`, `dytallixNetworkId`,
 ///     `dytallixChainId`: strings
@@ -63,6 +67,10 @@ public enum ManagedConfigurationLoader {
     var dnsSearchDomains = base.dnsSearchDomains
     var rendezvousServers = base.rendezvousServers
     var relayServers = base.relayServers
+    var allowedRelayEndpoints = base.allowedRelayEndpoints
+    var relayTLSPolicy = base.relayTLSPolicy
+    var maximumCandidateAgeSeconds = base.maximumCandidateAgeSeconds
+    var failClosedOnNoCandidate = base.failClosedOnNoCandidate
     var routeMode = base.routeMode
     var dnsMode = base.dnsMode
     var killSwitch = base.killSwitch
@@ -140,6 +148,36 @@ public enum ManagedConfigurationLoader {
       case "relayServers":
         if let arrayValue = value as? [String] {
           relayServers = arrayValue
+          applied.append(key)
+        } else {
+          rejected.append(key)
+        }
+      case "allowedRelayEndpoints":
+        if let arrayValue = value as? [String] {
+          allowedRelayEndpoints = arrayValue
+          applied.append(key)
+        } else {
+          rejected.append(key)
+        }
+      case "relayTLSPolicy":
+        if let stringValue = value as? String,
+          let parsed = RelayTLSPolicy(rawValue: stringValue)
+        {
+          relayTLSPolicy = parsed
+          applied.append(key)
+        } else {
+          rejected.append(key)
+        }
+      case "maximumCandidateAgeSeconds":
+        if let intValue = value as? Int, intValue > 0 {
+          maximumCandidateAgeSeconds = UInt64(intValue)
+          applied.append(key)
+        } else {
+          rejected.append(key)
+        }
+      case "failClosedOnNoCandidate":
+        if let boolValue = value as? Bool {
+          failClosedOnNoCandidate = boolValue
           applied.append(key)
         } else {
           rejected.append(key)
@@ -271,6 +309,10 @@ public enum ManagedConfigurationLoader {
       discoveryModes: base.discoveryModes,
       rendezvousServers: rendezvousServers,
       relayServers: relayServers,
+      allowedRelayEndpoints: allowedRelayEndpoints,
+      relayTLSPolicy: relayTLSPolicy,
+      maximumCandidateAgeSeconds: maximumCandidateAgeSeconds,
+      failClosedOnNoCandidate: failClosedOnNoCandidate,
       mtu: mtu,
       crypto: base.crypto,
       killSwitch: killSwitch,

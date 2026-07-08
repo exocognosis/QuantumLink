@@ -3,10 +3,11 @@ import Foundation
 /// Redaction policy applied to a `DiagnosticsBundle`.
 ///
 /// `default` runs every string field through `PrivacyDefaults.redactNetworkIdentifiers`
-/// and replaces address-shaped identifiers (IPv4, IPv6, bracketed-IPv6, port
-/// suffixes) with `[redacted-ip]`. Persistent mesh, device, peer, and registry
-/// identifiers are also redacted because they can correlate support bundles with
-/// Dytallix testnet activity and repeated mesh sessions.
+/// and replaces address-shaped identifiers, DNS/FQDN endpoint names, URL hosts,
+/// and Dytallix wallet/contract addresses with `[redacted-ip]`. Persistent mesh,
+/// device, peer, and registry identifiers are also redacted because they can
+/// correlate support bundles with Dytallix testnet activity and repeated mesh
+/// sessions.
 ///
 /// `raw` preserves every field verbatim. Operators must opt in explicitly —
 /// the bundled UI surface defaults to `default` and an explicit "Export raw
