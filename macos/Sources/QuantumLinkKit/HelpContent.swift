@@ -411,7 +411,7 @@ public enum HelpKnowledgeBase {
         HelpSection(
           title: "Pre-production boundary",
           body:
-            "Local dry-run planning, qlink0 packet I/O initialization, or transport ready: no status is not proof of protected peer traffic. Real readiness requires a two-Deck or equivalent SteamOS/Linux validation path.",
+            "Local dry-run planning, qlinkctl status, qlinkctl doctor, qlink0 packet I/O initialization, or transport ready: no status is not proof of protected peer traffic. Real readiness requires a two-Deck or equivalent SteamOS/Linux validation path.",
           bullets: [
             "Validate qlinkd under systemd on the target host.",
             "Validate nftables ownership and teardown behavior after --activate-network.",
