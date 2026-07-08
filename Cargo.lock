@@ -171,6 +171,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32637268377fc7b10a8c6d51de3e7fba1ce5dd371a96e342b34e6078db558e7f"
 
 [[package]]
+name = "bech32"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "efbd3e1070bbdf4cd88a75264e18e8a26f7cb5c6949eadf0ceb85fb159cf08f8"
+
+[[package]]
 name = "bit-vec"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -600,7 +606,7 @@ name = "dytallix-core"
 version = "0.1.0"
 source = "git+https://github.com/DytallixHQ/dytallix-sdk?rev=657d0db4794904f7c25192c9d0c1039c5b9fe5f0#657d0db4794904f7c25192c9d0c1039c5b9fe5f0"
 dependencies = [
- "bech32",
+ "bech32 0.11.1",
  "blake3",
  "fips204",
  "pqcrypto-sphincsplus",
@@ -1818,7 +1824,7 @@ name = "quantumlink-node-registry"
 version = "0.1.0"
 dependencies = [
  "base64",
- "bech32",
+ "bech32 0.12.0",
  "blake3",
  "dytallix-core",
  "fips204",
