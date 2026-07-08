@@ -99,7 +99,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y zstd jq
 
       - name: Download release binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: steamos-release-binaries
           path: target/release
@@ -174,7 +174,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y zstd jq
 
       - name: Download package output
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: steamos-release-package
           path: dist/steamos
@@ -224,13 +224,13 @@ jobs:
     needs: verify-release
     steps:
       - name: Download package output
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: steamos-release-package
           path: dist/steamos
 
       - name: Download final verification report
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: steamos-release-verification
           path: final-verification
