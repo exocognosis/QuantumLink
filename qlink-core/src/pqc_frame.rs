@@ -3,10 +3,7 @@ use crate::{
     error::{QlinkError, Result},
     replay::ReplayWindow,
 };
-use sha3::{
-    digest::{ExtendableOutput, Update, XofReader},
-    Shake256,
-};
+use shake::{ExtendableOutput, Shake256, Update, XofReader};
 
 const FRAME_MAGIC: &[u8; 6] = b"QLPQC1";
 const FRAME_VERSION: u8 = 1;
