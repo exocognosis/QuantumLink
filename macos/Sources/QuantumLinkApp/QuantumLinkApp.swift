@@ -66,6 +66,7 @@ private struct DashboardView: View {
   @State private var dytallixIdentityOperationInProgress: DytallixIdentityOperation?
   @State private var dytallixKeyRotationInProgress = false
   @State private var dytallixLastIdentityError: String?
+  @State private var selectedHelpTopic: HelpTopicID?
   @State private var draftConnectionProfile = ConnectionProfile(
     sourceIPAddress: TunnelConfiguration.defaultDevelopment.overlayIPv4Address,
     destinationIPAddress: "",
@@ -135,12 +136,22 @@ private struct DashboardView: View {
         },
         onToggleFavoriteConnection: { profile in
           toggleFavoriteConnection(profile)
-        }
+        },
+        selectedHelpTopic: $selectedHelpTopic
       )
       .padding(24)
       .toolbar {
         ToolbarItem(placement: .navigation) {
           TitleBarBrandView()
+        }
+
+        ToolbarItem(placement: .primaryAction) {
+          Button {
+            openHelpForCurrentTab()
+          } label: {
+            Label("Help", systemImage: "questionmark.circle")
+          }
+          .help("Open help for \((selectedTab ?? defaultTab).title)")
         }
       }
     }
@@ -185,6 +196,12 @@ private struct DashboardView: View {
 
   private var defaultTab: SidebarTab {
     onboardingTabVisible ? .onboarding : .home
+  }
+
+  private func openHelpForCurrentTab() {
+    let tab = selectedTab ?? defaultTab
+    selectedHelpTopic = tab.helpTopicID
+    selectedTab = .help
   }
 
   private var deploymentMode: QuantumLinkDeploymentMode {
@@ -566,6 +583,25 @@ private enum SidebarTab: CaseIterable, Hashable, Identifiable {
     case .help: "questionmark.circle"
     }
   }
+
+  var helpTopicID: HelpTopicID {
+    switch self {
+    case .onboarding, .home:
+      .gettingStarted
+    case .connections, .peers:
+      .connectingPeers
+    case .activity, .diagnostics:
+      .activityDiagnostics
+    case .network, .routes:
+      .routingProfiles
+    case .security:
+      .cryptography
+    case .configuration:
+      .dytallixIdentityTrust
+    case .help:
+      .gettingStarted
+    }
+  }
 }
 
 private enum AppearancePreference: String, CaseIterable, Hashable, Identifiable {
@@ -905,6 +941,7 @@ private struct DashboardDetailView: View {
   let onRotateDytallixDeviceIdentity: () -> Void
   let onStartConnection: (ConnectionProfile) -> Void
   let onToggleFavoriteConnection: (ConnectionProfile) -> Void
+  @Binding var selectedHelpTopic: HelpTopicID?
 
   var body: some View {
     Group {
@@ -1005,7 +1042,7 @@ private struct DashboardDetailView: View {
           onRotateDytallixDeviceIdentity: onRotateDytallixDeviceIdentity
         )
       case .help:
-        HelpPanel()
+        HelpPanel(selectedTopicID: $selectedHelpTopic)
       }
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -2733,17 +2770,26 @@ private struct ConfigurationPanel: View {
 }
 
 private struct HelpPanel: View {
+  @Binding var selectedTopicID: HelpTopicID?
   @State private var searchText = ""
   @State private var selectedPlatform: HelpPlatform = .macOS
 
   private var filteredTopics: [HelpTopic] {
-    HelpKnowledgeBase.topics(for: selectedPlatform).filter { topic in
+    let topics = HelpKnowledgeBase.topics(for: selectedPlatform).filter { topic in
       let normalizedSearch = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
         .lowercased()
       let matchesSearch =
         normalizedSearch.isEmpty || topic.searchableText.lowercased().contains(normalizedSearch)
       return matchesSearch
     }
+    guard
+      let selectedTopicID,
+      let focusedTopic = HelpKnowledgeBase.topic(selectedTopicID, for: selectedPlatform),
+      topics.contains(where: { $0.id == focusedTopic.id })
+    else {
+      return topics
+    }
+    return [focusedTopic] + topics.filter { $0.id != focusedTopic.id }
   }
 
   var body: some View {
@@ -2773,6 +2819,22 @@ private struct HelpPanel: View {
           .font(.callout)
           .foregroundStyle(.secondary)
           .fixedSize(horizontal: false, vertical: true)
+
+          if let selectedTopicID,
+            let selectedTopic = HelpKnowledgeBase.topic(selectedTopicID, for: selectedPlatform)
+          {
+            HStack(alignment: .center, spacing: 10) {
+              Label(selectedTopic.title, systemImage: selectedTopic.id.systemImage)
+                .font(.callout.weight(.semibold))
+              Spacer()
+              Button {
+                self.selectedTopicID = nil
+              } label: {
+                Label("Show All Topics", systemImage: "list.bullet")
+              }
+              .buttonStyle(.bordered)
+            }
+          }
         }
       }
 

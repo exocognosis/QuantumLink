@@ -52,6 +52,7 @@ public sealed record TunnelStatus
     [JsonPropertyName("protectedRoutes")] public List<string> ProtectedRoutes { get; init; } = [];
     [JsonPropertyName("peers")] public List<PeerStatus> Peers { get; init; } = [];
     [JsonPropertyName("metrics")] public MeshMetrics Metrics { get; init; } = new();
+    [JsonPropertyName("peerTrust")] public DytallixPeerTrustSummary PeerTrust { get; init; } = new();
     [JsonPropertyName("transport")] public TunnelTransportMetrics? Transport { get; init; }
     [JsonPropertyName("pump")] public PacketPumpMetrics? Pump { get; init; }
     [JsonPropertyName("killSwitchEngaged")] public bool? KillSwitchEngaged { get; init; }
@@ -69,10 +70,20 @@ public sealed record PeerStatus
 {
     [JsonPropertyName("identity")] public PeerIdentity Identity { get; init; } = new();
     [JsonPropertyName("pathType")] public string PathType { get; init; } = "probing";
+    [JsonPropertyName("endpoints")] public List<PeerEndpoint> Endpoints { get; init; } = [];
     [JsonPropertyName("overlayAddress")] public string OverlayAddress { get; init; } = "";
     [JsonPropertyName("rttMilliseconds")] public int? RttMilliseconds { get; init; }
+    [JsonPropertyName("lastRekeyUnix")] public ulong? LastRekeyUnix { get; init; }
     [JsonPropertyName("bytesIn")] public ulong BytesIn { get; init; }
     [JsonPropertyName("bytesOut")] public ulong BytesOut { get; init; }
+}
+
+public sealed record PeerEndpoint
+{
+    [JsonPropertyName("candidateType")] public string CandidateType { get; init; } = "";
+    [JsonPropertyName("address")] public string Address { get; init; } = "";
+    [JsonPropertyName("port")] public ushort Port { get; init; }
+    [JsonPropertyName("priority")] public long Priority { get; init; }
 }
 
 public sealed record MeshMetrics
@@ -83,6 +94,20 @@ public sealed record MeshMetrics
     [JsonPropertyName("bytesIn")] public ulong BytesIn { get; init; }
     [JsonPropertyName("bytesOut")] public ulong BytesOut { get; init; }
     [JsonPropertyName("replayDrops")] public ulong ReplayDrops { get; init; }
+    [JsonPropertyName("lastPathProbeUnix")] public ulong? LastPathProbeUnix { get; init; }
+}
+
+public sealed record DytallixPeerTrustSummary
+{
+    [JsonPropertyName("required")] public bool Required { get; init; }
+    [JsonPropertyName("policy")] public string Policy { get; init; } = "development_optional";
+    [JsonPropertyName("identityMode")] public string IdentityMode { get; init; } = "off";
+    [JsonPropertyName("registryConfigured")] public bool RegistryConfigured { get; init; }
+    [JsonPropertyName("verifiedPeerCount")] public uint VerifiedPeerCount { get; init; }
+    [JsonPropertyName("unverifiedPeerCount")] public uint UnverifiedPeerCount { get; init; }
+    [JsonPropertyName("pendingPeerCount")] public uint PendingPeerCount { get; init; }
+    [JsonPropertyName("failedPeerCount")] public uint FailedPeerCount { get; init; }
+    [JsonPropertyName("lastCheckedAtUnix")] public ulong? LastCheckedAtUnix { get; init; }
 }
 
 public sealed record TunnelTransportMetrics
@@ -95,6 +120,7 @@ public sealed record TunnelTransportMetrics
     [JsonPropertyName("bytesReceived")] public ulong BytesReceived { get; init; }
     [JsonPropertyName("sendFailures")] public ulong SendFailures { get; init; }
     [JsonPropertyName("receiveFailures")] public ulong ReceiveFailures { get; init; }
+    [JsonPropertyName("networkEventCount")] public ulong NetworkEventCount { get; init; }
     [JsonPropertyName("reconnectCount")] public ulong ReconnectCount { get; init; }
 }
 

@@ -13,6 +13,7 @@
                 <RowDefinition Height="Auto" />
                 <RowDefinition Height="Auto" />
                 <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
             </Grid.RowDefinitions>
 
             <!-- Header -->
@@ -53,6 +54,8 @@
                                 Orientation="Horizontal"
                                 Spacing="8"
                                 HorizontalAlignment="Right">
+                        <Button Content="Refresh status"
+                                Command="{x:Bind ViewModel.RefreshStatusCommand}" />
                         <Button Content="Connect"
                                 Command="{x:Bind ViewModel.ConnectTunnelCommand}"
                                 Visibility="{x:Bind ViewModel.ConnectButtonVisibility, Mode=OneWay}" />
@@ -129,20 +132,32 @@
                                 <RowDefinition Height="Auto" />
                                 <RowDefinition Height="Auto" />
                                 <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
                             </Grid.RowDefinitions>
 
                             <TextBlock Grid.Row="0" Grid.Column="0" Text="Path" Opacity="0.6" />
                             <TextBlock Grid.Row="0" Grid.Column="1" Text="{x:Bind ViewModel.PathType, Mode=OneWay}" TextWrapping="Wrap" />
-                            <TextBlock Grid.Row="1" Grid.Column="0" Text="Overlay address" Opacity="0.6" />
-                            <TextBlock Grid.Row="1" Grid.Column="1" Text="{x:Bind ViewModel.OverlayAddress, Mode=OneWay}" TextWrapping="Wrap" />
-                            <TextBlock Grid.Row="2" Grid.Column="0" Text="Protected routes" Opacity="0.6" />
-                            <TextBlock Grid.Row="2" Grid.Column="1" Text="{x:Bind ViewModel.RouteSummary, Mode=OneWay}" TextWrapping="Wrap" />
-                            <TextBlock Grid.Row="3" Grid.Column="0" Text="Kill switch" Opacity="0.6" />
-                            <TextBlock Grid.Row="3" Grid.Column="1" Text="{x:Bind ViewModel.KillSwitchEngaged, Mode=OneWay}" />
-                            <TextBlock Grid.Row="4" Grid.Column="0" Text="Service" Opacity="0.6" />
-                            <TextBlock Grid.Row="4" Grid.Column="1" Text="{x:Bind ViewModel.ServiceState, Mode=OneWay}" TextWrapping="Wrap" />
-                            <TextBlock Grid.Row="5" Grid.Column="0" Text="Last error" Opacity="0.6" />
-                            <TextBlock Grid.Row="5" Grid.Column="1"
+                            <TextBlock Grid.Row="1" Grid.Column="0" Text="Route mode" Opacity="0.6" />
+                            <TextBlock Grid.Row="1" Grid.Column="1" Text="{x:Bind ViewModel.RouteMode, Mode=OneWay}" TextWrapping="Wrap" />
+                            <TextBlock Grid.Row="2" Grid.Column="0" Text="DNS mode" Opacity="0.6" />
+                            <TextBlock Grid.Row="2" Grid.Column="1" Text="{x:Bind ViewModel.DnsMode, Mode=OneWay}" TextWrapping="Wrap" />
+                            <TextBlock Grid.Row="3" Grid.Column="0" Text="Overlay address" Opacity="0.6" />
+                            <TextBlock Grid.Row="3" Grid.Column="1" Text="{x:Bind ViewModel.OverlayAddress, Mode=OneWay}" TextWrapping="Wrap" />
+                            <TextBlock Grid.Row="4" Grid.Column="0" Text="Protected routes" Opacity="0.6" />
+                            <TextBlock Grid.Row="4" Grid.Column="1" Text="{x:Bind ViewModel.RouteSummary, Mode=OneWay}" TextWrapping="Wrap" />
+                            <TextBlock Grid.Row="5" Grid.Column="0" Text="Peers" Opacity="0.6" />
+                            <TextBlock Grid.Row="5" Grid.Column="1" Text="{x:Bind ViewModel.PeerSummary, Mode=OneWay}" TextWrapping="Wrap" />
+                            <TextBlock Grid.Row="6" Grid.Column="0" Text="Traffic" Opacity="0.6" />
+                            <TextBlock Grid.Row="6" Grid.Column="1" Text="{x:Bind ViewModel.TrafficSummary, Mode=OneWay}" TextWrapping="Wrap" />
+                            <TextBlock Grid.Row="7" Grid.Column="0" Text="Kill switch" Opacity="0.6" />
+                            <TextBlock Grid.Row="7" Grid.Column="1" Text="{x:Bind ViewModel.KillSwitchEngaged, Mode=OneWay}" />
+                            <TextBlock Grid.Row="8" Grid.Column="0" Text="Service" Opacity="0.6" />
+                            <TextBlock Grid.Row="8" Grid.Column="1" Text="{x:Bind ViewModel.ServiceState, Mode=OneWay}" TextWrapping="Wrap" />
+                            <TextBlock Grid.Row="9" Grid.Column="0" Text="Last error" Opacity="0.6" />
+                            <TextBlock Grid.Row="9" Grid.Column="1"
                                        Text="{x:Bind ViewModel.LastError, Mode=OneWay}"
                                        Foreground="{ThemeResource SystemFillColorCriticalBrush}"
                                        TextWrapping="Wrap" />
@@ -169,7 +184,13 @@
                                    Style="{StaticResource SubtitleTextBlockStyle}" />
                         <StackPanel Spacing="4">
                             <TextBlock Text="Identity" FontWeight="SemiBold" />
-                            <TextBlock Text="{x:Bind ViewModel.IdentitySummary, Mode=OneWay}"
+                            <TextBlock Text="{x:Bind ViewModel.TrustSummary, Mode=OneWay}"
+                                       TextWrapping="Wrap"
+                                       Opacity="0.75" />
+                        </StackPanel>
+                        <StackPanel Spacing="4">
+                            <TextBlock Text="Registry" FontWeight="SemiBold" />
+                            <TextBlock Text="{x:Bind ViewModel.RegistrySummary, Mode=OneWay}"
                                        TextWrapping="Wrap"
                                        Opacity="0.75" />
                         </StackPanel>
@@ -218,8 +239,45 @@
                 </Border>
             </Grid>
 
+            <Grid Grid.Row="3" ColumnSpacing="16">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="*" />
+                </Grid.ColumnDefinitions>
+
+                <Border Grid.Column="0"
+                        Padding="18"
+                        CornerRadius="8"
+                        Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                        BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                        BorderThickness="1">
+                    <StackPanel Spacing="10">
+                        <TextBlock Text="Transport"
+                                   Style="{StaticResource SubtitleTextBlockStyle}" />
+                        <TextBlock Text="{x:Bind ViewModel.TransportSummary, Mode=OneWay}"
+                                   TextWrapping="Wrap"
+                                   Opacity="0.75" />
+                    </StackPanel>
+                </Border>
+
+                <Border Grid.Column="1"
+                        Padding="18"
+                        CornerRadius="8"
+                        Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                        BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                        BorderThickness="1">
+                    <StackPanel Spacing="10">
+                        <TextBlock Text="Packet Pump"
+                                   Style="{StaticResource SubtitleTextBlockStyle}" />
+                        <TextBlock Text="{x:Bind ViewModel.PacketPumpSummary, Mode=OneWay}"
+                                   TextWrapping="Wrap"
+                                   Opacity="0.75" />
+                    </StackPanel>
+                </Border>
+            </Grid>
+
             <!-- Peers -->
-            <Border Grid.Row="3"
+            <Border Grid.Row="4"
                     Padding="18"
                     CornerRadius="8"
                     Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
@@ -259,7 +317,7 @@
             </Border>
 
             <!-- Diagnostics -->
-            <Border Grid.Row="4"
+            <Border Grid.Row="5"
                     Padding="18"
                     CornerRadius="8"
                     Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
