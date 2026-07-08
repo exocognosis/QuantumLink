@@ -80,10 +80,7 @@ use crate::{
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use rand_core_06::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
-use sha3::{
-    digest::{ExtendableOutput, Update, XofReader},
-    Shake256,
-};
+use shake::{ExtendableOutput, Shake256, Update, XofReader};
 use std::{
     collections::{BTreeMap, HashMap},
     fs,

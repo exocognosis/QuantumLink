@@ -10,10 +10,7 @@ use ml_kem::{
     MlKem768,
 };
 use serde::{Deserialize, Serialize};
-use sha3::{
-    digest::{ExtendableOutput, Update},
-    Shake256,
-};
+use shake::{ExtendableOutput, Shake256, Update};
 use slh_dsa::{
     signature::rand_core::{Infallible as SlhInfallible, TryCryptoRng as SlhTryCryptoRng},
     Shake128s, Signature as SlhSignature, SigningKey as SlhSigningKey,
