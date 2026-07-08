@@ -18,6 +18,9 @@ NFTABLES_TXT="$EVIDENCE_DIR/nftables.txt"
 IP_ROUTE_TXT="$EVIDENCE_DIR/ip-route.txt"
 SUPPORT_REDACTION_TXT="$EVIDENCE_DIR/support-bundle-redaction.txt"
 REPORT_JSON="$EVIDENCE_DIR/validation-report.json"
+OS_RELEASE_FILE="${QLINK_DECK_OS_RELEASE_FILE:-/etc/os-release}"
+PRODUCT_NAME_FILE="${QLINK_DECK_PRODUCT_NAME_FILE:-/sys/devices/virtual/dmi/id/product_name}"
+BOARD_NAME_FILE="${QLINK_DECK_BOARD_NAME_FILE:-/sys/devices/virtual/dmi/id/board_name}"
 
 mkdir -p "$EVIDENCE_DIR"
 
@@ -53,9 +56,89 @@ json_escape() {
     printf '%s' "$input"
 }
 
+json_bool() {
+    if [ "${1:-false}" = "true" ]; then
+        printf 'true'
+    else
+        printf 'false'
+    fi
+}
+
+read_first_line() {
+    local path="$1"
+    if [ -r "$path" ]; then
+        sed -n '1p' "$path" 2>/dev/null || true
+    fi
+}
+
+os_release_value() {
+    local key="$1"
+    local value=""
+    if [ -r "$OS_RELEASE_FILE" ]; then
+        value="$(awk -F= -v key="$key" '$1 == key { print substr($0, index($0, "=") + 1); exit }' "$OS_RELEASE_FILE" 2>/dev/null || true)"
+    fi
+    value="${value%\"}"
+    value="${value#\"}"
+    printf '%s' "$value"
+}
+
+is_steamos_host() {
+    local os_id os_name
+    os_id="$(os_release_value ID)"
+    os_name="$(os_release_value NAME)"
+    case "${os_id}:${os_name}" in
+        *steamos*|*SteamOS*) printf 'true' ;;
+        *) printf 'false' ;;
+    esac
+}
+
+is_steam_deck_hardware() {
+    local product board combined
+    product="$(read_first_line "$PRODUCT_NAME_FILE")"
+    board="$(read_first_line "$BOARD_NAME_FILE")"
+    combined="$product $board"
+    case "$combined" in
+        *"Steam Deck"*|*"Jupiter"*|*"Galileo"*) printf 'true' ;;
+        *) printf 'false' ;;
+    esac
+}
+
+hardware_claimed() {
+    local os_ok deck_ok
+    os_ok="$(is_steamos_host)"
+    deck_ok="$(is_steam_deck_hardware)"
+    if [ "$os_ok" = "true" ] && [ "$deck_ok" = "true" ]; then
+        printf 'true'
+    else
+        printf 'false'
+    fi
+}
+
+host_metadata_json() {
+    local os_id os_name product board os_ok deck_ok
+    os_id="$(os_release_value ID)"
+    os_name="$(os_release_value NAME)"
+    product="$(read_first_line "$PRODUCT_NAME_FILE")"
+    board="$(read_first_line "$BOARD_NAME_FILE")"
+    os_ok="$(is_steamos_host)"
+    deck_ok="$(is_steam_deck_hardware)"
+    cat <<EOF
+{
+    "osId": "$(json_escape "$os_id")",
+    "osName": "$(json_escape "$os_name")",
+    "productName": "$(json_escape "$product")",
+    "boardName": "$(json_escape "$board")",
+    "isSteamOS": $(json_bool "$os_ok"),
+    "isSteamDeckHardware": $(json_bool "$deck_ok")
+  }
+EOF
+}
+
 write_report() {
     local status="$1"
     local detail="${2:-}"
+    local hardware
+    hardware="$(hardware_claimed)"
     cat > "$REPORT_JSON" <<EOF
 {
   "mode": "$(json_escape "$MODE")",
@@ -63,7 +146,8 @@ write_report() {
   "detail": "$(json_escape "$detail")",
   "timestampUtc": "$(json_escape "$TIMESTAMP")",
   "evidenceDir": "$(json_escape "$EVIDENCE_DIR")",
-  "hardwareClaimed": false,
+  "hardwareClaimed": $(json_bool "$hardware"),
+  "host": $(host_metadata_json),
   "rawPcapCommitted": false,
   "rawSupportBundleCommitted": false,
   "privateMaterialCommitted": false,

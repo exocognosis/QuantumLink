@@ -31,6 +31,49 @@ pub enum ControlError {
 
 pub const DEFAULT_STATE_DIR: &str = "/var/lib/quantumlink";
 
+pub fn format_guide() -> String {
+    [
+        "QuantumLink SteamOS Guide",
+        "",
+        "Onboarding",
+        "- Build and install qlinkd plus qlinkctl, edit /etc/quantumlink/config.json, then start qlinkd under systemd.",
+        "- Begin with qlinkctl status and qlinkctl doctor before changing any network state.",
+        "- Keep support bundles redacted before sharing logs outside the Deck.",
+        "",
+        "Runtime modes",
+        "- qlinkd starts in dry-run planning mode by default; it validates config and reports the intended TUN, route, and nftables plan without mutating networking.",
+        "- qlinkd --check validates configuration/status and exits.",
+        "- qlinkd --activate-network is the explicit operator opt-in for live TUN, route, and nftables application.",
+        "- qlinkd --deactivate-network removes only QuantumLink-owned network state from the persisted ownership record.",
+        "- qlinkctl doctor reports packet I/O, data-plane health, and whether transport ready is yes or no.",
+        "",
+        "Peer and invite commands",
+        "- qlinkctl status shows daemon status as JSON.",
+        "- qlinkctl doctor summarizes readiness and failure/warning verdicts.",
+        "- qlinkctl invite import <encoded-invite> stores a private mesh peer invite.",
+        "- qlinkctl invite decode <code> inspects an invite without storing it.",
+        "- qlinkctl peer list lists stored peers.",
+        "- qlinkctl peer trust <peer-id> explains trust source, mesh mode, and Dytallix requirements.",
+        "- qlinkctl peer revoke <peer-id> marks a peer revoked; qlinkctl peer remove <peer-id> deletes it.",
+        "",
+        "Diagnostics and support",
+        "- qlinkctl support-bundle --output <path> exports redacted daemon status and doctor output.",
+        "- Share support bundles instead of raw logs when reporting bugs, tunnel issues, or security concerns.",
+        "- Route security-sensitive reports through SECURITY.md and keep secrets, wallet seeds, tokens, and raw packet payloads out of tickets.",
+        "",
+        "Steam-safe routing",
+        "- Steam-safe traffic bypass keeps Steam account, store, wallet, checkout, inventory, marketplace, launcher, and embedded browser traffic off QuantumLink by default.",
+        "- QuantumLink protects selected game or party traffic through explicit game profile routing and keeps the default route off the VPN by default.",
+        "- Activated mode owns qlink0, overlay routes, and qlink nftables state; teardown removes only owned state.",
+        "- Validate Steam launch options, LAN discovery, voice chat, and anti-cheat behavior per title before broad use.",
+        "",
+        "Production gates",
+        "- SteamOS remains pre-production until Deck validation proves real two-Deck transport, production-signed release artifacts, public Dytallix registry evidence, hardened rendezvous/relay evidence, and game compatibility validation.",
+        "- Local dry-run planning, packet I/O initialization, or transport ready: no status is not proof of protected peer traffic.",
+    ]
+    .join("\n")
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PeerCommandError {
     #[error("{0}")]
@@ -750,6 +793,32 @@ mod tests {
             error: error.map(str::to_string),
         };
         status
+    }
+
+    #[test]
+    fn format_guide_explains_steamos_modes_and_gates() {
+        let guide = format_guide();
+        assert!(guide.contains("QuantumLink SteamOS Guide"));
+        assert!(guide.contains("dry-run planning"));
+        assert!(guide.contains("systemd"));
+        assert!(guide.contains("--activate-network"));
+        assert!(guide.contains("qlink0"));
+        assert!(guide.contains("nftables"));
+        assert!(guide.contains("Steam-safe traffic"));
+        assert!(guide.contains("game profile"));
+        assert!(guide.contains("Deck validation"));
+        assert!(guide.contains("transport ready"));
+        assert!(guide.contains("pre-production"));
+    }
+
+    #[test]
+    fn format_guide_lists_operator_command_groups() {
+        let guide = format_guide();
+        assert!(guide.contains("qlinkctl status"));
+        assert!(guide.contains("qlinkctl doctor"));
+        assert!(guide.contains("qlinkctl invite import"));
+        assert!(guide.contains("qlinkctl peer trust"));
+        assert!(guide.contains("qlinkctl support-bundle --output"));
     }
 
     fn unique_temp_dir(prefix: &str) -> PathBuf {

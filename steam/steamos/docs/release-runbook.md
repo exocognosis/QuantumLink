@@ -17,6 +17,7 @@ The script builds `qlinkd` and `qlinkctl`, stages the package payload, writes `d
 - `release-manifest.json`
 - `verify-report.json`
 - `quantumlink-steamos-<version>.tar.zst.dev.sig` for dev packages
+- `production-evidence-manifest.json` when `QLINK_STEAMOS_PRODUCTION_EVIDENCE_MANIFEST` is provided
 
 The archive payload includes:
 
@@ -46,6 +47,17 @@ Production packaging requires `QLINK_STEAMOS_SIGNING_MODE=production` plus eithe
 - `QLINK_STEAMOS_SIGNATURE_FILE=/path/to/quantumlink-steamos-<version>.tar.zst.sig`
 - `QLINK_STEAMOS_RELEASE_PRIVATE_KEY=/path/to/ed25519-private-key.pem`
 
+Production-ready publication also requires non-hardware production evidence:
+
+```sh
+QLINK_STEAMOS_PRODUCTION_EVIDENCE_MANIFEST=/path/to/production-evidence-manifest.json
+```
+
+The packager copies this manifest to
+`dist/steamos/quantumlink-steamos-<version>/production-evidence-manifest.json`
+and includes it in checksums and release-manifest artifact hashes. The manifest
+schema is documented in [`production-evidence.md`](production-evidence.md).
+
 The verifier validates production signatures with:
 
 ```sh
@@ -67,9 +79,9 @@ Run the standalone verifier:
 bash steam/steamos/scripts/verify-steamos-release.sh dist/steamos/quantumlink-steamos-<version>.tar.zst
 ```
 
-The verifier checks expected files, executable bits, checksums, manifest artifact hashes and sizes, production signature status, secret-like paths/content, and installer shell syntax.
+The verifier checks expected files, executable bits, checksums, manifest artifact hashes and sizes, production signature status, non-hardware production evidence status, secret-like paths/content, and installer shell syntax.
 
-Dev signatures are valid for development inspection only. A report with `"notProductionReady":true` must block production publication.
+Dev signatures are valid for development inspection only. A report with `"notProductionReady":true` must block production publication. Passing non-hardware evidence may set `"nonHardwareProductionReady":true`, but full `"productionReady":true` still requires the hardware evidence gates in `production-readiness.md`.
 
 ## 2026-06-30 Closeout Result
 
@@ -82,5 +94,6 @@ Before tagging or attaching public SteamOS artifacts:
 - Run packaging with `QLINK_STEAMOS_SIGNING_MODE=production`.
 - Provide `QLINK_STEAMOS_SIGNATURE_FILE` or `QLINK_STEAMOS_RELEASE_PRIVATE_KEY`.
 - Verify with `QLINK_STEAMOS_RELEASE_PUBLIC_KEY`.
+- Provide or package `QLINK_STEAMOS_PRODUCTION_EVIDENCE_MANIFEST`.
 - Set `QLINK_STEAMOS_REQUIRE_PRODUCTION_READY=1` in publication gates.
 - Link active rendezvous/relay endpoint evidence and real Steam Deck validation evidence from `production-readiness.md`.

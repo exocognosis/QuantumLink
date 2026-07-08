@@ -14,6 +14,7 @@ SKIP_BUILD="${QLINK_STEAMOS_SKIP_BUILD:-0}"
 SIGNING_MODE="${QLINK_STEAMOS_SIGNING_MODE:-dev-classical}"
 SIGNATURE_FILE="${QLINK_STEAMOS_SIGNATURE_FILE:-}"
 PRIVATE_KEY_FILE="${QLINK_STEAMOS_RELEASE_PRIVATE_KEY:-}"
+PRODUCTION_EVIDENCE_MANIFEST_SOURCE="${QLINK_STEAMOS_PRODUCTION_EVIDENCE_MANIFEST:-}"
 SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-0}"
 
 need_cmd() {
@@ -88,6 +89,7 @@ SBOM="$SIDECAR_DIR/SBOM.spdx.json"
 MANIFEST="$SIDECAR_DIR/release-manifest.json"
 SUMS="$SIDECAR_DIR/SHA256SUMS.txt"
 VERIFY_REPORT="$SIDECAR_DIR/verify-report.json"
+PRODUCTION_EVIDENCE_MANIFEST="$SIDECAR_DIR/production-evidence-manifest.json"
 
 if [ "$SKIP_BUILD" != "1" ]; then
     cargo build --release -p qlinkd -p qlinkctl
@@ -111,6 +113,7 @@ install_payload_file "$STEAMOS_ROOT/packaging/systemd/qlinkd.service.d/activate-
     "$PAYLOAD_ROOT/packaging/systemd/qlinkd.service.d/activate-network.conf.sample" 0644
 
 install -d -m 0755 "$PAYLOAD_ROOT/config/games" "$PAYLOAD_ROOT/docs"
+install_payload_file "$STEAMOS_ROOT/config/steam-bypass.toml" "$PAYLOAD_ROOT/config/steam-bypass.toml" 0644
 for profile in "$STEAMOS_ROOT"/config/games/*.toml; do
     install_payload_file "$profile" "$PAYLOAD_ROOT/config/games/$(basename "$profile")" 0644
 done
@@ -133,7 +136,7 @@ cat > "$PAYLOAD_ROOT/config/config.example.json" <<'JSON'
 }
 JSON
 
-for doc in README.md docs/production-readiness.md docs/rendezvous-relay-production.md docs/release-runbook.md; do
+for doc in README.md docs/deck-validation.md docs/production-evidence.md docs/production-readiness.md docs/rendezvous-relay-production.md docs/release-runbook.md; do
     if [ -f "$STEAMOS_ROOT/$doc" ]; then
         install_payload_file "$STEAMOS_ROOT/$doc" "$PAYLOAD_ROOT/$doc" 0644
     fi
@@ -186,7 +189,6 @@ PY
 
 SIG_ARTIFACT=""
 SIG_ALGORITHM="sha256-dev-attestation"
-SIG_PRODUCTION_READY="false"
 if [ "$SIGNING_MODE" = "production" ]; then
     SIG_ALGORITHM="openssl-ed25519-raw"
     SIG_ARTIFACT="$PACKAGE_NAME.tar.zst.sig"
@@ -199,7 +201,6 @@ if [ "$SIGNING_MODE" = "production" ]; then
         echo "production signing requested but no QLINK_STEAMOS_SIGNATURE_FILE or QLINK_STEAMOS_RELEASE_PRIVATE_KEY was provided" >&2
         exit 1
     fi
-    SIG_PRODUCTION_READY="true"
 else
     SIG_ARTIFACT="$PACKAGE_NAME.tar.zst.dev.sig"
     {
@@ -209,9 +210,18 @@ else
     } > "$SIDECAR_DIR/$SIG_ARTIFACT"
 fi
 
+if [ -n "$PRODUCTION_EVIDENCE_MANIFEST_SOURCE" ]; then
+    if [ ! -f "$PRODUCTION_EVIDENCE_MANIFEST_SOURCE" ]; then
+        echo "missing production evidence manifest: $PRODUCTION_EVIDENCE_MANIFEST_SOURCE" >&2
+        exit 1
+    fi
+    install_payload_file "$PRODUCTION_EVIDENCE_MANIFEST_SOURCE" "$PRODUCTION_EVIDENCE_MANIFEST" 0644
+fi
+
 ARCHIVE_PATH="$ARCHIVE" \
 SBOM_PATH="$SBOM" \
 SIG_PATH="$SIDECAR_DIR/$SIG_ARTIFACT" \
+PRODUCTION_EVIDENCE_MANIFEST="$PRODUCTION_EVIDENCE_MANIFEST" \
 MANIFEST_PATH="$MANIFEST" \
 PRODUCT="$PRODUCT" \
 VERSION="$VERSION" \
@@ -219,7 +229,6 @@ PLATFORM="$PLATFORM" \
 SIGNING_MODE="$SIGNING_MODE" \
 SIG_ARTIFACT="$SIG_ARTIFACT" \
 SIG_ALGORITHM="$SIG_ALGORITHM" \
-SIG_PRODUCTION_READY="$SIG_PRODUCTION_READY" \
 SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
 python3 - <<'PY'
 import json
@@ -246,6 +255,7 @@ created = datetime.fromtimestamp(int(os.environ["SOURCE_DATE_EPOCH"]), timezone.
 archive_path = os.environ["ARCHIVE_PATH"]
 sbom_path = os.environ["SBOM_PATH"]
 sig_path = os.environ["SIG_PATH"]
+production_evidence_manifest = os.environ["PRODUCTION_EVIDENCE_MANIFEST"]
 manifest = {
     "product": os.environ["PRODUCT"],
     "version": os.environ["VERSION"],
@@ -260,10 +270,14 @@ manifest = {
         "mode": os.environ["SIGNING_MODE"],
         "algorithm": os.environ["SIG_ALGORITHM"],
         "artifact": os.environ["SIG_ARTIFACT"],
-        "productionReady": os.environ["SIG_PRODUCTION_READY"] == "true",
+        "productionMode": os.environ["SIGNING_MODE"] == "production",
+        "signatureProvided": True,
+        "covers": [os.path.basename(archive_path)],
         "validatedBy": "steam/steamos/scripts/verify-steamos-release.sh",
     },
 }
+if os.path.isfile(production_evidence_manifest):
+    manifest["artifacts"].append(artifact(production_evidence_manifest))
 with open(os.environ["MANIFEST_PATH"], "w", encoding="utf-8") as handle:
     json.dump(manifest, handle, separators=(",", ":"), sort_keys=True)
     handle.write("\n")
@@ -273,6 +287,9 @@ PY
 for artifact in "$ARCHIVE" "$SBOM" "$MANIFEST" "$SIDECAR_DIR/$SIG_ARTIFACT"; do
     printf '%s  %s\n' "$(sha256_file "$artifact")" "$(basename "$artifact")" >> "$SUMS"
 done
+if [ -f "$PRODUCTION_EVIDENCE_MANIFEST" ]; then
+    printf '%s  %s\n' "$(sha256_file "$PRODUCTION_EVIDENCE_MANIFEST")" "$(basename "$PRODUCTION_EVIDENCE_MANIFEST")" >> "$SUMS"
+fi
 
 VERIFY_REPORT="$VERIFY_REPORT" "$SCRIPT_DIR/verify-steamos-release.sh" "$ARCHIVE"
 

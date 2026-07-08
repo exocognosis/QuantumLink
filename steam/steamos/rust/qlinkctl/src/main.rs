@@ -1,4 +1,5 @@
 use qlink_proto::InviteCode;
+use qlinkctl::format_guide;
 #[cfg(unix)]
 use qlinkctl::{
     current_unix_seconds, format_doctor, format_peer_list, format_peer_trust, format_status,
@@ -12,6 +13,7 @@ use std::path::Path;
 fn main() {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
+        Some("guide") => println!("{}", format_guide()),
         Some("status") => status_command(),
         Some("doctor") => doctor_command(),
         Some("support-bundle") => {
@@ -87,7 +89,7 @@ fn main() {
             }
         },
         _ => {
-            eprintln!("usage: qlinkctl <status|doctor|support-bundle --output|invite|peer>");
+            eprintln!("usage: qlinkctl <guide|status|doctor|support-bundle --output|invite|peer>");
             std::process::exit(2);
         }
     }

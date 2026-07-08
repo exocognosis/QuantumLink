@@ -90,8 +90,10 @@ private struct DashboardView: View {
         }
 
         Section("Manage") {
-          SidebarItem(tab: .configuration)
-            .tag(SidebarTab.configuration)
+          ForEach([SidebarTab.configuration, .help]) { tab in
+            SidebarItem(tab: tab)
+              .tag(tab)
+          }
         }
       }
       .listStyle(.sidebar)
@@ -352,10 +354,11 @@ private struct DashboardView: View {
           settings.applying(identityCommandOutput: output)
       case .failure(let error):
         dytallixEnrollmentSettingsBinding.wrappedValue = settings.replacing(status: .failed)
-        dytallixLastIdentityError = DytallixIdentityFailurePresentation(
-          operation: operation,
-          commandOutput: error.dytallixCommandOutput
-        ).message
+        dytallixLastIdentityError =
+          DytallixIdentityFailurePresentation(
+            operation: operation,
+            commandOutput: error.dytallixCommandOutput
+          ).message
       }
     }
   }
@@ -424,16 +427,17 @@ private struct DashboardView: View {
       relayServers: baseConfiguration.relayServers,
       mtu: baseConfiguration.mtu,
       crypto: CryptoPolicy(pqcAlgorithm: pqcAlgorithm),
-	      killSwitch: baseConfiguration.killSwitch,
-	      meshTrustPolicy: baseConfiguration.meshTrustPolicy,
-	      discoveryIdentityMode: effectiveDiscoveryIdentityMode,
+      killSwitch: baseConfiguration.killSwitch,
+      meshTrustPolicy: baseConfiguration.meshTrustPolicy,
+      discoveryIdentityMode: effectiveDiscoveryIdentityMode,
       dytallixIdentity: dytallixEnrollmentSettings.runtimeConfiguration(
         mode: effectiveDiscoveryIdentityMode
       )
     )
-    baseConfiguration = ManagedConfigurationLoader.currentManagedOverride(
-      base: baseConfiguration
-    ).configuration
+    baseConfiguration =
+      ManagedConfigurationLoader.currentManagedOverride(
+        base: baseConfiguration
+      ).configuration
     if let profile {
       return deploymentMode.configuration(from: baseConfiguration, profile: profile)
     }
@@ -527,6 +531,7 @@ private enum SidebarTab: CaseIterable, Hashable, Identifiable {
   case security
   case diagnostics
   case configuration
+  case help
 
   var id: Self { self }
 
@@ -542,6 +547,7 @@ private enum SidebarTab: CaseIterable, Hashable, Identifiable {
     case .security: "Security"
     case .diagnostics: "Diagnostics"
     case .configuration: "Configuration"
+    case .help: "Help"
     }
   }
 
@@ -557,6 +563,7 @@ private enum SidebarTab: CaseIterable, Hashable, Identifiable {
     case .security: "lock.shield"
     case .diagnostics: "waveform.path.ecg"
     case .configuration: "slider.horizontal.3"
+    case .help: "questionmark.circle"
     }
   }
 }
@@ -629,10 +636,11 @@ private enum DytallixIdentityProcess {
     try process.run()
     process.waitUntilExit()
 
-    let output = String(
-      data: pipe.fileHandleForReading.readDataToEndOfFile(),
-      encoding: .utf8
-    ) ?? ""
+    let output =
+      String(
+        data: pipe.fileHandleForReading.readDataToEndOfFile(),
+        encoding: .utf8
+      ) ?? ""
     guard process.terminationStatus == 0 else {
       throw DytallixEnrollmentProcessError.commandFailed(output)
     }
@@ -769,7 +777,8 @@ private enum DytallixIdentityProcess {
   }
 
   private static func applicationSupportDirectory() throws -> URL {
-    let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
+    let base =
+      FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
       .first ?? FileManager.default.homeDirectoryForCurrentUser
     let directory = base.appendingPathComponent("QuantumLink", isDirectory: true)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -995,6 +1004,8 @@ private struct DashboardDetailView: View {
           onRevokeDytallixIdentity: onRevokeDytallixIdentity,
           onRotateDytallixDeviceIdentity: onRotateDytallixDeviceIdentity
         )
+      case .help:
+        HelpPanel()
       }
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -1357,9 +1368,11 @@ private struct OnboardingPanel: View {
 
   private var firstConnectionChecklistDetail: String {
     if identityRequiresRegistry {
-      return "Public/interoperable meshes accept discovery only after this device has an active registry identity."
+      return
+        "Public/interoperable meshes accept discovery only after this device has an active registry identity."
     }
-    return "After confirming a destination IP and port in Home or Connections, start your first session."
+    return
+      "After confirming a destination IP and port in Home or Connections, start your first session."
   }
 }
 
@@ -1834,7 +1847,8 @@ private struct ConnectionLauncherPanel: View {
       gamePort: draft.port > 0 ? draft.port : 27015
     )
     partyInviteCode = (try? invite.joinCode()) ?? ""
-    partyJoinMessage = partyInviteCode.isEmpty
+    partyJoinMessage =
+      partyInviteCode.isEmpty
       ? "Party code could not be created from the current configuration."
       : "\(invite.trustSummary). \(invite.pathSummary)."
     deploymentMode = .partyMesh
@@ -1987,7 +2001,8 @@ private struct KPIGrid: View {
       KPICard(
         title: "Latency",
         value: latencyValue,
-        detail: status.peers.contains { $0.rttMilliseconds != nil } ? "Average peer RTT" : "RTT not reported",
+        detail: status.peers.contains { $0.rttMilliseconds != nil }
+          ? "Average peer RTT" : "RTT not reported",
         systemImage: "speedometer"
       )
       KPICard(
@@ -2260,9 +2275,21 @@ private struct ConfigurationPanel: View {
           .foregroundStyle(.secondary)
           .fixedSize(horizontal: false, vertical: true)
 
-          KnowledgeRow(title: "Invite", detail: "Create Code packages the mesh ID, host overlay address, rendezvous endpoints, relay endpoints, game port, and trust mode.")
-          KnowledgeRow(title: "Join", detail: "Join parses a Party Mesh code and fills the host overlay address and game port in the connection launcher.")
-          KnowledgeRow(title: "Telemetry", detail: "Latency and direct/relay status display only after the transport reports real peer path data.")
+          KnowledgeRow(
+            title: "Invite",
+            detail:
+              "Create Code packages the mesh ID, host overlay address, rendezvous endpoints, relay endpoints, game port, and trust mode."
+          )
+          KnowledgeRow(
+            title: "Join",
+            detail:
+              "Join parses a Party Mesh code and fills the host overlay address and game port in the connection launcher."
+          )
+          KnowledgeRow(
+            title: "Telemetry",
+            detail:
+              "Latency and direct/relay status display only after the transport reports real peer path data."
+          )
         }
 
         ConfigurationCard(
@@ -2306,8 +2333,12 @@ private struct ConfigurationPanel: View {
               label: discoveryIdentityPresentation.rowLabel,
               value: discoveryIdentityPresentation.status
             )
-            InfoRow(label: "Peer ID", value: dytallixEnrollmentSettings.registeredPeerID ?? "Not registered")
-            InfoRow(label: "Registry", value: registryConfiguration == nil ? "Missing endpoint or contract" : "Configured")
+            InfoRow(
+              label: "Peer ID",
+              value: dytallixEnrollmentSettings.registeredPeerID ?? "Not registered")
+            InfoRow(
+              label: "Registry",
+              value: registryConfiguration == nil ? "Missing endpoint or contract" : "Configured")
             InfoRow(label: "Enrollment", value: dytallixEnrollmentSettings.status.label)
             InfoRow(label: "Wallet Status", value: walletPresentation.status)
             if let walletAddress = dytallixEnrollmentSettings.walletAddress,
@@ -2369,7 +2400,8 @@ private struct ConfigurationPanel: View {
               } label: {
                 Label("Refresh Status", systemImage: "arrow.clockwise")
               }
-              .disabled(identityActionsDisabled || dytallixEnrollmentSettings.registeredPeerID == nil)
+              .disabled(
+                identityActionsDisabled || dytallixEnrollmentSettings.registeredPeerID == nil)
 
               Button(role: .destructive) {
                 onRevokeDytallixIdentity()
@@ -2389,10 +2421,12 @@ private struct ConfigurationPanel: View {
                 .foregroundStyle(.orange)
                 .fixedSize(horizontal: false, vertical: true)
             } else if configuration.discoveryIdentityMode == .off {
-              Text("Identity publishing is off. Enable Verified or Public Wallet mode before using registry actions.")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+              Text(
+                "Identity publishing is off. Enable Verified or Public Wallet mode before using registry actions."
+              )
+              .font(.callout)
+              .foregroundStyle(.secondary)
+              .fixedSize(horizontal: false, vertical: true)
             }
 
             Divider()
@@ -2440,11 +2474,13 @@ private struct ConfigurationPanel: View {
           )
           KnowledgeRow(
             title: "Wallet/Faucet",
-            detail: "Open the Dytallix wallet page when the local wallet is missing or a registry transaction needs testnet funds."
+            detail:
+              "Open the Dytallix wallet page when the local wallet is missing or a registry transaction needs testnet funds."
           )
           KnowledgeRow(
             title: "Off",
-            detail: "Use only for private or development meshes that do not require public identity."
+            detail:
+              "Use only for private or development meshes that do not require public identity."
           )
         }
 
@@ -2457,11 +2493,20 @@ private struct ConfigurationPanel: View {
           .fixedSize(horizontal: false, vertical: true)
 
           KnowledgeRow(title: "Endpoint", detail: "RPC or service URL for the Dytallix registry.")
-          KnowledgeRow(title: "Contract", detail: "Registry contract address used for peer records.")
+          KnowledgeRow(
+            title: "Contract", detail: "Registry contract address used for peer records.")
           KnowledgeRow(title: "Wallet", detail: "Dytallix wallet name resolved by the local CLI.")
-          KnowledgeRow(title: "Faucet", detail: "Use the Dytallix wallet/faucet page if enrollment fails because the wallet needs testnet funds.")
-          KnowledgeRow(title: "Key Rotation", detail: "Update or revoke the active registry record before rotating this device key.")
-          KnowledgeRow(title: "Result", detail: "Registered peer ID and wallet address returned by enrollment.")
+          KnowledgeRow(
+            title: "Faucet",
+            detail:
+              "Use the Dytallix wallet/faucet page if enrollment fails because the wallet needs testnet funds."
+          )
+          KnowledgeRow(
+            title: "Key Rotation",
+            detail: "Update or revoke the active registry record before rotating this device key.")
+          KnowledgeRow(
+            title: "Result", detail: "Registered peer ID and wallet address returned by enrollment."
+          )
         }
 
         ConfigurationCard(title: "Privacy Boundary", systemImage: "hand.raised") {
@@ -2472,16 +2517,38 @@ private struct ConfigurationPanel: View {
           .foregroundStyle(.secondary)
           .fixedSize(horizontal: false, vertical: true)
 
-          KnowledgeRow(title: "Stored", detail: "Endpoint, contract, wallet name, wallet address, peer ID, and enrollment status.")
-          KnowledgeRow(title: "Not Stored", detail: "Wallet private keys, passphrases, and local keystore paths.")
-          KnowledgeRow(title: "Public Wallet", detail: "Only enable when the mesh should publish wallet identity for discovery.")
+          KnowledgeRow(
+            title: "Stored",
+            detail:
+              "Endpoint, contract, wallet name, wallet address, peer ID, and enrollment status.")
+          KnowledgeRow(
+            title: "Not Stored",
+            detail: "Wallet private keys, passphrases, and local keystore paths.")
+          KnowledgeRow(
+            title: "Public Wallet",
+            detail: "Only enable when the mesh should publish wallet identity for discovery.")
         }
 
-        ConfigurationCard(title: "Registry Troubleshooting", systemImage: "wrench.and.screwdriver") {
-          KnowledgeRow(title: "Wallet Needed", detail: "Open Wallet/Faucet, create or unlock a Dytallix wallet, then retry registration.")
-          KnowledgeRow(title: "Transaction Fails", detail: "Use Wallet/Faucet to check testnet funds, faucet cooldown, or wallet availability.")
-          KnowledgeRow(title: "Already Registered", detail: "Use Update Registry Record for the same device, or revoke before rotating the device key.")
-          KnowledgeRow(title: "Peer Blocked", detail: "Security and Peers show exact registry states such as missing, revoked, expired, suspended, or binding mismatch.")
+        ConfigurationCard(title: "Registry Troubleshooting", systemImage: "wrench.and.screwdriver")
+        {
+          KnowledgeRow(
+            title: "Wallet Needed",
+            detail:
+              "Open Wallet/Faucet, create or unlock a Dytallix wallet, then retry registration.")
+          KnowledgeRow(
+            title: "Transaction Fails",
+            detail:
+              "Use Wallet/Faucet to check testnet funds, faucet cooldown, or wallet availability.")
+          KnowledgeRow(
+            title: "Already Registered",
+            detail:
+              "Use Update Registry Record for the same device, or revoke before rotating the device key."
+          )
+          KnowledgeRow(
+            title: "Peer Blocked",
+            detail:
+              "Security and Peers show exact registry states such as missing, revoked, expired, suspended, or binding mismatch."
+          )
         }
 
         ConfigurationCard(title: "Appearance", systemImage: "paintbrush") {
@@ -2646,7 +2713,9 @@ private struct ConfigurationPanel: View {
   private var dytallixContractBinding: Binding<String> {
     Binding(
       get: { dytallixEnrollmentSettings.contractAddress },
-      set: { dytallixEnrollmentSettings = dytallixEnrollmentSettings.replacing(contractAddress: $0) }
+      set: {
+        dytallixEnrollmentSettings = dytallixEnrollmentSettings.replacing(contractAddress: $0)
+      }
     )
   }
 
@@ -2660,6 +2729,190 @@ private struct ConfigurationPanel: View {
         )
       }
     )
+  }
+}
+
+private struct HelpPanel: View {
+  @State private var searchText = ""
+  @State private var selectedPlatform: HelpPlatform = .macOS
+
+  private var filteredTopics: [HelpTopic] {
+    HelpKnowledgeBase.topics(for: selectedPlatform).filter { topic in
+      let normalizedSearch = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased()
+      let matchesSearch =
+        normalizedSearch.isEmpty || topic.searchableText.lowercased().contains(normalizedSearch)
+      return matchesSearch
+    }
+  }
+
+  var body: some View {
+    PanelChrome {
+      PanelHeader(
+        tab: .help,
+        subtitle:
+          "Search setup, routing, privacy, diagnostics, platform readiness, and support guidance."
+      )
+
+      ConfigurationCard(title: "Knowledge Base", systemImage: "books.vertical") {
+        VStack(alignment: .leading, spacing: 12) {
+          TextField("Search help topics", text: $searchText)
+            .textFieldStyle(.roundedBorder)
+
+          Picker("Platform", selection: $selectedPlatform) {
+            ForEach(HelpPlatform.allCases, id: \.self) { platform in
+              Text(platform.label)
+                .tag(platform)
+            }
+          }
+          .pickerStyle(.segmented)
+
+          Text(
+            "Help content is filtered by platform so each build uses operating-system-specific language, controls, and readiness boundaries."
+          )
+          .font(.callout)
+          .foregroundStyle(.secondary)
+          .fixedSize(horizontal: false, vertical: true)
+        }
+      }
+
+      PanelGrid {
+        ConfigurationCard(title: "First-Run Path", systemImage: "sparkles") {
+          KnowledgeRow(
+            title: "Set identity",
+            detail:
+              "Choose private, verified, or public-wallet Dytallix discovery before accepting peers."
+          )
+          KnowledgeRow(
+            title: selectedPlatform.readinessTitle,
+            detail: selectedPlatform.readinessDetail
+          )
+          KnowledgeRow(
+            title: "Export safely",
+            detail:
+              "Share redacted support bundles instead of raw logs, packet captures, routes, wallet addresses, or peer IDs."
+          )
+        }
+
+        ConfigurationCard(title: "Platform Boundary", systemImage: "square.stack.3d.up") {
+          HelpPlatformSummaryRow(
+            platform: selectedPlatform,
+            detail: selectedPlatform.helpDetail
+          )
+        }
+      }
+
+      if filteredTopics.isEmpty {
+        ContentUnavailableView(
+          "No Help Topics",
+          systemImage: "magnifyingglass",
+          description: Text("Clear the search field or choose a different platform.")
+        )
+      } else {
+        PanelGrid {
+          ForEach(filteredTopics, id: \.id) { topic in
+            HelpTopicCard(topic: topic)
+          }
+        }
+      }
+    }
+  }
+}
+
+private struct HelpTopicCard: View {
+  let topic: HelpTopic
+
+  var body: some View {
+    ConfigurationCard(title: topic.title, systemImage: topic.id.systemImage) {
+      VStack(alignment: .leading, spacing: 12) {
+        Text(topic.summary)
+          .font(.callout)
+          .foregroundStyle(.secondary)
+          .fixedSize(horizontal: false, vertical: true)
+
+        FlowLayout(spacing: 8) {
+          ForEach(topic.platforms, id: \.self) { platform in
+            HelpPlatformChip(platform: platform)
+          }
+        }
+
+        Divider()
+
+        ForEach(topic.sections, id: \.title) { section in
+          HelpSectionBlock(section: section)
+        }
+      }
+    }
+  }
+}
+
+private struct HelpSectionBlock: View {
+  let section: HelpSection
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 8) {
+      Text(section.title)
+        .font(.callout.weight(.semibold))
+      Text(section.body)
+        .font(.callout)
+        .foregroundStyle(.secondary)
+        .fixedSize(horizontal: false, vertical: true)
+
+      if !section.bullets.isEmpty {
+        VStack(alignment: .leading, spacing: 6) {
+          ForEach(section.bullets, id: \.self) { bullet in
+            HStack(alignment: .top, spacing: 8) {
+              Image(systemName: "checkmark.circle.fill")
+                .font(.caption)
+                .foregroundStyle(.green)
+                .frame(width: 14)
+              Text(bullet)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            }
+          }
+        }
+      }
+    }
+    .frame(maxWidth: .infinity, alignment: .leading)
+  }
+}
+
+private struct HelpPlatformSummaryRow: View {
+  let platform: HelpPlatform
+  let detail: String
+
+  var body: some View {
+    HStack(alignment: .top, spacing: 12) {
+      Image(systemName: platform.systemImage)
+        .font(.title3)
+        .foregroundStyle(platform.tint)
+        .frame(width: 28)
+
+      VStack(alignment: .leading, spacing: 4) {
+        Text(platform.label)
+          .font(.callout.weight(.semibold))
+        Text(detail)
+          .font(.callout)
+          .foregroundStyle(.secondary)
+          .fixedSize(horizontal: false, vertical: true)
+      }
+    }
+    .frame(maxWidth: .infinity, alignment: .leading)
+  }
+}
+
+private struct HelpPlatformChip: View {
+  let platform: HelpPlatform
+
+  var body: some View {
+    Label(platform.label, systemImage: platform.systemImage)
+      .font(.caption.weight(.semibold))
+      .foregroundStyle(platform.tint)
+      .padding(.horizontal, 10)
+      .padding(.vertical, 6)
+      .background(platform.tint.opacity(0.12), in: Capsule())
   }
 }
 
@@ -2995,18 +3248,24 @@ private struct SecurityDetail: View {
       )
 
       PanelGrid {
-        ConfigurationCard(title: "Dytallix Trust Anchor", systemImage: "person.badge.shield.checkmark") {
+        ConfigurationCard(
+          title: "Dytallix Trust Anchor", systemImage: "person.badge.shield.checkmark"
+        ) {
           InfoRow(label: "Discovery", value: configuration.discoveryIdentityMode.title)
           InfoRow(label: "Trust Policy", value: configuration.meshTrustPolicy.label)
           InfoRow(label: "Trust Required", value: status.peerTrust.required ? "Yes" : "No")
-          InfoRow(label: "Registry", value: status.peerTrust.registryConfigured ? "Configured" : "Not configured")
+          InfoRow(
+            label: "Registry",
+            value: status.peerTrust.registryConfigured ? "Configured" : "Not configured")
           InfoRow(label: "Verified", value: "\(status.peerTrust.verifiedPeerCount)")
           InfoRow(label: "Pending", value: "\(status.peerTrust.pendingPeerCount)")
           InfoRow(label: "Unverified", value: "\(status.peerTrust.unverifiedPeerCount)")
           InfoRow(label: "Blocked", value: "\(status.peerTrust.failedPeerCount)")
           InfoRow(label: "Last Checked", value: trustLastCheckedLabel)
           InfoRow(label: "Enrollment", value: dytallixEnrollmentSettings.status.label)
-          InfoRow(label: "Peer ID", value: dytallixEnrollmentSettings.registeredPeerID ?? "Not registered")
+          InfoRow(
+            label: "Peer ID", value: dytallixEnrollmentSettings.registeredPeerID ?? "Not registered"
+          )
 
           Text(
             "Public meshes require a registry-backed identity before peer discovery is trusted. Private and development meshes can keep identity publishing off."
@@ -3114,7 +3373,9 @@ private struct DiagnosticsDetail: View {
           InfoRow(label: "Policy", value: configuration.meshTrustPolicy.label)
           InfoRow(label: "Discovery", value: configuration.discoveryIdentityMode.title)
           InfoRow(label: "Trust Required", value: status.peerTrust.required ? "Yes" : "No")
-          InfoRow(label: "Registry", value: status.peerTrust.registryConfigured ? "Configured" : "Not configured")
+          InfoRow(
+            label: "Registry",
+            value: status.peerTrust.registryConfigured ? "Configured" : "Not configured")
           InfoRow(label: "Enrollment", value: dytallixEnrollmentSettings.status.label)
           InfoRow(label: "Wallet", value: walletDiagnosticsLabel)
           InfoRow(label: "Verified Peers", value: "\(status.peerTrust.verifiedPeerCount)")
@@ -3458,6 +3719,83 @@ private struct FlowLayout: Layout {
   }
 }
 
+extension HelpTopicID {
+  fileprivate var systemImage: String {
+    switch self {
+    case .gettingStarted: "sparkles"
+    case .connectingPeers: "point.3.connected.trianglepath.dotted"
+    case .activityDiagnostics: "waveform.path.ecg"
+    case .cryptography: "lock.shield"
+    case .routingProfiles: "arrow.triangle.branch"
+    case .dytallixIdentityTrust: "person.badge.shield.checkmark"
+    case .mdmEnterprise: "building.2"
+    case .steamOSGameRouting: "gamecontroller"
+    case .privacySecurity: "hand.raised"
+    case .troubleshooting: "wrench.and.screwdriver"
+    case .supportTicket: "envelope.badge"
+    }
+  }
+}
+
+extension HelpPlatform {
+  fileprivate var systemImage: String {
+    switch self {
+    case .macOS: "macwindow"
+    case .windows: "rectangle.grid.2x2"
+    case .steamOS: "gamecontroller"
+    case .enterprise: "building.2"
+    }
+  }
+
+  fileprivate var tint: Color {
+    switch self {
+    case .macOS: .blue
+    case .windows: .cyan
+    case .steamOS: .green
+    case .enterprise: .orange
+    }
+  }
+
+  fileprivate var helpDetail: String {
+    switch self {
+    case .macOS:
+      "SwiftUI client over Network Extension, Keychain-backed identity, MDM profiles, Developer ID signing, notarization, and Sparkle-style updates."
+    case .windows:
+      "WinUI dashboard over the privileged Windows service, Wintun adapter, WFP kill switch, DPAPI secret storage, named-pipe IPC, MSI, and WiX."
+    case .steamOS:
+      "Pre-production qlinkd and qlinkctl operator flow with systemd, dry-run planning, explicit --activate-network, qlink0, nftables, and Steam-safe routing."
+    case .enterprise:
+      "Administrator-managed route, identity, entitlement, diagnostics, release, and support-export policy across supported platform builds."
+    }
+  }
+
+  fileprivate var readinessTitle: String {
+    switch self {
+    case .macOS:
+      "Confirm Network Extension"
+    case .windows:
+      "Confirm Windows service"
+    case .steamOS:
+      "Confirm qlinkd"
+    case .enterprise:
+      "Confirm managed policy"
+    }
+  }
+
+  fileprivate var readinessDetail: String {
+    switch self {
+    case .macOS:
+      "Check Network Extension permission, tunnel-controller readiness, and Keychain identity before applying DNS, route, or peer changes."
+    case .windows:
+      "Check the Windows service, named-pipe IPC, Wintun adapter, and WFP policy before applying DNS, route, or peer changes."
+    case .steamOS:
+      "Run qlinkctl status or qlinkctl doctor to confirm qlinkd, systemd, qlink0, and nftables readiness before activating routes."
+    case .enterprise:
+      "Check managed configuration, release channel, identity policy, and fleet rollout readiness before applying DNS, route, or peer changes."
+    }
+  }
+}
+
 extension RouteMode {
   fileprivate var label: String {
     switch self {
@@ -3548,11 +3886,12 @@ extension DytallixPeerTrustState {
     case .pending, .unknown: .secondary
     case .notConfigured, .unverified, .expired, .lookupFailed: .orange
     case .missingRegistryRecord,
-         .revoked,
-         .suspended,
-         .bindingMismatch,
-         .verificationFailed,
-         .failed: .red
+      .revoked,
+      .suspended,
+      .bindingMismatch,
+      .verificationFailed,
+      .failed:
+      .red
     }
   }
 }
