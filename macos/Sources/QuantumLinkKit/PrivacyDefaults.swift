@@ -242,14 +242,15 @@ public enum PrivacyDefaults {
     /// - IPv4 literals, with optional `:port` suffix (`192.168.1.10:4433`)
     /// - IPv6 literals, including bracketed forms (`[fe80::1]:4433`)
     /// - Bracketed IPv6 without ports (`[2001:db8::1]`)
+    /// - DNS/FQDN endpoint names and URL hosts (`relay.example.net:9472`)
+    /// - Dytallix/EVM-style wallet or contract addresses (`0x...`)
     ///
     /// The regex matches deliberately err on the side of over-redaction:
     /// false positives produce harmless `[redacted-ip]` strings, false
-    /// negatives leak addresses. We do NOT attempt to redact hostnames or
-    /// FQDNs — those require domain knowledge of which strings are
-    /// addresses vs. configuration keys vs. peer aliases. Hostname
-    /// redaction is a v2 feature once we have a clearer separation in the
-    /// data model.
+    /// negatives leak addresses. Hostname/FQDN matching deliberately
+    /// over-redacts dotted names in diagnostic strings so DNS data and
+    /// rendezvous/relay endpoint names do not appear in default support
+    /// exports or `.public` log output.
     ///
     /// **Note**: this function does NOT touch `peer_id` strings — by
     /// design, since support bundles use it and intentionally keep
@@ -259,6 +260,7 @@ public enum PrivacyDefaults {
         // Order matters: redact bracketed IPv6 (with optional port) FIRST,
         // because the inner address would otherwise be matched by the
         // bare-IPv6 pattern and leave dangling brackets.
+        let dytallixAddress = #"\b0x[0-9a-fA-F]{40}\b"#
         let bracketedIPv6WithOptionalPort =
             #"\[(?:[0-9a-fA-F:]+|::1)\](?::\d{1,5})?"#
         // Bare IPv6: at least two consecutive `<hex-group>:` runs, where
@@ -272,8 +274,14 @@ public enum PrivacyDefaults {
         // IPv4 with optional `:port` suffix. Bound by word boundaries so
         // that `192.168.1.10` is captured but `version 1.2.3.4.5` is not.
         let ipv4WithOptionalPort = #"\b(?:\d{1,3}\.){3}\d{1,3}(?::\d{1,5})?\b"#
+        // Hostnames/FQDNs with alphabetic TLDs, optionally prefixed by a
+        // URL scheme and optionally suffixed by a port. This intentionally
+        // redacts support-worthy DNS data but avoids version strings like
+        // `1.2.3` because the final label must be alphabetic.
+        let fqdnWithOptionalSchemeAndPort =
+            #"(?i)\b(?:[a-z][a-z0-9+.-]*://)?(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}(?::\d{1,5})?\b"#
 
-        let combined = "(?:\(bracketedIPv6WithOptionalPort))|(?:\(bareIPv6))|(?:\(ipv4WithOptionalPort))"
+        let combined = "(?:\(dytallixAddress))|(?:\(bracketedIPv6WithOptionalPort))|(?:\(bareIPv6))|(?:\(ipv4WithOptionalPort))|(?:\(fqdnWithOptionalSchemeAndPort))"
 
         return value.replacingOccurrences(
             of: combined,

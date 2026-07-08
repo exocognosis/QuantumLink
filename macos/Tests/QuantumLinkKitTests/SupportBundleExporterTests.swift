@@ -29,9 +29,10 @@ final class SupportBundleExporterTests: XCTestCase {
             peers: [],
             metrics: MeshMetrics(),
             transport: nil,
-            // Synthesize a "leaky" error string with multiple address forms;
-            // the redactor must scrub every one in default mode.
-            lastError: "rendezvous 10.0.0.5:9471 unreachable; relay [2001:db8::beef]:9472 timed out from 192.168.1.42"
+            // Synthesize a "leaky" error string with multiple address,
+            // endpoint, DNS, and Dytallix address forms; the redactor must
+            // scrub every one in default mode.
+            lastError: "rendezvous 10.0.0.5:9471 unreachable; relay [2001:db8::beef]:9472 timed out from 192.168.1.42; dns corp.acme.example; wallet 0x1111111111111111111111111111111111111111"
         )
     }
 
@@ -97,7 +98,7 @@ final class SupportBundleExporterTests: XCTestCase {
         let bundle = exporter.buildBundle(
             status: tunnelStatusWithLeakyError(),
             meshMetrics: meshMetricsWithLeakyState(),
-            meshLastError: "QUIC handshake to [fe80::1]:4433 failed",
+            meshLastError: "QUIC handshake to [fe80::1]:4433 failed via relay.quantumlink.example:4433",
             pumpCounters: leakyPumpCounters(),
             configuration: leakyConfiguration(),
             redactionMode: .default
@@ -111,6 +112,9 @@ final class SupportBundleExporterTests: XCTestCase {
         XCTAssertFalse(body.contains("192.168.1.42"))
         XCTAssertFalse(body.contains("2001:db8"))
         XCTAssertFalse(body.contains("fe80::1"))
+        XCTAssertFalse(body.contains("corp.acme.example"))
+        XCTAssertFalse(body.contains("relay.quantumlink.example"))
+        XCTAssertFalse(body.contains("0x1111111111111111111111111111111111111111"))
         XCTAssertFalse(body.contains(":9471"))
         XCTAssertFalse(body.contains(":9472"))
         XCTAssertFalse(body.contains(":4433"))
@@ -132,7 +136,7 @@ final class SupportBundleExporterTests: XCTestCase {
         let bundle = exporter.buildBundle(
             status: tunnelStatusWithLeakyError(),
             meshMetrics: meshMetricsWithLeakyState(),
-            meshLastError: "QUIC handshake to [fe80::1]:4433 failed",
+            meshLastError: "QUIC handshake to [fe80::1]:4433 failed via relay.quantumlink.example:4433",
             pumpCounters: leakyPumpCounters(),
             configuration: leakyConfiguration(),
             redactionMode: .raw
@@ -146,6 +150,9 @@ final class SupportBundleExporterTests: XCTestCase {
         XCTAssertTrue(body.contains("192.168.1.42"))
         XCTAssertTrue(body.contains("[2001:db8::beef]:9472"))
         XCTAssertTrue(body.contains("[fe80::1]:4433"))
+        XCTAssertTrue(body.contains("corp.acme.example"))
+        XCTAssertTrue(body.contains("relay.quantumlink.example:4433"))
+        XCTAssertTrue(body.contains("0x1111111111111111111111111111111111111111"))
         XCTAssertTrue(body.contains("100.64.255.1"))
         // No redaction sentinel.
         XCTAssertFalse(body.contains("[redacted-ip]"))

@@ -531,7 +531,12 @@ assert_contains "$PACKAGE_ROOT/SHA256SUMS.txt" "quantumlink-steamos-9.9.9-test.t
 assert_contains "$PACKAGE_ROOT/release-manifest.json" '"product":"QuantumLink SteamOS"'
 assert_contains "$PACKAGE_ROOT/release-manifest.json" '"platform":"steamos"'
 assert_contains "$PACKAGE_ROOT/release-manifest.json" '"mode":"dev-classical"'
+assert_contains "$PACKAGE_ROOT/release-manifest.json" '"productionMode":false'
+assert_not_contains "$PACKAGE_ROOT/release-manifest.json" '"productionReady"'
 assert_contains "$PACKAGE_ROOT/verify-report.json" '"notProductionReady":true'
+assert_contains "$PACKAGE_ROOT/verify-report.json" '"requireProductionReady":false'
+assert_contains "$PACKAGE_ROOT/verify-report.json" '"signatureMode":"dev-classical"'
+assert_contains "$PACKAGE_ROOT/verify-report.json" '"signatureValidated":false'
 
 VERIFY_REPORT="$TMP_ROOT/standalone-verify-report.json" \
     bash "$VERIFIER" "$PACKAGE_ARCHIVE" >"$TMP_ROOT/verify.out" 2>"$TMP_ROOT/verify.err"

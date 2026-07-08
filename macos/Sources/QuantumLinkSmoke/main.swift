@@ -69,14 +69,17 @@ enum QuantumLinkSmoke {
                        TransportSmokeRunner.isExpectedDisabledDevQuicLoopback(error) {
                         print("preflight_transport_kind=\(TunnelTransportKind.devQuicLoopback.rawValue)")
                         print("preflight_transport_state=\(TunnelTransportState.failed.rawValue)")
+                        print("preflight_transport_path=\(PathType.unavailable.rawValue)")
                         print("preflight_packet_round_trip=false")
-                        print("preflight_smoke_outcome=session-frame-protection-unavailable-fail-closed")
+                        print("preflight_smoke_outcome=fail-closed")
                         return 0
                     }
                     throw error
                 }
                 print("preflight_transport_kind=\(transport.transportMetrics.kind.rawValue)")
                 print("preflight_transport_state=\(transport.transportMetrics.state.rawValue)")
+                print("preflight_transport_path=\(transport.transportMetrics.pathType.rawValue)")
+                print("preflight_smoke_outcome=\(transport.transportMetrics.smokeOutcome)")
                 print("preflight_packet_round_trip=\(transport.packetRoundTrip)")
                 return transport.packetRoundTrip ? 0 : 1
             }
@@ -100,6 +103,7 @@ enum QuantumLinkSmoke {
             print("transport_kind=\(result.transportMetrics.kind.rawValue)")
             print("transport_state=\(result.transportMetrics.state.rawValue)")
             print("transport_path=\(result.transportMetrics.pathType.rawValue)")
+            print("transport_smoke_outcome=\(result.transportMetrics.smokeOutcome)")
             print("frames_sent=\(result.transportMetrics.framesSent)")
             print("frames_received=\(result.transportMetrics.framesReceived)")
             print("frames_dropped=\(result.transportMetrics.framesDropped)")

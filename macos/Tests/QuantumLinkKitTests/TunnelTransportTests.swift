@@ -62,6 +62,30 @@ final class TunnelTransportTests: XCTestCase {
         XCTAssertEqual(decoded.transport?.framesReceived, 1)
     }
 
+    func testProductionTransportMetricsExposeSmokeOutcomeLabels() {
+        XCTAssertEqual(
+            TunnelTransportMetrics(
+                kind: .nativeUdpMesh,
+                pathType: .direct
+            ).smokeOutcome,
+            "native-udp-direct"
+        )
+        XCTAssertEqual(
+            TunnelTransportMetrics(
+                kind: .nativeUdpMesh,
+                pathType: .relay
+            ).smokeOutcome,
+            "relay"
+        )
+        XCTAssertEqual(
+            TunnelTransportMetrics(
+                kind: .nativeUdpMesh,
+                pathType: .unavailable
+            ).smokeOutcome,
+            "fail-closed"
+        )
+    }
+
     func testRustDevQuicLoopbackTransportIsDisabled() throws {
         let transport = RustDevQuicLoopbackTransport()
 

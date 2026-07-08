@@ -6,12 +6,15 @@ use qlinkctl::{
     revoke_peer_in_store, status_from_daemon, write_support_bundle, SupportBundleOptions,
     SupportBundleReleaseInfo, DEFAULT_STATE_DIR,
 };
+use qlinkctl::{format_guide, format_onboarding_checklist};
 #[cfg(unix)]
 use std::path::Path;
 
 fn main() {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
+        Some("guide") => println!("{}", format_guide()),
+        Some("onboarding") => onboarding_command(),
         Some("status") => status_command(),
         Some("doctor") => doctor_command(),
         Some("support-bundle") => {
@@ -87,10 +90,37 @@ fn main() {
             }
         },
         _ => {
-            eprintln!("usage: qlinkctl <status|doctor|support-bundle --output|invite|peer>");
+            eprintln!(
+                "usage: qlinkctl <guide|onboarding|status|doctor|support-bundle --output|invite|peer>"
+            );
             std::process::exit(2);
         }
     }
+}
+
+#[cfg(unix)]
+fn onboarding_command() {
+    let status = match status_from_daemon(Path::new("/run/quantumlink/qlinkd.sock")) {
+        Ok(status) => status,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+    };
+    let peer_store = match load_peer_store_for_state_dir(Path::new(DEFAULT_STATE_DIR)) {
+        Ok(store) => store,
+        Err(error) => {
+            eprintln!("failed to load peer store: {error}");
+            std::process::exit(1);
+        }
+    };
+    println!("{}", format_onboarding_checklist(&status, &peer_store));
+}
+
+#[cfg(not(unix))]
+fn onboarding_command() {
+    eprintln!("qlinkctl onboarding is only supported on Unix-like SteamOS hosts");
+    std::process::exit(2);
 }
 
 #[cfg(unix)]

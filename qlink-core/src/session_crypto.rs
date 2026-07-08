@@ -8,10 +8,7 @@ use ml_kem::{
     MlKem768,
 };
 use serde::{Deserialize, Serialize};
-use sha3::{
-    digest::{ExtendableOutput, Update, XofReader},
-    Shake256,
-};
+use shake::{ExtendableOutput, Shake256, Update, XofReader};
 
 pub const PQC_SESSION_VERSION: u8 = 1;
 pub const PQC_SESSION_SUITE: &str = "QLINK-FIPS203-MLKEM768-SHAKE256-v1";

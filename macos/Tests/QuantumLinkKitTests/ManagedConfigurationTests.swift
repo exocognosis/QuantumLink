@@ -111,4 +111,28 @@ final class ManagedConfigurationTests: XCTestCase {
         XCTAssertTrue(result.appliedKeys.contains("dytallixChainId"))
         XCTAssertTrue(result.appliedKeys.contains("dytallixAllowedRpcEndpoints"))
     }
+
+    func testManagedRelayCandidatePolicyKeysOverlayBase() {
+        let base = TunnelConfiguration.defaultDevelopment
+        let managed: [String: Any] = [
+            "allowedRelayEndpoints": ["relay-a.example:9472", "relay-b.example:9472"],
+            "relayTLSPolicy": "required",
+            "maximumCandidateAgeSeconds": 90,
+            "failClosedOnNoCandidate": true
+        ]
+
+        let result = ManagedConfigurationLoader.apply(managed: managed, to: base)
+
+        XCTAssertEqual(
+            result.configuration.allowedRelayEndpoints,
+            ["relay-a.example:9472", "relay-b.example:9472"]
+        )
+        XCTAssertEqual(result.configuration.relayTLSPolicy, .required)
+        XCTAssertEqual(result.configuration.maximumCandidateAgeSeconds, 90)
+        XCTAssertTrue(result.configuration.failClosedOnNoCandidate)
+        XCTAssertTrue(result.appliedKeys.contains("allowedRelayEndpoints"))
+        XCTAssertTrue(result.appliedKeys.contains("relayTLSPolicy"))
+        XCTAssertTrue(result.appliedKeys.contains("maximumCandidateAgeSeconds"))
+        XCTAssertTrue(result.appliedKeys.contains("failClosedOnNoCandidate"))
+    }
 }

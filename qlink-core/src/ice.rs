@@ -43,10 +43,7 @@
 
 use crate::error::{QlinkError, Result};
 use serde::{Deserialize, Serialize};
-use sha3::{
-    digest::{ExtendableOutput, Update},
-    Shake256,
-};
+use shake::{ExtendableOutput, Shake256, Update};
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,

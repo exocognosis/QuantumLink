@@ -24,7 +24,7 @@ Implemented baseline:
 - Packet metadata normalization before packet-frame emission: DSCP/ECN is cleared, TTL is normalized, non-fragment IPv4 IDs are cleared, and IPv4 header checksums are recomputed.
 - Public peer-record minimization: clear aliases are replaced with sequence-rotating pseudonyms and rendezvous publication keeps relay candidates only by default.
 - Raw QUIC, raw relay, and legacy mesh loopback smoke paths fail closed unless an end-to-end app-layer PQC session exists.
-- Native UDP carrier seam with fragmented authenticated control-message support; current tests prove the PQC session wire establishes matching ML-KEM/SHAKE keys over this non-TLS carrier.
+- Native UDP carrier with fragmented authenticated control-message support; default live mesh direct dialing and inbound response use this non-TLS carrier with the app-layer PQC session wire, and tests prove both sides establish matching ML-KEM/SHAKE keys.
 - Default `qlink-core` builds keep the legacy Quinn/rustls/rcgen carrier dependencies out of the compiled dependency graph; the dev QUIC carrier remains available only with `--features dev-quic-carrier`.
 
 Dytallix wallet and registry boundary:
@@ -68,7 +68,6 @@ regenerate `peers.json` after rolling the new build.
 
 Not yet production-complete:
 
-- Switching rendezvous publication and direct mesh probing to the native UDP carrier. Default live mesh dialing fails closed until that path is wired. The optional `dev-quic-carrier` path still configures Quinn/rustls with `X25519MLKEM768` for development comparison smokes.
 - Full ICE/STUN/TURN candidate gathering and nomination beyond local host/STUN parser scaffolding.
 - Notarized Developer ID app and extension bundles.
 - Managed Device Attestation and SSO integration.
@@ -79,6 +78,6 @@ Not yet production-complete:
 - Removal of every classical primitive from every build/tooling path. Default `qlink-core` builds should exclude the dev Quinn/rustls/aws-lc/ring carrier graph, but optional dev-carrier builds, platform signing/redaction helpers, and lockfile contents remain outside a full zero-classical claim.
 - Full anonymity guarantees. QuantumLink minimizes app/control-plane metadata by default, but outer transport IPs, relay timing, account context, and endpoint behavior can still identify users unless a future relay/egress architecture is built specifically for that threat model.
 
-The development rendezvous and relay binaries are local protocol tools. Do not expose them on the public internet without adding TLS, authentication policy, rate limits, abuse monitoring, durable revocation, and retention controls.
+The development rendezvous and relay binaries are local protocol tools. Do not expose them on the public internet without adding TLS, authentication policy, rate limits, abuse monitoring, durable revocation, retention controls, and production Dytallix registry pinning for public meshes.
 
 For repository-scoped reviewer guides, see `../THREAT_MODEL.md` and `../QUANTUM_THREATS.md`.

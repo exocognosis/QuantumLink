@@ -209,6 +209,10 @@ impl<C: TunnelCoreAdapting> TunnelPacketPump<C> {
                     result.dropped_unprotected += 1;
                     self.counters.dropped_unprotected += 1;
                 }
+                Ok(PacketDisposition::DroppedPeerSessionUnavailable) => {
+                    result.dropped_fail_closed += 1;
+                    self.counters.dropped_fail_closed += 1;
+                }
                 Err(_) => {
                     result.failed_submissions += 1;
                     self.counters.failed_submissions += 1;
@@ -307,6 +311,19 @@ mod tests {
         .expect("test core config")
     }
 
+    fn peer_session_required_core() -> PacketTunnelCore {
+        PacketTunnelCore::from_json(
+            br#"{
+                "protectedRoutes": ["100.127.0.0/16"],
+                "excludedRoutes": [],
+                "routeMode": "splitTunnel",
+                "mtu": 1280,
+                "requirePeerSession": true
+            }"#,
+        )
+        .expect("peer-session-required test core config")
+    }
+
     fn ipv4_packet(destination: [u8; 4]) -> Vec<u8> {
         let mut packet = vec![0_u8; 20];
         packet[0] = 0x45;
@@ -375,6 +392,25 @@ mod tests {
         let result = pump.handle_packets(&[(2, &packet)], &sink);
         assert_eq!(result.dropped_unprotected, 1);
         assert!(sink.sent.borrow().is_empty());
+    }
+
+    #[test]
+    fn unavailable_peer_session_drops_fail_closed_without_transport_frame() {
+        let mut pump = TunnelPacketPump::new(Some(peer_session_required_core()));
+        let sink = ClosureSink::new(true);
+        let packet = ipv4_packet([100, 127, 0, 9]);
+
+        let result = pump.handle_packets(&[(2, &packet)], &sink);
+        assert_eq!(result.dropped_fail_closed, 1);
+        assert_eq!(result.queued_for_transport, 0);
+        assert!(sink.sent.borrow().is_empty());
+        assert_eq!(pump.counters().dropped_fail_closed, 1);
+        assert_eq!(
+            pump.core_metrics()
+                .unwrap()
+                .dropped_peer_session_unavailable,
+            1
+        );
     }
 
     #[test]

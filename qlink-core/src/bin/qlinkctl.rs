@@ -4,7 +4,7 @@ use qlink_core::{
     discovery::{CandidateEndpoint, CandidateType, PeerRecord, UnsignedPeerRecord},
     dytallix_identity::MeshTrustPolicy,
     ice::{perform_ice_check, spawn_dev_ice_responder, IceCheckRequest, IceCredentials},
-    mesh_connection::{ConnectionOutcome, PathKind},
+    mesh_connection::{ConnectionOutcome, MeshConnector, MeshConnectorConfig, PathKind},
     mesh_transport::{MeshTransportConfig, MeshTransportHandle},
     relay::run_relay,
     rendezvous::{run_rendezvous, RendezvousClient},
@@ -13,10 +13,7 @@ use qlink_core::{
 };
 #[cfg(feature = "dev-quic-carrier")]
 use qlink_core::{
-    mesh_connection::{MeshConnector, MeshConnectorConfig},
-    quic_transport::QuicEndpoint,
-    relay::spawn_dev_relay,
-    rendezvous::spawn_dev_rendezvous,
+    quic_transport::QuicEndpoint, relay::spawn_dev_relay, rendezvous::spawn_dev_rendezvous,
 };
 use serde::Serialize;
 use std::{
@@ -295,7 +292,7 @@ async fn main() -> qlink_core::Result<()> {
             println!(
                 "selected_path={}",
                 match outcome.path_kind {
-                    PathKind::Direct => "direct",
+                    PathKind::Direct => "native-udp-direct",
                     PathKind::Relay => "relay",
                 }
             );
@@ -366,7 +363,9 @@ impl DirectSendTimingReport {
             rendezvous_lookup_ms: 0,
             direct_probe_wall_clock_ms: run.outcome.total_elapsed.as_millis(),
             quic_connect_ms: established_attempt.map(|attempt| attempt.elapsed.as_millis()),
-            identity_assertion_ms: None,
+            identity_assertion_ms: established_attempt
+                .and_then(|attempt| attempt.identity_assertion_elapsed)
+                .map(|elapsed| elapsed.as_millis()),
             relay_connect_ms: None,
             datagram_delivery_ms: run.datagram_delivery_elapsed.as_millis(),
             total_elapsed_ms: run.outcome.total_elapsed.as_millis(),
@@ -376,18 +375,40 @@ impl DirectSendTimingReport {
 
 #[cfg(not(feature = "dev-quic-carrier"))]
 async fn run_direct_send_detailed(
-    _rendezvous_url: &str,
-    _mesh_id: &str,
-    _remote_peer_id: &str,
-    _bind_addr: &str,
-    _keyfile: Option<&str>,
-    _payload: &[u8],
-    _timeout_ms: u64,
+    rendezvous_url: &str,
+    mesh_id: &str,
+    remote_peer_id: &str,
+    bind_addr: &str,
+    keyfile: Option<&str>,
+    payload: &[u8],
+    timeout_ms: u64,
 ) -> qlink_core::Result<DirectSendRun> {
-    Err(qlink_core::QlinkError::Protocol(
-        "native UDP live mesh carrier is not wired yet; enable dev-quic-carrier for legacy Quinn development carrier"
-            .into(),
-    ))
+    let keypair = Arc::new(load_or_generate_keypair(keyfile)?);
+    let local_peer_id = keypair.public_key().peer_id();
+    let _bind_addr: SocketAddr = bind_addr
+        .parse()
+        .map_err(|err| qlink_core::QlinkError::Protocol(format!("invalid bind_addr: {err}")))?;
+    let rendezvous_client = RendezvousClient::new(rendezvous_url.to_string());
+    let timeout = Duration::from_millis(timeout_ms);
+    let connector = MeshConnector::new(
+        MeshConnectorConfig::new(mesh_id.to_string(), local_peer_id)
+            .with_local_device_keypair(keypair)
+            .with_overall_deadline(timeout)
+            .with_direct_probe_timeout(timeout.min(Duration::from_millis(1_500)))
+            .with_probe_pacing(Duration::from_millis(50)),
+        rendezvous_client,
+    );
+
+    let (mut link, outcome) = connector.connect(remote_peer_id).await?;
+    let datagram_started = Instant::now();
+    link.send_frame(payload.to_vec()).await?;
+    let datagram_delivery_elapsed = datagram_started.elapsed();
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    link.close(b"direct-send complete");
+    Ok(DirectSendRun {
+        outcome,
+        datagram_delivery_elapsed,
+    })
 }
 
 #[cfg(feature = "dev-quic-carrier")]
@@ -707,7 +728,7 @@ async fn run_mesh_connect_demo(scenario: &str) -> qlink_core::Result<()> {
     println!(
         "selected_path={}",
         match outcome.path_kind {
-            PathKind::Direct => "direct",
+            PathKind::Direct => "native-udp-direct",
             PathKind::Relay => "relay",
         }
     );
@@ -924,6 +945,74 @@ mod tests {
         };
 
         assert_eq!(inbound.frame, b"direct-test-frame".to_vec());
+    }
+}
+
+#[cfg(all(test, not(feature = "dev-quic-carrier")))]
+mod native_udp_tests {
+    use super::*;
+    use qlink_core::rendezvous::spawn_dev_rendezvous;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn direct_send_reaches_published_native_udp_responder() {
+        let rendezvous = spawn_dev_rendezvous().await.unwrap();
+        let rendezvous_url = rendezvous.local_addr().to_string();
+        let remote_key = Arc::new(DeviceKeypair::generate().unwrap());
+        let remote_peer_id = remote_key.public_key().peer_id();
+
+        let remote_handle = tokio::task::spawn_blocking({
+            let rendezvous_url = rendezvous_url.clone();
+            let remote_peer_id = remote_peer_id.clone();
+            let remote_key = remote_key.clone();
+            move || {
+                MeshTransportHandle::new_with_keypair(
+                    MeshTransportConfig {
+                        mesh_id: "devmesh".to_string(),
+                        local_peer_id: remote_peer_id,
+                        remote_peer_id: "qlink_unused".to_string(),
+                        rendezvous_url,
+                        relay_url: None,
+                        bind_addr: "127.0.0.1:0".to_string(),
+                        overall_deadline_ms: 3_000,
+                        direct_probe_timeout_ms: 750,
+                        probe_pacing_ms: 50,
+                        enable_ice: false,
+                        reconnect_initial_backoff_ms: 250,
+                        reconnect_max_backoff_ms: 30_000,
+                        metrics_endpoint_bind_addr: None,
+                        inbound_acl: None,
+                        disable_inbound_responder: false,
+                        peer_store_path: None,
+                        peer_store_key_b64: None,
+                        mesh_trust_policy: MeshTrustPolicy::DevelopmentOptional,
+                        dytallix_identity: None,
+                    },
+                    Some(remote_key),
+                )
+            }
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        remote_handle
+            .publish_self(remote_key.as_ref(), &rendezvous_url, 120, 1, vec![])
+            .await
+            .unwrap();
+
+        let outcome = run_direct_send(
+            &rendezvous_url,
+            "devmesh",
+            &remote_peer_id,
+            "127.0.0.1:0",
+            None,
+            b"native-direct-test-frame",
+            5_000,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.path_kind, PathKind::Direct);
     }
 }
 

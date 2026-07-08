@@ -67,7 +67,20 @@ Typical next steps:
 sudoedit /etc/quantumlink/config.json
 sudo systemctl enable --now qlinkd
 sudo qlinkctl status
+sudo qlinkctl guide
+sudo qlinkctl onboarding
 ```
+
+`qlinkctl guide` is the first operator-facing guided UX for SteamOS until a
+native SteamOS UI exists. It uses SteamOS/Linux language for `qlinkd`,
+`qlinkctl status`, `qlinkctl doctor`, systemd, dry-run planning,
+`--activate-network`, `qlink0`, nftables, Steam-safe traffic bypass, game
+profile routing, support bundles, and the remaining Deck validation gates.
+
+`qlinkctl onboarding` reads the live daemon status plus the local peer store and
+formats a checklist for the current Deck: daemon reachability, dry-run or
+activated network readiness, peer invite import, packet I/O, transport
+readiness, safe next commands, and the pre-production release boundary.
 
 `qlinkctl doctor` includes both network ownership and data-plane readiness:
 
