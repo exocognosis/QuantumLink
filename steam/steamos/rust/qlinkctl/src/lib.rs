@@ -62,12 +62,13 @@ pub fn format_guide() -> String {
         "- Route security-sensitive reports through SECURITY.md and keep secrets, wallet seeds, tokens, and raw packet payloads out of tickets.",
         "",
         "Steam-safe routing",
-        "- QuantumLink protects selected game or party traffic and keeps the default route off the VPN by default.",
+        "- Steam-safe traffic bypass keeps Steam account, store, wallet, checkout, inventory, marketplace, launcher, and embedded browser traffic off QuantumLink by default.",
+        "- QuantumLink protects selected game or party traffic through explicit game profile routing and keeps the default route off the VPN by default.",
         "- Activated mode owns qlink0, overlay routes, and qlink nftables state; teardown removes only owned state.",
         "- Validate Steam launch options, LAN discovery, voice chat, and anti-cheat behavior per title before broad use.",
         "",
         "Production gates",
-        "- SteamOS remains pre-production until real two-Deck transport validation, production-signed release artifacts, public Dytallix registry evidence, hardened rendezvous/relay evidence, and game compatibility validation pass.",
+        "- SteamOS remains pre-production until Deck validation proves real two-Deck transport, production-signed release artifacts, public Dytallix registry evidence, hardened rendezvous/relay evidence, and game compatibility validation.",
         "- Local dry-run planning, packet I/O initialization, or transport ready: no status is not proof of protected peer traffic.",
     ]
     .join("\n")
@@ -799,7 +800,13 @@ mod tests {
         let guide = format_guide();
         assert!(guide.contains("QuantumLink SteamOS Guide"));
         assert!(guide.contains("dry-run planning"));
+        assert!(guide.contains("systemd"));
         assert!(guide.contains("--activate-network"));
+        assert!(guide.contains("qlink0"));
+        assert!(guide.contains("nftables"));
+        assert!(guide.contains("Steam-safe traffic"));
+        assert!(guide.contains("game profile"));
+        assert!(guide.contains("Deck validation"));
         assert!(guide.contains("transport ready"));
         assert!(guide.contains("pre-production"));
     }
