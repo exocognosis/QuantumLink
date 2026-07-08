@@ -11,6 +11,12 @@ central infrastructure: peers discover each other through short-lived
 signed records, connect directly when possible, fall back to relay when
 necessary, and preserve a fail-closed L3 overlay on each supported OS.
 
+The product promise is: **identity on-chain, traffic off-chain, access
+accountless, transport server-minimized.** Peer identity is verified
+against the [Dytallix](https://github.com/DytallixHQ) blockchain
+registry before public mesh peers are dialed or accepted, while packet
+data, routes, DNS, endpoints, and session keys never touch the chain.
+
 The repository is not a macOS-only proof of concept. It is a product monorepo:
 `qlink-core` owns the mesh protocol, cryptography, packet framing,
 rendezvous, relay, ICE/STUN helpers, peer stores, identity assertions,
@@ -48,6 +54,7 @@ release mechanics.
 | Silo | Path | Status | What it contains |
 |------|------|--------|------------------|
 | **Shared core** | [`qlink-core/`](qlink-core) | Active | Rust mesh engine, PQC crypto, signed peer records, packet core, QUIC transport, rendezvous, relay, ICE/STUN, peer store, metrics, tracing bridge, FFI, and `qlinkctl` loopback/smoke tooling. |
+| **On-chain identity** | [`dytallix/`](dytallix) | Active model layer | `quantumlink-node-registry`: Dytallix node registry records (peer ID, owner wallet, device/transport key hashes, status, reputation, stake), wallet and device-binding authorizations, and registry events, built against the pinned Dytallix SDK with native and WASM contract targets. |
 | **macOS** | [`macos/`](macos) | Implemented baseline | SwiftUI app, `NEPacketTunnelProvider`, `QuantumLinkKit`, Rust FFI bridge, transport smoke runner, Dytallix enrollment UI/models, MDM payload templates, XcodeGen project, entitlements, Sparkle/appcast scripts, and unsigned/package build flows. |
 | **Windows** | [`windows/`](windows) | Alpha implementation | Privileged Rust tunnel service, Wintun adapter path, WFP kill switch, DPAPI secret storage, named-pipe IPC schema, WinUI 3 dashboard, WiX MSI packaging, beta runbook, and Windows CI smoke coverage. |
 | **Steam / SteamOS** | [`steam/`](steam) | Product track / planning baseline | Steam-safe gamer edition notes for desktop and companion surfaces: game-aware routing, SDR awareness, account/store traffic bypass policy, latency-sensitive mode, streamer/privacy modes, and future SteamOS packaging direction. |
@@ -71,6 +78,10 @@ qlink-core/                         Shared Rust mesh protocol core
   src/peer_acl.rs                   Peer allow/deny policy
   include/qlink_core.h              Swift/C FFI surface
 
+dytallix/
+  quantumlink-node-registry/        On-chain identity registry models
+                                    (Dytallix SDK, native + WASM targets)
+
 macos/
   Package.swift, Sources/, Tests/   SwiftPM app, QuantumLinkKit, tunnel
   project.yml                       XcodeGen spec; generate project locally
@@ -86,7 +97,8 @@ windows/
 
 steam/
   README.md, version.md             Steam gamer edition product direction
-  docs/version-mobile.md            Mobile companion direction
+  steamos/                          SteamOS/Linux daemon runtime (qlinkd, qlinkctl)
+  mobile/                           Steam Mobile companion silo (planning scaffold)
 
 config/                             Shared example mesh configuration
 docs/                               Architecture, security, beta, perf notes
@@ -103,18 +115,72 @@ afterthought bolted onto transport setup.
 - Peer records are signed, expiring, sequence-numbered documents that
   bind peer ID, device public key, routes, endpoint candidates, ICE
   credentials, QUIC certificate material, and discovery metadata.
-- Dytallix registry configuration supports lookup-only trust decisions,
-  contract/network allowlists, wallet-aware enrollment outputs, and
-  operator-visible trust status in the app and support bundles. The
-  external Dytallix project publishes the public SDK/CLI, PQC primitive
-  crate, documentation, node, faucet, explorer surface map, and on-chain
-  WASM contract repositories under
-  [`DytallixHQ`](https://github.com/DytallixHQ).
 - The mesh transport records registry failures and ACL rejections so a
   peer can surface "why this connection was blocked" without requiring
   payload traffic from that peer first.
 - Diagnostics redact raw `qlink_*` peer identifiers and network
   addresses by default; raw support-bundle export is an explicit opt-in.
+
+### On-Chain Identity Via The Dytallix Blockchain
+
+On-chain identity verification is a first-class product feature. It
+binds a QuantumLink peer identity to a
+[Dytallix](https://github.com/DytallixHQ) blockchain registry entry:
+the registry proves that a Dytallix wallet owns or authorizes a
+QuantumLink device identity, and peers use that registry state as a
+connection policy input before dialing, accepting, or publishing into
+public mesh infrastructure. Unregistered, revoked, suspended, or
+mismatched identities are rejected before transport setup.
+
+The [`dytallix/quantumlink-node-registry`](dytallix) workspace crate
+implements the registry model layer: node records keyed by `peer_id`
+with owner wallet address, device/transport public-key hashes, latest
+peer-record hash binding, `active`/`revoked`/`suspended` status,
+reputation score, and stake status, plus wallet and device-binding
+authorizations and registry events. It builds against the pinned
+Dytallix SDK for native targets and compiles as a WASM contract
+artifact.
+
+Identity modes:
+
+| Mode | Meaning | Intended use |
+|---|---|---|
+| `Off` | No Dytallix identity for discovery or peer policy. | Development and fully private meshes; not allowed for public meshes. |
+| `Verified` | Verify active registry status without publishing the wallet address in rendezvous records. | Default for public meshes. |
+| `Public Wallet` | Publish the Dytallix wallet address in the discovery record. | Operators who intentionally want visible identity, reputation, or staking. |
+
+Mesh trust policy:
+
+| Mesh type | Registry behavior | Connection behavior |
+|---|---|---|
+| Public | Required | Fail closed: reject peers without an active, matching Dytallix registry entry. |
+| Private | Preferred | Accept valid QuantumLink peers; warn when registry status is missing, stale, or unavailable. |
+| Development | Optional | Registry enforcement can be disabled entirely. |
+
+The identity layer is discovery-adjacent, not packet-path
+infrastructure. The registry stores identity, status, and policy data
+only; it does not store raw peer endpoints, hostnames, routes, DNS
+activity, packet data or timing, relay paths, or session keys, and
+packet encryption never depends on the chain. Enrollment binds both
+ownerships: the device key signs a binding statement and the Dytallix
+wallet submits the registry contract call. Wallet secrets stay in the
+Dytallix keystore, device private keys stay in the platform secret
+store, and the tunnel runtime receives only validated policy and
+registry configuration.
+
+Rejected peers produce operator-readable reasons such as
+`rejected_missing_registry`, `rejected_revoked`, `rejected_suspended`,
+`rejected_key_mismatch`, and `registry_unavailable`, surfaced in the
+app and redacted support bundles.
+
+Registry configuration supports lookup-only trust decisions,
+contract/network allowlists, wallet-aware enrollment outputs, and
+operator-visible trust status. The external Dytallix project publishes
+the public SDK/CLI, PQC primitive crate, documentation, node, faucet,
+explorer surface map, and on-chain WASM contract repositories under
+[`DytallixHQ`](https://github.com/DytallixHQ). Live public-registry
+enforcement evidence against hosted Dytallix infrastructure remains an
+open production gate; see the platform readiness ledgers.
 
 ## Cryptographic Core
 
@@ -203,9 +269,12 @@ windows\scripts\build-windows.ps1
 
 Steam / SteamOS:
 
-- Current source is product and policy planning, not a compiled client.
+- The SteamOS/Linux runtime (`steam/steamos`) is a compiling pre-production
+  daemon scaffold; the Steam Mobile silo (`steam/mobile`) is a planning-stage
+  companion scaffold.
 - See [`steam/README.md`](steam/README.md), [`steam/version.md`](steam/version.md),
-  and [`steam/docs/version-mobile.md`](steam/docs/version-mobile.md).
+  [`steam/steamos/README.md`](steam/steamos/README.md), and
+  [`steam/mobile/README.md`](steam/mobile/README.md).
 
 ## Open Source Status
 

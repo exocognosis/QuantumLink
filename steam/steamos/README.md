@@ -6,6 +6,8 @@ Status: Pre-production daemon scaffold. Production readiness is tracked in
 `steam/steamos/docs/production-readiness.md`. SteamOS remains pre-production
 until live transport, signed release, Steam-safe routing, and Deck validation
 gates pass.
+The SteamOS security test plan lives at
+`steam/steamos/docs/security-test-plan.md`.
 
 2026-06-30 closeout status: local Rust, shell, installer, and dev-package
 verification gates pass, but production publication is a No-Go until production
