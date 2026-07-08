@@ -32,11 +32,8 @@ use crate::{
     crypto::{shake256_xof, DevicePublicKey},
     error::{QlinkError, Result},
 };
-use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
-use std::{
-    collections::HashMap,
-    net::{IpAddr, SocketAddr},
-};
+use mdns_sd::{Receiver as MdnsReceiver, ServiceDaemon, ServiceEvent, ServiceInfo};
+use std::{collections::HashMap, net::SocketAddr};
 use tokio::sync::mpsc;
 
 /// DNS-SD service type. The `.local.` suffix is required by mDNS.
@@ -270,7 +267,7 @@ impl Drop for MdnsBrowser {
 }
 
 fn forward_browse_events(
-    raw_rx: flume::Receiver<ServiceEvent>,
+    raw_rx: MdnsReceiver<ServiceEvent>,
     mesh_id_filter: String,
     tx: mpsc::Sender<MdnsPeerObservation>,
 ) {
@@ -305,7 +302,7 @@ fn forward_browse_events(
             let addresses: Vec<SocketAddr> = info
                 .get_addresses()
                 .iter()
-                .map(|ip: &IpAddr| SocketAddr::new(*ip, port))
+                .map(|ip| SocketAddr::new(ip.to_ip_addr(), port))
                 .collect();
 
             let observation = MdnsPeerObservation {
