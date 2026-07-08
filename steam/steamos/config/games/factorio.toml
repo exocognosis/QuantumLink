@@ -5,3 +5,13 @@ udp_ports = [34197]
 lan_discovery = true
 voice_chat_safe = true
 low_latency = true
+
+# Validation role:
+# - dedicated server traffic on UDP 34197
+# - LAN discovery heavy title
+# - relay-disallowed low-latency profile during Deck validation
+#
+# Routing boundary:
+# - split-tunnel game traffic only
+# - do not protect Steam account, store, wallet, checkout, inventory,
+#   marketplace, launcher, or embedded browser categories

@@ -1,6 +1,9 @@
 pub mod data_plane;
 
 use data_plane::{packet_core_from_parts, BoxedTunDevice, DataPlaneError, DataPlaneRuntime};
+use qlink_core::dytallix_identity::{
+    evaluate_dytallix_policy_status, DytallixPolicyStatus, MeshTrustPolicy,
+};
 use qlink_core::packet_core::{FfiRouteMode, PacketTunnelCore};
 use qlink_linux::{
     LinuxNetworkPlan, LinuxRuntimePlan, NetworkApplyError, NetworkExecutor, NetworkOperation,
@@ -8,15 +11,18 @@ use qlink_linux::{
     TunPacketIo,
 };
 use qlink_proto::{
-    ConnectionPhase, DaemonConfig, DaemonStatus, DataPlaneState, DataPlaneStatus, NetworkPlanState,
-    NetworkStatus, PeerStatus, RouteMode,
+    load_peer_store_at, peer_store_path_from_state_dir, store_peer_store_at, ConnectionPhase,
+    DaemonConfig, DaemonStatus, DataPlaneState, DataPlaneStatus, InviteCode, MeshTrustMode,
+    NetworkPlanState, NetworkStatus, PeerStatus, PeerStore, RouteMode, StoredPeer,
 };
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::io::{BufRead, BufReader};
 use std::io::{ErrorKind, Read, Write};
 #[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
@@ -30,6 +36,9 @@ const MAX_CONTROL_REQUEST_BYTES: usize = 1024;
 const CONTROL_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(2);
 const NETWORK_OWNERSHIP_FILE: &str = "network-ownership.json";
 const NETWORK_OWNERSHIP_SCHEMA_VERSION: u8 = 1;
+pub const LOCAL_CONTROL_GROUP: &str = "quantumlink";
+pub const LOCAL_CONTROL_SOCKET_MODE: u32 = 0o660;
+pub const LOCAL_CONTROL_SOCKET_OWNER_UID: u32 = 0;
 const QLINK_FWMARK: u32 = 0x514c;
 const QLINK_ROUTE_TABLE: u32 = 51820;
 const NFT_FAMILY: &str = "inet";
@@ -38,6 +47,45 @@ const FULL_TUNNEL_CIDR: &str = "0.0.0.0/0";
 const DATA_PLANE_MTU: usize = 1280;
 
 type EngineDataPlaneRuntime = DataPlaneRuntime<BoxedTunDevice, PacketTunnelCore>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalControlSocketAcl {
+    pub path: PathBuf,
+    pub owner_uid: u32,
+    pub group_name: &'static str,
+    pub mode: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlPolicy {
+    QuantumlinkGroup,
+    ElevatedOnly,
+    Unsupported,
+}
+
+pub fn local_control_socket_acl() -> LocalControlSocketAcl {
+    LocalControlSocketAcl {
+        path: DaemonPaths::default().socket,
+        owner_uid: LOCAL_CONTROL_SOCKET_OWNER_UID,
+        group_name: LOCAL_CONTROL_GROUP,
+        mode: LOCAL_CONTROL_SOCKET_MODE,
+    }
+}
+
+pub fn local_control_command_policy(request: &str) -> ControlPolicy {
+    let request = request.trim();
+    if request == "status" || request == "doctor" || request == r#"{"type":"status"}"# {
+        ControlPolicy::QuantumlinkGroup
+    } else if request.contains("activate-network")
+        || request.contains("deactivate-network")
+        || request.contains("revoke-peer")
+        || request.contains("peer-revoke")
+    {
+        ControlPolicy::ElevatedOnly
+    } else {
+        ControlPolicy::Unsupported
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonPaths {
@@ -54,6 +102,161 @@ impl Default for DaemonPaths {
             socket: PathBuf::from("/run/quantumlink/qlinkd.sock"),
         }
     }
+}
+
+#[derive(Debug)]
+pub enum PeerLifecycleError {
+    InviteDecode(qlink_proto::InviteDecodeError),
+    ExpiredInvite { expires_at_unix: u64, now_unix: u64 },
+    UnknownPeer { peer_id: String },
+    Io(std::io::Error),
+    DytallixPolicy(qlink_core::QlinkError),
+}
+
+impl std::fmt::Display for PeerLifecycleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InviteDecode(error) => write!(f, "{error}"),
+            Self::ExpiredInvite {
+                expires_at_unix,
+                now_unix,
+            } => write!(
+                f,
+                "invite expired at {expires_at_unix}; current time is {now_unix}"
+            ),
+            Self::UnknownPeer { peer_id } => write!(f, "unknown peer {peer_id}"),
+            Self::Io(error) => write!(f, "{error}"),
+            Self::DytallixPolicy(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for PeerLifecycleError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InviteDecode(error) => Some(error),
+            Self::Io(error) => Some(error),
+            Self::DytallixPolicy(error) => Some(error),
+            Self::ExpiredInvite { .. } | Self::UnknownPeer { .. } => None,
+        }
+    }
+}
+
+impl From<qlink_proto::InviteDecodeError> for PeerLifecycleError {
+    fn from(error: qlink_proto::InviteDecodeError) -> Self {
+        Self::InviteDecode(error)
+    }
+}
+
+impl From<std::io::Error> for PeerLifecycleError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl From<qlink_core::QlinkError> for PeerLifecycleError {
+    fn from(error: qlink_core::QlinkError) -> Self {
+        Self::DytallixPolicy(error)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerDytallixPolicyDecision {
+    pub accepted: bool,
+    pub warning: Option<String>,
+}
+
+pub fn peer_store_path(paths: &DaemonPaths) -> PathBuf {
+    peer_store_path_from_state_dir(&paths.state_dir)
+}
+
+pub fn load_peer_store(paths: &DaemonPaths) -> Result<PeerStore, PeerLifecycleError> {
+    load_peer_store_at(peer_store_path(paths)).map_err(Into::into)
+}
+
+pub fn store_peer_store(
+    paths: &DaemonPaths,
+    store: &PeerStore,
+) -> Result<PathBuf, PeerLifecycleError> {
+    store_peer_store_at(&paths.state_dir, store).map_err(Into::into)
+}
+
+pub fn import_invite(
+    paths: &DaemonPaths,
+    encoded_invite: &str,
+    now_unix: u64,
+) -> Result<StoredPeer, PeerLifecycleError> {
+    let invite = InviteCode::decode(encoded_invite)?;
+    if invite.expires_at_unix <= now_unix {
+        return Err(PeerLifecycleError::ExpiredInvite {
+            expires_at_unix: invite.expires_at_unix,
+            now_unix,
+        });
+    }
+
+    let peer = invite.stored_peer();
+    let mut store = load_peer_store(paths)?;
+    store.upsert(peer.clone());
+    store_peer_store(paths, &store)?;
+    Ok(peer)
+}
+
+pub fn dial_candidates(
+    paths: &DaemonPaths,
+    now_unix: u64,
+) -> Result<Vec<StoredPeer>, PeerLifecycleError> {
+    Ok(load_peer_store(paths)?.dial_candidates(now_unix))
+}
+
+pub fn remove_peer(paths: &DaemonPaths, peer_id: &str) -> Result<(), PeerLifecycleError> {
+    let mut store = load_peer_store(paths)?;
+    if !store.remove(peer_id) {
+        return Err(PeerLifecycleError::UnknownPeer {
+            peer_id: peer_id.to_string(),
+        });
+    }
+    store_peer_store(paths, &store)?;
+    Ok(())
+}
+
+pub fn revoke_peer(paths: &DaemonPaths, peer_id: &str) -> Result<(), PeerLifecycleError> {
+    let mut store = load_peer_store(paths)?;
+    if !store.revoke(peer_id) {
+        return Err(PeerLifecycleError::UnknownPeer {
+            peer_id: peer_id.to_string(),
+        });
+    }
+    store_peer_store(paths, &store)?;
+    Ok(())
+}
+
+pub fn validate_peer_dytallix_policy(
+    peer: &StoredPeer,
+    status: DytallixPolicyStatus,
+) -> Result<PeerDytallixPolicyDecision, PeerLifecycleError> {
+    let policy = mesh_trust_policy(peer.trust_mode);
+    let decision =
+        evaluate_dytallix_policy_status(policy, status, peer_explicitly_requires_dytallix(peer))?;
+    Ok(PeerDytallixPolicyDecision {
+        accepted: decision.accepted,
+        warning: decision.warning,
+    })
+}
+
+fn mesh_trust_policy(mode: MeshTrustMode) -> MeshTrustPolicy {
+    match mode {
+        MeshTrustMode::PrivateFriends => MeshTrustPolicy::PrivatePreferred,
+        MeshTrustMode::PublicDytallixRequired => MeshTrustPolicy::PublicRequired,
+        MeshTrustMode::DevelopmentOptional => MeshTrustPolicy::DevelopmentOptional,
+    }
+}
+
+fn peer_explicitly_requires_dytallix(peer: &StoredPeer) -> bool {
+    peer.trust_mode == MeshTrustMode::PublicDytallixRequired
+        || matches!(
+            peer.trust_source.as_str(),
+            "dytallix-required" | "verified-dytallix" | "public-dytallix"
+        )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +276,16 @@ impl NetworkRuntimePlan {
             protected_cidr: plan.protected_cidr().to_string(),
             commands: plan.network.commands.clone(),
             nftables_rules: plan.nftables.rules.clone(),
+        }
+    }
+
+    fn from_config_without_commands(config: &DaemonConfig) -> Self {
+        Self {
+            interface_name: config.interface_name.clone(),
+            route_mode: config.route_mode,
+            protected_cidr: protected_cidr_for_record(config).to_string(),
+            commands: Vec::new(),
+            nftables_rules: Vec::new(),
         }
     }
 
@@ -381,6 +594,9 @@ impl DaemonEngine {
                 state: DataPlaneState::Failed,
                 packet_io_available: false,
                 transport_ready: false,
+                transport_path: None,
+                peer_session_ready: false,
+                last_transport_error: Some(error.to_string()),
                 metrics: Default::default(),
                 error: Some(error.to_string()),
             };
@@ -392,6 +608,9 @@ impl DaemonEngine {
             state: DataPlaneState::Starting,
             packet_io_available: false,
             transport_ready: false,
+            transport_path: None,
+            peer_session_ready: false,
+            last_transport_error: None,
             metrics: Default::default(),
             error: None,
         };
@@ -473,6 +692,9 @@ impl DaemonEngine {
             state: DataPlaneState::Failed,
             packet_io_available: false,
             transport_ready: false,
+            transport_path: None,
+            peer_session_ready: false,
+            last_transport_error: Some(error.to_string()),
             metrics: Default::default(),
             error: Some(error.to_string()),
         };
@@ -499,21 +721,19 @@ impl DaemonEngine {
         NE: NetworkExecutor,
         NF: NftablesExecutor,
     {
-        let plan = LinuxRuntimePlan::from_config(&self.config).map_err(|error| {
-            NetworkApplyError::new(format!("failed to plan SteamOS networking: {error}"))
-        })?;
+        let plan = match LinuxRuntimePlan::from_config(&self.config) {
+            Ok(plan) => plan,
+            Err(error) => {
+                let error =
+                    NetworkApplyError::new(format!("failed to plan SteamOS networking: {error}"));
+                self.runtime.network = NetworkRuntimeState::ApplyFailed {
+                    plan: NetworkRuntimePlan::from_config_without_commands(&self.config),
+                    error: error.message().to_string(),
+                };
+                return Err(error);
+            }
+        };
         let runtime_plan = NetworkRuntimePlan::from_plan(&self.config, &plan);
-
-        if self.config.route_mode == RouteMode::FullTunnel {
-            let error = NetworkApplyError::new(
-                "full-tunnel activation requires underlay exemptions before real apply",
-            );
-            self.runtime.network = NetworkRuntimeState::ApplyFailed {
-                plan: runtime_plan,
-                error: error.message().to_string(),
-            };
-            return Err(error);
-        }
 
         if let Err(error) = prepare_network_ownership_storage(&self.paths) {
             let error = NetworkApplyError::new(format!(
@@ -835,7 +1055,7 @@ pub fn serve_status_stream(mut stream: UnixStream, engine: &DaemonEngine) -> std
         }
     };
 
-    if request.trim() == r#"{"type":"status"}"# || request.trim() == "status" {
+    if local_control_command_policy(&request) == ControlPolicy::QuantumlinkGroup {
         serde_json::to_writer(&mut stream, &engine.status())?;
         stream.write_all(b"\n")?;
     } else {
@@ -907,7 +1127,51 @@ pub fn run_resident(engine: DaemonEngine) -> std::io::Result<()> {
     }
 
     let listener = UnixListener::bind(&socket)?;
+    apply_local_control_socket_acl(&socket)?;
     serve_status_streams(listener.incoming(), &engine)
+}
+
+#[cfg(unix)]
+fn apply_local_control_socket_acl(socket: &PathBuf) -> std::io::Result<()> {
+    let group_id = resolve_group_id(LOCAL_CONTROL_GROUP)?;
+    let socket_cstr = std::ffi::CString::new(socket.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("socket path contains interior nul: {}", socket.display()),
+        )
+    })?;
+
+    let chown_result = unsafe {
+        libc::chown(
+            socket_cstr.as_ptr(),
+            LOCAL_CONTROL_SOCKET_OWNER_UID,
+            group_id,
+        )
+    };
+    if chown_result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    std::fs::set_permissions(
+        socket,
+        std::fs::Permissions::from_mode(LOCAL_CONTROL_SOCKET_MODE),
+    )
+}
+
+#[cfg(unix)]
+fn resolve_group_id(name: &str) -> std::io::Result<u32> {
+    let name = std::ffi::CString::new(name).map_err(|_| {
+        std::io::Error::new(ErrorKind::InvalidInput, "group name contains interior nul")
+    })?;
+    let group = unsafe { libc::getgrnam(name.as_ptr()) };
+    if group.is_null() {
+        Err(std::io::Error::new(
+            ErrorKind::NotFound,
+            format!("required system group {LOCAL_CONTROL_GROUP} is missing"),
+        ))
+    } else {
+        Ok(unsafe { (*group).gr_gid })
+    }
 }
 
 pub fn load_config_or_default(paths: &DaemonPaths) -> std::io::Result<DaemonConfig> {
@@ -1358,8 +1622,7 @@ mod tests {
             route_mode: RouteMode::FullTunnel,
             ..DaemonConfig::default()
         };
-        let mut engine = DaemonEngine::try_new(config, paths.clone())
-            .expect("full tunnel remains valid for dry-run planning");
+        let mut engine = DaemonEngine::new(config, paths.clone());
         let mut network_executor = RecordingNetworkExecutor::default();
         let mut nftables_executor = RecordingNftablesExecutor::default();
 
@@ -1674,8 +1937,7 @@ mod tests {
             route_mode: RouteMode::FullTunnel,
             ..DaemonConfig::default()
         };
-        let mut engine = DaemonEngine::try_new(config, DaemonPaths::default())
-            .expect("full tunnel remains valid for dry-run planning");
+        let mut engine = DaemonEngine::new(config, DaemonPaths::default());
         let mut network_executor = RecordingNetworkExecutor::default();
         let mut nftables_executor = RecordingNftablesExecutor::default();
 
@@ -1684,37 +1946,36 @@ mod tests {
             .unwrap_err();
         let status = engine.status();
 
-        assert!(error.message().contains("full-tunnel activation"));
+        assert!(error
+            .message()
+            .contains("full tunnel requires explicit underlay exemptions before activation"));
         assert!(network_executor.operations.is_empty());
         assert!(nftables_executor.operations.is_empty());
         assert_eq!(status.network.state, NetworkPlanState::ApplyFailed);
         assert_eq!(status.network.route_mode, Some(RouteMode::FullTunnel));
         assert_eq!(status.network.protected_cidr.as_deref(), Some("0.0.0.0/0"));
-        assert!(!status.network.commands.is_empty());
+        assert!(status.network.commands.is_empty());
         assert!(!status.network.dry_run);
         assert!(status
             .network
             .error
             .as_deref()
             .expect("activation failure should be recorded")
-            .contains("full-tunnel activation"));
+            .contains("full tunnel requires explicit underlay exemptions before activation"));
     }
 
     #[test]
-    fn try_new_full_tunnel_still_plans_dry_run_without_activation() {
+    fn try_new_full_tunnel_fails_closed_without_underlay_exemptions() {
         let config = DaemonConfig {
             route_mode: RouteMode::FullTunnel,
             ..DaemonConfig::default()
         };
 
-        let engine = DaemonEngine::try_new(config, DaemonPaths::default())
-            .expect("full tunnel remains valid for dry-run planning");
-        let status = engine.status();
+        let error = DaemonEngine::try_new(config, DaemonPaths::default()).unwrap_err();
 
-        assert_eq!(status.network.state, NetworkPlanState::Planned);
-        assert_eq!(status.network.route_mode, Some(RouteMode::FullTunnel));
-        assert_eq!(status.network.protected_cidr.as_deref(), Some("0.0.0.0/0"));
-        assert!(status.network.dry_run);
+        assert!(error
+            .to_string()
+            .contains("full tunnel requires explicit underlay exemptions before activation"));
     }
 
     #[test]

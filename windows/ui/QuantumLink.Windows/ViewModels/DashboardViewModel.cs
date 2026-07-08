@@ -40,6 +40,33 @@ public partial class DashboardViewModel : ObservableObject
     public Microsoft.UI.Xaml.Visibility DisconnectButtonVisibility =>
         IsConnected ? Microsoft.UI.Xaml.Visibility.Visible : Microsoft.UI.Xaml.Visibility.Collapsed;
 
+    public string PlatformBadge => "Windows alpha";
+    public string ReadinessSummary => "WinUI dashboard over the privileged QuantumLink Windows service; Wintun, WFP, MSI/WiX, and service validation remain Windows-host gated.";
+    public string IdentitySummary => "Dytallix identity follows shared qlink-core policy while Windows-local secrets stay behind service-owned DPAPI storage boundaries.";
+    public string PolicySummary => "Routes, DNS, Wintun adapter state, and WFP kill-switch policy are owned by the Windows service, not this unprivileged dashboard.";
+    public string HelpSummary => "Use redacted support exports plus Event Viewer service logs. Security reports should follow SECURITY.md.";
+
+    public ObservableCollection<string> OnboardingItems { get; } =
+    [
+        "Confirm the QuantumLink Windows service is installed and running",
+        "Verify named-pipe IPC from the WinUI dashboard to the service",
+        "Connect through the LocalSystem tunnel service, not direct UI networking",
+        "Verify Wintun adapter state and WFP kill-switch policy from service status",
+        "Use MSI/WiX install logs and Event Viewer before reinstalling",
+        "Export redacted diagnostics before sharing logs"
+    ];
+
+    public ObservableCollection<string> HelpTopics { get; } =
+    [
+        "Windows service setup: install the MSI, start the service, and confirm named-pipe IPC",
+        "Tunnel control: Connect and Disconnect ask the service to manage Wintun and routes",
+        "WFP kill switch: service status should report fail-closed policy state",
+        "DPAPI identity storage: keep Windows-local secrets out of dashboard state",
+        "Diagnostics: export redacted JSON and check Event Viewer service logs",
+        "Packaging: use MSI/WiX validation before treating the build as releasable",
+        "Security reports: keep raw wallet, peer, DNS, route, and packet data out of tickets"
+    ];
+
     public ObservableCollection<PeerStatus> Peers { get; } = [];
 
     public async Task InitializeAsync()

@@ -144,7 +144,10 @@ pub unsafe extern "C" fn qlink_tunnel_core_submit_packet(
 
     match core.submit_tunnel_packet(protocol_family, packet) {
         Ok(PacketDisposition::QueuedForTransport) => 1,
-        Ok(PacketDisposition::DroppedUnprotected) => 0,
+        Ok(
+            PacketDisposition::DroppedUnprotected
+            | PacketDisposition::DroppedPeerSessionUnavailable,
+        ) => 0,
         Err(_) => -1,
     }
 }
