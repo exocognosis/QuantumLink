@@ -61,6 +61,33 @@ run URL, release asset name, or manually archived validation bundle.
 | Diagnostics redaction report | Pending |
 | Upgrade/repair/rollback/uninstall report | Pending |
 
+## Task 4 Packet-Session Evidence
+
+Local code evidence now covers the packet-session fail-closed default:
+
+- `TunnelConfiguration::packet_core_config_json()` emits
+  `requirePeerSession=true` for public, identity-required, or
+  rendezvous-backed Windows mesh packet-core construction. Explicit
+  local loopback/development smoke config remains exempt so it can test
+  packet encode/decode without claiming production key readiness.
+- `PacketTunnelCore` and the Windows pump drop protected packets when an
+  authenticated peer-session key is unavailable, increment fail-closed
+  counters, and emit no transport frame.
+- Windows service status and diagnostics expose only operator-safe
+  readiness fields (`peerSessionKeyAvailable=false`,
+  `peerSessionKeyState=unavailable`) without peer IDs, key material, or
+  transport failure details.
+- Windows does not yet expose a real authenticated packet-session
+  install source to the service. Local echo/development transport does
+  not satisfy the production gate and no static development packet key
+  is used.
+
+The packet-session key readiness gate remains **Blocked** until a
+Windows-host validation report proves that a live two-peer mesh installs
+authenticated peer-session metadata, protected packets flow only after
+that state is ready, decrypt failures are counted, and no plaintext is
+written to Wintun.
+
 ## Release Rule
 
 Do not change `windows/version.md` to a production-candidate status until every

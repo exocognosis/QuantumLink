@@ -246,6 +246,12 @@ pub struct TunnelStatus {
     pub transport: Option<TunnelTransportMetrics>,
     #[serde(default)]
     pub pump: Option<PacketPumpMetrics>,
+    /// Operator-safe packet-session readiness. This reports only the
+    /// availability state, never peer IDs, keys, or failure details.
+    #[serde(default)]
+    pub peer_session_key_available: bool,
+    #[serde(default = "default_peer_session_key_state")]
+    pub peer_session_key_state: String,
     /// Whether the WFP kill-switch filters are currently installed.
     /// Windows-specific diagnostic; absent on macOS.
     #[serde(default)]
@@ -268,6 +274,8 @@ impl TunnelStatus {
             peer_trust: DytallixPeerTrustSummary::default(),
             transport: None,
             pump: None,
+            peer_session_key_available: false,
+            peer_session_key_state: default_peer_session_key_state(),
             kill_switch_engaged: None,
             last_error: None,
         }
@@ -339,17 +347,30 @@ fn default_mtu() -> u32 {
     1280
 }
 
+fn default_peer_session_key_state() -> String {
+    "unavailable".to_string()
+}
+
 impl TunnelConfiguration {
     /// JSON config consumed by `qlink_tunnel_core_create` (camelCase keys
     /// per `PacketTunnelCoreConfig` in `qlink-core/src/packet_core.rs`).
     pub fn packet_core_config_json(&self) -> serde_json::Value {
+        let require_peer_session = self.requires_packet_peer_session();
         serde_json::json!({
             "protectedRoutes": self.protected_routes,
             "excludedRoutes": self.excluded_routes,
             "routeMode": self.route_mode,
             "mtu": self.mtu,
             "crypto": { "suite": self.crypto.suite },
+            "requirePeerSession": require_peer_session,
         })
+    }
+
+    pub fn requires_packet_peer_session(&self) -> bool {
+        !self.rendezvous_servers.is_empty()
+            || self.mesh_trust_policy != MeshTrustPolicy::DevelopmentOptional
+            || self.discovery_identity_mode != DiscoveryIdentityMode::Off
+            || self.dytallix_identity.is_some()
     }
 }
 
@@ -402,6 +423,36 @@ mod tests {
         let core_config = config.packet_core_config_json();
         assert_eq!(core_config["routeMode"], "splitTunnel");
         assert_eq!(core_config["mtu"], 1280);
+    }
+
+    #[test]
+    fn packet_core_config_does_not_require_peer_session_for_local_loopback_dev() {
+        let config = crate::privacy::default_tunnel_configuration();
+
+        let core_config = config.packet_core_config_json();
+
+        assert_eq!(core_config["requirePeerSession"], false);
+    }
+
+    #[test]
+    fn packet_core_config_requires_peer_session_for_public_identity_mesh() {
+        let mut config = crate::privacy::default_tunnel_configuration();
+        config.mesh_trust_policy = MeshTrustPolicy::PublicRequired;
+        config.discovery_identity_mode = DiscoveryIdentityMode::Verified;
+        config.dytallix_identity = Some(DytallixIdentityConfiguration {
+            endpoint: "https://registry.example".to_string(),
+            contract_address: "0xabc1230000000000000000000000000000000000".to_string(),
+            publish_wallet_address: false,
+            network_id: None,
+            chain_id: None,
+            allowed_rpc_endpoints: Vec::new(),
+            keystore_path: None,
+            wallet_name: None,
+        });
+
+        let core_config = config.packet_core_config_json();
+
+        assert_eq!(core_config["requirePeerSession"], true);
     }
 
     #[test]

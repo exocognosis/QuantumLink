@@ -159,6 +159,10 @@ impl PacketTunnelCore {
         self.peer_session_packets = 0;
     }
 
+    pub fn peer_session_required(&self) -> bool {
+        self.require_peer_session
+    }
+
     pub fn peer_session_ready(&self) -> bool {
         self.peer_session_block_reason().is_none()
     }
@@ -625,6 +629,25 @@ mod tests {
             .contains("requires rekey"));
         assert_eq!(core.metrics().transport_frames_out, 1);
         assert_eq!(core.metrics().dropped_peer_session_unavailable, 1);
+    }
+
+    #[test]
+    fn inbound_transport_frame_drops_when_peer_session_required_but_missing() {
+        let packet = test_ipv4_packet([100, 127, 0, 10]);
+        let mut sender = test_core(SUITE_FIPS203);
+        sender.submit_tunnel_packet(2, &packet).unwrap();
+        let frame = sender.pop_transport_frame().unwrap();
+        let mut receiver = test_core_requiring_peer_session();
+
+        let error = receiver.accept_transport_frame(&frame).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("peer session keys are not installed"));
+        assert!(receiver.pop_tunnel_packet().is_none());
+        assert_eq!(receiver.metrics().transport_frames_in, 0);
+        assert_eq!(receiver.metrics().packets_to_tunnel, 0);
+        assert_eq!(receiver.metrics().dropped_peer_session_unavailable, 1);
     }
 
     #[test]

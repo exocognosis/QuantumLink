@@ -517,6 +517,13 @@ impl TunnelEngine {
                 ..DytallixPeerTrustSummary::default()
             };
             status.pump = Some(session.pump.lock().unwrap().counters().as_proto());
+            if session.config.requires_packet_peer_session() {
+                status.peer_session_key_available = false;
+                status.peer_session_key_state = "unavailable".to_string();
+            } else {
+                status.peer_session_key_available = true;
+                status.peer_session_key_state = "notRequired".to_string();
+            }
             if let Some(error) = session.last_error.lock().unwrap().clone() {
                 status.last_error = Some(error);
             }
@@ -644,6 +651,8 @@ fn diagnostics_status(status: &TunnelStatus) -> serde_json::Value {
         "metrics": status.metrics,
         "transport": status.transport,
         "pump": status.pump,
+        "peerSessionKeyAvailable": status.peer_session_key_available,
+        "peerSessionKeyState": status.peer_session_key_state,
         "killSwitchEngaged": status.kill_switch_engaged,
         "peerTrust": {
             "required": status.peer_trust.required,
@@ -724,7 +733,7 @@ fn spawn_inbound_loop(
                 };
                 let mut pump = pump.lock().unwrap();
                 if pump
-                    .accept_transport_frame(&frame, peer_id.as_deref())
+                    .accept_transport_frame(&frame, peer_id.as_deref(), None)
                     .is_ok()
                 {
                     while let Some(packet) = pump.pop_tunnel_packet() {
@@ -1028,7 +1037,7 @@ mod tests {
     }
 
     #[test]
-    fn packet_pump_full_path_via_loopback_platform() {
+    fn peer_session_key_unavailable_drops_protected_packets_and_reports_status() {
         // Use a platform that exposes the adapter it created so the test
         // can inject packets.
         struct CapturingPlatform {
@@ -1078,36 +1087,65 @@ mod tests {
             Arc::clone(&platform) as Arc<dyn PlatformNetwork>,
             std::env::temp_dir(),
         );
-        engine.connect(dev_config()).unwrap();
+        let mut config = dev_config();
+        config.discovery_identity_mode = DiscoveryIdentityMode::Verified;
+        let connected_status = engine.connect(config).unwrap();
+        assert_eq!(connected_status.path_type, PathType::Direct);
+        assert_eq!(connected_status.peer_session_key_available, false);
+        assert_eq!(connected_status.peer_session_key_state, "unavailable");
         let adapter = platform.adapter.lock().unwrap().clone().unwrap();
 
-        // Protected packet: encode -> echo transport -> decode -> back
-        // out the adapter.
+        // Protected packet: without an authenticated peer-session key,
+        // the pump/core must fail closed before any transport frame can
+        // echo back into Wintun.
         adapter.inject_inbound(ipv4_packet([100, 127, 0, 9]));
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            let outbound = adapter.drain_outbound();
-            if !outbound.is_empty() {
-                assert_eq!(&outbound[0][16..20], &[100, 127, 0, 9]);
-                break;
-            }
+        while engine
+            .status()
+            .pump
+            .as_ref()
+            .is_none_or(|pump| pump.dropped_fail_closed < 1)
+        {
             assert!(
                 std::time::Instant::now() < deadline,
-                "decrypted packet never came back out the adapter"
+                "protected packet was not counted as fail-closed"
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+        assert!(adapter.drain_outbound().is_empty());
 
         // Unprotected packet is dropped by core policy, never echoed.
         adapter.inject_inbound(ipv4_packet([8, 8, 8, 8]));
-        std::thread::sleep(Duration::from_millis(200));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while engine
+            .status()
+            .pump
+            .as_ref()
+            .is_none_or(|pump| pump.dropped_unprotected < 1)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "unprotected packet was not counted as dropped"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert!(adapter.drain_outbound().is_empty());
 
         let status = engine.status();
+        let status_json = serde_json::to_value(&status).unwrap();
+        assert_eq!(status_json["peerSessionKeyAvailable"], false);
+        assert_eq!(status_json["peerSessionKeyState"], "unavailable");
         let pump = status.pump.unwrap();
-        assert_eq!(pump.queued_for_transport, 1);
+        assert_eq!(pump.queued_for_transport, 0);
+        assert_eq!(pump.dropped_fail_closed, 1);
         assert_eq!(pump.dropped_unprotected, 1);
-        assert_eq!(pump.tunnel_packets_emitted, 1);
+        assert_eq!(pump.transport_frames_emitted, 0);
+        assert_eq!(pump.tunnel_packets_emitted, 0);
+
+        let diagnostics = engine.diagnostics();
+        assert!(diagnostics.contains(r#""peerSessionKeyAvailable": false"#));
+        assert!(diagnostics.contains(r#""peerSessionKeyState": "unavailable"#));
+        assert!(!diagnostics.contains("peer-a"));
         engine.disconnect();
     }
 }
