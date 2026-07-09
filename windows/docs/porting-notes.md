@@ -55,6 +55,10 @@ open. Source references are to the QuantumLinkOS repository.
 
 ## Known gaps / follow-up (tracked for beta)
 
+Production closeout status for these gaps is tracked in
+`production-release-readiness.md`; until the matching production gate has
+passing evidence, the gap remains a release blocker.
+
 1. **WFP filters are session-dynamic**: they vanish if the service
    crashes (fail-open after crash for `failClosed` policy, matching
    macOS semantics). Strict deployments want persistent + boot-time

@@ -7,6 +7,10 @@ This is a beta gate for the current Windows alpha. Passing this runbook means
 the artifact is acceptable for limited beta testing only; it does not imply
 production readiness.
 
+Production release readiness is tracked separately in
+`production-release-readiness.md`. Any unchecked production gate or missing
+evidence link in that ledger blocks a production-candidate Windows release.
+
 ## CI coverage vs manual validation
 
 Current CI proves:

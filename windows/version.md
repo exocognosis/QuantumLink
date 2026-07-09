@@ -1,7 +1,7 @@
 # QuantumLink Windows Version
 
 Version: 0.2.0-windows-alpha
-Status: Windows alpha scaffold; signed MSI deployment and clean Windows validation remain beta gates
+Status: Alpha implementation; production candidate work is tracked in docs/production-release-readiness.md
 Date: 2026-06-15
 
 ## Baseline
@@ -42,7 +42,8 @@ release Rust artifact builds, and the WinUI Release build. CI does not yet
 prove Wintun sourcing, MSI build/signing, checksum generation, install/uninstall
 behavior, WFP/Wintun networking behavior, leak tests, two-machine mesh, or
 macOS interop. Those are manual beta gates tracked in
-`docs/beta-runbook-windows.md`.
+`docs/beta-runbook-windows.md`. Production readiness is tracked in
+`docs/production-release-readiness.md`.
 
 ## Target architecture
 
@@ -57,5 +58,6 @@ macOS interop. Those are manual beta gates tracked in
 
 ## Open items
 
-See "Known gaps / follow-up" in docs/porting-notes.md and the test
-matrix in docs/beta-runbook-windows.md.
+See "Known gaps / follow-up" in docs/porting-notes.md, the test matrix in
+docs/beta-runbook-windows.md, and the production gate ledger in
+docs/production-release-readiness.md.
