@@ -3,6 +3,7 @@
 
 require "digest"
 require "fileutils"
+require "ipaddr"
 require "json"
 require "pathname"
 require "time"
@@ -26,6 +27,7 @@ MAX_EVIDENCE_BYTES = 1_048_576
 MAX_EVIDENCE_AGE_SECONDS = 7 * 24 * 60 * 60
 MAX_FUTURE_SKEW_SECONDS = 5 * 60
 RESERVED_ENDPOINT_SUFFIXES = %w[.invalid .localhost .test .example].freeze
+RESERVED_ENDPOINT_DOMAINS = %w[example.com example.net example.org].freeze
 
 FORBIDDEN_MARKERS = /
   BEGIN\ (?:RSA\ |EC\ |OPENSSH\ )?PRIVATE\ KEY|
@@ -91,8 +93,16 @@ def production_host?(host)
   return false unless nonempty_string?(host)
 
   normalized = host.downcase.chomp(".")
-  return false unless normalized.include?(".")
+  return false unless normalized.match?(/\A(?=.{1,253}\z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}\z/)
   return false if RESERVED_ENDPOINT_SUFFIXES.any? { |suffix| normalized.end_with?(suffix) }
+  return false if RESERVED_ENDPOINT_DOMAINS.any? { |domain| normalized == domain || normalized.end_with?(".#{domain}") }
+
+  begin
+    IPAddr.new(normalized)
+    return false
+  rescue IPAddr::InvalidAddressError
+    # A production endpoint must be a DNS host rather than an IP literal.
+  end
 
   true
 end

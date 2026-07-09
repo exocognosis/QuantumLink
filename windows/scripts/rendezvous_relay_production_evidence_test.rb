@@ -104,6 +104,25 @@ class RendezvousRelayProductionEvidenceTest < Minitest::Test
     assert_includes report.fetch("failures"), "rendezvousRelay.relayEndpoints must contain only production turns or HTTPS endpoints"
   end
 
+  def test_ip_private_and_example_hosts_fail
+    [
+      ["https://127.0.0.1", "turns:10.0.0.1:5349"],
+      ["https://rv.example.com", "turns:relay.example.net:5349"],
+      ["https://..", "turns:..:5349"]
+    ].each do |rendezvous, relay|
+      manifest = write_manifest("bad-host-#{Digest::SHA256.hexdigest(rendezvous)[0, 8]}.json") do |value|
+        value["rendezvousRelay"]["rendezvousEndpoints"] = [rendezvous]
+        value["rendezvousRelay"]["relayEndpoints"] = [relay]
+      end
+      stdout, _stderr, status = run_verifier(manifest)
+      report = JSON.parse(stdout)
+
+      refute status.success?
+      assert_includes report.fetch("failures"), "rendezvousRelay.rendezvousEndpoints must contain only production HTTPS URLs"
+      assert_includes report.fetch("failures"), "rendezvousRelay.relayEndpoints must contain only production turns or HTTPS endpoints"
+    end
+  end
+
   def test_manifest_must_be_repo_relative_and_contained
     absolute = File.join(@tmpdir, write_manifest("absolute.json"))
     stdout, _stderr, status = invoke(

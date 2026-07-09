@@ -777,6 +777,7 @@ jobs:
             windows/build/release/windows-sbom.spdx.json
             windows/build/release/windows-release-manifest.json
             windows/build/release/windows-release-evidence.json
+            windows/build/release/rendezvous-relay-*.json
           if-no-files-found: error
 
       - name: Attach to GitHub Release
@@ -790,4 +791,5 @@ jobs:
             windows/build/release/windows-sbom.spdx.json
             windows/build/release/windows-release-manifest.json
             windows/build/release/windows-release-evidence.json
+            windows/build/release/rendezvous-relay-*.json
           fail_on_unmatched_files: true

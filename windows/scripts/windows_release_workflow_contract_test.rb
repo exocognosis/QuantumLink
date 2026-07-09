@@ -378,9 +378,11 @@ class WindowsReleaseWorkflowContractTest < Minitest::Test
     assert_includes upload_step.fetch("with").fetch("path"), ARTIFACT_EVIDENCE_PATH
     assert_includes upload_step.fetch("with").fetch("path"), ARTIFACT_SBOM_PATH
     assert_includes upload_step.fetch("with").fetch("path"), ARTIFACT_RELEASE_MANIFEST_PATH
+    assert_includes upload_step.fetch("with").fetch("path"), "windows/build/release/rendezvous-relay-*.json"
     assert_includes release_step.fetch("with").fetch("files"), ARTIFACT_EVIDENCE_PATH
     assert_includes release_step.fetch("with").fetch("files"), ARTIFACT_SBOM_PATH
     assert_includes release_step.fetch("with").fetch("files"), ARTIFACT_RELEASE_MANIFEST_PATH
+    assert_includes release_step.fetch("with").fetch("files"), "windows/build/release/rendezvous-relay-*.json"
   end
 
   def test_docs_reference_local_validation_script_and_report
