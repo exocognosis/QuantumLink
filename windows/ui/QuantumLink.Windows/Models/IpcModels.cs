@@ -108,6 +108,9 @@ public sealed record DytallixPeerTrustSummary
     [JsonPropertyName("pendingPeerCount")] public uint PendingPeerCount { get; init; }
     [JsonPropertyName("failedPeerCount")] public uint FailedPeerCount { get; init; }
     [JsonPropertyName("lastCheckedAtUnix")] public ulong? LastCheckedAtUnix { get; init; }
+    [JsonPropertyName("lastFailureCode")] public string? LastFailureCode { get; init; }
+    [JsonPropertyName("lastFailureSummary")] public string? LastFailureSummary { get; init; }
+    [JsonPropertyName("warning")] public string? Warning { get; init; }
 }
 
 public sealed record TunnelTransportMetrics
@@ -145,6 +148,31 @@ public sealed record CryptoPolicy
     [JsonPropertyName("rekeyAfterBytes")] public ulong RekeyAfterBytes { get; init; } = 1_073_741_824;
 }
 
+public sealed record DytallixIdentityConfiguration
+{
+    [JsonPropertyName("mode")] public string Mode { get; init; } = "verified";
+    [JsonPropertyName("registryEndpoint")] public string RegistryEndpoint { get; init; } = "";
+    [JsonPropertyName("contract")] public string Contract { get; init; } = "quantumlink-node-registry";
+    [JsonPropertyName("cachedProofGraceSeconds")] public ulong CachedProofGraceSeconds { get; init; }
+    [JsonPropertyName("contractAddress")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ContractAddress { get; init; }
+    [JsonPropertyName("publishWalletAddress")] public bool PublishWalletAddress { get; init; }
+    [JsonPropertyName("networkID")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? NetworkId { get; init; }
+    [JsonPropertyName("chainID")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ChainId { get; init; }
+    [JsonPropertyName("allowedRPCEndpoints")] public List<string> AllowedRpcEndpoints { get; init; } = [];
+    [JsonPropertyName("keystorePath")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? KeystorePath { get; init; }
+    [JsonPropertyName("walletName")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? WalletName { get; init; }
+}
+
 public sealed record TunnelConfiguration
 {
     [JsonPropertyName("meshID")] public string MeshId { get; init; } = "";
@@ -163,4 +191,10 @@ public sealed record TunnelConfiguration
     [JsonPropertyName("mtu")] public uint Mtu { get; init; } = 1280;
     [JsonPropertyName("crypto")] public CryptoPolicy Crypto { get; init; } = new();
     [JsonPropertyName("killSwitch")] public string KillSwitch { get; init; } = "failClosed";
+    [JsonPropertyName("meshType")] public string MeshType { get; init; } = "development";
+    [JsonPropertyName("meshTrustPolicy")] public string MeshTrustPolicy { get; init; } = "development_optional";
+    [JsonPropertyName("discoveryIdentityMode")] public string DiscoveryIdentityMode { get; init; } = "off";
+    [JsonPropertyName("dytallixIdentity")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public DytallixIdentityConfiguration? DytallixIdentity { get; init; }
 }

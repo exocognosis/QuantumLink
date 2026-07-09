@@ -52,7 +52,7 @@ public partial class DashboardViewModel : ObservableObject
     public string ReadinessSummary => "WinUI dashboard over the privileged QuantumLink Windows service; Wintun, WFP, MSI/WiX, and service validation remain Windows-host gated.";
     public string IdentitySummary => "Dytallix identity follows shared qlink-core policy while Windows-local secrets stay behind service-owned DPAPI storage boundaries.";
     public string PolicySummary => "Routes, DNS, Wintun adapter state, and WFP kill-switch policy are owned by the Windows service, not this unprivileged dashboard.";
-    public string HelpSummary => "Use redacted support exports plus Event Viewer service logs. Security reports should follow SECURITY.md.";
+    public string HelpSummary => "Use the bounded redacted support export plus Event Viewer service logs. Security reports should follow SECURITY.md.";
 
     public ObservableCollection<string> OnboardingItems { get; } =
     [
@@ -61,7 +61,7 @@ public partial class DashboardViewModel : ObservableObject
         "Connect through the LocalSystem tunnel service, not direct UI networking",
         "Verify Wintun adapter state and WFP kill-switch policy from service status",
         "Use MSI/WiX install logs and Event Viewer before reinstalling",
-        "Export redacted diagnostics before sharing logs"
+        "Generate the bounded redacted support export before sharing diagnostics"
     ];
 
     public ObservableCollection<string> HelpTopics { get; } =
@@ -70,7 +70,7 @@ public partial class DashboardViewModel : ObservableObject
         "Tunnel control: Connect and Disconnect ask the service to manage Wintun and routes",
         "WFP kill switch: service status should report fail-closed policy state",
         "DPAPI identity storage: keep Windows-local secrets out of dashboard state",
-        "Diagnostics: export redacted JSON and check Event Viewer service logs",
+        "Diagnostics: generate the bounded redacted support JSON and check Event Viewer service logs",
         "Packaging: use MSI/WiX validation before treating the build as releasable",
         "Security reports: keep raw wallet, peer, DNS, route, and packet data out of tickets"
     ];
@@ -177,10 +177,7 @@ public partial class DashboardViewModel : ObservableObject
         TrafficSummary = $"{FormatBytes(status.Metrics.BytesIn)} in · {FormatBytes(status.Metrics.BytesOut)} out · {status.Metrics.ReplayDrops} replay drops";
         TrustSummary =
             $"{FormatIdentityMode(status.PeerTrust.IdentityMode)} · {FormatTrustPolicy(status.PeerTrust.Policy)} · {(status.PeerTrust.Required ? "required" : "optional")}";
-        RegistrySummary =
-            status.PeerTrust.RegistryConfigured
-                ? $"Registry configured · {status.PeerTrust.VerifiedPeerCount} verified · {status.PeerTrust.FailedPeerCount} blocked"
-                : "Registry not configured";
+        RegistrySummary = FormatRegistrySummary(status.PeerTrust);
         TransportSummary = status.Transport is null
             ? "Transport metrics not reported yet"
             : $"state {status.Transport.StateCode} · path {status.Transport.PathKindCode} · {FormatBytes(status.Transport.BytesSent)} sent · {FormatBytes(status.Transport.BytesReceived)} received · {status.Transport.ReconnectCount} reconnects · {status.Transport.NetworkEventCount} network events";
@@ -208,11 +205,50 @@ public partial class DashboardViewModel : ObservableObject
         return unitIndex == 0 ? $"{bytes} {units[unitIndex]}" : $"{value:0.##} {units[unitIndex]}";
     }
 
+    private static string FormatRegistrySummary(DytallixPeerTrustSummary peerTrust)
+    {
+        var parts = new List<string>
+        {
+            peerTrust.RegistryConfigured ? "Registry configured" : "Registry not configured"
+        };
+        if (peerTrust.RegistryConfigured)
+        {
+            parts.Add($"{peerTrust.VerifiedPeerCount} verified");
+            parts.Add($"{peerTrust.FailedPeerCount} blocked");
+        }
+        if (!string.IsNullOrWhiteSpace(peerTrust.LastFailureCode))
+        {
+            var label = FormatFailureCode(peerTrust.LastFailureCode);
+            var detail = string.IsNullOrWhiteSpace(peerTrust.LastFailureSummary)
+                ? label
+                : $"{label}: {peerTrust.LastFailureSummary}";
+            parts.Add(detail);
+        }
+        if (!string.IsNullOrWhiteSpace(peerTrust.Warning))
+        {
+            parts.Add($"Warning: {peerTrust.Warning}");
+        }
+        return string.Join(" · ", parts);
+    }
+
     private static string FormatIdentityMode(string value) => value switch
     {
         "verified" => "Verified",
         "public_wallet" => "Public Wallet",
         "off" => "Off",
+        _ => value
+    };
+
+    private static string FormatFailureCode(string value) => value switch
+    {
+        "rejected_missing_registry" => "Missing registry record",
+        "rejected_revoked" => "Revoked registry record",
+        "rejected_suspended" => "Suspended registry record",
+        "rejected_expired" => "Expired registry record",
+        "rejected_key_mismatch" => "Key mismatch",
+        "rejected_record_hash_mismatch" => "Record hash mismatch",
+        "rejected_stake_or_reputation" => "Stake or reputation check failed",
+        "registry_unavailable" => "Registry unavailable",
         _ => value
     };
 

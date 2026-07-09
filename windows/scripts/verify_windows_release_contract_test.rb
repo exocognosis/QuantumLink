@@ -14,12 +14,16 @@ class VerifyWindowsReleaseContractTest < Minitest::Test
     ChecksumsPath
     WintunDllPath
     WintunLicensePath
+    SbomPath
+    ReleaseManifestPath
     InstallValidationReportPath
     EvidencePath
     ExpectedPublisherSubject
     ExpectedPublisherThumbprint
     RequireValidSignature
     RequireTimestamp
+    RequireSbom
+    RequireReleaseManifest
     RequireInstallValidation
     ContractOnly
   ].freeze
@@ -31,6 +35,9 @@ class VerifyWindowsReleaseContractTest < Minitest::Test
     msi
     checksums
     wintun
+    sbom
+    releaseManifest
+    releaseSummary
     installValidation
     failures
     passed
@@ -68,6 +75,29 @@ class VerifyWindowsReleaseContractTest < Minitest::Test
     license
   ].freeze
 
+  REQUIRED_JSON_ARTIFACT_KEYS = %w[
+    path
+    resolvedPath
+    exists
+    sha256
+    lengthBytes
+    parsed
+    schemaVersion
+    spdxVersion
+    error
+  ].freeze
+
+  REQUIRED_RELEASE_SUMMARY_KEYS = %w[
+    signed
+    timestamped
+    msiArchitecture
+    publisher
+    wintunDllPassed
+    checksumsPassed
+    sbomExists
+    releaseManifestExists
+  ].freeze
+
   REQUIRED_INSTALL_VALIDATION_KEYS = %w[
     skipped
     required
@@ -98,6 +128,8 @@ class VerifyWindowsReleaseContractTest < Minitest::Test
     assert_match(/SHA256SUMS\.txt/, @script)
     assert_match(/wintun\.dll/, @script)
     assert_match(/WINTUN-LICENSE\.txt/, @script)
+    assert_match(/windows-sbom\.spdx\.json/, @script)
+    assert_match(/windows-release-manifest\.json/, @script)
     assert_match(/install-validation-report\.json/, @script)
   end
 
@@ -116,6 +148,14 @@ class VerifyWindowsReleaseContractTest < Minitest::Test
 
     REQUIRED_WINTUN_KEYS.each do |key|
       assert_match(/#{Regexp.escape(key)}/, @script, "missing wintun key #{key}")
+    end
+
+    REQUIRED_JSON_ARTIFACT_KEYS.each do |key|
+      assert_match(/#{Regexp.escape(key)}/, @script, "missing JSON artifact key #{key}")
+    end
+
+    REQUIRED_RELEASE_SUMMARY_KEYS.each do |key|
+      assert_match(/#{Regexp.escape(key)}/, @script, "missing releaseSummary key #{key}")
     end
 
     REQUIRED_INSTALL_VALIDATION_KEYS.each do |key|
@@ -177,6 +217,29 @@ class VerifyWindowsReleaseContractTest < Minitest::Test
     assert_match(/Get-ReleaseFileSnapshot\s+-Path\s+\$WintunDllPath/, @script)
     assert_match(/Get-AuthenticodeEvidence\s+-Path\s+\$dll\.resolvedPath/, @script)
     assert_match(/Get-ReleaseFileSnapshot\s+-Path\s+\$WintunLicensePath/, @script)
+  end
+
+  def test_verifies_sbom_and_release_manifest_when_required
+    assert_match(/SbomPath/, @script)
+    assert_match(/ReleaseManifestPath/, @script)
+    assert_match(/RequireSbom/, @script)
+    assert_match(/RequireReleaseManifest/, @script)
+    assert_match(/Get-ReleaseJsonEvidence\s+-Path\s+\$SbomPath/, @script)
+    assert_match(/Get-ReleaseJsonEvidence\s+-Path\s+\$ReleaseManifestPath/, @script)
+    assert_match(/SBOM is required/, @script)
+    assert_match(/SBOM JSON could not be parsed/, @script)
+    assert_match(/Release manifest is required/, @script)
+    assert_match(/Release manifest JSON could not be parsed/, @script)
+  end
+
+  def test_release_summary_exposes_production_gate_booleans
+    assert_match(/releaseSummary\s*=\s*\[ordered\]@\{/, @script)
+    REQUIRED_RELEASE_SUMMARY_KEYS.each do |key|
+      assert_match(/#{Regexp.escape(key)}\s*=/, @script, "missing releaseSummary assignment #{key}")
+    end
+    assert_match(/signed\s*=\s*\(\$msi\.signatureStatus\s*-eq\s*"Valid"\)/, @script)
+    assert_match(/timestamped\s*=\s*\[bool\]\$msi\.timestampPassed/, @script)
+    assert_match(/checksumsPassed\s*=\s*\(\$checksums\.passed\s*-and\s+\$checksums\.msiEntryFound\s*-and\s+\$checksums\.msiHashMatched\)/, @script)
   end
 
   def test_parses_required_install_validation_report
@@ -244,6 +307,9 @@ class VerifyWindowsReleaseContractTest < Minitest::Test
       assert_kind_of Hash, evidence.fetch("msi")
       assert_kind_of Hash, evidence.fetch("checksums")
       assert_kind_of Hash, evidence.fetch("wintun")
+      assert_kind_of Hash, evidence.fetch("sbom")
+      assert_kind_of Hash, evidence.fetch("releaseManifest")
+      assert_kind_of Hash, evidence.fetch("releaseSummary")
       assert_kind_of Hash, evidence.fetch("installValidation")
       assert_kind_of Array, evidence.fetch("failures")
     end

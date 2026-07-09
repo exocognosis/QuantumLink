@@ -6,6 +6,10 @@ on:
       - "v*"
   workflow_dispatch:
     inputs:
+      production_release:
+        description: "Requires signing, timestamping, install validation, SBOM, manifest, release evidence, and rendezvous/relay production evidence before artifact upload."
+        type: boolean
+        default: false
       run_install_validation:
         description: "Installs/uninstalls the generated MSI on the GitHub Windows runner and uploads JSON evidence."
         type: boolean
@@ -49,6 +53,10 @@ on:
         options:
           - UninstallReinstall
           - DirectDowngrade
+      rendezvous_relay_production_evidence_manifest:
+        description: "Repo-relative JSON rendezvous/relay production evidence manifest required when production_release=true."
+        type: string
+        default: "windows/validation/rendezvous-relay-production-evidence.json"
 
 permissions:
   contents: write
@@ -65,6 +73,11 @@ jobs:
       WIX_VERSION: "6.0.2"
     steps:
       - uses: actions/checkout@v7
+
+      - name: Setup Ruby evidence verifier
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v5
@@ -214,11 +227,18 @@ jobs:
           "available=$available" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
           Write-Host "Authenticode signing available: $available"
 
-      - name: Require Authenticode signing for tag releases
-        if: startsWith(github.ref, 'refs/tags/v') && steps.signing.outputs.available != 'true'
+      - name: Require Authenticode signing for production releases
+        if: (startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.production_release)) && steps.signing.outputs.available != 'true'
         shell: pwsh
         run: |
-          Write-Error "Windows tag releases require Authenticode signing secrets. Configure both WINDOWS_SIGNING_CERT_PFX_BASE64 and WINDOWS_SIGNING_CERT_PASSWORD before pushing refs/tags/v*."
+          Write-Error "Windows production releases require Authenticode signing secrets. Configure both WINDOWS_SIGNING_CERT_PFX_BASE64 and WINDOWS_SIGNING_CERT_PASSWORD before publishing a tag or setting production_release=true."
+          exit 1
+
+      - name: Require install validation for production releases
+        if: github.event_name == 'workflow_dispatch' && inputs.production_release && !inputs.run_install_validation
+        shell: pwsh
+        run: |
+          Write-Error "Windows production releases require run_install_validation=true so the staged MSI is bound to install/uninstall evidence."
           exit 1
 
       - name: Build and package MSI
@@ -554,8 +574,25 @@ jobs:
           path: windows/build/validation/install-validation-report.json
           if-no-files-found: error
 
-      - name: Stage release artifacts and checksums
+      - name: Require rendezvous/relay production evidence
+        if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.production_release)
         shell: pwsh
+        env:
+          RENDEZVOUS_RELAY_PRODUCTION_EVIDENCE_MANIFEST: ${{ inputs.rendezvous_relay_production_evidence_manifest || 'windows/validation/rendezvous-relay-production-evidence.json' }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          ruby .\windows\scripts\verify-rendezvous-relay-production-evidence.rb `
+            --require-ready `
+            --expected-sha $env:GITHUB_SHA `
+            --expected-ref $env:GITHUB_REF `
+            --report windows/build/validation/rendezvous-relay-production-evidence-verification.json `
+            $env:RENDEZVOUS_RELAY_PRODUCTION_EVIDENCE_MANIFEST
+
+      - name: Stage release artifacts, SBOM, manifest, and checksums
+        shell: pwsh
+        env:
+          RENDEZVOUS_RELAY_PRODUCTION_EVIDENCE_MANIFEST: ${{ inputs.rendezvous_relay_production_evidence_manifest || 'windows/validation/rendezvous-relay-production-evidence.json' }}
         run: |
           $ErrorActionPreference = "Stop"
 
@@ -579,6 +616,87 @@ jobs:
           Copy-Item -Path "windows\QuantumLink.msi" -Destination $stagedMsi -Force
           Copy-Item -Path "wintun\LICENSE.txt" -Destination (Join-Path $releaseDir "WINTUN-LICENSE.txt") -Force
 
+          $productionEvidenceReport = "windows\build\validation\rendezvous-relay-production-evidence-verification.json"
+          if (Test-Path -LiteralPath $productionEvidenceReport -PathType Leaf) {
+            Copy-Item -LiteralPath $productionEvidenceReport `
+              -Destination (Join-Path $releaseDir "rendezvous-relay-production-evidence-verification.json") `
+              -Force
+            Copy-Item -LiteralPath $env:RENDEZVOUS_RELAY_PRODUCTION_EVIDENCE_MANIFEST `
+              -Destination (Join-Path $releaseDir "rendezvous-relay-production-evidence.json") `
+              -Force
+
+            $verifiedEvidence = Get-Content -LiteralPath $productionEvidenceReport -Raw | ConvertFrom-Json
+            foreach ($controlEvidence in @($verifiedEvidence.controlEvidence)) {
+              $safeControl = ([string]$controlEvidence.control) -replace '[^A-Za-z0-9._-]', '-'
+              Copy-Item -LiteralPath ([string]$controlEvidence.evidence) `
+                -Destination (Join-Path $releaseDir "rendezvous-relay-control-$safeControl.json") `
+                -Force
+            }
+          }
+
+          $generatedAt = (Get-Date).ToUniversalTime().ToString("o")
+          $sbomPath = Join-Path $releaseDir "windows-sbom.spdx.json"
+          $sbomPackages = @(
+            [ordered]@{
+              SPDXID = "SPDXRef-Package-QuantumLink-Windows-MSI"
+              name = $msiName
+              downloadLocation = "NOASSERTION"
+              filesAnalyzed = $false
+              licenseConcluded = "NOASSERTION"
+              licenseDeclared = "NOASSERTION"
+              copyrightText = "NOASSERTION"
+            },
+            [ordered]@{
+              SPDXID = "SPDXRef-Package-Wintun"
+              name = "Wintun"
+              downloadLocation = "${{ vars.WINTUN_DOWNLOAD_URL }}"
+              filesAnalyzed = $false
+              licenseConcluded = "NOASSERTION"
+              licenseDeclared = "NOASSERTION"
+              copyrightText = "NOASSERTION"
+            }
+          )
+          [ordered]@{
+            spdxVersion = "SPDX-2.3"
+            dataLicense = "CC0-1.0"
+            SPDXID = "SPDXRef-DOCUMENT"
+            name = "QuantumLink Windows $versionLabel"
+            documentNamespace = "https://github.com/${{ github.repository }}/releases/windows/$env:GITHUB_RUN_ID"
+            creationInfo = [ordered]@{
+              created = $generatedAt
+              creators = @("Tool: GitHub Actions windows-release.yml")
+            }
+            packages = $sbomPackages
+          } | ConvertTo-Json -Depth 8 | Set-Content -Path $sbomPath -Encoding UTF8
+
+          $releaseArtifacts = @(
+            Get-ChildItem -Path $releaseDir -File |
+              Sort-Object Name |
+              ForEach-Object {
+                $hash = Get-FileHash -Algorithm SHA256 -Path $_.FullName
+                [ordered]@{
+                  name = $_.Name
+                  sha256 = $hash.Hash.ToLowerInvariant()
+                  lengthBytes = $_.Length
+                }
+              }
+          )
+
+          $manifestPath = Join-Path $releaseDir "windows-release-manifest.json"
+          [ordered]@{
+            schemaVersion = "1.0"
+            generatedAt = $generatedAt
+            repository = $env:GITHUB_REPOSITORY
+            ref = $env:GITHUB_REF
+            sha = $env:GITHUB_SHA
+            runId = $env:GITHUB_RUN_ID
+            runNumber = $env:GITHUB_RUN_NUMBER
+            versionLabel = $versionLabel
+            platform = "windows"
+            architecture = "x64"
+            artifacts = $releaseArtifacts
+          } | ConvertTo-Json -Depth 8 | Set-Content -Path $manifestPath -Encoding UTF8
+
           $checksumsPath = Join-Path $releaseDir "SHA256SUMS.txt"
           Get-ChildItem -Path $releaseDir -File |
             Sort-Object Name |
@@ -594,6 +712,7 @@ jobs:
         shell: pwsh
         env:
           SIGNING_AVAILABLE: ${{ steps.signing.outputs.available }}
+          PRODUCTION_RELEASE: ${{ (startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.production_release)) }}
           RUN_INSTALL_VALIDATION: ${{ github.event_name == 'workflow_dispatch' && inputs.run_install_validation }}
           EXPECTED_PUBLISHER_SUBJECT: ${{ inputs.expected_publisher_subject }}
           EXPECTED_PUBLISHER_THUMBPRINT: ${{ inputs.expected_publisher_thumbprint }}
@@ -617,12 +736,19 @@ jobs:
             ChecksumsPath = ".\windows\build\release\SHA256SUMS.txt"
             WintunDllPath = ".\wintun\bin\amd64\wintun.dll"
             WintunLicensePath = ".\windows\build\release\WINTUN-LICENSE.txt"
+            SbomPath = ".\windows\build\release\windows-sbom.spdx.json"
+            ReleaseManifestPath = ".\windows\build\release\windows-release-manifest.json"
             EvidencePath = ".\windows\build\release\windows-release-evidence.json"
           }
 
-          if ($env:SIGNING_AVAILABLE -eq "true" -or $env:GITHUB_REF -like "refs/tags/v*") {
+          if ($env:SIGNING_AVAILABLE -eq "true" -or $env:PRODUCTION_RELEASE -eq "true") {
             $arguments.RequireValidSignature = $true
             $arguments.RequireTimestamp = $true
+          }
+
+          if ($env:PRODUCTION_RELEASE -eq "true") {
+            $arguments.RequireSbom = $true
+            $arguments.RequireReleaseManifest = $true
           }
 
           if (-not [string]::IsNullOrWhiteSpace($env:EXPECTED_PUBLISHER_SUBJECT)) {
@@ -648,7 +774,10 @@ jobs:
             windows/build/release/*.msi
             windows/build/release/WINTUN-LICENSE.txt
             windows/build/release/SHA256SUMS.txt
+            windows/build/release/windows-sbom.spdx.json
+            windows/build/release/windows-release-manifest.json
             windows/build/release/windows-release-evidence.json
+            windows/build/release/rendezvous-relay-*.json
           if-no-files-found: error
 
       - name: Attach to GitHub Release
@@ -659,5 +788,8 @@ jobs:
             windows/build/release/*.msi
             windows/build/release/WINTUN-LICENSE.txt
             windows/build/release/SHA256SUMS.txt
+            windows/build/release/windows-sbom.spdx.json
+            windows/build/release/windows-release-manifest.json
             windows/build/release/windows-release-evidence.json
+            windows/build/release/rendezvous-relay-*.json
           fail_on_unmatched_files: true

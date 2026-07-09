@@ -20,12 +20,160 @@ param(
     [string]$MsiPath,
     [switch]$RepairMsi,
     [switch]$UninstallMsi,
-    [switch]$CheckPipeAcl
+    [switch]$CheckPipeAcl,
+    [string]$ReportPath = (Join-Path $PSScriptRoot "../build/validation/windows-security-validation-report.json"),
+    [switch]$IncludeHostIdentifiers,
+    [switch]$ContractOnly
 )
 
 $ErrorActionPreference = "Stop"
+$script:SchemaVersion = "1.0"
+$script:MaxEvidenceItems = 100
+$script:MaxEvidenceLineLength = 400
 $script:Failures = New-Object System.Collections.Generic.List[string]
 $script:Warnings = New-Object System.Collections.Generic.List[string]
+$script:Passes = New-Object System.Collections.Generic.List[string]
+$script:EvidenceTruncated = $false
+
+function Get-SecurityValidationTimestamp {
+    return (Get-Date).ToUniversalTime().ToString("o")
+}
+
+function ConvertTo-BoundedEvidenceString {
+    param(
+        [AllowNull()]
+        [object]$Value
+    )
+
+    if ($null -eq $Value) {
+        return $null
+    }
+
+    $text = [string]$Value
+    if (-not $IncludeHostIdentifiers) {
+        foreach ($identifier in @($env:COMPUTERNAME, [System.Environment]::UserName)) {
+            if (-not [string]::IsNullOrWhiteSpace($identifier)) {
+                $text = [regex]::Replace(
+                    $text,
+                    [regex]::Escape($identifier),
+                    "[redacted]",
+                    [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+                )
+            }
+        }
+    }
+
+    if ($text.Length -le $script:MaxEvidenceLineLength) {
+        return $text
+    }
+
+    $script:EvidenceTruncated = $true
+    return ($text.Substring(0, $script:MaxEvidenceLineLength) + "...[truncated]")
+}
+
+function Add-BoundedEvidenceItem {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [System.Collections.Generic.List[string]]$Items,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Message
+    )
+
+    if ($Items.Count -ge $script:MaxEvidenceItems) {
+        $script:EvidenceTruncated = $true
+        return
+    }
+
+    $Items.Add((ConvertTo-BoundedEvidenceString -Value $Message))
+}
+
+function ConvertTo-HostIdentifierEvidence {
+    param(
+        [AllowNull()]
+        [object]$Value
+    )
+
+    if ($IncludeHostIdentifiers) {
+        return (ConvertTo-BoundedEvidenceString -Value $Value)
+    }
+
+    if ($null -eq $Value) {
+        return $null
+    }
+
+    return "[redacted]"
+}
+
+function Get-SecurityValidationHostSnapshot {
+    $os = $null
+    try {
+        $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
+    } catch {
+        # OS metadata is useful but not required for the validation result.
+    }
+
+    return [ordered]@{
+        computerName = (ConvertTo-HostIdentifierEvidence -Value $env:COMPUTERNAME)
+        userName = (ConvertTo-HostIdentifierEvidence -Value ([System.Environment]::UserName))
+        osCaption = if ($null -ne $os) { ConvertTo-BoundedEvidenceString -Value $os.Caption } else { [System.Environment]::OSVersion.ToString() }
+        osVersion = if ($null -ne $os) { ConvertTo-BoundedEvidenceString -Value $os.Version } else { $null }
+        osBuild = if ($null -ne $os) { ConvertTo-BoundedEvidenceString -Value $os.BuildNumber } else { $null }
+        architecture = (ConvertTo-BoundedEvidenceString -Value $env:PROCESSOR_ARCHITECTURE)
+        powerShellVersion = $PSVersionTable.PSVersion.ToString()
+    }
+}
+
+function Resolve-SecurityValidationReportPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    if ([System.IO.Path]::IsPathRooted($Path)) {
+        return [System.IO.Path]::GetFullPath($Path)
+    }
+
+    return [System.IO.Path]::GetFullPath((Join-Path (Get-Location).Path $Path))
+}
+
+function Write-SecurityValidationReport {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("passed", "failed", "contract_only")]
+        [string]$Status
+    )
+
+    $resolvedPath = Resolve-SecurityValidationReportPath -Path $ReportPath
+    $reportDirectory = Split-Path -Parent $resolvedPath
+    if (-not (Test-Path -LiteralPath $reportDirectory -PathType Container)) {
+        New-Item -ItemType Directory -Path $reportDirectory -Force | Out-Null
+    }
+
+    $report = [ordered]@{
+        schemaVersion = $script:SchemaVersion
+        reportType = "quantumlink.windows.security-validation"
+        generatedAt = (Get-SecurityValidationTimestamp)
+        status = $Status
+        passed = ($Status -eq "passed")
+        contractOnly = [bool]$ContractOnly
+        hostIdentifiersIncluded = [bool]$IncludeHostIdentifiers
+        host = (Get-SecurityValidationHostSnapshot)
+        summary = [ordered]@{
+            passCount = $script:Passes.Count
+            failureCount = $script:Failures.Count
+            warningCount = $script:Warnings.Count
+        }
+        passes = @($script:Passes)
+        failures = @($script:Failures)
+        warnings = @($script:Warnings)
+        evidenceTruncated = [bool]$script:EvidenceTruncated
+    }
+
+    $json = $report | ConvertTo-Json -Depth 8
+    Set-Content -LiteralPath $resolvedPath -Value $json -Encoding UTF8
+}
 
 function Write-Step {
     param([string]$Message)
@@ -34,18 +182,19 @@ function Write-Step {
 
 function Add-Failure {
     param([string]$Message)
-    $script:Failures.Add($Message)
+    Add-BoundedEvidenceItem -Items $script:Failures -Message $Message
     Write-Host "FAIL: $Message" -ForegroundColor Red
 }
 
 function Add-Warning {
     param([string]$Message)
-    $script:Warnings.Add($Message)
+    Add-BoundedEvidenceItem -Items $script:Warnings -Message $Message
     Write-Host "WARN: $Message" -ForegroundColor Yellow
 }
 
 function Add-Pass {
     param([string]$Message)
+    Add-BoundedEvidenceItem -Items $script:Passes -Message $Message
     Write-Host "PASS: $Message" -ForegroundColor Green
 }
 
@@ -296,7 +445,7 @@ function Test-NamedPipe {
             Add-Pass "Named pipe ACL does not grant broad FullControl access."
         }
     } catch {
-        Add-Warning "Could not inspect named pipe ACL for '$Name': $($_.Exception.Message)"
+        Add-Failure "Could not inspect required named pipe ACL for '$Name': $($_.Exception.Message)"
     }
 }
 
@@ -337,19 +486,19 @@ function Test-RuntimeSecurityProbe {
     $exitCode = $LASTEXITCODE
     $probeText = ($probeOutput | Out-String).Trim()
     if ($exitCode -ne 0) {
-        Add-Failure "Runtime security probe failed with exit code $exitCode. Output: $probeText"
+        Add-Failure "Runtime security probe failed with exit code $exitCode."
         return
     }
 
     try {
         $report = $probeText | ConvertFrom-Json
     } catch {
-        Add-Failure "Runtime security probe did not emit valid JSON: $($_.Exception.Message). Output: $probeText"
+        Add-Failure "Runtime security probe did not emit valid JSON: $($_.Exception.Message)."
         return
     }
 
     if (-not $report.passed) {
-        Add-Failure "Runtime security probe reported passed=false. Output: $probeText"
+        Add-Failure "Runtime security probe reported passed=false."
         return
     }
 
@@ -414,28 +563,60 @@ function Invoke-MsiHook {
     }
 }
 
-Assert-Admin
-$service = Test-ServiceIdentity -Name $ServiceName
-Test-InstalledFiles -Directory $InstallDir
-Test-StateLayout -Directory $StateDir
-Test-NamedPipe -Name $PipeName -Acl:$CheckPipeAcl
-Test-WintunPlacement -Directory $InstallDir
-Test-RuntimeSecurityProbe -Service $service
-Invoke-MsiHook -Path $MsiPath -Repair:$RepairMsi -Uninstall:$UninstallMsi
+function Invoke-WindowsSecurityValidation {
+    if ($ContractOnly) {
+        Add-Warning "Contract-only mode emitted schema evidence without Windows-native validation."
+        Write-SecurityValidationReport -Status "contract_only"
+        return 0
+    }
 
-Write-Host ""
-Write-Host "QuantumLink Windows security validation summary" -ForegroundColor Cyan
-Write-Host "Warnings: $($script:Warnings.Count)"
-Write-Host "Failures: $($script:Failures.Count)"
+    Assert-Admin
+    $service = Test-ServiceIdentity -Name $ServiceName
+    Test-InstalledFiles -Directory $InstallDir
+    Test-StateLayout -Directory $StateDir
+    Test-NamedPipe -Name $PipeName -Acl:$CheckPipeAcl
+    Test-WintunPlacement -Directory $InstallDir
+    Test-RuntimeSecurityProbe -Service $service
+    Invoke-MsiHook -Path $MsiPath -Repair:$RepairMsi -Uninstall:$UninstallMsi
 
-if ($script:Failures.Count -gt 0) {
     Write-Host ""
-    Write-Host "Required Windows-native evidence is missing:" -ForegroundColor Red
-    foreach ($failure in $script:Failures) {
-        Write-Host " - $failure" -ForegroundColor Red
+    Write-Host "QuantumLink Windows security validation summary" -ForegroundColor Cyan
+    Write-Host "Warnings: $($script:Warnings.Count)"
+    Write-Host "Failures: $($script:Failures.Count)"
+
+    if ($script:Failures.Count -gt 0) {
+        Write-Host ""
+        Write-Host "Required Windows-native evidence is missing:" -ForegroundColor Red
+        foreach ($failure in $script:Failures) {
+            Write-Host " - $failure" -ForegroundColor Red
+        }
+        Write-SecurityValidationReport -Status "failed"
+        return 1
+    }
+
+    Write-SecurityValidationReport -Status "passed"
+    Write-Host "All required Windows-native security evidence checks passed." -ForegroundColor Green
+    return 0
+}
+
+if ($MyInvocation.InvocationName -eq ".") {
+    return
+}
+
+try {
+    $scriptExitCode = Invoke-WindowsSecurityValidation
+} catch {
+    Add-Failure "Unhandled Windows security validation error: $($_.Exception.Message)"
+    try {
+        Write-SecurityValidationReport -Status "failed"
+    } catch {
+        Write-Error -Message "Failed to write fallback security validation report: $($_.Exception.Message)" -ErrorAction Continue
     }
     exit 1
 }
 
-Write-Host "All required Windows-native security evidence checks passed." -ForegroundColor Green
+if ($scriptExitCode -ne 0) {
+    exit 1
+}
+
 exit 0

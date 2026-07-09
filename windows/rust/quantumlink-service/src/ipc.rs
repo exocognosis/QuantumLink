@@ -138,9 +138,18 @@ async fn dispatch(request: PipeRequest, context: &IpcContext) -> PipeResponse {
             TunnelCommand::Status => TunnelProviderMessage::Status {
                 status: engine.status(),
             },
-            TunnelCommand::ExportDiagnostics => TunnelProviderMessage::Diagnostic {
-                text: engine.diagnostics(),
-            },
+            // This command has no raw/elevated mode. Every caller receives the
+            // bounded default-safe support bundle.
+            TunnelCommand::ExportDiagnostics { raw: Some(_) } => {
+                TunnelProviderMessage::Error {
+                    message: "raw diagnostics export is not supported".to_string(),
+                }
+            }
+            TunnelCommand::ExportDiagnostics { raw: None } => {
+                TunnelProviderMessage::Diagnostic {
+                    text: engine.diagnostics(),
+                }
+            }
             TunnelCommand::PeerState { peer_id } => match engine.peer_state_code(&peer_id) {
                 Some(code) => TunnelProviderMessage::Diagnostic {
                     text: format!("{code}"),
@@ -297,6 +306,38 @@ mod tests {
             panic!("expected status, got {:?}", responses[3].message);
         };
         assert_eq!(status.phase, ConnectionPhase::Idle);
+    }
+
+    #[tokio::test]
+    async fn diagnostics_command_rejects_unsupported_raw_mode() {
+        let responses = roundtrip(&[
+            r#"{"id":1,"command":"hello","schemaVersion":1}"#,
+            r#"{"id":2,"command":"exportDiagnostics","raw":true}"#,
+        ])
+        .await;
+
+        let TunnelProviderMessage::Error { message } = &responses[1].message else {
+            panic!("expected unsupported raw-mode error");
+        };
+        assert_eq!(message, "raw diagnostics export is not supported");
+    }
+
+    #[tokio::test]
+    async fn diagnostics_command_returns_only_default_safe_support_bundle() {
+        let responses = roundtrip(&[
+            r#"{"id":1,"command":"hello","schemaVersion":1}"#,
+            r#"{"id":2,"command":"exportDiagnostics"}"#,
+        ])
+        .await;
+
+        let TunnelProviderMessage::Diagnostic { text } = &responses[1].message else {
+            panic!("expected diagnostic support bundle");
+        };
+        let bundle: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(bundle["schemaVersion"], 1);
+        assert_eq!(bundle["redactionPolicy"]["name"], "default-safe-v1");
+        assert_eq!(bundle["redactionPolicy"]["rawExportAvailable"], false);
+        assert_eq!(bundle["diagnostics"]["packetCapturesIncluded"], false);
     }
 
     #[tokio::test]

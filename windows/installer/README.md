@@ -13,7 +13,8 @@ Windows deployment requires:
 - A WiX-built MSI from the release commit.
 - Official signed Wintun DLL sourcing, with the upstream license retained.
 - Authenticode signing and timestamping for the MSI.
-- SHA-256 checksums published alongside the MSI.
+- SHA-256 checksums, SBOM, release manifest, and release evidence published
+  alongside the MSI.
 - Clean install, network, service, upgrade, and uninstall validation on
   Windows hardware or VMs.
 
@@ -49,6 +50,10 @@ copies the upstream Wintun license text into the release artifact set.
 Tagged releases still require the Authenticode signing secrets and
 external/manual validation evidence before publication; manual workflow builds
 may upload unsigned internal artifacts when signing is not configured.
+Set `production_release=true` only for production-candidate manual runs. That
+mode requires Authenticode signing, timestamping, `run_install_validation=true`,
+the release SBOM, the release manifest, and
+`windows-release-evidence.json` before artifacts are uploaded.
 
 Manual workflow runs can also set `run_install_validation` to run
 `.\windows\scripts\validate-install.ps1` against the generated MSI on
@@ -80,9 +85,11 @@ Additional manual workflow inputs:
 The release workflow runs `.\windows\scripts\verify-windows-release.ps1` before
 uploading artifacts. It writes
 `windows/build/release/windows-release-evidence.json` alongside the MSI,
-`SHA256SUMS.txt`, and `WINTUN-LICENSE.txt`. For signed manual artifacts and all
-tag releases, this evidence requires a valid MSI signature and trusted
-timestamp. When `run_install_validation` is enabled, the evidence also requires
+`SHA256SUMS.txt`, `windows-sbom.spdx.json`,
+`windows-release-manifest.json`, and `WINTUN-LICENSE.txt`. For signed manual
+artifacts and all production releases, this evidence requires a valid MSI
+signature and trusted timestamp. When `run_install_validation` is enabled, the
+evidence also requires
 `.\windows\build\validation\install-validation-report.json` and checks that the
 report's MSI SHA-256 matches the staged release MSI.
 
@@ -173,12 +180,15 @@ Get-Content $checksumsPath
       `expected_publisher_thumbprint` when publisher identity should be
       enforced by `windows-release-evidence.json`.
 - [ ] Generate and publish the SHA-256 checksum next to the MSI.
+- [ ] Confirm `windows-sbom.spdx.json` and `windows-release-manifest.json`
+      are present in the release artifact set.
 - [ ] If validating upgrade, configure `upgrade_from_msi_url` and
       `upgrade_from_msi_sha256`. If validating rollback, also set
       `validate_rollback`, choose `rollback_mode`, and optionally configure
       `rollback_to_msi_url` plus `rollback_to_msi_sha256`.
 - [ ] Confirm `windows-release-evidence.json` is uploaded alongside the MSI,
-      `SHA256SUMS.txt`, and `WINTUN-LICENSE.txt`.
+      `SHA256SUMS.txt`, `windows-sbom.spdx.json`,
+      `windows-release-manifest.json`, and `WINTUN-LICENSE.txt`.
 - [ ] Run the Windows beta runbook on clean Windows 10 22H2 and Windows 11 x64
       VMs plus at least one physical x64 Windows machine.
 - [ ] Treat any install, Wintun, WFP, leak-test, service lifecycle, checksum,
@@ -193,9 +203,10 @@ command passes, release Rust artifacts build, and the WinUI 3 app builds.
 
 The Windows release workflow sources Wintun from the pinned URL/checksum, builds
 the WiX MSI, optionally Authenticode-signs manual artifacts, requires signing
-for tag releases, creates checksums, verifies the release evidence contract, and
-uploads `windows-release-evidence.json` plus the Wintun license text with the
-artifacts. For manual runs with `run_install_validation` enabled, it also
+for production releases, creates checksums, SBOM, and release manifest files,
+verifies the release evidence contract, and uploads `windows-release-evidence.json`
+plus the Wintun license text with the artifacts. For manual runs with
+`run_install_validation` enabled, it also
 installs and uninstalls the generated MSI on `windows-latest` by running
 `.\windows\scripts\validate-install.ps1`, optionally exercises upgrade and
 rollback validation from the configured MSI URLs, then uploads

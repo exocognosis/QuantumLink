@@ -15,12 +15,16 @@ param(
     [string]$ChecksumsPath,
     [string]$WintunDllPath,
     [string]$WintunLicensePath,
+    [string]$SbomPath,
+    [string]$ReleaseManifestPath,
     [string]$InstallValidationReportPath,
     [string]$EvidencePath = (Join-Path -Path (Get-Location).Path -ChildPath "windows-release-evidence.json"),
     [string]$ExpectedPublisherSubject,
     [string]$ExpectedPublisherThumbprint,
     [switch]$RequireValidSignature,
     [switch]$RequireTimestamp,
+    [switch]$RequireSbom,
+    [switch]$RequireReleaseManifest,
     [switch]$RequireInstallValidation,
     [switch]$ContractOnly
 )
@@ -242,6 +246,39 @@ function Get-ReleaseFileSnapshot {
         $file = Get-Item -LiteralPath $snapshot.resolvedPath -ErrorAction Stop
         $snapshot.lengthBytes = $file.Length
         $snapshot.sha256 = (Get-FileHash -LiteralPath $snapshot.resolvedPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    } catch {
+        $snapshot.error = Limit-ReleaseString -Value $_.Exception.Message
+    }
+
+    return $snapshot
+}
+
+function Get-ReleaseJsonEvidence {
+    param(
+        [AllowNull()]
+        [string]$Path,
+
+        [string]$MissingMessage = "JSON file path is required."
+    )
+
+    $snapshot = Get-ReleaseFileSnapshot -Path $Path -MissingMessage $MissingMessage
+    Add-Member -InputObject $snapshot -NotePropertyName parsed -NotePropertyValue $false
+    Add-Member -InputObject $snapshot -NotePropertyName schemaVersion -NotePropertyValue $null
+    Add-Member -InputObject $snapshot -NotePropertyName spdxVersion -NotePropertyValue $null
+
+    if (-not $snapshot.exists) {
+        return $snapshot
+    }
+
+    try {
+        $json = Get-Content -LiteralPath $snapshot.resolvedPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        $snapshot.parsed = $true
+        if ($null -ne $json.PSObject.Properties["schemaVersion"]) {
+            $snapshot.schemaVersion = Limit-ReleaseString -Value $json.schemaVersion
+        }
+        if ($null -ne $json.PSObject.Properties["spdxVersion"]) {
+            $snapshot.spdxVersion = Limit-ReleaseString -Value $json.spdxVersion
+        }
     } catch {
         $snapshot.error = Limit-ReleaseString -Value $_.Exception.Message
     }
@@ -625,6 +662,9 @@ function New-ReleaseBaseEvidence {
             dll = [ordered]@{}
             license = [ordered]@{}
         }
+        sbom = [ordered]@{}
+        releaseManifest = [ordered]@{}
+        releaseSummary = [ordered]@{}
         installValidation = [ordered]@{}
         failures = @()
         passed = $false
@@ -697,6 +737,40 @@ function New-ReleaseContractEvidence {
                 lengthBytes = $null
                 reason = $reason
             }
+        }
+        sbom = [ordered]@{
+            skipped = $true
+            path = $SbomPath
+            resolvedPath = $null
+            exists = $null
+            sha256 = $null
+            lengthBytes = $null
+            parsed = $true
+            schemaVersion = $null
+            spdxVersion = "SPDX-2.3"
+            reason = $reason
+        }
+        releaseManifest = [ordered]@{
+            skipped = $true
+            path = $ReleaseManifestPath
+            resolvedPath = $null
+            exists = $null
+            sha256 = $null
+            lengthBytes = $null
+            parsed = $true
+            schemaVersion = "1.0"
+            spdxVersion = $null
+            reason = $reason
+        }
+        releaseSummary = [ordered]@{
+            signed = $true
+            timestamped = $true
+            msiArchitecture = "x64"
+            publisher = $null
+            wintunDllPassed = $true
+            checksumsPassed = $true
+            sbomExists = $true
+            releaseManifestExists = $true
         }
         installValidation = [ordered]@{
             skipped = $true
@@ -811,6 +885,24 @@ function Invoke-ReleaseVerification {
         $defaultPathErrors += $wintunLicensePathEvidence.error
     }
 
+    $sbomPathEvidence = Resolve-ReleaseDefaultPath `
+        -ExplicitPath $SbomPath `
+        -ArtifactRoot $artifactRoot `
+        -Candidates @("windows-sbom.spdx.json", "sbom.spdx.json")
+    $SbomPath = $sbomPathEvidence.path
+    if (-not [string]::IsNullOrWhiteSpace($sbomPathEvidence.error)) {
+        $defaultPathErrors += $sbomPathEvidence.error
+    }
+
+    $releaseManifestPathEvidence = Resolve-ReleaseDefaultPath `
+        -ExplicitPath $ReleaseManifestPath `
+        -ArtifactRoot $artifactRoot `
+        -Candidates @("windows-release-manifest.json", "release-manifest.json")
+    $ReleaseManifestPath = $releaseManifestPathEvidence.path
+    if (-not [string]::IsNullOrWhiteSpace($releaseManifestPathEvidence.error)) {
+        $defaultPathErrors += $releaseManifestPathEvidence.error
+    }
+
     if ($RequireInstallValidation -or -not [string]::IsNullOrWhiteSpace($InstallValidationReportPath)) {
         $installValidationPathEvidence = Resolve-ReleaseDefaultPath `
             -ExplicitPath $InstallValidationReportPath `
@@ -899,6 +991,26 @@ function Invoke-ReleaseVerification {
         $failures += "Wintun license was not found."
     }
 
+    $sbom = Get-ReleaseJsonEvidence -Path $SbomPath -MissingMessage "SbomPath is required."
+    $evidence.sbom = $sbom
+    if ($RequireSbom) {
+        if (-not $sbom.exists) {
+            $failures += "SBOM is required."
+        } elseif (-not $sbom.parsed) {
+            $failures += "SBOM JSON could not be parsed."
+        }
+    }
+
+    $releaseManifest = Get-ReleaseJsonEvidence -Path $ReleaseManifestPath -MissingMessage "ReleaseManifestPath is required."
+    $evidence.releaseManifest = $releaseManifest
+    if ($RequireReleaseManifest) {
+        if (-not $releaseManifest.exists) {
+            $failures += "Release manifest is required."
+        } elseif (-not $releaseManifest.parsed) {
+            $failures += "Release manifest JSON could not be parsed."
+        }
+    }
+
     $installValidation = Get-InstallValidationEvidence -Path $InstallValidationReportPath `
         -Required:$RequireInstallValidation `
         -ExpectedMsiSha256 $msi.sha256
@@ -914,6 +1026,17 @@ function Invoke-ReleaseVerification {
                 $failures += "Install validation report MSI SHA-256 does not match the selected MSI."
             }
         }
+    }
+
+    $evidence.releaseSummary = [ordered]@{
+        signed = ($msi.signatureStatus -eq "Valid")
+        timestamped = [bool]$msi.timestampPassed
+        msiArchitecture = "x64"
+        publisher = $msi.signerSubject
+        wintunDllPassed = ($dll.exists -and (-not $RequireValidSignature -or $dll.signatureStatus -eq "Valid"))
+        checksumsPassed = ($checksums.passed -and $checksums.msiEntryFound -and $checksums.msiHashMatched)
+        sbomExists = [bool]$sbom.exists
+        releaseManifestExists = [bool]$releaseManifest.exists
     }
 
     return Complete-ReleaseEvidence -Evidence $evidence -Failures $failures -OutputPath $EvidencePath

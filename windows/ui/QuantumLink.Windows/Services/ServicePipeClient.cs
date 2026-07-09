@@ -60,6 +60,8 @@ public sealed class ServicePipeClient : IAsyncDisposable
         RoundTripAsync(new PipeRequest { Command = "reloadConfiguration", Configuration = configuration }, ct);
 
     public Task<PipeResponse> ExportDiagnosticsAsync(CancellationToken ct = default) =>
+        // The service command always returns the bounded default-safe bundle;
+        // no raw export option exists on the IPC schema.
         RoundTripAsync(new PipeRequest { Command = "exportDiagnostics" }, ct);
 
     private async Task<PipeResponse> RoundTripAsync(PipeRequest request, CancellationToken cancellation)

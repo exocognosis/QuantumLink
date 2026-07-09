@@ -325,10 +325,10 @@
                     BorderThickness="1">
                 <StackPanel Spacing="12">
                     <StackPanel Orientation="Horizontal" Spacing="12">
-                        <TextBlock Text="Diagnostics"
+                        <TextBlock Text="Redacted support export"
                                    Style="{StaticResource SubtitleTextBlockStyle}"
                                    VerticalAlignment="Center" />
-                        <Button Content="Export diagnostics"
+                        <Button Content="Generate redacted JSON"
                                 Command="{x:Bind ViewModel.ExportDiagnosticsCommand}" />
                     </StackPanel>
                     <TextBlock Text="{x:Bind ViewModel.DiagnosticsText, Mode=OneWay}"
