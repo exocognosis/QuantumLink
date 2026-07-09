@@ -51,6 +51,7 @@ run URL, release asset name, or manually archived validation bundle.
 | Windows 11 x64 VM validation | Pending |
 | Physical Windows x64 validation | Pending |
 | Security validation report | Pending |
+| Automated Windows validation manifest | `windows/build/validation/windows-beta-validation-manifest.json` Pending Windows host run |
 | Fail-closed leak capture | Pending |
 | Strict-mode leak capture | Pending |
 | Service-crash kill-switch capture | Pending |
@@ -59,7 +60,7 @@ run URL, release asset name, or manually archived validation bundle.
 | Rendezvous/relay production evidence manifest | `windows/validation/rendezvous-relay-production-evidence.json` Pending |
 | macOS-Windows interop report | Pending |
 | Dytallix public mesh rejection report | Pending |
-| Diagnostics redaction report | Pending |
+| Diagnostics redaction report | `windows/docs/diagnostics-support-bundle.md`; Rust redaction tests pass, Windows UI/host audit Pending |
 | Upgrade/repair/rollback/uninstall report | Pending |
 
 ## Task 4 Packet-Session Evidence
@@ -114,6 +115,37 @@ until every required control has passing redacted evidence.
 Passing evidence must be fresh, control-specific, digest-bound to distinct JSON
 proof files, bound to the exact release commit/ref and deployment endpoint set,
 and preserved inside the checksummed release artifact set.
+
+## Automated Windows Validation Evidence
+
+`windows/scripts/run-beta-validation.ps1` now runs install validation followed
+by required security validation and writes a bounded three-file evidence set
+under `windows/build/validation/`. Missing or unreadable named-pipe ACL proof,
+skipped network checks, missing reports, malformed reports, and contract-only
+output all fail closed. Host and user identifiers are redacted by default.
+
+This is code-complete but remains **Blocked** until the scripts execute on the
+required Windows 10, Windows 11, and physical x64 hosts. macOS static contract
+tests do not substitute for PowerShell execution or Windows-native evidence.
+
+## Diagnostics Privacy Evidence
+
+`windows/docs/diagnostics-support-bundle.md` defines the IPC/UI support export.
+The service constructs it from support-only DTO allowlists, caps it at 64 KiB
+and 32 ephemeral peer entries, rejects raw-export requests, never includes
+logs or packet captures, and emits a bounded fallback instead of panicking.
+
+Rust privacy, size, fallback, compatibility, and IPC tests pass locally. This
+gate remains **Blocked** until the Windows UI build and host audit confirm the
+shipped binary produces the same default-safe output and no alternate raw
+export surface exists.
+
+## Current Release Decision
+
+The current decision is **No-Go**. See
+`windows/docs/release-candidate-go-no-go.md` for the code-complete controls,
+remaining implementation blockers, required external evidence, and the exact
+promotion rule.
 
 ## Release Rule
 
