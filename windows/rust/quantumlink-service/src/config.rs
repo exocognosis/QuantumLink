@@ -11,6 +11,7 @@ use quantumlink_proto::models::{
     DiscoveryIdentityMode, DnsMode, MeshTrustPolicy, TunnelConfiguration,
 };
 use quantumlink_proto::privacy;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::io;
 use std::net::Ipv4Addr;
@@ -21,7 +22,42 @@ pub const CONFIG_FILE: &str = "config.json";
 pub const PEER_STORE_FILE: &str = "peers.json";
 pub const SECRETS_DIR: &str = "secrets";
 pub const LOGS_DIR: &str = "logs";
+pub const DEFAULT_PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)";
 const MAX_PROTECTED_ROUTES: usize = 256;
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowsSecurityConfig {
+    #[serde(default = "default_pipe_sddl")]
+    pub pipe_sddl: String,
+}
+
+impl Default for WindowsSecurityConfig {
+    fn default() -> Self {
+        Self {
+            pipe_sddl: default_pipe_sddl(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ServiceLocalConfig {
+    #[serde(default)]
+    windows_security: WindowsSecurityConfig,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ServicePersistedConfig<'a> {
+    #[serde(flatten)]
+    tunnel: &'a TunnelConfiguration,
+    windows_security: WindowsSecurityConfig,
+}
+
+fn default_pipe_sddl() -> String {
+    DEFAULT_PIPE_SDDL.to_string()
+}
 
 /// Root state directory for the service.
 ///
@@ -71,12 +107,46 @@ pub fn load_configuration(root: &Path) -> io::Result<Option<TunnelConfiguration>
     }
 }
 
+pub fn load_windows_security(root: &Path) -> io::Result<WindowsSecurityConfig> {
+    let path = root.join(CONFIG_FILE);
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            let config: ServiceLocalConfig = serde_json::from_slice(&bytes).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("config.json windowsSecurity is malformed: {error}"),
+                )
+            })?;
+            if config.windows_security.pipe_sddl.trim().is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "windowsSecurity.pipeSddl must not be empty",
+                ));
+            }
+            Ok(config.windows_security)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Ok(WindowsSecurityConfig::default())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub fn load_pipe_sddl(root: &Path) -> io::Result<String> {
+    Ok(load_windows_security(root)?.pipe_sddl)
+}
+
 /// Persists atomically (write-temp + rename) so a crash mid-write never
 /// leaves a truncated config behind.
 pub fn save_configuration(root: &Path, config: &TunnelConfiguration) -> io::Result<()> {
     validate_configuration(config)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-    let bytes = serde_json::to_vec_pretty(config)
+    let windows_security = load_windows_security(root)?;
+    let persisted = ServicePersistedConfig {
+        tunnel: config,
+        windows_security,
+    };
+    let bytes = serde_json::to_vec_pretty(&persisted)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     let temp = root.join(format!("{CONFIG_FILE}.tmp"));
     let final_path = root.join(CONFIG_FILE);
@@ -316,4 +386,112 @@ mod tests {
         let error = load_for_connect(dir.path()).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
+
+    #[test]
+    fn pipe_sddl_defaults_to_consumer_local_users_acl() {
+        let dir = tempfile::tempdir().unwrap();
+        ensure_state_dirs(dir.path()).unwrap();
+
+        let security = load_windows_security(dir.path()).unwrap();
+
+        assert_eq!(
+            security.pipe_sddl,
+            "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)"
+        );
+    }
+
+    #[test]
+    fn pipe_sddl_accepts_enterprise_group_override_from_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        ensure_state_dirs(dir.path()).unwrap();
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            br#"{
+              "meshID": "mesh-test",
+              "windowsSecurity": {
+                "pipeSddl": "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;S-1-5-21-1-2-3-4567)"
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let security = load_windows_security(dir.path()).unwrap();
+
+        assert_eq!(
+            security.pipe_sddl,
+            "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;S-1-5-21-1-2-3-4567)"
+        );
+    }
+
+    #[test]
+    fn pipe_sddl_rejects_empty_override() {
+        let dir = tempfile::tempdir().unwrap();
+        ensure_state_dirs(dir.path()).unwrap();
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            br#"{
+              "windowsSecurity": {
+                "pipeSddl": "   "
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let error = load_windows_security(dir.path()).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn pipe_server_selects_configured_sddl_from_state() {
+        let dir = tempfile::tempdir().unwrap();
+        ensure_state_dirs(dir.path()).unwrap();
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            br#"{
+              "windowsSecurity": {
+                "pipeSddl": "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;S-1-5-21-9)"
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let sddl = load_pipe_sddl(dir.path()).unwrap();
+
+        assert_eq!(sddl, "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;S-1-5-21-9)");
+    }
+
+    #[test]
+    fn save_configuration_preserves_enterprise_pipe_sddl() {
+        let dir = tempfile::tempdir().unwrap();
+        ensure_state_dirs(dir.path()).unwrap();
+        let enterprise_sddl = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;S-1-5-21-1-2-3-4567)";
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            format!(
+                r#"{{
+                  "windowsSecurity": {{
+                    "pipeSddl": "{enterprise_sddl}"
+                  }}
+                }}"#
+            ),
+        )
+        .unwrap();
+
+        let config = privacy::default_tunnel_configuration();
+        save_configuration(dir.path(), &config).unwrap();
+        let security = load_windows_security(dir.path()).unwrap();
+
+        assert_eq!(security.pipe_sddl, enterprise_sddl);
+    }
 }
+
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "win/routes.rs"]
+mod routes_contract;
+
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "win/wfp.rs"]
+mod wfp_contract;

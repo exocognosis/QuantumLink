@@ -18,7 +18,7 @@ pub struct WindowsPlatform {
 impl PlatformNetwork for WindowsPlatform {
     fn create_adapter(
         &self,
-        _config: &TunnelConfiguration,
+        config: &TunnelConfiguration,
     ) -> Result<Arc<dyn TunnelAdapter>, EngineError> {
         let adapter = WintunAdapter::create()?;
         *self.adapter_luid.lock().unwrap() = Some(adapter.luid());
@@ -29,7 +29,11 @@ impl PlatformNetwork for WindowsPlatform {
         // interface.
         let mut guard = self.kill_switch.lock().unwrap();
         if let Some(config_routes) = guard.as_ref().map(|g| g.protected_routes().to_vec()) {
-            *guard = Some(KillSwitchGuard::engage(&config_routes, adapter.luid())?);
+            *guard = Some(KillSwitchGuard::engage_with_policy(
+                &config_routes,
+                adapter.luid(),
+                config.kill_switch,
+            )?);
         }
         Ok(Arc::new(adapter))
     }
@@ -46,7 +50,11 @@ impl PlatformNetwork for WindowsPlatform {
         // LUID 0 = "no interface yet": only the block filters are
         // meaningful until create_adapter re-engages with the real LUID.
         let luid = self.adapter_luid.lock().unwrap().unwrap_or(0);
-        let guard = KillSwitchGuard::engage(&config.protected_routes, luid)?;
+        let guard = KillSwitchGuard::engage_with_policy(
+            &config.protected_routes,
+            luid,
+            config.kill_switch,
+        )?;
         *self.kill_switch.lock().unwrap() = Some(guard);
         Ok(())
     }

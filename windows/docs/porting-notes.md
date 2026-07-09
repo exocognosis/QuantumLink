@@ -29,8 +29,8 @@ open. Source references are to the QuantumLinkOS repository.
 | Apple dependency | Windows replacement | Where |
 |------------------|--------------------|-------|
 | `NEPacketTunnelProvider` packet flow | Wintun session ring | `win/wintun_adapter.rs` |
-| `NEIPv4Settings`/`NEDNSSettings` | netsh-driven IP/MTU/route/DNS programming (IP Helper migration planned) | `win/routes.rs` |
-| NetworkExtension route ownership (kill switch layer 1) | WFP block+permit filters in a dynamic session | `win/wfp.rs` |
+| `NEIPv4Settings`/`NEDNSSettings` | IP Helper route/DNS programming; `netsh` is an explicit development fallback | `win/routes.rs` |
+| NetworkExtension route ownership (kill switch layer 1) | WFP block+permit filters; `failClosed` is dynamic-session, `strict` plans persistent boot-time coverage | `win/wfp.rs` |
 | Keychain | DPAPI machine-scope blobs in ACL'd ProgramData | `win/dpapi.rs` |
 | `NWPathMonitor` | `NotifyIpInterfaceChange` + `NotifyNetworkConnectivityHintChange` | `win/netmon.rs` |
 | NSWorkspace sleep/wake | `SERVICE_CONTROL_POWEREVENT` | `win/service.rs` |
@@ -59,13 +59,16 @@ Production closeout status for these gaps is tracked in
 `production-release-readiness.md`; until the matching production gate has
 passing evidence, the gap remains a release blocker.
 
-1. **WFP filters are session-dynamic**: they vanish if the service
-   crashes (fail-open after crash for `failClosed` policy, matching
-   macOS semantics). Strict deployments want persistent + boot-time
-   filters (`FWPM_SESSION0` non-dynamic + BFE boot-time option).
-2. **netsh-based route/DNS programming** should migrate to
-   `CreateUnicastIpAddressEntry`/`CreateIpForwardEntry2`/
-   `SetInterfaceDnsSettings` for atomicity and error fidelity.
+1. **Strict WFP persistence install**: the service now has a tested
+   persistent boot-time filter plan for strict deployments, including
+   block+permit tunnel-interface coverage at ALE auth connect v4 and
+   outbound IP packet v4. Production runtime currently refuses strict
+   startup instead of falling back to dynamic filters; install/uninstall
+   must still prove persistent filter creation and cleanup on Windows.
+2. **Route manager validation**: production default is IP Helper.
+   `netsh` remains only as an explicit development fallback with a
+   diagnostic, and Windows CI/hardware validation must prove the IP
+   Helper path.
 3. **Peer management over IPC**: `connect` uses the persisted/default
    configuration; an `addPeer`/`removePeer` command pair exists in the
    engine (`TunnelEngine::add_peer`) but is not yet exposed in the pipe
@@ -75,8 +78,7 @@ passing evidence, the gap remains a release blocker.
 5. **IPv6**: overlay and kill switch are IPv4-only, same as the macOS
    MVP.
 6. **Windows ARM64**: deferred; x64 first.
-7. **Pipe ACL hardening**: enterprise SDDL restricting which users may
-   connect to the control pipe (today: any local user, matching the
-   macOS single-user posture).
-8. **`FWPM_LAYER_OUTBOUND_IPPACKET_V4` second-layer filters** to also
-   cover non-ALE (forwarded/raw) traffic.
+7. **Pipe ACL hardening**: `windowsSecurity.pipeSddl` is parsed and
+   non-empty validated from `config.json`; default is
+   `D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)`. Enterprise deployments
+   can replace the interactive-user ACE with a group SID.

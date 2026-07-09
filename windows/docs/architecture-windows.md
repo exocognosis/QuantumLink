@@ -20,8 +20,8 @@ UI (asInvoker)
                     ├── PacketTunnelCore (qlink-core, linked natively)
                     ├── MeshTransportHandle (qlink-core QUIC/relay/rendezvous)
                     ├── TunnelAdapter (Wintun session)
-                    ├── win::routes (netsh)         IP/MTU/routes/DNS
-                    ├── win::wfp (KillSwitchGuard)  block+permit filters
+                    ├── win::routes (IP Helper)     IP/routes/DNS
+                    ├── win::wfp (KillSwitchGuard)  dynamic/persistent filter plan
                     └── KillSwitchWatchdog          strict-mode deadline
 ```
 
@@ -77,4 +77,14 @@ accounts, hardware IDs, or installer state.
   transport re-probe/backoff reset.
 - Service crash: dynamic WFP session and Wintun handles are reclaimed
   by the OS; protected prefixes lose their route (dark, not leaked).
-  Persistent-filter strict mode is on the roadmap (porting-notes #1).
+  `failClosed` uses dynamic-session filters so crash cleanup is owned by
+  BFE. `strict` has a persistent, boot-time fail-closed plan with
+  block+permit tunnel-interface coverage at ALE auth connect v4 and
+  outbound IP packet v4, but the current runtime refuses strict startup
+  rather than silently downgrading to dynamic filters until persistent
+  install/uninstall is implemented.
+
+Named-pipe access is configured by `windowsSecurity.pipeSddl` in
+`config.json`; the default SDDL is
+`D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)`, granting SYSTEM and
+Administrators full access and interactive users read/write access.
