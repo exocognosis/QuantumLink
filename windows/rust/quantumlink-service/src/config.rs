@@ -8,7 +8,7 @@
 //! pipe and the service persists.
 
 use quantumlink_proto::models::{
-    DiscoveryIdentityMode, DnsMode, MeshTrustPolicy, TunnelConfiguration,
+    DiscoveryIdentityMode, DnsMode, MeshTrustPolicy, MeshType, TunnelConfiguration,
 };
 use quantumlink_proto::privacy;
 use serde::{Deserialize, Serialize};
@@ -210,15 +210,82 @@ pub fn validate_configuration(config: &TunnelConfiguration) -> Result<(), String
         validate_socket_endpoint(endpoint, "relay server")?;
     }
 
-    if config.mesh_trust_policy == MeshTrustPolicy::PublicRequired
+    validate_dytallix_identity_policy(config)?;
+    Ok(())
+}
+
+pub fn configuration_warnings(config: &TunnelConfiguration) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let effective_policy = config.effective_mesh_trust_policy();
+    if config.mesh_type == MeshType::Private
+        && effective_policy == MeshTrustPolicy::PrivatePreferred
         && config.discovery_identity_mode == DiscoveryIdentityMode::Off
     {
-        return Err("publicRequired dytallix identity must not use mode off".into());
+        warnings.push(
+            "private mesh is running with Dytallix identity enforcement off; peers are accepted under private trust policy".to_string(),
+        );
     }
-    if config.mesh_trust_policy == MeshTrustPolicy::PublicRequired
-        && config.dytallix_identity.is_none()
+    warnings
+}
+
+fn validate_dytallix_identity_policy(config: &TunnelConfiguration) -> Result<(), String> {
+    let effective_policy = config.effective_mesh_trust_policy();
+    let public_mesh =
+        config.mesh_type == MeshType::Public || effective_policy == MeshTrustPolicy::PublicRequired;
+
+    if public_mesh && config.discovery_identity_mode == DiscoveryIdentityMode::Off {
+        return Err("publicRequired public mesh Dytallix identity must not use mode off".into());
+    }
+    if public_mesh && config.dytallix_identity.is_none() {
+        return Err("public mesh Dytallix identity requires registry configuration".into());
+    }
+
+    let Some(identity) = config.dytallix_identity.as_ref() else {
+        return Ok(());
+    };
+
+    if public_mesh && identity.mode != DiscoveryIdentityMode::Verified {
+        return Err("public mesh dytallixIdentity.mode must be verified".into());
+    }
+    if public_mesh && identity.registry_endpoint.trim().is_empty() {
+        return Err("public mesh dytallixIdentity.registryEndpoint is required".into());
+    }
+    if public_mesh && identity.contract != "quantumlink-node-registry" {
+        return Err(
+            "public mesh dytallixIdentity.contract must be quantumlink-node-registry".into(),
+        );
+    }
+    if public_mesh && identity.cached_proof_grace_seconds != 0 {
+        return Err("public mesh dytallixIdentity.cachedProofGraceSeconds must be 0".into());
+    }
+    if public_mesh
+        && identity
+            .network_id
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
     {
-        return Err("publicRequired dytallix identity requires registry configuration".into());
+        return Err("public mesh dytallixIdentity.networkID is required".into());
+    }
+    if public_mesh
+        && identity
+            .chain_id
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+    {
+        return Err("public mesh dytallixIdentity.chainID is required".into());
+    }
+    if public_mesh && identity.allowed_rpc_endpoints.is_empty() {
+        return Err("public mesh dytallixIdentity.allowedRPCEndpoints is required".into());
+    }
+    if public_mesh
+        && !identity
+            .allowed_rpc_endpoints
+            .iter()
+            .any(|endpoint| endpoint == &identity.registry_endpoint)
+    {
+        return Err(
+            "public mesh dytallixIdentity.allowedRPCEndpoints must include registryEndpoint".into(),
+        );
     }
     Ok(())
 }
@@ -375,6 +442,109 @@ mod tests {
         config.dytallix_identity = None;
         let error = validate_configuration(&config).unwrap_err();
         assert!(error.contains("requires registry"));
+    }
+
+    #[test]
+    fn dytallix_public_mesh_rejects_identity_off_even_without_legacy_policy() {
+        let mut config = privacy::default_tunnel_configuration();
+        config.mesh_type = quantumlink_proto::models::MeshType::Public;
+        config.mesh_trust_policy = MeshTrustPolicy::DevelopmentOptional;
+        config.discovery_identity_mode = DiscoveryIdentityMode::Off;
+        config.dytallix_identity = Some(quantumlink_proto::models::DytallixIdentityConfiguration {
+            mode: DiscoveryIdentityMode::Verified,
+            registry_endpoint: "https://registry.dytallix.example".to_string(),
+            contract: "quantumlink-node-registry".to_string(),
+            cached_proof_grace_seconds: 0,
+            contract_address: None,
+            publish_wallet_address: false,
+            network_id: Some("dytallix-mainnet".to_string()),
+            chain_id: Some("dytallix-mainnet-1".to_string()),
+            allowed_rpc_endpoints: vec!["https://registry.dytallix.example".to_string()],
+            keystore_path: None,
+            wallet_name: None,
+        });
+
+        let error = validate_configuration(&config).unwrap_err();
+
+        assert!(error.contains("public mesh"));
+        assert!(error.contains("identity"));
+        assert!(error.contains("off"));
+    }
+
+    #[test]
+    fn dytallix_public_mesh_requires_verified_named_registry_config() {
+        let mut config = privacy::default_tunnel_configuration();
+        config.mesh_type = quantumlink_proto::models::MeshType::Public;
+        config.mesh_trust_policy = MeshTrustPolicy::PublicRequired;
+        config.discovery_identity_mode = DiscoveryIdentityMode::Verified;
+        config.dytallix_identity = Some(quantumlink_proto::models::DytallixIdentityConfiguration {
+            mode: DiscoveryIdentityMode::Verified,
+            registry_endpoint: "https://registry.dytallix.example".to_string(),
+            contract: "quantumlink-node-registry".to_string(),
+            cached_proof_grace_seconds: 0,
+            contract_address: None,
+            publish_wallet_address: false,
+            network_id: Some("dytallix-mainnet".to_string()),
+            chain_id: Some("dytallix-mainnet-1".to_string()),
+            allowed_rpc_endpoints: vec!["https://registry.dytallix.example".to_string()],
+            keystore_path: None,
+            wallet_name: None,
+        });
+
+        validate_configuration(&config).unwrap();
+    }
+
+    #[test]
+    fn dytallix_public_mesh_requires_registry_endpoint_in_rpc_allowlist() {
+        let mut config = privacy::default_tunnel_configuration();
+        config.mesh_type = quantumlink_proto::models::MeshType::Public;
+        config.mesh_trust_policy = MeshTrustPolicy::PublicRequired;
+        config.discovery_identity_mode = DiscoveryIdentityMode::Verified;
+        config.dytallix_identity = Some(quantumlink_proto::models::DytallixIdentityConfiguration {
+            mode: DiscoveryIdentityMode::Verified,
+            registry_endpoint: "https://registry.dytallix.example".to_string(),
+            contract: "quantumlink-node-registry".to_string(),
+            cached_proof_grace_seconds: 0,
+            contract_address: None,
+            publish_wallet_address: false,
+            network_id: Some("dytallix-mainnet".to_string()),
+            chain_id: Some("dytallix-mainnet-1".to_string()),
+            allowed_rpc_endpoints: vec!["https://rpc.dytallix.example".to_string()],
+            keystore_path: None,
+            wallet_name: None,
+        });
+
+        let error = validate_configuration(&config).unwrap_err();
+
+        assert!(error.contains("allowedRPCEndpoints"));
+        assert!(error.contains("registryEndpoint"));
+    }
+
+    #[test]
+    fn dytallix_private_mesh_allows_off_with_operator_warning() {
+        let mut config = privacy::default_tunnel_configuration();
+        config.mesh_type = quantumlink_proto::models::MeshType::Private;
+        config.mesh_trust_policy = MeshTrustPolicy::PrivatePreferred;
+        config.discovery_identity_mode = DiscoveryIdentityMode::Off;
+
+        validate_configuration(&config).unwrap();
+        let warnings = configuration_warnings(&config);
+
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("private mesh")));
+        assert!(warnings.iter().any(|warning| warning.contains("Dytallix")));
+    }
+
+    #[test]
+    fn dytallix_development_mesh_allows_identity_off_without_warning() {
+        let mut config = privacy::default_tunnel_configuration();
+        config.mesh_type = quantumlink_proto::models::MeshType::Development;
+        config.mesh_trust_policy = MeshTrustPolicy::DevelopmentOptional;
+        config.discovery_identity_mode = DiscoveryIdentityMode::Off;
+
+        validate_configuration(&config).unwrap();
+        assert!(configuration_warnings(&config).is_empty());
     }
 
     #[test]

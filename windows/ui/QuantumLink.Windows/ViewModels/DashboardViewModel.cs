@@ -177,10 +177,7 @@ public partial class DashboardViewModel : ObservableObject
         TrafficSummary = $"{FormatBytes(status.Metrics.BytesIn)} in · {FormatBytes(status.Metrics.BytesOut)} out · {status.Metrics.ReplayDrops} replay drops";
         TrustSummary =
             $"{FormatIdentityMode(status.PeerTrust.IdentityMode)} · {FormatTrustPolicy(status.PeerTrust.Policy)} · {(status.PeerTrust.Required ? "required" : "optional")}";
-        RegistrySummary =
-            status.PeerTrust.RegistryConfigured
-                ? $"Registry configured · {status.PeerTrust.VerifiedPeerCount} verified · {status.PeerTrust.FailedPeerCount} blocked"
-                : "Registry not configured";
+        RegistrySummary = FormatRegistrySummary(status.PeerTrust);
         TransportSummary = status.Transport is null
             ? "Transport metrics not reported yet"
             : $"state {status.Transport.StateCode} · path {status.Transport.PathKindCode} · {FormatBytes(status.Transport.BytesSent)} sent · {FormatBytes(status.Transport.BytesReceived)} received · {status.Transport.ReconnectCount} reconnects · {status.Transport.NetworkEventCount} network events";
@@ -208,11 +205,50 @@ public partial class DashboardViewModel : ObservableObject
         return unitIndex == 0 ? $"{bytes} {units[unitIndex]}" : $"{value:0.##} {units[unitIndex]}";
     }
 
+    private static string FormatRegistrySummary(DytallixPeerTrustSummary peerTrust)
+    {
+        var parts = new List<string>
+        {
+            peerTrust.RegistryConfigured ? "Registry configured" : "Registry not configured"
+        };
+        if (peerTrust.RegistryConfigured)
+        {
+            parts.Add($"{peerTrust.VerifiedPeerCount} verified");
+            parts.Add($"{peerTrust.FailedPeerCount} blocked");
+        }
+        if (!string.IsNullOrWhiteSpace(peerTrust.LastFailureCode))
+        {
+            var label = FormatFailureCode(peerTrust.LastFailureCode);
+            var detail = string.IsNullOrWhiteSpace(peerTrust.LastFailureSummary)
+                ? label
+                : $"{label}: {peerTrust.LastFailureSummary}";
+            parts.Add(detail);
+        }
+        if (!string.IsNullOrWhiteSpace(peerTrust.Warning))
+        {
+            parts.Add($"Warning: {peerTrust.Warning}");
+        }
+        return string.Join(" · ", parts);
+    }
+
     private static string FormatIdentityMode(string value) => value switch
     {
         "verified" => "Verified",
         "public_wallet" => "Public Wallet",
         "off" => "Off",
+        _ => value
+    };
+
+    private static string FormatFailureCode(string value) => value switch
+    {
+        "rejected_missing_registry" => "Missing registry record",
+        "rejected_revoked" => "Revoked registry record",
+        "rejected_suspended" => "Suspended registry record",
+        "rejected_expired" => "Expired registry record",
+        "rejected_key_mismatch" => "Key mismatch",
+        "rejected_record_hash_mismatch" => "Record hash mismatch",
+        "rejected_stake_or_reputation" => "Stake or reputation check failed",
+        "registry_unavailable" => "Registry unavailable",
         _ => value
     };
 

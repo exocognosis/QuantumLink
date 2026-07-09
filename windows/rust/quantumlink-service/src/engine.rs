@@ -29,12 +29,14 @@ use crate::secret_store::{
 use base64::Engine as _;
 use qlink_core::crypto::DeviceKeypair;
 use qlink_core::mesh_connection::NetworkEvent;
-use qlink_core::mesh_transport::{MeshTransportConfig, MeshTransportHandle};
+use qlink_core::mesh_transport::{
+    peer_trust_failure_code_label, peer_trust_failure_summary, MeshTransportConfig,
+    MeshTransportHandle,
+};
 use qlink_core::packet_core::PacketTunnelCore;
 use quantumlink_proto::models::{
-    ConnectionPhase, DiscoveryIdentityMode, DytallixPeerTrustSummary, KillSwitchPolicy,
-    MeshMetrics, MeshTrustPolicy, PathType, PeerIdentity, PeerStatus, TunnelConfiguration,
-    TunnelStatus, TunnelTransportMetrics,
+    ConnectionPhase, DytallixPeerTrustSummary, KillSwitchPolicy, MeshMetrics, MeshTrustPolicy,
+    PathType, PeerIdentity, PeerStatus, TunnelConfiguration, TunnelStatus, TunnelTransportMetrics,
 };
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -409,20 +411,8 @@ impl TunnelEngine {
         keypair: &DeviceKeypair,
         peer_store_key: &[u8; 32],
     ) -> Result<MeshTransportHandle, EngineError> {
-        let peer_store_path = self.state_dir.join(crate::config::PEER_STORE_FILE);
-        let mesh_config: MeshTransportConfig = serde_json::from_value(serde_json::json!({
-            "meshId": config.mesh_id,
-            "localPeerId": keypair.public_key().peer_id(),
-            // Peers are added dynamically via add_peer; the primary slot
-            // uses the same sentinel qlinkctl uses pre-configuration.
-            "remotePeerId": "qlink_unconfigured",
-            "rendezvousUrl": rendezvous_url,
-            "relayUrl": config.relay_servers.first(),
-            "bindAddr": "0.0.0.0:0",
-            "peerStorePath": peer_store_path.to_string_lossy(),
-            "peerStoreKeyB64": base64::engine::general_purpose::STANDARD.encode(peer_store_key),
-        }))
-        .map_err(|error| EngineError::Config(format!("mesh config: {error}")))?;
+        let mesh_config =
+            self.mesh_transport_config(config, rendezvous_url, keypair, peer_store_key)?;
 
         let owned_keypair = keypair
             .seed()
@@ -433,6 +423,40 @@ impl TunnelEngine {
             })?;
         MeshTransportHandle::new_with_keypair(mesh_config, Some(Arc::new(owned_keypair)))
             .map_err(EngineError::Core)
+    }
+
+    fn mesh_transport_config(
+        &self,
+        config: &TunnelConfiguration,
+        rendezvous_url: &str,
+        keypair: &DeviceKeypair,
+        peer_store_key: &[u8; 32],
+    ) -> Result<MeshTransportConfig, EngineError> {
+        let peer_store_path = self.state_dir.join(crate::config::PEER_STORE_FILE);
+        let mut mesh_config_json = serde_json::json!({
+            "meshId": config.mesh_id,
+            "localPeerId": keypair.public_key().peer_id(),
+            // Peers are added dynamically via add_peer; the primary slot
+            // uses the same sentinel qlinkctl uses pre-configuration.
+            "remotePeerId": "qlink_unconfigured",
+            "rendezvousUrl": rendezvous_url,
+            "relayUrl": config.relay_servers.first(),
+            "bindAddr": "0.0.0.0:0",
+            "peerStorePath": peer_store_path.to_string_lossy(),
+            "peerStoreKeyB64": base64::engine::general_purpose::STANDARD.encode(peer_store_key),
+            "meshTrustPolicy": config.effective_mesh_trust_policy(),
+        });
+        if let Some(identity) = config.dytallix_identity.as_ref() {
+            mesh_config_json["dytallixIdentity"] = serde_json::json!({
+                "endpoint": identity.registry_endpoint,
+                "contractAddress": identity.core_contract_identifier(),
+                "networkId": identity.network_id,
+                "chainId": identity.chain_id,
+                "allowedRpcEndpoints": identity.allowed_rpc_endpoints,
+            });
+        }
+        serde_json::from_value(mesh_config_json)
+            .map_err(|error| EngineError::Config(format!("mesh config: {error}")))
     }
 
     pub fn disconnect(&self) -> TunnelStatus {
@@ -509,11 +533,14 @@ impl TunnelEngine {
             status.overlay_ipv4_address = session.config.overlay_ipv4_address.clone();
             status.protected_routes = session.config.protected_routes.clone();
             status.peer_trust = DytallixPeerTrustSummary {
-                required: session.config.mesh_trust_policy == MeshTrustPolicy::PublicRequired
-                    || session.config.discovery_identity_mode != DiscoveryIdentityMode::Off,
-                policy: session.config.mesh_trust_policy,
+                required: session.config.effective_mesh_trust_policy()
+                    == MeshTrustPolicy::PublicRequired,
+                policy: session.config.effective_mesh_trust_policy(),
                 identity_mode: session.config.discovery_identity_mode,
                 registry_configured: session.config.dytallix_identity.is_some(),
+                warning: crate::config::configuration_warnings(&session.config)
+                    .into_iter()
+                    .next(),
                 ..DytallixPeerTrustSummary::default()
             };
             status.pump = Some(session.pump.lock().unwrap().counters().as_proto());
@@ -586,6 +613,7 @@ impl TunnelEngine {
                         last_path_probe_unix: None,
                     };
                     status.peers = peers;
+                    apply_peer_trust_status(&mut status.peer_trust, handle.as_ref());
                 }
                 ActiveTransport::LocalEcho(_) => {
                     status.path_type = PathType::Direct;
@@ -664,12 +692,30 @@ fn diagnostics_status(status: &TunnelStatus) -> serde_json::Value {
             "pendingPeerCount": status.peer_trust.pending_peer_count,
             "failedPeerCount": status.peer_trust.failed_peer_count,
             "lastCheckedAtUnix": status.peer_trust.last_checked_at_unix,
+            "lastFailureCode": status.peer_trust.last_failure_code,
+            "lastFailureSummary": status.peer_trust.last_failure_summary,
+            "warning": status.peer_trust.warning,
         },
         "lastError": status
             .last_error
             .as_ref()
             .map(|error| quantumlink_proto::privacy::redact_diagnostics_text(error)),
     })
+}
+
+fn apply_peer_trust_status(summary: &mut DytallixPeerTrustSummary, handle: &MeshTransportHandle) {
+    let blocked = handle.blocked_peer_history();
+    summary.failed_peer_count = blocked.len() as u32;
+    if let Some(last_failure) = blocked
+        .iter()
+        .max_by_key(|entry| (entry.observed_at_unix, entry.checked_at_unix))
+    {
+        summary.last_checked_at_unix = Some(last_failure.checked_at_unix);
+        summary.last_failure_code =
+            peer_trust_failure_code_label(last_failure.failure_code).map(str::to_string);
+        summary.last_failure_summary =
+            peer_trust_failure_summary(last_failure.failure_code).map(str::to_string);
+    }
 }
 
 impl Drop for TunnelEngine {
@@ -784,7 +830,7 @@ mod tests {
     use super::*;
     use crate::adapter::{AdapterError, LoopbackAdapter};
     use crate::secret_store::InMemorySecretStore;
-    use quantumlink_proto::models::DytallixIdentityConfiguration;
+    use quantumlink_proto::models::{DiscoveryIdentityMode, DytallixIdentityConfiguration};
     use quantumlink_proto::privacy;
     use std::sync::atomic::AtomicUsize;
 
@@ -987,12 +1033,18 @@ mod tests {
         config.mesh_trust_policy = MeshTrustPolicy::PublicRequired;
         config.discovery_identity_mode = DiscoveryIdentityMode::Verified;
         config.dytallix_identity = Some(DytallixIdentityConfiguration {
-            endpoint: "https://registry.private.example".to_string(),
-            contract_address: "0xabc1230000000000000000000000000000000000".to_string(),
+            mode: DiscoveryIdentityMode::Verified,
+            registry_endpoint: "https://registry.private.example".to_string(),
+            contract: "quantumlink-node-registry".to_string(),
+            cached_proof_grace_seconds: 0,
+            contract_address: Some("0xabc1230000000000000000000000000000000000".to_string()),
             publish_wallet_address: false,
             network_id: Some("private-net".to_string()),
             chain_id: Some("private-chain".to_string()),
-            allowed_rpc_endpoints: vec!["https://rpc.private.example".to_string()],
+            allowed_rpc_endpoints: vec![
+                "https://registry.private.example".to_string(),
+                "https://rpc.private.example".to_string(),
+            ],
             keystore_path: Some(r"C:\QuantumLink\wallet.secret".to_string()),
             wallet_name: Some("operator-wallet".to_string()),
         });
@@ -1010,6 +1062,45 @@ mod tests {
         assert!(diagnostics.contains(r#""protectedRouteCount": 2"#));
         assert!(diagnostics.contains(r#""registryConfigured": true"#));
         engine.disconnect();
+    }
+
+    #[test]
+    fn mesh_transport_config_accepts_public_named_registry_contract_handoff() {
+        let (_platform, engine) = test_engine();
+        let mut config = dev_config();
+        config.mesh_type = quantumlink_proto::models::MeshType::Public;
+        config.mesh_trust_policy = MeshTrustPolicy::PublicRequired;
+        config.discovery_identity_mode = DiscoveryIdentityMode::Verified;
+        config.rendezvous_servers = vec!["127.0.0.1:9443".to_string()];
+        config.dytallix_identity = Some(DytallixIdentityConfiguration {
+            mode: DiscoveryIdentityMode::Verified,
+            registry_endpoint: "https://registry.dytallix.example".to_string(),
+            contract: "quantumlink-node-registry".to_string(),
+            cached_proof_grace_seconds: 0,
+            contract_address: None,
+            publish_wallet_address: false,
+            network_id: Some("dytallix-mainnet".to_string()),
+            chain_id: Some("dytallix-mainnet-1".to_string()),
+            allowed_rpc_endpoints: vec!["https://registry.dytallix.example".to_string()],
+            keystore_path: None,
+            wallet_name: None,
+        });
+        crate::config::validate_configuration(&config).unwrap();
+        let keypair = DeviceKeypair::generate().unwrap();
+        let peer_store_key = [7_u8; 32];
+
+        let mesh_config = engine
+            .mesh_transport_config(&config, "127.0.0.1:9443", &keypair, &peer_store_key)
+            .unwrap();
+
+        assert_eq!(
+            mesh_config
+                .dytallix_identity
+                .as_ref()
+                .unwrap()
+                .contract_address,
+            "quantumlink-node-registry"
+        );
     }
 
     #[test]

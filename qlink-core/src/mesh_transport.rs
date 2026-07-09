@@ -120,6 +120,9 @@ pub const PEER_TRUST_FAILURE_REGISTRY_EXPIRED: u32 = 4;
 pub const PEER_TRUST_FAILURE_REGISTRY_MISMATCH: u32 = 5;
 pub const PEER_TRUST_FAILURE_REGISTRY_LOOKUP: u32 = 6;
 pub const PEER_TRUST_FAILURE_REGISTRY_VERIFICATION: u32 = 7;
+pub const PEER_TRUST_FAILURE_REGISTRY_KEY_MISMATCH: u32 = 8;
+pub const PEER_TRUST_FAILURE_REGISTRY_RECORD_HASH_MISMATCH: u32 = 9;
+pub const PEER_TRUST_FAILURE_REGISTRY_STAKE_OR_REPUTATION: u32 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -245,19 +248,31 @@ fn registry_failure_code(message: &str) -> Option<u32> {
     {
         return Some(PEER_TRUST_FAILURE_REGISTRY_SUSPENDED);
     }
-    if message.contains("identity registry lookup failed") {
+    if message.contains("identity registry lookup failed")
+        || message.contains("registry unavailable")
+    {
         return Some(PEER_TRUST_FAILURE_REGISTRY_LOOKUP);
     }
-    let registry_binding_mismatch = [
-        "peer_id mismatch",
+    if message.contains("stake or reputation")
+        || (message.contains("stake") && message.contains("reputation"))
+    {
+        return Some(PEER_TRUST_FAILURE_REGISTRY_STAKE_OR_REPUTATION);
+    }
+    if message.contains("latest_peer_record_hash_hex mismatch") {
+        return Some(PEER_TRUST_FAILURE_REGISTRY_RECORD_HASH_MISMATCH);
+    }
+    let registry_key_mismatch = [
         "device_public_key_hash_hex mismatch",
-        "latest_peer_record_hash_hex mismatch",
         "pqc_binding_hash_hex mismatch",
         "node_signing_public_key_hash_hex mismatch",
         "transport_public_key_hash_hex mismatch",
     ]
     .iter()
     .any(|pattern| message.contains(pattern));
+    if registry_key_mismatch {
+        return Some(PEER_TRUST_FAILURE_REGISTRY_KEY_MISMATCH);
+    }
+    let registry_binding_mismatch = message.contains("peer_id mismatch");
     if registry_binding_mismatch || (message.contains("registry") && message.contains("mismatch")) {
         return Some(PEER_TRUST_FAILURE_REGISTRY_MISMATCH);
     }
@@ -265,6 +280,49 @@ fn registry_failure_code(message: &str) -> Option<u32> {
         return Some(PEER_TRUST_FAILURE_REGISTRY_VERIFICATION);
     }
     None
+}
+
+pub fn peer_trust_failure_code_label(failure_code: u32) -> Option<&'static str> {
+    match failure_code {
+        PEER_TRUST_FAILURE_REGISTRY_REQUIRED => Some("rejected_missing_registry"),
+        PEER_TRUST_FAILURE_REGISTRY_REVOKED => Some("rejected_revoked"),
+        PEER_TRUST_FAILURE_REGISTRY_SUSPENDED => Some("rejected_suspended"),
+        PEER_TRUST_FAILURE_REGISTRY_EXPIRED => Some("rejected_expired"),
+        PEER_TRUST_FAILURE_REGISTRY_MISMATCH | PEER_TRUST_FAILURE_REGISTRY_KEY_MISMATCH => {
+            Some("rejected_key_mismatch")
+        }
+        PEER_TRUST_FAILURE_REGISTRY_RECORD_HASH_MISMATCH => Some("rejected_record_hash_mismatch"),
+        PEER_TRUST_FAILURE_REGISTRY_STAKE_OR_REPUTATION => Some("rejected_stake_or_reputation"),
+        PEER_TRUST_FAILURE_REGISTRY_LOOKUP => Some("registry_unavailable"),
+        PEER_TRUST_FAILURE_REGISTRY_VERIFICATION => Some("registry_unavailable"),
+        PEER_TRUST_FAILURE_NONE => None,
+        _ => None,
+    }
+}
+
+pub fn peer_trust_failure_summary(failure_code: u32) -> Option<&'static str> {
+    match failure_code {
+        PEER_TRUST_FAILURE_REGISTRY_REQUIRED => {
+            Some("Public mesh requires a matching Dytallix registry record.")
+        }
+        PEER_TRUST_FAILURE_REGISTRY_REVOKED => Some("Dytallix registry record is revoked."),
+        PEER_TRUST_FAILURE_REGISTRY_SUSPENDED => Some("Dytallix registry record is suspended."),
+        PEER_TRUST_FAILURE_REGISTRY_EXPIRED => Some("Dytallix registry record has expired."),
+        PEER_TRUST_FAILURE_REGISTRY_MISMATCH | PEER_TRUST_FAILURE_REGISTRY_KEY_MISMATCH => {
+            Some("Dytallix registry key binding does not match the peer assertion.")
+        }
+        PEER_TRUST_FAILURE_REGISTRY_RECORD_HASH_MISMATCH => {
+            Some("Dytallix registry record hash does not match the signed peer record.")
+        }
+        PEER_TRUST_FAILURE_REGISTRY_STAKE_OR_REPUTATION => {
+            Some("Dytallix registry stake or reputation requirement was not met.")
+        }
+        PEER_TRUST_FAILURE_REGISTRY_LOOKUP | PEER_TRUST_FAILURE_REGISTRY_VERIFICATION => {
+            Some("Dytallix registry validation is unavailable.")
+        }
+        PEER_TRUST_FAILURE_NONE => None,
+        _ => None,
+    }
 }
 
 /// Per-peer session state. One instance per active remote peer.
@@ -2494,7 +2552,11 @@ mod tests {
             ),
             (
                 "device_public_key_hash_hex mismatch",
-                PEER_TRUST_FAILURE_REGISTRY_MISMATCH,
+                PEER_TRUST_FAILURE_REGISTRY_KEY_MISMATCH,
+            ),
+            (
+                "latest_peer_record_hash_hex mismatch",
+                PEER_TRUST_FAILURE_REGISTRY_RECORD_HASH_MISMATCH,
             ),
             (
                 "registry binding mismatch",
@@ -2508,12 +2570,46 @@ mod tests {
                 "registry response failed verification",
                 PEER_TRUST_FAILURE_REGISTRY_VERIFICATION,
             ),
+            (
+                "registry stake or reputation requirement failed",
+                PEER_TRUST_FAILURE_REGISTRY_STAKE_OR_REPUTATION,
+            ),
         ];
 
         for (message, expected) in cases {
             assert_eq!(registry_failure_code(message), Some(expected), "{message}");
         }
         assert_eq!(registry_failure_code("ordinary transport failure"), None);
+    }
+
+    #[test]
+    fn registry_failure_code_exports_stable_operator_reason_strings() {
+        let cases = [
+            (
+                PEER_TRUST_FAILURE_REGISTRY_REQUIRED,
+                "rejected_missing_registry",
+            ),
+            (PEER_TRUST_FAILURE_REGISTRY_REVOKED, "rejected_revoked"),
+            (PEER_TRUST_FAILURE_REGISTRY_SUSPENDED, "rejected_suspended"),
+            (
+                PEER_TRUST_FAILURE_REGISTRY_KEY_MISMATCH,
+                "rejected_key_mismatch",
+            ),
+            (
+                PEER_TRUST_FAILURE_REGISTRY_RECORD_HASH_MISMATCH,
+                "rejected_record_hash_mismatch",
+            ),
+            (
+                PEER_TRUST_FAILURE_REGISTRY_STAKE_OR_REPUTATION,
+                "rejected_stake_or_reputation",
+            ),
+            (PEER_TRUST_FAILURE_REGISTRY_LOOKUP, "registry_unavailable"),
+        ];
+
+        for (failure_code, expected) in cases {
+            assert_eq!(peer_trust_failure_code_label(failure_code), Some(expected));
+            assert!(!peer_trust_failure_summary(failure_code).unwrap().is_empty());
+        }
     }
 
     #[test]

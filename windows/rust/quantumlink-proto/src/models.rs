@@ -76,11 +76,36 @@ pub enum DiscoveryIdentityMode {
     PublicWallet,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum MeshType {
+    Public,
+    Private,
+    #[default]
+    Development,
+}
+
+fn default_dytallix_identity_mode() -> DiscoveryIdentityMode {
+    DiscoveryIdentityMode::Verified
+}
+
+fn default_dytallix_contract() -> String {
+    "quantumlink-node-registry".to_string()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DytallixIdentityConfiguration {
-    pub endpoint: String,
-    pub contract_address: String,
+    #[serde(default = "default_dytallix_identity_mode")]
+    pub mode: DiscoveryIdentityMode,
+    #[serde(rename = "registryEndpoint", alias = "endpoint")]
+    pub registry_endpoint: String,
+    #[serde(default = "default_dytallix_contract")]
+    pub contract: String,
+    #[serde(default)]
+    pub cached_proof_grace_seconds: u64,
+    #[serde(default)]
+    pub contract_address: Option<String>,
     #[serde(default)]
     pub publish_wallet_address: bool,
     #[serde(rename = "networkID", default)]
@@ -93,6 +118,16 @@ pub struct DytallixIdentityConfiguration {
     pub keystore_path: Option<String>,
     #[serde(default)]
     pub wallet_name: Option<String>,
+}
+
+impl DytallixIdentityConfiguration {
+    pub fn core_contract_identifier(&self) -> String {
+        self.contract_address
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(&self.contract)
+            .to_string()
+    }
 }
 
 /// Defines how the tunnel behaves when the data plane cannot protect a
@@ -163,7 +198,7 @@ pub struct MeshMetrics {
     pub last_path_probe_unix: Option<u64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DytallixPeerTrustSummary {
     pub required: bool,
@@ -176,6 +211,12 @@ pub struct DytallixPeerTrustSummary {
     pub failed_peer_count: u32,
     #[serde(default)]
     pub last_checked_at_unix: Option<u64>,
+    #[serde(default)]
+    pub last_failure_code: Option<String>,
+    #[serde(default)]
+    pub last_failure_summary: Option<String>,
+    #[serde(default)]
+    pub warning: Option<String>,
 }
 
 impl Default for DytallixPeerTrustSummary {
@@ -190,6 +231,9 @@ impl Default for DytallixPeerTrustSummary {
             pending_peer_count: 0,
             failed_peer_count: 0,
             last_checked_at_unix: None,
+            last_failure_code: None,
+            last_failure_summary: None,
+            warning: None,
         }
     }
 }
@@ -332,6 +376,8 @@ pub struct TunnelConfiguration {
     #[serde(default)]
     pub kill_switch: KillSwitchPolicy,
     #[serde(default)]
+    pub mesh_type: MeshType,
+    #[serde(default)]
     pub mesh_trust_policy: MeshTrustPolicy,
     #[serde(default)]
     pub discovery_identity_mode: DiscoveryIdentityMode,
@@ -352,6 +398,14 @@ fn default_peer_session_key_state() -> String {
 }
 
 impl TunnelConfiguration {
+    pub fn effective_mesh_trust_policy(&self) -> MeshTrustPolicy {
+        match self.mesh_type {
+            MeshType::Public => MeshTrustPolicy::PublicRequired,
+            MeshType::Private => MeshTrustPolicy::PrivatePreferred,
+            MeshType::Development => self.mesh_trust_policy,
+        }
+    }
+
     /// JSON config consumed by `qlink_tunnel_core_create` (camelCase keys
     /// per `PacketTunnelCoreConfig` in `qlink-core/src/packet_core.rs`).
     pub fn packet_core_config_json(&self) -> serde_json::Value {
@@ -368,7 +422,7 @@ impl TunnelConfiguration {
 
     pub fn requires_packet_peer_session(&self) -> bool {
         !self.rendezvous_servers.is_empty()
-            || self.mesh_trust_policy != MeshTrustPolicy::DevelopmentOptional
+            || self.effective_mesh_trust_policy() != MeshTrustPolicy::DevelopmentOptional
             || self.discovery_identity_mode != DiscoveryIdentityMode::Off
             || self.dytallix_identity.is_some()
     }
@@ -412,6 +466,7 @@ mod tests {
         assert_eq!(config.mtu, 1280);
         assert_eq!(config.route_mode, RouteMode::SplitTunnel);
         assert_eq!(config.kill_switch, KillSwitchPolicy::FailClosed);
+        assert_eq!(config.mesh_type, MeshType::Development);
         assert_eq!(config.discovery_modes, vec![DiscoveryMode::Rendezvous]);
         assert_eq!(
             config.mesh_trust_policy,
@@ -440,8 +495,11 @@ mod tests {
         config.mesh_trust_policy = MeshTrustPolicy::PublicRequired;
         config.discovery_identity_mode = DiscoveryIdentityMode::Verified;
         config.dytallix_identity = Some(DytallixIdentityConfiguration {
-            endpoint: "https://registry.example".to_string(),
-            contract_address: "0xabc1230000000000000000000000000000000000".to_string(),
+            mode: DiscoveryIdentityMode::Verified,
+            registry_endpoint: "https://registry.example".to_string(),
+            contract: "quantumlink-node-registry".to_string(),
+            cached_proof_grace_seconds: 0,
+            contract_address: Some("0xabc1230000000000000000000000000000000000".to_string()),
             publish_wallet_address: false,
             network_id: None,
             chain_id: None,
@@ -467,8 +525,12 @@ mod tests {
         }"#;
         let config: DytallixIdentityConfiguration = serde_json::from_str(json).unwrap();
         assert_eq!(
-            config.contract_address,
-            "0xabc1230000000000000000000000000000000000"
+            config.contract_address.as_deref(),
+            Some("0xabc1230000000000000000000000000000000000")
+        );
+        assert_eq!(
+            config.core_contract_identifier(),
+            "0xabc1230000000000000000000000000000000000".to_string()
         );
         assert!(config.publish_wallet_address);
         assert_eq!(config.network_id.as_deref(), Some("network"));
@@ -479,5 +541,81 @@ mod tests {
         assert_eq!(serialized["networkID"], "network");
         assert_eq!(serialized["chainID"], "chain");
         assert_eq!(serialized["allowedRPCEndpoints"][0], "https://rpc.example");
+    }
+
+    #[test]
+    fn dytallix_identity_accepts_windows_named_registry_contract() {
+        let json = r#"{
+            "mode": "verified",
+            "registryEndpoint": "https://registry.dytallix.example",
+            "contract": "quantumlink-node-registry",
+            "cachedProofGraceSeconds": 0,
+            "networkID": "dytallix-mainnet",
+            "chainID": "dytallix-mainnet-1",
+            "allowedRPCEndpoints": ["https://registry.dytallix.example"]
+        }"#;
+
+        let config: DytallixIdentityConfiguration = serde_json::from_str(json).unwrap();
+
+        assert_eq!(config.mode, DiscoveryIdentityMode::Verified);
+        assert_eq!(
+            config.registry_endpoint,
+            "https://registry.dytallix.example"
+        );
+        assert_eq!(config.contract, "quantumlink-node-registry");
+        assert_eq!(config.cached_proof_grace_seconds, 0);
+
+        let serialized = serde_json::to_value(config).unwrap();
+        assert_eq!(
+            serialized["registryEndpoint"],
+            "https://registry.dytallix.example"
+        );
+        assert_eq!(serialized["contract"], "quantumlink-node-registry");
+        assert_eq!(serialized["cachedProofGraceSeconds"], 0);
+    }
+
+    #[test]
+    fn tunnel_configuration_carries_mesh_type() {
+        let json = r#"{
+            "meshID": "mesh-public",
+            "meshType": "public",
+            "deviceAlias": "device-test",
+            "overlayIPv4Address": "100.64.0.2",
+            "tunnelRemoteAddress": "100.64.0.1",
+            "protectedRoutes": ["100.64.0.0/10"],
+            "dnsServers": ["100.64.0.1"]
+        }"#;
+
+        let config: TunnelConfiguration = serde_json::from_str(json).unwrap();
+
+        assert_eq!(config.mesh_type, MeshType::Public);
+        assert_eq!(serde_json::to_value(config).unwrap()["meshType"], "public");
+    }
+
+    #[test]
+    fn peer_trust_summary_surfaces_operator_rejection_code() {
+        let status = TunnelStatus {
+            peer_trust: DytallixPeerTrustSummary {
+                failed_peer_count: 1,
+                last_failure_code: Some("rejected_record_hash_mismatch".to_string()),
+                last_failure_summary: Some(
+                    "Peer registry record hash does not match the signed rendezvous record"
+                        .to_string(),
+                ),
+                ..DytallixPeerTrustSummary::default()
+            },
+            ..TunnelStatus::idle()
+        };
+
+        let json = serde_json::to_value(status).unwrap();
+
+        assert_eq!(
+            json["peerTrust"]["lastFailureCode"],
+            "rejected_record_hash_mismatch"
+        );
+        assert!(json["peerTrust"]["lastFailureSummary"]
+            .as_str()
+            .unwrap()
+            .contains("registry record hash"));
     }
 }
