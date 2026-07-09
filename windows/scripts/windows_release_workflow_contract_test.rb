@@ -8,6 +8,7 @@ class WindowsReleaseWorkflowContractTest < Minitest::Test
   REPO_ROOT = File.expand_path("../..", __dir__)
   WORKFLOW_PATH = File.join(REPO_ROOT, ".github/workflows/windows-release.yml")
   RUNBOOK_PATH = File.join(REPO_ROOT, "windows/docs/beta-runbook-windows.md")
+  PRODUCTION_READINESS_PATH = File.join(REPO_ROOT, "windows/docs/production-release-readiness.md")
   INSTALLER_README_PATH = File.join(REPO_ROOT, "windows/installer/README.md")
   INSTALLER_WXS_PATH = File.join(REPO_ROOT, "windows/installer/QuantumLink.wxs")
   BUILD_SCRIPT_PATH = File.join(REPO_ROOT, "windows/scripts/build-windows.ps1")
@@ -15,11 +16,13 @@ class WindowsReleaseWorkflowContractTest < Minitest::Test
 
   SCRIPT_PATH = ".\\windows\\scripts\\validate-install.ps1"
   VERIFY_SCRIPT_PATH = ".\\windows\\scripts\\verify-windows-release.ps1"
+  RENDEZVOUS_RELAY_EVIDENCE_SCRIPT_PATH = ".\\windows\\scripts\\verify-rendezvous-relay-production-evidence.rb"
   MSI_PATH = ".\\windows\\QuantumLink.msi"
   REPORT_PATH = ".\\windows\\build\\validation\\install-validation-report.json"
   EVIDENCE_PATH = ".\\windows\\build\\release\\windows-release-evidence.json"
   SBOM_PATH = ".\\windows\\build\\release\\windows-sbom.spdx.json"
   RELEASE_MANIFEST_PATH = ".\\windows\\build\\release\\windows-release-manifest.json"
+  RENDEZVOUS_RELAY_EVIDENCE_MANIFEST_PATH = "windows/validation/rendezvous-relay-production-evidence.json"
   ARTIFACT_REPORT_PATH = "windows/build/validation/install-validation-report.json"
   ARTIFACT_EVIDENCE_PATH = "windows/build/release/windows-release-evidence.json"
   ARTIFACT_SBOM_PATH = "windows/build/release/windows-sbom.spdx.json"
@@ -30,6 +33,7 @@ class WindowsReleaseWorkflowContractTest < Minitest::Test
     @workflow = File.read(WORKFLOW_PATH)
     @workflow_yaml = YAML.load_file(WORKFLOW_PATH)
     @runbook = File.read(RUNBOOK_PATH)
+    @production_readiness = File.read(PRODUCTION_READINESS_PATH)
     @installer_readme = File.read(INSTALLER_README_PATH)
     @installer_wxs = File.read(INSTALLER_WXS_PATH)
     @build_script = File.read(BUILD_SCRIPT_PATH)
@@ -79,7 +83,7 @@ class WindowsReleaseWorkflowContractTest < Minitest::Test
     inputs = workflow_dispatch_inputs
 
     production_release = inputs.fetch("production_release")
-    assert_match(/requires signing.*install validation.*SBOM.*manifest.*release evidence/i, production_release.fetch("description"))
+    assert_match(/requires signing.*install validation.*SBOM.*manifest.*release evidence.*rendezvous\/relay production evidence/i, production_release.fetch("description"))
     assert_equal "boolean", production_release.fetch("type")
     assert_equal false, production_release.fetch("default")
 
@@ -92,6 +96,11 @@ class WindowsReleaseWorkflowContractTest < Minitest::Test
     assert_match(/skips adapter\/route\/WFP evidence.*validate-install\.ps1/i, skip_network_checks.fetch("description"))
     assert_equal "boolean", skip_network_checks.fetch("type")
     assert_equal false, skip_network_checks.fetch("default")
+
+    rendezvous_relay_evidence = inputs.fetch("rendezvous_relay_production_evidence_manifest")
+    assert_match(/repo-relative JSON.*rendezvous\/relay production evidence/i, rendezvous_relay_evidence.fetch("description"))
+    assert_equal "string", rendezvous_relay_evidence.fetch("type")
+    assert_equal RENDEZVOUS_RELAY_EVIDENCE_MANIFEST_PATH, rendezvous_relay_evidence.fetch("default")
   end
 
   def test_workflow_declares_manual_publisher_and_upgrade_validation_inputs
@@ -118,6 +127,13 @@ class WindowsReleaseWorkflowContractTest < Minitest::Test
     assert_equal "choice", rollback_mode.fetch("type")
     assert_equal "UninstallReinstall", rollback_mode.fetch("default")
     assert_equal %w[UninstallReinstall DirectDowngrade], rollback_mode.fetch("options")
+  end
+
+  def test_workflow_pins_a_ruby_runtime_for_evidence_verification
+    step = workflow_step("Setup Ruby evidence verifier")
+
+    assert_equal "ruby/setup-ruby@v1", step.fetch("uses")
+    assert_equal "3.3", step.fetch("with").fetch("ruby-version")
   end
 
   def test_workflow_runs_validate_install_script_for_manual_opt_in
@@ -258,15 +274,32 @@ class WindowsReleaseWorkflowContractTest < Minitest::Test
     assert_includes validation_step.fetch("run"), "Windows production releases require run_install_validation=true"
   end
 
+  def test_workflow_requires_rendezvous_relay_production_evidence_for_production_releases
+    step = workflow_step("Require rendezvous/relay production evidence")
+
+    assert_equal "startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.production_release)", step.fetch("if")
+    assert_equal "pwsh", step.fetch("shell")
+    assert_equal "${{ inputs.rendezvous_relay_production_evidence_manifest || 'windows/validation/rendezvous-relay-production-evidence.json' }}", step.fetch("env").fetch("RENDEZVOUS_RELAY_PRODUCTION_EVIDENCE_MANIFEST")
+    assert_includes step.fetch("run"), RENDEZVOUS_RELAY_EVIDENCE_SCRIPT_PATH
+    assert_in_order step.fetch("run"), [
+      "ruby #{RENDEZVOUS_RELAY_EVIDENCE_SCRIPT_PATH}",
+      "--require-ready",
+      "$env:RENDEZVOUS_RELAY_PRODUCTION_EVIDENCE_MANIFEST"
+    ]
+  end
+
   def test_workflow_verifies_release_evidence_before_uploading_artifacts
     stage_index = @workflow.index("- name: Stage release artifacts, SBOM, manifest, and checksums")
+    production_evidence_index = @workflow.index("- name: Require rendezvous/relay production evidence")
     verify_index = @workflow.index("- name: Verify Windows release evidence")
     upload_index = @workflow.index("- name: Upload release artifacts")
 
     refute_nil stage_index
+    refute_nil production_evidence_index
     refute_nil verify_index
     refute_nil upload_index
     assert_operator stage_index, :<, verify_index
+    assert_operator production_evidence_index, :<, verify_index
     assert_operator verify_index, :<, upload_index
 
     step = workflow_step("Verify Windows release evidence")
@@ -351,6 +384,15 @@ class WindowsReleaseWorkflowContractTest < Minitest::Test
       assert_includes doc, "rollback_to_msi_sha256"
       assert_includes doc, "rollback_mode"
     end
+  end
+
+  def test_production_readiness_references_rendezvous_relay_sidecar_contract
+    assert_includes @production_readiness, "windows/docs/rendezvous-relay-production.md"
+    assert_includes @production_readiness, "windows/docs/production-evidence.md"
+    assert_includes @production_readiness, "windows/validation/rendezvous-relay-production-evidence.json"
+    assert_includes @production_readiness, "windows/scripts/verify-rendezvous-relay-production-evidence.rb"
+    assert_includes @production_readiness, "production_release=true"
+    assert_match(/remains \*\*Blocked\*\* until real production endpoint evidence is\s+supplied/i, @production_readiness)
   end
 
   def test_installer_manual_fallback_stages_release_artifacts_before_release_evidence

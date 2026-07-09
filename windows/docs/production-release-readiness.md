@@ -30,7 +30,7 @@ this file are closed.
 | Route and DNS ownership | Blocked | Route/DNS validation report for overlay address, protected prefixes, DNS, MTU, cleanup, sleep/wake, and network switch | Orphan routes, DNS leakage, failed cleanup, or unrecoverable network churn |
 | Packet-session key readiness | Blocked | Unit/integration tests proving packets do not leave before authenticated peer-session material exists | Static development key use, cross-peer decrypt acceptance, or plaintext packet emission |
 | Dytallix public identity policy | Blocked | Public mesh rejection reports for missing, revoked, suspended, mismatched, and stake/reputation-failed records | Public mesh can operate with identity enforcement disabled or stale invalid registry state |
-| Rendezvous and relay production profile | Blocked | Production config validation report and ops runbook covering auth, TLS, TTL, retention, revocation, monitoring, and incident rollback | Unauthenticated rendezvous/relay, missing TLS, missing retention/revocation policy, or excessive metadata exposure |
+| Rendezvous and relay production profile | Blocked | `windows/docs/rendezvous-relay-production.md`, `windows/docs/production-evidence.md`, `windows/validation/rendezvous-relay-production-evidence.json`, and production config validation covering auth, TLS, TTL, retention, revocation, monitoring, and incident rollback | Unauthenticated rendezvous/relay, missing TLS, missing retention/revocation policy, excessive metadata exposure, missing sidecar manifest, or blocked sidecar verifier output |
 | Diagnostics and support bundle privacy | Blocked | Redaction test report and elevated raw-export audit evidence | Peer IDs, wallet addresses, endpoints, routes, DNS, SSIDs, external IPs, or packet captures leak in default diagnostics |
 | Two-host mesh behavior | Blocked | Two Windows hosts, hostile-NAT relay fallback, and macOS-Windows interop reports | Direct mesh, relay fallback, or interop fails |
 | Upgrade, repair, rollback, uninstall | Blocked | MSI repair, upgrade, rollback, uninstall, and cleanup reports | Service, adapter, WFP filters, state, or install directories remain unexpectedly after cleanup |
@@ -56,6 +56,7 @@ run URL, release asset name, or manually archived validation bundle.
 | Service-crash kill-switch capture | Pending |
 | Two-Windows-machine mesh report | Pending |
 | Hostile-NAT relay report | Pending |
+| Rendezvous/relay production evidence manifest | `windows/validation/rendezvous-relay-production-evidence.json` Pending |
 | macOS-Windows interop report | Pending |
 | Dytallix public mesh rejection report | Pending |
 | Diagnostics redaction report | Pending |
@@ -87,6 +88,27 @@ Windows-host validation report proves that a live two-peer mesh installs
 authenticated peer-session metadata, protected packets flow only after
 that state is ready, decrypt failures are counted, and no plaintext is
 written to Wintun.
+
+## Rendezvous/Relay Production Evidence
+
+Windows production-release mode now requires a repo-relative sidecar manifest
+at `windows/validation/rendezvous-relay-production-evidence.json`. The schema
+and operator controls are documented in
+`windows/docs/rendezvous-relay-production.md` and
+`windows/docs/production-evidence.md`.
+
+Run the verifier before setting `production_release=true`:
+
+```sh
+ruby windows/scripts/verify-rendezvous-relay-production-evidence.rb \
+  --require-ready \
+  windows/validation/rendezvous-relay-production-evidence.json
+```
+
+This gate remains **Blocked** until real production endpoint evidence is
+supplied. A missing manifest or a manifest with `status: blocked` reports
+blockers rather than schema failures, but production-release mode still fails
+until every required control has passing redacted evidence.
 
 ## Release Rule
 

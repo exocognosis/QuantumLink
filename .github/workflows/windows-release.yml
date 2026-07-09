@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       production_release:
-        description: "Requires signing, timestamping, install validation, SBOM, manifest, and release evidence before artifact upload."
+        description: "Requires signing, timestamping, install validation, SBOM, manifest, release evidence, and rendezvous/relay production evidence before artifact upload."
         type: boolean
         default: false
       run_install_validation:
@@ -53,6 +53,10 @@ on:
         options:
           - UninstallReinstall
           - DirectDowngrade
+      rendezvous_relay_production_evidence_manifest:
+        description: "Repo-relative JSON rendezvous/relay production evidence manifest required when production_release=true."
+        type: string
+        default: "windows/validation/rendezvous-relay-production-evidence.json"
 
 permissions:
   contents: write
@@ -69,6 +73,11 @@ jobs:
       WIX_VERSION: "6.0.2"
     steps:
       - uses: actions/checkout@v7
+
+      - name: Setup Ruby evidence verifier
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v5
@@ -663,6 +672,18 @@ jobs:
             Set-Content -Path $checksumsPath -Encoding ascii
 
           Get-Content $checksumsPath
+
+      - name: Require rendezvous/relay production evidence
+        if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.production_release)
+        shell: pwsh
+        env:
+          RENDEZVOUS_RELAY_PRODUCTION_EVIDENCE_MANIFEST: ${{ inputs.rendezvous_relay_production_evidence_manifest || 'windows/validation/rendezvous-relay-production-evidence.json' }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          ruby .\windows\scripts\verify-rendezvous-relay-production-evidence.rb `
+            --require-ready `
+            $env:RENDEZVOUS_RELAY_PRODUCTION_EVIDENCE_MANIFEST
 
       - name: Verify Windows release evidence
         shell: pwsh
