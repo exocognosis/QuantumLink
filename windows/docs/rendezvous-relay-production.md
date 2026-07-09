@@ -43,6 +43,8 @@ and pass:
 ```sh
 ruby windows/scripts/verify-rendezvous-relay-production-evidence.rb \
   --require-ready \
+  --expected-sha "$(git rev-parse HEAD)" \
+  --expected-ref refs/tags/v1.0.0 \
   windows/validation/rendezvous-relay-production-evidence.json
 ```
 

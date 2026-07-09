@@ -284,7 +284,27 @@ class WindowsReleaseWorkflowContractTest < Minitest::Test
     assert_in_order step.fetch("run"), [
       "ruby #{RENDEZVOUS_RELAY_EVIDENCE_SCRIPT_PATH}",
       "--require-ready",
+      "--expected-sha $env:GITHUB_SHA",
+      "--expected-ref $env:GITHUB_REF",
+      "--report windows/build/validation/rendezvous-relay-production-evidence-verification.json",
       "$env:RENDEZVOUS_RELAY_PRODUCTION_EVIDENCE_MANIFEST"
+    ]
+  end
+
+  def test_workflow_stages_verified_control_plane_evidence_with_release_artifacts
+    step = workflow_step("Stage release artifacts, SBOM, manifest, and checksums")
+    run = step.fetch("run")
+
+    assert_includes run, "rendezvous-relay-production-evidence-verification.json"
+    assert_includes run, "rendezvous-relay-production-evidence.json"
+    assert_includes run, "$verifiedEvidence.controlEvidence"
+    assert_includes run, '"rendezvous-relay-control-$safeControl.json"'
+    assert_in_order run, [
+      "$productionEvidenceReport =",
+      "Copy-Item -LiteralPath $productionEvidenceReport",
+      "$verifiedEvidence = Get-Content",
+      "foreach ($controlEvidence in @($verifiedEvidence.controlEvidence))",
+      "$releaseArtifacts = @("
     ]
   end
 
@@ -299,7 +319,7 @@ class WindowsReleaseWorkflowContractTest < Minitest::Test
     refute_nil verify_index
     refute_nil upload_index
     assert_operator stage_index, :<, verify_index
-    assert_operator production_evidence_index, :<, verify_index
+    assert_operator production_evidence_index, :<, stage_index
     assert_operator verify_index, :<, upload_index
 
     step = workflow_step("Verify Windows release evidence")

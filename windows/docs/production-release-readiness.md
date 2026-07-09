@@ -102,6 +102,8 @@ Run the verifier before setting `production_release=true`:
 ```sh
 ruby windows/scripts/verify-rendezvous-relay-production-evidence.rb \
   --require-ready \
+  --expected-sha "$(git rev-parse HEAD)" \
+  --expected-ref refs/tags/v1.0.0 \
   windows/validation/rendezvous-relay-production-evidence.json
 ```
 
@@ -109,6 +111,9 @@ This gate remains **Blocked** until real production endpoint evidence is
 supplied. A missing manifest or a manifest with `status: blocked` reports
 blockers rather than schema failures, but production-release mode still fails
 until every required control has passing redacted evidence.
+Passing evidence must be fresh, control-specific, digest-bound to distinct JSON
+proof files, bound to the exact release commit/ref and deployment endpoint set,
+and preserved inside the checksummed release artifact set.
 
 ## Release Rule
 

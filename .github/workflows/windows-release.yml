@@ -574,8 +574,25 @@ jobs:
           path: windows/build/validation/install-validation-report.json
           if-no-files-found: error
 
+      - name: Require rendezvous/relay production evidence
+        if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.production_release)
+        shell: pwsh
+        env:
+          RENDEZVOUS_RELAY_PRODUCTION_EVIDENCE_MANIFEST: ${{ inputs.rendezvous_relay_production_evidence_manifest || 'windows/validation/rendezvous-relay-production-evidence.json' }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          ruby .\windows\scripts\verify-rendezvous-relay-production-evidence.rb `
+            --require-ready `
+            --expected-sha $env:GITHUB_SHA `
+            --expected-ref $env:GITHUB_REF `
+            --report windows/build/validation/rendezvous-relay-production-evidence-verification.json `
+            $env:RENDEZVOUS_RELAY_PRODUCTION_EVIDENCE_MANIFEST
+
       - name: Stage release artifacts, SBOM, manifest, and checksums
         shell: pwsh
+        env:
+          RENDEZVOUS_RELAY_PRODUCTION_EVIDENCE_MANIFEST: ${{ inputs.rendezvous_relay_production_evidence_manifest || 'windows/validation/rendezvous-relay-production-evidence.json' }}
         run: |
           $ErrorActionPreference = "Stop"
 
@@ -598,6 +615,24 @@ jobs:
           $stagedMsi = Join-Path $releaseDir $msiName
           Copy-Item -Path "windows\QuantumLink.msi" -Destination $stagedMsi -Force
           Copy-Item -Path "wintun\LICENSE.txt" -Destination (Join-Path $releaseDir "WINTUN-LICENSE.txt") -Force
+
+          $productionEvidenceReport = "windows\build\validation\rendezvous-relay-production-evidence-verification.json"
+          if (Test-Path -LiteralPath $productionEvidenceReport -PathType Leaf) {
+            Copy-Item -LiteralPath $productionEvidenceReport `
+              -Destination (Join-Path $releaseDir "rendezvous-relay-production-evidence-verification.json") `
+              -Force
+            Copy-Item -LiteralPath $env:RENDEZVOUS_RELAY_PRODUCTION_EVIDENCE_MANIFEST `
+              -Destination (Join-Path $releaseDir "rendezvous-relay-production-evidence.json") `
+              -Force
+
+            $verifiedEvidence = Get-Content -LiteralPath $productionEvidenceReport -Raw | ConvertFrom-Json
+            foreach ($controlEvidence in @($verifiedEvidence.controlEvidence)) {
+              $safeControl = ([string]$controlEvidence.control) -replace '[^A-Za-z0-9._-]', '-'
+              Copy-Item -LiteralPath ([string]$controlEvidence.evidence) `
+                -Destination (Join-Path $releaseDir "rendezvous-relay-control-$safeControl.json") `
+                -Force
+            }
+          }
 
           $generatedAt = (Get-Date).ToUniversalTime().ToString("o")
           $sbomPath = Join-Path $releaseDir "windows-sbom.spdx.json"
@@ -672,18 +707,6 @@ jobs:
             Set-Content -Path $checksumsPath -Encoding ascii
 
           Get-Content $checksumsPath
-
-      - name: Require rendezvous/relay production evidence
-        if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.production_release)
-        shell: pwsh
-        env:
-          RENDEZVOUS_RELAY_PRODUCTION_EVIDENCE_MANIFEST: ${{ inputs.rendezvous_relay_production_evidence_manifest || 'windows/validation/rendezvous-relay-production-evidence.json' }}
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          ruby .\windows\scripts\verify-rendezvous-relay-production-evidence.rb `
-            --require-ready `
-            $env:RENDEZVOUS_RELAY_PRODUCTION_EVIDENCE_MANIFEST
 
       - name: Verify Windows release evidence
         shell: pwsh
