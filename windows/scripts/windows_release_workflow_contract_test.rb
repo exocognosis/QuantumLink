@@ -18,8 +18,12 @@ class WindowsReleaseWorkflowContractTest < Minitest::Test
   MSI_PATH = ".\\windows\\QuantumLink.msi"
   REPORT_PATH = ".\\windows\\build\\validation\\install-validation-report.json"
   EVIDENCE_PATH = ".\\windows\\build\\release\\windows-release-evidence.json"
+  SBOM_PATH = ".\\windows\\build\\release\\windows-sbom.spdx.json"
+  RELEASE_MANIFEST_PATH = ".\\windows\\build\\release\\windows-release-manifest.json"
   ARTIFACT_REPORT_PATH = "windows/build/validation/install-validation-report.json"
   ARTIFACT_EVIDENCE_PATH = "windows/build/release/windows-release-evidence.json"
+  ARTIFACT_SBOM_PATH = "windows/build/release/windows-sbom.spdx.json"
+  ARTIFACT_RELEASE_MANIFEST_PATH = "windows/build/release/windows-release-manifest.json"
   ARTIFACT_NAME = "QuantumLink-Windows-InstallValidation-${{ github.run_number }}"
 
   def setup
@@ -73,6 +77,11 @@ class WindowsReleaseWorkflowContractTest < Minitest::Test
 
   def test_workflow_declares_manual_install_validation_inputs
     inputs = workflow_dispatch_inputs
+
+    production_release = inputs.fetch("production_release")
+    assert_match(/requires signing.*install validation.*SBOM.*manifest.*release evidence/i, production_release.fetch("description"))
+    assert_equal "boolean", production_release.fetch("type")
+    assert_equal false, production_release.fetch("default")
 
     run_install_validation = inputs.fetch("run_install_validation")
     assert_match(/installs\/uninstalls the generated MSI.*uploads JSON evidence/i, run_install_validation.fetch("description"))
@@ -239,8 +248,18 @@ class WindowsReleaseWorkflowContractTest < Minitest::Test
     assert_equal ARTIFACT_REPORT_PATH, step.fetch("with").fetch("path")
   end
 
+  def test_workflow_requires_signing_and_install_validation_for_production_releases
+    signing_step = workflow_step("Require Authenticode signing for production releases")
+    validation_step = workflow_step("Require install validation for production releases")
+
+    assert_equal "(startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.production_release)) && steps.signing.outputs.available != 'true'", signing_step.fetch("if")
+    assert_includes signing_step.fetch("run"), "Windows production releases require Authenticode signing secrets"
+    assert_equal "github.event_name == 'workflow_dispatch' && inputs.production_release && !inputs.run_install_validation", validation_step.fetch("if")
+    assert_includes validation_step.fetch("run"), "Windows production releases require run_install_validation=true"
+  end
+
   def test_workflow_verifies_release_evidence_before_uploading_artifacts
-    stage_index = @workflow.index("- name: Stage release artifacts and checksums")
+    stage_index = @workflow.index("- name: Stage release artifacts, SBOM, manifest, and checksums")
     verify_index = @workflow.index("- name: Verify Windows release evidence")
     upload_index = @workflow.index("- name: Upload release artifacts")
 
@@ -255,6 +274,7 @@ class WindowsReleaseWorkflowContractTest < Minitest::Test
     run = step.fetch("run")
 
     assert_equal "${{ steps.signing.outputs.available }}", env.fetch("SIGNING_AVAILABLE")
+    assert_equal "${{ (startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.production_release)) }}", env.fetch("PRODUCTION_RELEASE")
     assert_equal "${{ github.event_name == 'workflow_dispatch' && inputs.run_install_validation }}", env.fetch("RUN_INSTALL_VALIDATION")
     assert_equal "${{ inputs.expected_publisher_subject }}", env.fetch("EXPECTED_PUBLISHER_SUBJECT")
     assert_equal "${{ inputs.expected_publisher_thumbprint }}", env.fetch("EXPECTED_PUBLISHER_THUMBPRINT")
@@ -266,14 +286,21 @@ class WindowsReleaseWorkflowContractTest < Minitest::Test
       'ChecksumsPath = ".\windows\build\release\SHA256SUMS.txt"',
       'WintunDllPath = ".\wintun\bin\amd64\wintun.dll"',
       'WintunLicensePath = ".\windows\build\release\WINTUN-LICENSE.txt"',
+      "SbomPath = \"#{SBOM_PATH}\"",
+      "ReleaseManifestPath = \"#{RELEASE_MANIFEST_PATH}\"",
       "EvidencePath = \"#{EVIDENCE_PATH}\"",
       "}"
     ]
     refute_includes run, '"-WintunDllPath"'
     assert_in_order run, [
-      '$env:SIGNING_AVAILABLE -eq "true" -or $env:GITHUB_REF -like "refs/tags/v*"',
+      '$env:SIGNING_AVAILABLE -eq "true" -or $env:PRODUCTION_RELEASE -eq "true"',
       '$arguments.RequireValidSignature = $true',
       '$arguments.RequireTimestamp = $true'
+    ]
+    assert_in_order run, [
+      '$env:PRODUCTION_RELEASE -eq "true"',
+      '$arguments.RequireSbom = $true',
+      '$arguments.RequireReleaseManifest = $true'
     ]
     assert_in_order run, [
       '$env:EXPECTED_PUBLISHER_SUBJECT',
@@ -296,7 +323,11 @@ class WindowsReleaseWorkflowContractTest < Minitest::Test
     release_step = workflow_step("Attach to GitHub Release")
 
     assert_includes upload_step.fetch("with").fetch("path"), ARTIFACT_EVIDENCE_PATH
+    assert_includes upload_step.fetch("with").fetch("path"), ARTIFACT_SBOM_PATH
+    assert_includes upload_step.fetch("with").fetch("path"), ARTIFACT_RELEASE_MANIFEST_PATH
     assert_includes release_step.fetch("with").fetch("files"), ARTIFACT_EVIDENCE_PATH
+    assert_includes release_step.fetch("with").fetch("files"), ARTIFACT_SBOM_PATH
+    assert_includes release_step.fetch("with").fetch("files"), ARTIFACT_RELEASE_MANIFEST_PATH
   end
 
   def test_docs_reference_local_validation_script_and_report

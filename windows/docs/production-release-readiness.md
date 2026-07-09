@@ -22,7 +22,7 @@ this file are closed.
 
 | Gate | Status | Required Evidence | Blocking Condition |
 |------|--------|-------------------|--------------------|
-| Release trust chain | Blocked | GitHub Actions run, signed MSI, timestamp, checksum, SBOM, `windows-release-evidence.json` | Any unsigned, untimestamped, unverifiable, or checksum-mismatched artifact |
+| Release trust chain | Blocked | GitHub Actions run, signed MSI, timestamp, checksum, SBOM, `windows-release-manifest.json`, `windows-release-evidence.json` | Any unsigned, untimestamped, unverifiable, missing-manifest, missing-SBOM, or checksum-mismatched artifact |
 | Wintun provenance | Blocked | Pinned official Wintun URL/SHA, signed `wintun.dll`, bundled license evidence | Missing official source proof, signature proof, or license file |
 | Clean install and first run | Blocked | Windows 10 22H2 VM, Windows 11 x64 VM, and physical x64 validation reports | Install, service start, pipe handshake, adapter creation, route/DNS setup, or first connect fails |
 | Privileged service boundary | Blocked | Service security validation report covering LocalSystem service, install paths, ProgramData ACLs, DPAPI, and named-pipe ACL | Any writable privileged binary path, weak ProgramData/secrets ACL, or unrestricted production pipe policy |
@@ -45,6 +45,8 @@ run URL, release asset name, or manually archived validation bundle.
 | Windows release workflow run | Pending |
 | Signed MSI and checksum bundle | Pending |
 | SBOM | Pending |
+| Windows release manifest | Pending |
+| Windows release evidence JSON | Pending |
 | Windows 10 22H2 VM validation | Pending |
 | Windows 11 x64 VM validation | Pending |
 | Physical Windows x64 validation | Pending |

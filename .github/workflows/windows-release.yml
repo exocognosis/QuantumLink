@@ -6,6 +6,10 @@ on:
       - "v*"
   workflow_dispatch:
     inputs:
+      production_release:
+        description: "Requires signing, timestamping, install validation, SBOM, manifest, and release evidence before artifact upload."
+        type: boolean
+        default: false
       run_install_validation:
         description: "Installs/uninstalls the generated MSI on the GitHub Windows runner and uploads JSON evidence."
         type: boolean
@@ -214,11 +218,18 @@ jobs:
           "available=$available" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
           Write-Host "Authenticode signing available: $available"
 
-      - name: Require Authenticode signing for tag releases
-        if: startsWith(github.ref, 'refs/tags/v') && steps.signing.outputs.available != 'true'
+      - name: Require Authenticode signing for production releases
+        if: (startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.production_release)) && steps.signing.outputs.available != 'true'
         shell: pwsh
         run: |
-          Write-Error "Windows tag releases require Authenticode signing secrets. Configure both WINDOWS_SIGNING_CERT_PFX_BASE64 and WINDOWS_SIGNING_CERT_PASSWORD before pushing refs/tags/v*."
+          Write-Error "Windows production releases require Authenticode signing secrets. Configure both WINDOWS_SIGNING_CERT_PFX_BASE64 and WINDOWS_SIGNING_CERT_PASSWORD before publishing a tag or setting production_release=true."
+          exit 1
+
+      - name: Require install validation for production releases
+        if: github.event_name == 'workflow_dispatch' && inputs.production_release && !inputs.run_install_validation
+        shell: pwsh
+        run: |
+          Write-Error "Windows production releases require run_install_validation=true so the staged MSI is bound to install/uninstall evidence."
           exit 1
 
       - name: Build and package MSI
@@ -554,7 +565,7 @@ jobs:
           path: windows/build/validation/install-validation-report.json
           if-no-files-found: error
 
-      - name: Stage release artifacts and checksums
+      - name: Stage release artifacts, SBOM, manifest, and checksums
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -579,6 +590,69 @@ jobs:
           Copy-Item -Path "windows\QuantumLink.msi" -Destination $stagedMsi -Force
           Copy-Item -Path "wintun\LICENSE.txt" -Destination (Join-Path $releaseDir "WINTUN-LICENSE.txt") -Force
 
+          $generatedAt = (Get-Date).ToUniversalTime().ToString("o")
+          $sbomPath = Join-Path $releaseDir "windows-sbom.spdx.json"
+          $sbomPackages = @(
+            [ordered]@{
+              SPDXID = "SPDXRef-Package-QuantumLink-Windows-MSI"
+              name = $msiName
+              downloadLocation = "NOASSERTION"
+              filesAnalyzed = $false
+              licenseConcluded = "NOASSERTION"
+              licenseDeclared = "NOASSERTION"
+              copyrightText = "NOASSERTION"
+            },
+            [ordered]@{
+              SPDXID = "SPDXRef-Package-Wintun"
+              name = "Wintun"
+              downloadLocation = "${{ vars.WINTUN_DOWNLOAD_URL }}"
+              filesAnalyzed = $false
+              licenseConcluded = "NOASSERTION"
+              licenseDeclared = "NOASSERTION"
+              copyrightText = "NOASSERTION"
+            }
+          )
+          [ordered]@{
+            spdxVersion = "SPDX-2.3"
+            dataLicense = "CC0-1.0"
+            SPDXID = "SPDXRef-DOCUMENT"
+            name = "QuantumLink Windows $versionLabel"
+            documentNamespace = "https://github.com/${{ github.repository }}/releases/windows/$env:GITHUB_RUN_ID"
+            creationInfo = [ordered]@{
+              created = $generatedAt
+              creators = @("Tool: GitHub Actions windows-release.yml")
+            }
+            packages = $sbomPackages
+          } | ConvertTo-Json -Depth 8 | Set-Content -Path $sbomPath -Encoding UTF8
+
+          $releaseArtifacts = @(
+            Get-ChildItem -Path $releaseDir -File |
+              Sort-Object Name |
+              ForEach-Object {
+                $hash = Get-FileHash -Algorithm SHA256 -Path $_.FullName
+                [ordered]@{
+                  name = $_.Name
+                  sha256 = $hash.Hash.ToLowerInvariant()
+                  lengthBytes = $_.Length
+                }
+              }
+          )
+
+          $manifestPath = Join-Path $releaseDir "windows-release-manifest.json"
+          [ordered]@{
+            schemaVersion = "1.0"
+            generatedAt = $generatedAt
+            repository = $env:GITHUB_REPOSITORY
+            ref = $env:GITHUB_REF
+            sha = $env:GITHUB_SHA
+            runId = $env:GITHUB_RUN_ID
+            runNumber = $env:GITHUB_RUN_NUMBER
+            versionLabel = $versionLabel
+            platform = "windows"
+            architecture = "x64"
+            artifacts = $releaseArtifacts
+          } | ConvertTo-Json -Depth 8 | Set-Content -Path $manifestPath -Encoding UTF8
+
           $checksumsPath = Join-Path $releaseDir "SHA256SUMS.txt"
           Get-ChildItem -Path $releaseDir -File |
             Sort-Object Name |
@@ -594,6 +668,7 @@ jobs:
         shell: pwsh
         env:
           SIGNING_AVAILABLE: ${{ steps.signing.outputs.available }}
+          PRODUCTION_RELEASE: ${{ (startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.production_release)) }}
           RUN_INSTALL_VALIDATION: ${{ github.event_name == 'workflow_dispatch' && inputs.run_install_validation }}
           EXPECTED_PUBLISHER_SUBJECT: ${{ inputs.expected_publisher_subject }}
           EXPECTED_PUBLISHER_THUMBPRINT: ${{ inputs.expected_publisher_thumbprint }}
@@ -617,12 +692,19 @@ jobs:
             ChecksumsPath = ".\windows\build\release\SHA256SUMS.txt"
             WintunDllPath = ".\wintun\bin\amd64\wintun.dll"
             WintunLicensePath = ".\windows\build\release\WINTUN-LICENSE.txt"
+            SbomPath = ".\windows\build\release\windows-sbom.spdx.json"
+            ReleaseManifestPath = ".\windows\build\release\windows-release-manifest.json"
             EvidencePath = ".\windows\build\release\windows-release-evidence.json"
           }
 
-          if ($env:SIGNING_AVAILABLE -eq "true" -or $env:GITHUB_REF -like "refs/tags/v*") {
+          if ($env:SIGNING_AVAILABLE -eq "true" -or $env:PRODUCTION_RELEASE -eq "true") {
             $arguments.RequireValidSignature = $true
             $arguments.RequireTimestamp = $true
+          }
+
+          if ($env:PRODUCTION_RELEASE -eq "true") {
+            $arguments.RequireSbom = $true
+            $arguments.RequireReleaseManifest = $true
           }
 
           if (-not [string]::IsNullOrWhiteSpace($env:EXPECTED_PUBLISHER_SUBJECT)) {
@@ -648,6 +730,8 @@ jobs:
             windows/build/release/*.msi
             windows/build/release/WINTUN-LICENSE.txt
             windows/build/release/SHA256SUMS.txt
+            windows/build/release/windows-sbom.spdx.json
+            windows/build/release/windows-release-manifest.json
             windows/build/release/windows-release-evidence.json
           if-no-files-found: error
 
@@ -659,5 +743,7 @@ jobs:
             windows/build/release/*.msi
             windows/build/release/WINTUN-LICENSE.txt
             windows/build/release/SHA256SUMS.txt
+            windows/build/release/windows-sbom.spdx.json
+            windows/build/release/windows-release-manifest.json
             windows/build/release/windows-release-evidence.json
           fail_on_unmatched_files: true
