@@ -624,83 +624,14 @@ impl TunnelEngine {
         status
     }
 
-    /// Diagnostics export — Windows analog of `SupportBundleExporter`.
-    /// Peer ids are redacted per the privacy spec before anything is
-    /// written where a user might paste it into a ticket.
+    /// Bounded, default-safe diagnostics export for user-shareable support.
     pub fn diagnostics(&self) -> String {
-        let status = self.status();
-        let json = serde_json::json!({
-            "service": env!("CARGO_PKG_VERSION"),
-            "qlinkCoreSuite": "QLINK-FIPS203-MLKEM768-SHAKE256-v1",
-            "status": diagnostics_status(&status),
-        });
-        quantumlink_proto::privacy::redact_diagnostics_text(
-            &serde_json::to_string_pretty(&json).unwrap_or_else(|_| "{}".to_string()),
-        )
+        crate::support_bundle::export(&self.status())
     }
 
     fn set_phase(&self, phase: ConnectionPhase) {
         *self.phase.lock().unwrap() = phase;
     }
-}
-
-fn diagnostics_status(status: &TunnelStatus) -> serde_json::Value {
-    let peers: Vec<_> = status
-        .peers
-        .iter()
-        .map(|peer| {
-            serde_json::json!({
-                "identity": {
-                    "peerID": quantumlink_proto::privacy::redact_peer_identifiers(
-                        &peer.identity.peer_id,
-                    ),
-                    "aliasPresent": !peer.identity.alias.is_empty(),
-                    "publicKeyFingerprintPresent": !peer.identity.public_key_fingerprint.is_empty(),
-                },
-                "pathType": peer.path_type,
-                "endpointCount": peer.endpoints.len(),
-                "overlayAddressPresent": !peer.overlay_address.is_empty(),
-                "rttMilliseconds": peer.rtt_milliseconds,
-                "lastRekeyUnix": peer.last_rekey_unix,
-                "bytesIn": peer.bytes_in,
-                "bytesOut": peer.bytes_out,
-            })
-        })
-        .collect();
-
-    serde_json::json!({
-        "phase": status.phase,
-        "pathType": status.path_type,
-        "routeMode": status.route_mode,
-        "dnsMode": status.dns_mode,
-        "overlayAddressPresent": !status.overlay_ipv4_address.is_empty(),
-        "protectedRouteCount": status.protected_routes.len(),
-        "peers": peers,
-        "metrics": status.metrics,
-        "transport": status.transport,
-        "pump": status.pump,
-        "peerSessionKeyAvailable": status.peer_session_key_available,
-        "peerSessionKeyState": status.peer_session_key_state,
-        "killSwitchEngaged": status.kill_switch_engaged,
-        "peerTrust": {
-            "required": status.peer_trust.required,
-            "trustPolicy": status.peer_trust.policy,
-            "identityMode": status.peer_trust.identity_mode,
-            "registryConfigured": status.peer_trust.registry_configured,
-            "verifiedPeerCount": status.peer_trust.verified_peer_count,
-            "unverifiedPeerCount": status.peer_trust.unverified_peer_count,
-            "pendingPeerCount": status.peer_trust.pending_peer_count,
-            "failedPeerCount": status.peer_trust.failed_peer_count,
-            "lastCheckedAtUnix": status.peer_trust.last_checked_at_unix,
-            "lastFailureCode": status.peer_trust.last_failure_code,
-            "lastFailureSummary": status.peer_trust.last_failure_summary,
-            "warning": status.peer_trust.warning,
-        },
-        "lastError": status
-            .last_error
-            .as_ref()
-            .map(|error| quantumlink_proto::privacy::redact_diagnostics_text(error)),
-    })
 }
 
 fn apply_peer_trust_status(summary: &mut DytallixPeerTrustSummary, handle: &MeshTransportHandle) {
@@ -1020,7 +951,9 @@ mod tests {
         let (_platform, engine) = test_engine();
         engine.connect(dev_config()).unwrap();
         let diagnostics = engine.diagnostics();
-        assert!(!diagnostics.contains("qlink_") || diagnostics.contains("qlink_[redacted]"));
+        assert!(!diagnostics.contains("qlink_"));
+        assert!(diagnostics.contains(r#""schemaVersion": 1"#));
+        assert!(diagnostics.contains(r#""name": "default-safe-v1""#));
         engine.disconnect();
     }
 
@@ -1061,6 +994,7 @@ mod tests {
         assert!(!diagnostics.contains("operator-wallet"));
         assert!(diagnostics.contains(r#""protectedRouteCount": 2"#));
         assert!(diagnostics.contains(r#""registryConfigured": true"#));
+        assert!(diagnostics.contains(r#""rawExportAvailable": false"#));
         engine.disconnect();
     }
 
@@ -1113,7 +1047,7 @@ mod tests {
         let diagnostics = engine.diagnostics();
 
         assert!(!diagnostics.contains("dns.private.example"));
-        assert!(diagnostics.contains("[redacted-url]"));
+        assert!(diagnostics.contains(r#""lastError": "dns""#));
     }
 
     #[test]
