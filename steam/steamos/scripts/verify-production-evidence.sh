@@ -42,6 +42,10 @@ def is_relative_evidence_path(value: object) -> bool:
     return not path.is_absolute() and ".." not in path.parts
 
 
+def is_sha256(value: object) -> bool:
+    return isinstance(value, str) and bool(re.fullmatch(r"[0-9a-f]{64}", value))
+
+
 def endpoint_has_secure_scheme(value: str, allowed: set[str]) -> bool:
     parsed = urlparse(value)
     if parsed.scheme not in allowed:
@@ -172,6 +176,8 @@ else:
             fail(f"Dytallix case {case_name} must be redacted")
         if not is_relative_evidence_path(entry.get("evidence")):
             fail(f"Dytallix case {case_name} evidence must be a relative path")
+        if "sha256" in entry and not is_sha256(entry.get("sha256")):
+            fail(f"Dytallix case {case_name} sha256 must be a 64-character lowercase hex digest")
 
 rendezvous = manifest.get("rendezvousRelay")
 rendezvous_failures_at_start = len(failures)
@@ -247,6 +253,8 @@ else:
                 fail(f"rendezvous/relay control {control_name} status must be pass, blocked, or fail")
         if not is_relative_evidence_path(entry.get("evidence")):
             fail(f"rendezvous/relay control {control_name} evidence must be a relative path")
+        if "sha256" in entry and not is_sha256(entry.get("sha256")):
+            fail(f"rendezvous/relay control {control_name} sha256 must be a 64-character lowercase hex digest")
 
 dytallix_ready = len(failures) == dytallix_failures_at_start and len(blockers) == dytallix_blockers_at_start
 rendezvous_ready = len(failures) == rendezvous_failures_at_start and len(blockers) == rendezvous_blockers_at_start

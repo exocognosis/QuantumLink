@@ -43,18 +43,24 @@ jobs:
       - name: Shell syntax
         run: |
           bash -n steam/steamos/scripts/package-steamos.sh
+          bash -n steam/steamos/scripts/collect-production-evidence.sh
+          bash -n steam/steamos/scripts/steamos-rc-dry-run.sh
           bash -n steam/steamos/scripts/verify-production-evidence.sh
           bash -n steam/steamos/scripts/verify-steamos-release.sh
+          bash -n steam/steamos/tests/collect-production-evidence-test.sh
           bash -n steam/steamos/tests/deck-validation.sh
           bash -n steam/steamos/tests/deck-validation-test.sh
           bash -n steam/steamos/tests/production-evidence-test.sh
+          bash -n steam/steamos/tests/steamos-rc-dry-run-test.sh
           bash -n steam/steamos/tests/verify-deck-evidence.sh
           bash -n steam/steamos/tests/verify-steamos-release-test.sh
 
       - name: SteamOS install/package smoke test
         run: |
+          bash steam/steamos/tests/collect-production-evidence-test.sh
           bash steam/steamos/tests/deck-validation-test.sh
           bash steam/steamos/tests/production-evidence-test.sh
+          bash steam/steamos/tests/steamos-rc-dry-run-test.sh
           bash steam/steamos/tests/verify-steamos-release-test.sh
           bash steam/steamos/tests/install-steamos-test.sh
 

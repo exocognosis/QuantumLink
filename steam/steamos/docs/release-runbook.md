@@ -58,6 +58,14 @@ The packager copies this manifest to
 and includes it in checksums and release-manifest artifact hashes. The manifest
 schema is documented in [`production-evidence.md`](production-evidence.md).
 
+To build the manifest from a redacted operator evidence bundle:
+
+```sh
+bash steam/steamos/scripts/collect-production-evidence.sh \
+  --evidence-root steam/steamos/validation/non-hardware/<timestamp> \
+  --output steam/steamos/validation/non-hardware/<timestamp>/production-evidence-manifest.json
+```
+
 The verifier validates production signatures with:
 
 ```sh
@@ -70,6 +78,20 @@ Publication gates should add:
 ```sh
 QLINK_STEAMOS_REQUIRE_PRODUCTION_READY=1
 ```
+
+For an RC dry run that proves production signing and non-hardware evidence
+without claiming Deck validation:
+
+```sh
+QLINK_STEAMOS_RELEASE_PRIVATE_KEY=/secure/path/steamos-release-private.pem \
+QLINK_STEAMOS_RELEASE_PUBLIC_KEY=/secure/path/steamos-release-public.pem \
+bash steam/steamos/scripts/steamos-rc-dry-run.sh \
+  --evidence-root steam/steamos/validation/non-hardware/<timestamp>
+```
+
+Expected RC dry-run result: `valid=true`, `signatureValidated=true`,
+`nonHardwareProductionEvidenceValidated=true`,
+`nonHardwareProductionReady=true`, and `productionReady=false`.
 
 ## Verification
 
@@ -95,5 +117,7 @@ Before tagging or attaching public SteamOS artifacts:
 - Provide `QLINK_STEAMOS_SIGNATURE_FILE` or `QLINK_STEAMOS_RELEASE_PRIVATE_KEY`.
 - Verify with `QLINK_STEAMOS_RELEASE_PUBLIC_KEY`.
 - Provide or package `QLINK_STEAMOS_PRODUCTION_EVIDENCE_MANIFEST`.
+- Prefer generating the manifest through `collect-production-evidence.sh` so
+  evidence file paths and hashes are normalized before packaging.
 - Set `QLINK_STEAMOS_REQUIRE_PRODUCTION_READY=1` in publication gates.
 - Link active rendezvous/relay endpoint evidence and real Steam Deck validation evidence from `production-readiness.md`.
