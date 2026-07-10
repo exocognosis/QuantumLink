@@ -7,6 +7,10 @@ This is a beta gate for the current Windows alpha. Passing this runbook means
 the artifact is acceptable for limited beta testing only; it does not imply
 production readiness.
 
+Production release readiness is tracked separately in
+`production-release-readiness.md`. Any unchecked production gate or missing
+evidence link in that ledger blocks a production-candidate Windows release.
+
 ## CI coverage vs manual validation
 
 Current CI proves:
@@ -38,6 +42,31 @@ Manual Windows validation must still prove:
   routing, service lifecycle, upgrade, uninstall, diagnostics, two-machine
   mesh, and macOS interop pass on clean Windows 10/11 VMs and physical
   Windows hardware.
+
+## Automated Windows-native report bundle
+
+From an elevated PowerShell session at the repository root, run the required
+install and security validators through the fail-closed orchestrator:
+
+```powershell
+.\windows\scripts\run-beta-validation.ps1 `
+    -MsiPath .\windows\QuantumLink.msi
+```
+
+Preserve these three files together:
+
+- `windows/build/validation/windows-beta-validation-manifest.json`
+- `windows/build/validation/install-validation-report.json`
+- `windows/build/validation/windows-security-validation-report.json`
+
+The command exits nonzero when either required report is blocked, missing,
+malformed, skipped, or failed. The install validator defers uninstall so the
+security validator can inspect the live service. A passing manifest proves
+only the automated Windows-native checks and always reports
+`productionReady: false`; complete the remaining runbook gates and separate
+uninstall/residue validation before promotion. Report schema, status meanings,
+privacy defaults, and contract-only commands are documented in
+`validation-reports/README.md`.
 
 ## Release operator checklist
 
@@ -143,11 +172,16 @@ identity creation:
 
 ```powershell
 .\windows\scripts\validate-windows-security.ps1 `
-    -MsiPath .\QuantumLink.msi `
-    -CheckPipeAcl
+    -MsiPath .\windows\QuantumLink.msi `
+    -CheckPipeAcl `
+    -ReportPath .\windows\build\validation\windows-security-validation-report.json
 ```
 
 - [ ] Script exits 0 on the installed host.
+- [ ] `windows/build/validation/windows-security-validation-report.json`
+      reports `status: passed`, `passed: true`, zero failures, and redacted
+      `computerName` / `userName` values unless identifier capture was
+      explicitly approved.
 - [ ] Output confirms `QuantumLinkService` is LocalSystem, auto-start,
       running, and launched from `quantumlink-service.exe service`.
 - [ ] Output confirms installed binary placement for
@@ -173,8 +207,9 @@ Collect MSI repair evidence without uninstalling:
 
 ```powershell
 .\windows\scripts\validate-windows-security.ps1 `
-    -MsiPath .\QuantumLink.msi `
-    -RepairMsi
+    -MsiPath .\windows\QuantumLink.msi `
+    -RepairMsi `
+    -ReportPath .\windows\build\validation\windows-security-repair-validation-report.json
 ```
 
 - [ ] Repair exits 0 and the verbose repair log path is captured from
@@ -186,8 +221,9 @@ Collect uninstall evidence only in a disposable VM:
 
 ```powershell
 .\windows\scripts\validate-windows-security.ps1 `
-    -MsiPath .\QuantumLink.msi `
-    -UninstallMsi
+    -MsiPath .\windows\QuantumLink.msi `
+    -UninstallMsi `
+    -ReportPath .\windows\build\validation\windows-security-uninstall-validation-report.json
 ```
 
 - [ ] Uninstall exits 0 and the verbose uninstall log path is captured.

@@ -254,6 +254,7 @@ pub fn default_tunnel_configuration() -> crate::models::TunnelConfiguration {
         mtu: 1280,
         crypto: crate::models::CryptoPolicy::default(),
         kill_switch: crate::models::KillSwitchPolicy::FailClosed,
+        mesh_type: crate::models::MeshType::Development,
         mesh_trust_policy: crate::models::MeshTrustPolicy::DevelopmentOptional,
         discovery_identity_mode: crate::models::DiscoveryIdentityMode::Off,
         dytallix_identity: None,

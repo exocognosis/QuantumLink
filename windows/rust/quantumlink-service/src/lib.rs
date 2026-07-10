@@ -27,6 +27,7 @@ pub mod netmon;
 pub mod pump;
 pub mod secret_store;
 pub mod smoke;
+pub mod support_bundle;
 
 #[cfg(windows)]
 pub mod win;

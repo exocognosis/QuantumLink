@@ -30,7 +30,7 @@ jobs:
     name: Test SteamOS Release Inputs
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install release tooling
         run: sudo apt-get update && sudo apt-get install -y zstd jq
@@ -72,7 +72,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: test
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -99,13 +99,13 @@ jobs:
       QLINK_STEAMOS_VERSION: ${{ inputs.version }}
       QLINK_STEAMOS_SIGNING_MODE: ${{ startsWith(github.ref, 'refs/tags/v') && 'production' || inputs.signing_mode || 'dev-classical' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install release tooling
         run: sudo apt-get update && sudo apt-get install -y zstd jq
 
       - name: Download release binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: steamos-release-binaries
           path: target/release
@@ -174,13 +174,13 @@ jobs:
     runs-on: ubuntu-latest
     needs: package
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install release tooling
         run: sudo apt-get update && sudo apt-get install -y zstd jq
 
       - name: Download package output
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: steamos-release-package
           path: dist/steamos
@@ -230,13 +230,13 @@ jobs:
     needs: verify-release
     steps:
       - name: Download package output
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: steamos-release-package
           path: dist/steamos
 
       - name: Download final verification report
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: steamos-release-verification
           path: final-verification

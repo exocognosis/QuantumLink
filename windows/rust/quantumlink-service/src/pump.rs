@@ -21,7 +21,7 @@
 //!    not a leaked one.
 
 use qlink_core::packet_core::{
-    PacketCoreMetrics, PacketDisposition, PacketTunnelCore, TunnelPacket,
+    InstalledPeerSession, PacketCoreMetrics, PacketDisposition, PacketTunnelCore, TunnelPacket,
 };
 use quantumlink_proto::models::PacketPumpMetrics;
 use std::collections::HashMap;
@@ -40,6 +40,8 @@ pub enum PumpError {
 /// Abstraction over the Rust packet core so tests can inject failures.
 /// `PacketTunnelCore` implements this directly — no FFI hop on Windows.
 pub trait TunnelCoreAdapting: Send {
+    fn install_peer_session(&mut self, session: InstalledPeerSession);
+    fn clear_peer_session(&mut self);
     fn submit_tunnel_packet(
         &mut self,
         protocol_family: u32,
@@ -49,9 +51,19 @@ pub trait TunnelCoreAdapting: Send {
     fn accept_transport_frame(&mut self, frame: &[u8]) -> Result<(), qlink_core::QlinkError>;
     fn pop_tunnel_packet(&mut self) -> Option<TunnelPacket>;
     fn metrics(&self) -> PacketCoreMetrics;
+    fn peer_session_required(&self) -> bool;
+    fn peer_session_ready(&self) -> bool;
 }
 
 impl TunnelCoreAdapting for PacketTunnelCore {
+    fn install_peer_session(&mut self, session: InstalledPeerSession) {
+        PacketTunnelCore::install_peer_session(self, session)
+    }
+
+    fn clear_peer_session(&mut self) {
+        PacketTunnelCore::clear_peer_session(self)
+    }
+
     fn submit_tunnel_packet(
         &mut self,
         protocol_family: u32,
@@ -75,12 +87,23 @@ impl TunnelCoreAdapting for PacketTunnelCore {
     fn metrics(&self) -> PacketCoreMetrics {
         PacketTunnelCore::metrics(self)
     }
+
+    fn peer_session_required(&self) -> bool {
+        PacketTunnelCore::peer_session_required(self)
+    }
+
+    fn peer_session_ready(&self) -> bool {
+        PacketTunnelCore::peer_session_ready(self)
+    }
 }
 
 /// Port of Swift `TransportFrameSink`.
 pub trait TransportFrameSink {
     fn is_ready(&self) -> bool {
         true
+    }
+    fn installed_peer_session(&self) -> Option<InstalledPeerSession> {
+        None
     }
     fn send_transport_frame(&self, frame: Vec<u8>) -> Result<(), PumpError>;
 }
@@ -177,6 +200,7 @@ impl<C: TunnelCoreAdapting> TunnelPacketPump<C> {
         // submit packets to the core. No plaintext crosses the encode
         // boundary while the data plane is unhealthy.
         if !sink.is_ready() {
+            core.clear_peer_session();
             self.counters.dropped_kill_switch += packets.len() as u64;
             return PacketPumpBatchResult {
                 packets_observed: packets.len(),
@@ -191,6 +215,12 @@ impl<C: TunnelCoreAdapting> TunnelPacketPump<C> {
         };
 
         for (family, packet) in packets {
+            if core.peer_session_required() {
+                match sink.installed_peer_session() {
+                    Some(session) => core.install_peer_session(session),
+                    None => core.clear_peer_session(),
+                }
+            }
             match core.submit_tunnel_packet(*family, packet) {
                 Ok(PacketDisposition::QueuedForTransport) => {
                     result.queued_for_transport += 1;
@@ -230,6 +260,7 @@ impl<C: TunnelCoreAdapting> TunnelPacketPump<C> {
         &mut self,
         frame: &[u8],
         peer_id: Option<&str>,
+        peer_session: Option<InstalledPeerSession>,
     ) -> Result<(), PumpError> {
         let Some(core) = self.core.as_mut() else {
             self.counters.failed_inbound_frames += 1;
@@ -237,6 +268,12 @@ impl<C: TunnelCoreAdapting> TunnelPacketPump<C> {
                 "Rust core is unavailable for inbound transport frame".into(),
             ));
         };
+        if core.peer_session_required() {
+            match peer_session {
+                Some(session) => core.install_peer_session(session),
+                None => core.clear_peer_session(),
+            }
+        }
         match core.accept_transport_frame(frame) {
             Ok(()) => {
                 self.counters.transport_frames_accepted += 1;
@@ -274,6 +311,7 @@ mod tests {
         ready: bool,
         sent: RefCell<Vec<Vec<u8>>>,
         fail_sends: bool,
+        peer_session: Option<InstalledPeerSession>,
     }
 
     impl ClosureSink {
@@ -282,6 +320,7 @@ mod tests {
                 ready,
                 sent: RefCell::new(Vec::new()),
                 fail_sends: false,
+                peer_session: None,
             }
         }
     }
@@ -289,6 +328,9 @@ mod tests {
     impl TransportFrameSink for ClosureSink {
         fn is_ready(&self) -> bool {
             self.ready
+        }
+        fn installed_peer_session(&self) -> Option<InstalledPeerSession> {
+            self.peer_session.clone()
         }
         fn send_transport_frame(&self, frame: Vec<u8>) -> Result<(), PumpError> {
             if self.fail_sends {
@@ -346,7 +388,7 @@ mod tests {
         assert_eq!(result.transport_frames_emitted, 1);
 
         let frame = sink.sent.borrow()[0].clone();
-        pump.accept_transport_frame(&frame, Some("qlink_peer"))
+        pump.accept_transport_frame(&frame, Some("qlink_peer"), None)
             .unwrap();
         let restored = pump.pop_tunnel_packet().expect("decrypted packet");
         assert_eq!(restored.protocol_family, 2);
@@ -366,7 +408,7 @@ mod tests {
         let result = pump.handle_packets(&[(2, &packet)], &sink);
         assert_eq!(result.dropped_fail_closed, 1);
         assert_eq!(result.queued_for_transport, 0);
-        assert!(pump.accept_transport_frame(b"frame", None).is_err());
+        assert!(pump.accept_transport_frame(b"frame", None, None).is_err());
     }
 
     #[test]
@@ -414,6 +456,25 @@ mod tests {
     }
 
     #[test]
+    fn available_peer_session_allows_required_core_to_emit_transport_frame() {
+        let mut pump = TunnelPacketPump::new(Some(peer_session_required_core()));
+        let mut sink = ClosureSink::new(true);
+        sink.peer_session = Some(InstalledPeerSession {
+            peer_id: "qlink_peer".to_string(),
+            expires_at_unix: now_unix_seconds() + 60,
+            rekey_after_packets: 0,
+        });
+        let packet = ipv4_packet([100, 127, 0, 9]);
+
+        let result = pump.handle_packets(&[(2, &packet)], &sink);
+
+        assert_eq!(result.queued_for_transport, 1);
+        assert_eq!(result.transport_frames_emitted, 1);
+        assert_eq!(result.dropped_fail_closed, 0);
+        assert_eq!(sink.sent.borrow().len(), 1);
+    }
+
+    #[test]
     fn failed_sends_lose_frames_not_plaintext() {
         let mut pump = TunnelPacketPump::new(Some(test_core()));
         let mut sink = ClosureSink::new(true);
@@ -425,5 +486,12 @@ mod tests {
         assert_eq!(result.transport_frames_emitted, 0);
         assert_eq!(result.failed_submissions, 1);
         assert!(sink.sent.borrow().is_empty());
+    }
+
+    fn now_unix_seconds() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or_default()
     }
 }

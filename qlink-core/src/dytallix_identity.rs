@@ -556,7 +556,7 @@ impl DytallixRegistryLookupConfig {
     pub fn new(endpoint: impl Into<String>, contract_address: impl Into<String>) -> Result<Self> {
         Ok(Self {
             endpoint: endpoint.into(),
-            contract_address: normalize_contract_address(&contract_address.into())?,
+            contract_address: normalize_lookup_contract_identifier(&contract_address.into())?,
             network_id: None,
             chain_id: None,
             allowed_rpc_endpoints: Vec::new(),
@@ -741,7 +741,7 @@ impl DytallixIdentityRegistry {
     }
 
     pub fn from_lookup_config(mut config: DytallixRegistryLookupConfig) -> Result<Self> {
-        config.contract_address = normalize_contract_address(&config.contract_address)?;
+        config.contract_address = normalize_lookup_contract_identifier(&config.contract_address)?;
         Self::build(config, None)
     }
 
@@ -1064,6 +1064,14 @@ fn normalize_contract_address(raw: &str) -> Result<String> {
         )));
     }
     Ok(format!("0x{hex}"))
+}
+
+fn normalize_lookup_contract_identifier(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed == REGISTRY_CONTRACT_NAME {
+        return Ok(REGISTRY_CONTRACT_NAME.to_string());
+    }
+    normalize_contract_address(trimmed)
 }
 
 fn require_match(field: &str, actual: &str, expected: &str) -> Result<()> {
@@ -1423,6 +1431,20 @@ mod tests {
             config.allowed_rpc_endpoints,
             vec!["https://dytallix.com/".to_string()]
         );
+    }
+
+    #[test]
+    fn registry_lookup_config_accepts_named_quantumlink_contract() {
+        let config: DytallixRegistryLookupConfig = serde_json::from_value(json!({
+            "endpoint": "https://dytallix.com",
+            "contractAddress": "quantumlink-node-registry",
+            "networkId": "dytallix-mainnet",
+            "chainId": "dytallix-mainnet-1",
+            "allowedRpcEndpoints": ["https://dytallix.com"]
+        }))
+        .unwrap();
+
+        assert_eq!(config.contract_address, "quantumlink-node-registry");
     }
 
     #[test]

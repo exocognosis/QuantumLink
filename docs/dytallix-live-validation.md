@@ -57,6 +57,16 @@ Expected artifacts:
 - `build/dytallix-live-validation/quantumlink-dytallix-public.json`
 - command logs under `build/dytallix-live-validation/logs/`
 
+The generated QuantumLink validation config includes public-mesh trust pins:
+
+- `networkId`, default `dytallix-testnet`
+- `chainId`, default `dytallix-testnet-1`
+- `allowedRpcEndpoints`, default `https://dytallix.com`
+
+Override these with `QL_DYTALLIX_NETWORK_ID`, `QL_DYTALLIX_CHAIN_ID`, and
+comma-separated `QL_DYTALLIX_ALLOWED_RPC_ENDPOINTS` when validating a different
+trusted registry root.
+
 Expected checks:
 
 - `dytallix --help` succeeds.
@@ -166,6 +176,8 @@ Required behavior:
 
 - `meshTrustPolicy` is `public_required`.
 - `discoveryIdentityMode` is `verified` or `public_wallet`.
+- Runtime `dytallixIdentity` includes pinned `networkId`, `chainId`, and
+  `allowedRpcEndpoints`.
 - Missing registry record is rejected.
 - Revoked registry record is rejected.
 - Expired registry record is rejected.

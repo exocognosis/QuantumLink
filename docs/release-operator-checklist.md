@@ -47,12 +47,16 @@ Record:
 
 ## Validation
 
+- Complete `docs/beta-testing/macos-production-validation.md` for the release
+  candidate and attach the resulting evidence to the release PR.
 - Run `codesign --verify --deep --strict --verbose=2` on the exported app.
 - Run `spctl --assess --type execute --verbose=4` on the exported app.
 - Run `spctl --assess --type install --verbose=4` on the signed PKG.
 - Install on a clean test Mac.
 - Confirm the packet tunnel extension installs, prompts correctly, starts, and
   stops.
+- Confirm native UDP direct peer paths work and hardened relay fallback is used
+  only when direct candidates fail.
 - Confirm public mesh Dytallix verification fails closed when RPC or registry
   status is unavailable.
 - Confirm private/development meshes can opt out of identity verification.

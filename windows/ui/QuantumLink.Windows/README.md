@@ -7,10 +7,20 @@ admin network operations itself.
 ## Surface (parity targets with the macOS dashboard)
 
 - [x] Connect / Disconnect
-- [x] Phase, path type, overlay address, protected routes
+- [x] Manual Refresh status command over the existing `status` IPC call
+- [x] Platform readiness badge and Windows alpha summary
+- [x] Onboarding checklist for Windows service install, named-pipe IPC,
+      LocalSystem tunnel control, Wintun/WFP policy, MSI/WiX logs, Event
+      Viewer, and diagnostics export
+- [x] Phase, path type, route mode, DNS mode, overlay address, protected routes
 - [x] Kill-switch indicator
+- [x] Live Dytallix peer-trust summary, registry state, DPAPI boundary, and route-policy summaries
+- [x] Traffic counters, transport metrics, and packet-pump summaries reported by the service
 - [x] Peer list (id, path, overlay address)
-- [x] Diagnostics export (peer-id-redacted JSON)
+- [x] Grouped diagnostics export and peer-id-redacted JSON display
+- [x] Windows-specific help topics for service setup, Wintun, WFP,
+      DPAPI, named-pipe IPC, MSI/WiX packaging, Event Viewer, diagnostics,
+      and security reporting
 - [ ] Configuration editor (route mode, DNS mode, rendezvous/relay
       servers) — sends `reloadConfiguration`; form pending
 - [ ] Live status pushes (schema supports `id: 0` notifications; UI

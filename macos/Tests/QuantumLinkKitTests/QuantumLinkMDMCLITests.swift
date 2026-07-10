@@ -165,6 +165,9 @@ final class QuantumLinkMDMCLITests: XCTestCase {
                 "--action", "connect",
                 "--ssid", "Acme-Corp,Acme-Guest",
                 "--dns-domain", "corp.acme.com",
+                "--app-bundle-id", "com.acme.quantumlink",
+                "--tunnel-bundle-id", "com.acme.quantumlink.PacketTunnel",
+                "--app-group", "group.com.acme.quantumlink",
                 "--payload-identifier", "com.quantumlink.test.ondemand",
                 "--display-name", "Acme On Demand",
                 "--organization", "Acme",
@@ -193,6 +196,15 @@ final class QuantumLinkMDMCLITests: XCTestCase {
             content[0]["PayloadType"] as? String,
             "com.apple.vpn.managed"
         )
+        XCTAssertEqual(content[0]["VPNType"] as? String, "VPN")
+        XCTAssertEqual(content[0]["VPNSubType"] as? String, "com.acme.quantumlink.PacketTunnel")
+        XCTAssertEqual(content[0]["ProviderBundleIdentifier"] as? String, "com.acme.quantumlink.PacketTunnel")
+        XCTAssertEqual(content[0]["ProviderType"] as? String, "packet-tunnel")
+        let vendorConfig = try XCTUnwrap(content[0]["VendorConfig"] as? [String: Any])
+        XCTAssertEqual(vendorConfig["appBundleIdentifier"] as? String, "com.acme.quantumlink")
+        XCTAssertEqual(vendorConfig["appGroup"] as? String, "group.com.acme.quantumlink")
+        XCTAssertNil(content[0]["KernelExtensionBundleIdentifier"])
+        XCTAssertNil(content[0]["PFRuleAnchor"])
         XCTAssertEqual(content[0]["OnDemandEnabled"] as? Int, 1)
         let rules = try XCTUnwrap(content[0]["OnDemandRules"] as? [[String: Any]])
         // Two rules: the user-supplied one + trailing default-disconnect.
@@ -209,6 +221,9 @@ final class QuantumLinkMDMCLITests: XCTestCase {
             [
                 "build-ondemand",
                 "--action", "connect",
+                "--app-bundle-id", "com.acme.quantumlink",
+                "--tunnel-bundle-id", "com.acme.quantumlink.PacketTunnel",
+                "--app-group", "group.com.acme.quantumlink",
                 "--payload-identifier", "com.quantumlink.test.ondemand",
                 "--display-name", "Acme On Demand",
                 "--organization", "Acme",
@@ -223,6 +238,29 @@ final class QuantumLinkMDMCLITests: XCTestCase {
             result.stderr.contains("at least one match condition"),
             "stderr: \(result.stderr)"
         )
+    }
+
+    func testBuildOnDemandRejectsPlaceholderProductionIdentifiers() throws {
+        let p12Path = try generateP12(passphrase: "qlink-test")
+        let result = try runCLI(
+            [
+                "build-ondemand",
+                "--action", "connect",
+                "--ssid", "Acme-Corp",
+                "--app-bundle-id", "com.quantumlink.macos",
+                "--tunnel-bundle-id", "com.quantumlink.macos.PacketTunnel",
+                "--app-group", "group.com.quantumlink.macos",
+                "--payload-identifier", "com.quantumlink.test.ondemand",
+                "--display-name", "Acme On Demand",
+                "--organization", "Acme",
+                "--vpn-payload-uuid", UUID().uuidString,
+                "--signing-p12", p12Path.path,
+                "--output", workDir.appendingPathComponent("placeholder.mobileconfig").path,
+            ],
+            extraEnvironment: ["QLINK_P12_PASS": "qlink-test"]
+        )
+        XCTAssertEqual(result.exitCode, 2, "stderr: \(result.stderr)")
+        XCTAssertTrue(result.stderr.contains("must use a production value"), "stderr: \(result.stderr)")
     }
 
     // MARK: - helpers

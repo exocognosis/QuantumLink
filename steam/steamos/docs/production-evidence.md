@@ -114,7 +114,6 @@ Minimum `metadata.json` shape:
   }
 }
 ```
-
 ## Rendezvous And Relay Gate
 
 The `rendezvousRelay` section proves hardened staging or production endpoint

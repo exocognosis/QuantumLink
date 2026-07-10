@@ -47,7 +47,12 @@ pub enum TunnelCommand {
         configuration: TunnelConfiguration,
     },
     Status,
-    ExportDiagnostics,
+    /// Return bounded `default-safe-v1` support-bundle JSON. This command has
+    /// no raw mode; unknown request properties cannot enable one.
+    ExportDiagnostics {
+        #[serde(default)]
+        raw: Option<bool>,
+    },
     /// Per-peer state probe (multi-peer surface).
     PeerState {
         peer_id: String,

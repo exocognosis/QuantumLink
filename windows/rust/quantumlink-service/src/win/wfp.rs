@@ -24,11 +24,16 @@
 //! in the beta runbook as follow-up work.
 
 use crate::engine::EngineError;
+#[cfg(windows)]
 use std::ffi::c_void;
 use std::net::Ipv4Addr;
+#[cfg(windows)]
 use std::sync::OnceLock;
+#[cfg(windows)]
 use windows::core::GUID;
+#[cfg(windows)]
 use windows::Win32::Foundation::HANDLE;
+#[cfg(windows)]
 use windows::Win32::NetworkManagement::WindowsFilteringPlatform::{
     FwpmEngineClose0, FwpmEngineOpen0, FwpmFilterAdd0, FwpmSubLayerAdd0,
     FWPM_CONDITION_IP_LOCAL_INTERFACE, FWPM_CONDITION_IP_REMOTE_ADDRESS, FWPM_FILTER0,
@@ -37,14 +42,126 @@ use windows::Win32::NetworkManagement::WindowsFilteringPlatform::{
     FWP_ACTION_TYPE, FWP_MATCH_EQUAL, FWP_UINT64, FWP_UINT8, FWP_V4_ADDR_AND_MASK,
     FWP_V4_ADDR_MASK,
 };
+#[cfg(windows)]
 use windows::Win32::System::Rpc::RPC_C_AUTHN_DEFAULT;
 
 /// Stable product GUIDs (random, fixed at build time).
+#[cfg(windows)]
 const SUBLAYER_KEY: GUID = GUID::from_u128(0x7c1a44d0_3f2e_4b8a_9c61_d5a0e84b91f2);
 
+#[cfg(windows)]
 const BLOCK_WEIGHT: u8 = 0;
+#[cfg(windows)]
 const PERMIT_WEIGHT: u8 = 15;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WfpFilterMode {
+    FailClosed,
+    Strict,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WfpLayer {
+    AleAuthConnectV4,
+    OutboundIpPacketV4,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WfpAction {
+    Block,
+    Permit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedWfpFilter {
+    pub layer: WfpLayer,
+    pub action: WfpAction,
+    pub route: String,
+    pub tunnel_interface_required: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WfpFilterPlan {
+    pub mode: WfpFilterMode,
+    pub dynamic_session: bool,
+    pub persistent_filters: bool,
+    pub boot_time_fail_closed: bool,
+    pub cleanup_required_on_uninstall: bool,
+    pub filters: Vec<PlannedWfpFilter>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WfpRuntimeInstall {
+    DynamicSession,
+    PersistentBootTime,
+}
+
+pub fn build_filter_plan(
+    policy: quantumlink_proto::models::KillSwitchPolicy,
+    protected_routes: &[String],
+) -> Result<WfpFilterPlan, EngineError> {
+    let mut filters = Vec::new();
+    for route in protected_routes {
+        parse_v4_cidr(route)?;
+        filters.push(PlannedWfpFilter {
+            layer: WfpLayer::AleAuthConnectV4,
+            action: WfpAction::Block,
+            route: route.clone(),
+            tunnel_interface_required: false,
+        });
+        filters.push(PlannedWfpFilter {
+            layer: WfpLayer::AleAuthConnectV4,
+            action: WfpAction::Permit,
+            route: route.clone(),
+            tunnel_interface_required: true,
+        });
+        if policy == quantumlink_proto::models::KillSwitchPolicy::Strict {
+            filters.push(PlannedWfpFilter {
+                layer: WfpLayer::OutboundIpPacketV4,
+                action: WfpAction::Block,
+                route: route.clone(),
+                tunnel_interface_required: false,
+            });
+            filters.push(PlannedWfpFilter {
+                layer: WfpLayer::OutboundIpPacketV4,
+                action: WfpAction::Permit,
+                route: route.clone(),
+                tunnel_interface_required: true,
+            });
+        }
+    }
+
+    Ok(match policy {
+        quantumlink_proto::models::KillSwitchPolicy::FailClosed => WfpFilterPlan {
+            mode: WfpFilterMode::FailClosed,
+            dynamic_session: true,
+            persistent_filters: false,
+            boot_time_fail_closed: false,
+            cleanup_required_on_uninstall: false,
+            filters,
+        },
+        quantumlink_proto::models::KillSwitchPolicy::Strict => WfpFilterPlan {
+            mode: WfpFilterMode::Strict,
+            dynamic_session: false,
+            persistent_filters: true,
+            boot_time_fail_closed: true,
+            cleanup_required_on_uninstall: true,
+            filters,
+        },
+    })
+}
+
+pub fn runtime_install_for_plan(plan: &WfpFilterPlan) -> Result<WfpRuntimeInstall, EngineError> {
+    if plan.persistent_filters || plan.boot_time_fail_closed {
+        return Err(EngineError::Platform(
+            "strict WFP requires persistent boot-time filters; refusing dynamic-session fallback"
+                .into(),
+        ));
+    }
+    Ok(WfpRuntimeInstall::DynamicSession)
+}
+
+#[cfg(windows)]
 pub struct KillSwitchGuard {
     engine: HANDLE,
     protected_routes: Vec<String>,
@@ -52,14 +169,41 @@ pub struct KillSwitchGuard {
 
 // HANDLE is a raw pointer; the WFP engine handle is safe to close from
 // another thread, which is all we do with it after creation.
+#[cfg(windows)]
 unsafe impl Send for KillSwitchGuard {}
+#[cfg(windows)]
 unsafe impl Sync for KillSwitchGuard {}
 
+#[cfg(windows)]
 impl KillSwitchGuard {
+    pub fn engage_with_policy(
+        protected_routes: &[String],
+        tunnel_luid: u64,
+        policy: quantumlink_proto::models::KillSwitchPolicy,
+    ) -> Result<Self, EngineError> {
+        let plan = build_filter_plan(policy, protected_routes)?;
+        match runtime_install_for_plan(&plan)? {
+            WfpRuntimeInstall::DynamicSession => {
+                Self::engage_dynamic(protected_routes, tunnel_luid)
+            }
+            WfpRuntimeInstall::PersistentBootTime => Err(EngineError::Platform(
+                "persistent WFP install is not implemented".into(),
+            )),
+        }
+    }
+
     /// Opens a dynamic WFP session and installs block+permit filters for
     /// the supplied protected prefixes. `tunnel_luid` is the Wintun
     /// adapter LUID traffic is permitted through.
     pub fn engage(protected_routes: &[String], tunnel_luid: u64) -> Result<Self, EngineError> {
+        Self::engage_with_policy(
+            protected_routes,
+            tunnel_luid,
+            quantumlink_proto::models::KillSwitchPolicy::FailClosed,
+        )
+    }
+
+    fn engage_dynamic(protected_routes: &[String], tunnel_luid: u64) -> Result<Self, EngineError> {
         let mut engine = HANDLE::default();
         let session = FWPM_SESSION0 {
             flags: FWPM_SESSION_FLAG_DYNAMIC,
@@ -211,6 +355,7 @@ impl KillSwitchGuard {
     }
 }
 
+#[cfg(windows)]
 impl Drop for KillSwitchGuard {
     fn drop(&mut self) {
         // Dynamic session: closing the engine handle removes the
@@ -221,6 +366,7 @@ impl Drop for KillSwitchGuard {
     }
 }
 
+#[cfg(windows)]
 fn display_data(
     name: &'static str,
 ) -> windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_DISPLAY_DATA0 {
@@ -231,6 +377,7 @@ fn display_data(
     }
 }
 
+#[cfg(windows)]
 fn display_name_ptr(name: &'static str) -> *mut u16 {
     static KILL_SWITCH: OnceLock<Box<[u16]>> = OnceLock::new();
     static BLOCK_PREFIX: OnceLock<Box<[u16]>> = OnceLock::new();
@@ -275,10 +422,20 @@ fn prefix_to_mask(prefix: u8) -> u32 {
 }
 
 pub(crate) fn probe_dynamic_filter_attach() -> Result<(), EngineError> {
-    let routes = vec!["198.51.100.0/24".to_string()];
-    let guard = KillSwitchGuard::engage(&routes, 0)?;
-    drop(guard);
-    Ok(())
+    #[cfg(not(windows))]
+    {
+        return Err(EngineError::Platform(
+            "WFP dynamic filter probe requires Windows".into(),
+        ));
+    }
+
+    #[cfg(windows)]
+    {
+        let routes = vec!["198.51.100.0/24".to_string()];
+        let guard = KillSwitchGuard::engage(&routes, 0)?;
+        drop(guard);
+        Ok(())
+    }
 }
 
 pub(crate) fn looks_like_admin_required(error: &EngineError) -> bool {
@@ -294,4 +451,75 @@ pub(crate) fn looks_like_admin_required(error: &EngineError) -> bool {
 }
 
 #[allow(dead_code)]
+#[cfg(windows)]
 fn _suppress_unused(_: *const c_void) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quantumlink_proto::models::KillSwitchPolicy;
+
+    #[test]
+    fn wfp_fail_closed_plan_uses_dynamic_session_filters() {
+        let routes = vec!["100.64.0.0/10".to_string()];
+        let plan = build_filter_plan(KillSwitchPolicy::FailClosed, &routes).unwrap();
+
+        assert_eq!(plan.mode, WfpFilterMode::FailClosed);
+        assert!(plan.dynamic_session);
+        assert!(!plan.persistent_filters);
+        assert!(!plan.boot_time_fail_closed);
+        assert!(plan
+            .filters
+            .iter()
+            .all(|filter| filter.layer == WfpLayer::AleAuthConnectV4));
+    }
+
+    #[test]
+    fn wfp_strict_plan_is_persistent_boot_time_and_covers_outbound_packets() {
+        let routes = vec!["100.64.0.0/10".to_string()];
+        let plan = build_filter_plan(KillSwitchPolicy::Strict, &routes).unwrap();
+
+        assert_eq!(plan.mode, WfpFilterMode::Strict);
+        assert!(!plan.dynamic_session);
+        assert!(plan.persistent_filters);
+        assert!(plan.boot_time_fail_closed);
+        assert!(plan.cleanup_required_on_uninstall);
+        assert!(plan
+            .filters
+            .iter()
+            .any(|filter| filter.layer == WfpLayer::AleAuthConnectV4));
+        assert!(plan
+            .filters
+            .iter()
+            .any(|filter| filter.layer == WfpLayer::OutboundIpPacketV4));
+    }
+
+    #[test]
+    fn wfp_strict_outbound_packet_plan_has_block_and_permit_filters() {
+        let routes = vec!["100.64.0.0/10".to_string()];
+        let plan = build_filter_plan(KillSwitchPolicy::Strict, &routes).unwrap();
+
+        assert!(plan.filters.iter().any(|filter| {
+            filter.layer == WfpLayer::OutboundIpPacketV4 && filter.action == WfpAction::Block
+        }));
+        assert!(plan.filters.iter().any(|filter| {
+            filter.layer == WfpLayer::OutboundIpPacketV4
+                && filter.action == WfpAction::Permit
+                && filter.tunnel_interface_required
+        }));
+    }
+
+    #[test]
+    fn wfp_strict_runtime_refuses_dynamic_session_fallback() {
+        let routes = vec!["100.64.0.0/10".to_string()];
+        let plan = build_filter_plan(KillSwitchPolicy::Strict, &routes).unwrap();
+        let error = runtime_install_for_plan(&plan).unwrap_err();
+
+        match error {
+            EngineError::Platform(message) => {
+                assert!(message.contains("refusing dynamic-session fallback"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+}

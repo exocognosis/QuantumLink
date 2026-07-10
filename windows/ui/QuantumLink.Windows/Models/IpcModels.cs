@@ -52,6 +52,7 @@ public sealed record TunnelStatus
     [JsonPropertyName("protectedRoutes")] public List<string> ProtectedRoutes { get; init; } = [];
     [JsonPropertyName("peers")] public List<PeerStatus> Peers { get; init; } = [];
     [JsonPropertyName("metrics")] public MeshMetrics Metrics { get; init; } = new();
+    [JsonPropertyName("peerTrust")] public DytallixPeerTrustSummary PeerTrust { get; init; } = new();
     [JsonPropertyName("transport")] public TunnelTransportMetrics? Transport { get; init; }
     [JsonPropertyName("pump")] public PacketPumpMetrics? Pump { get; init; }
     [JsonPropertyName("killSwitchEngaged")] public bool? KillSwitchEngaged { get; init; }
@@ -69,10 +70,20 @@ public sealed record PeerStatus
 {
     [JsonPropertyName("identity")] public PeerIdentity Identity { get; init; } = new();
     [JsonPropertyName("pathType")] public string PathType { get; init; } = "probing";
+    [JsonPropertyName("endpoints")] public List<PeerEndpoint> Endpoints { get; init; } = [];
     [JsonPropertyName("overlayAddress")] public string OverlayAddress { get; init; } = "";
     [JsonPropertyName("rttMilliseconds")] public int? RttMilliseconds { get; init; }
+    [JsonPropertyName("lastRekeyUnix")] public ulong? LastRekeyUnix { get; init; }
     [JsonPropertyName("bytesIn")] public ulong BytesIn { get; init; }
     [JsonPropertyName("bytesOut")] public ulong BytesOut { get; init; }
+}
+
+public sealed record PeerEndpoint
+{
+    [JsonPropertyName("candidateType")] public string CandidateType { get; init; } = "";
+    [JsonPropertyName("address")] public string Address { get; init; } = "";
+    [JsonPropertyName("port")] public ushort Port { get; init; }
+    [JsonPropertyName("priority")] public long Priority { get; init; }
 }
 
 public sealed record MeshMetrics
@@ -83,6 +94,23 @@ public sealed record MeshMetrics
     [JsonPropertyName("bytesIn")] public ulong BytesIn { get; init; }
     [JsonPropertyName("bytesOut")] public ulong BytesOut { get; init; }
     [JsonPropertyName("replayDrops")] public ulong ReplayDrops { get; init; }
+    [JsonPropertyName("lastPathProbeUnix")] public ulong? LastPathProbeUnix { get; init; }
+}
+
+public sealed record DytallixPeerTrustSummary
+{
+    [JsonPropertyName("required")] public bool Required { get; init; }
+    [JsonPropertyName("policy")] public string Policy { get; init; } = "development_optional";
+    [JsonPropertyName("identityMode")] public string IdentityMode { get; init; } = "off";
+    [JsonPropertyName("registryConfigured")] public bool RegistryConfigured { get; init; }
+    [JsonPropertyName("verifiedPeerCount")] public uint VerifiedPeerCount { get; init; }
+    [JsonPropertyName("unverifiedPeerCount")] public uint UnverifiedPeerCount { get; init; }
+    [JsonPropertyName("pendingPeerCount")] public uint PendingPeerCount { get; init; }
+    [JsonPropertyName("failedPeerCount")] public uint FailedPeerCount { get; init; }
+    [JsonPropertyName("lastCheckedAtUnix")] public ulong? LastCheckedAtUnix { get; init; }
+    [JsonPropertyName("lastFailureCode")] public string? LastFailureCode { get; init; }
+    [JsonPropertyName("lastFailureSummary")] public string? LastFailureSummary { get; init; }
+    [JsonPropertyName("warning")] public string? Warning { get; init; }
 }
 
 public sealed record TunnelTransportMetrics
@@ -95,6 +123,7 @@ public sealed record TunnelTransportMetrics
     [JsonPropertyName("bytesReceived")] public ulong BytesReceived { get; init; }
     [JsonPropertyName("sendFailures")] public ulong SendFailures { get; init; }
     [JsonPropertyName("receiveFailures")] public ulong ReceiveFailures { get; init; }
+    [JsonPropertyName("networkEventCount")] public ulong NetworkEventCount { get; init; }
     [JsonPropertyName("reconnectCount")] public ulong ReconnectCount { get; init; }
 }
 
@@ -119,6 +148,31 @@ public sealed record CryptoPolicy
     [JsonPropertyName("rekeyAfterBytes")] public ulong RekeyAfterBytes { get; init; } = 1_073_741_824;
 }
 
+public sealed record DytallixIdentityConfiguration
+{
+    [JsonPropertyName("mode")] public string Mode { get; init; } = "verified";
+    [JsonPropertyName("registryEndpoint")] public string RegistryEndpoint { get; init; } = "";
+    [JsonPropertyName("contract")] public string Contract { get; init; } = "quantumlink-node-registry";
+    [JsonPropertyName("cachedProofGraceSeconds")] public ulong CachedProofGraceSeconds { get; init; }
+    [JsonPropertyName("contractAddress")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ContractAddress { get; init; }
+    [JsonPropertyName("publishWalletAddress")] public bool PublishWalletAddress { get; init; }
+    [JsonPropertyName("networkID")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? NetworkId { get; init; }
+    [JsonPropertyName("chainID")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ChainId { get; init; }
+    [JsonPropertyName("allowedRPCEndpoints")] public List<string> AllowedRpcEndpoints { get; init; } = [];
+    [JsonPropertyName("keystorePath")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? KeystorePath { get; init; }
+    [JsonPropertyName("walletName")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? WalletName { get; init; }
+}
+
 public sealed record TunnelConfiguration
 {
     [JsonPropertyName("meshID")] public string MeshId { get; init; } = "";
@@ -137,4 +191,10 @@ public sealed record TunnelConfiguration
     [JsonPropertyName("mtu")] public uint Mtu { get; init; } = 1280;
     [JsonPropertyName("crypto")] public CryptoPolicy Crypto { get; init; } = new();
     [JsonPropertyName("killSwitch")] public string KillSwitch { get; init; } = "failClosed";
+    [JsonPropertyName("meshType")] public string MeshType { get; init; } = "development";
+    [JsonPropertyName("meshTrustPolicy")] public string MeshTrustPolicy { get; init; } = "development_optional";
+    [JsonPropertyName("discoveryIdentityMode")] public string DiscoveryIdentityMode { get; init; } = "off";
+    [JsonPropertyName("dytallixIdentity")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public DytallixIdentityConfiguration? DytallixIdentity { get; init; }
 }

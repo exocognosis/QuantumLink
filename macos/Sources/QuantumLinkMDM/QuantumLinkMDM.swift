@@ -65,6 +65,9 @@ enum QuantumLinkMDM {
           --apps <p1,p2,...>             Comma-separated paths to installed .app bundles (required).
 
         build-ondemand options:
+          --app-bundle-id <id>           Production QuantumLink app bundle ID (required).
+          --tunnel-bundle-id <id>        Production packet-tunnel provider bundle ID (required).
+          --app-group <group.id>         Production app group shared with the provider (required).
           --action <connect|disconnect|evaluate|ignore>
                                           Action when match conditions hold (default: connect).
           --ssid <s1,s2,...>             SSIDs that trigger this rule (Wi-Fi only).
@@ -136,10 +139,11 @@ enum QuantumLinkMDM {
                 rules: [rule, trailingDefault]
             )
 
-            // The on-demand keys live under a VPN payload — produce a
-            // minimal stub VPN payload that carries them. The downstream
-            // MDM should layer this over the real VPN payload it owns;
-            // this CLI is not the place to invent a full VPN payload.
+            // The on-demand keys live under a real Network Extension VPN
+            // payload, not a generic stub. Production profile generation
+            // requires non-placeholder bundle IDs and a production app group
+            // so MDM validation catches accidental dev identifiers before
+            // deployment.
             var vpnPayload: [String: Any] = [
                 "PayloadType": "com.apple.vpn.managed",
                 "PayloadVersion": 1,
@@ -147,6 +151,15 @@ enum QuantumLinkMDM {
                 "PayloadUUID": opts.commonSigning.vpnPayloadUUID.uuidString,
                 "PayloadDisplayName": opts.commonSigning.displayName,
                 "UserDefinedName": opts.commonSigning.displayName,
+                "VPNType": "VPN",
+                "VPNSubType": opts.tunnelBundleIdentifier,
+                "ProviderBundleIdentifier": opts.tunnelBundleIdentifier,
+                "ProviderType": "packet-tunnel",
+                "VendorConfig": [
+                    "appBundleIdentifier": opts.appBundleIdentifier,
+                    "appGroup": opts.appGroup,
+                    "configurationProfile": "on-demand",
+                ],
             ]
             for (key, value) in fragment.plistKeys() {
                 vpnPayload[key] = value
@@ -253,6 +266,9 @@ private enum ArgumentError: Swift.Error, CLIUsageError, LocalizedError {
     case invalidAction(String)
     case invalidInterface(String)
     case noOnDemandMatchesSupplied
+    case invalidBundleIdentifier(flag: String, value: String)
+    case invalidAppGroup(String)
+    case placeholderProductionValue(flag: String, value: String)
 
     var errorDescription: String? {
         switch self {
@@ -267,6 +283,12 @@ private enum ArgumentError: Swift.Error, CLIUsageError, LocalizedError {
         case .noOnDemandMatchesSupplied:
             "build-ondemand needs at least one match condition "
             + "(--ssid, --dns-domain, --dns-server, --probe-url, or --interface)"
+        case .invalidBundleIdentifier(let flag, let value):
+            "Invalid --\(flag) value: \(value)"
+        case .invalidAppGroup(let value):
+            "Invalid --app-group value: \(value) (must start with group.)"
+        case .placeholderProductionValue(let flag, let value):
+            "--\(flag) must use a production value, not placeholder \(value)"
         }
     }
 }
@@ -298,12 +320,26 @@ private struct BuildPerAppOptions {
 }
 
 private struct BuildOnDemandOptions {
+    let appBundleIdentifier: String
+    let tunnelBundleIdentifier: String
+    let appGroup: String
     let action: OnDemandRuleAction
     let matches: [OnDemandRuleMatch]
     let commonSigning: CommonSigningOptions
 
     init(arguments: [String]) throws {
         let parsed = ArgumentMap(arguments)
+        appBundleIdentifier = try parseProductionBundleIdentifier(
+            parsed["app-bundle-id"],
+            flag: "app-bundle-id",
+            placeholder: "com.quantumlink.macos"
+        )
+        tunnelBundleIdentifier = try parseProductionBundleIdentifier(
+            parsed["tunnel-bundle-id"],
+            flag: "tunnel-bundle-id",
+            placeholder: "com.quantumlink.macos.PacketTunnel"
+        )
+        appGroup = try parseProductionAppGroup(parsed["app-group"])
         action = try parseAction(parsed["action"] ?? "connect")
 
         var matches: [OnDemandRuleMatch] = []
@@ -327,6 +363,61 @@ private struct BuildOnDemandOptions {
         }
         self.matches = matches
         commonSigning = try CommonSigningOptions(parsed: parsed)
+    }
+}
+
+private func parseProductionBundleIdentifier(
+    _ raw: String?,
+    flag: String,
+    placeholder: String
+) throws -> String {
+    guard let raw else {
+        throw ArgumentError.missing(flag)
+    }
+    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard isValidReverseDNSIdentifier(trimmed) else {
+        throw ArgumentError.invalidBundleIdentifier(flag: flag, value: raw)
+    }
+    guard trimmed != placeholder else {
+        throw ArgumentError.placeholderProductionValue(flag: flag, value: trimmed)
+    }
+    return trimmed
+}
+
+private func parseProductionAppGroup(_ raw: String?) throws -> String {
+    guard let raw else {
+        throw ArgumentError.missing("app-group")
+    }
+    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard trimmed.hasPrefix("group.") else {
+        throw ArgumentError.invalidAppGroup(raw)
+    }
+    guard isValidReverseDNSIdentifier(String(trimmed.dropFirst("group.".count))) else {
+        throw ArgumentError.invalidAppGroup(raw)
+    }
+    guard trimmed != "group.com.quantumlink.macos" else {
+        throw ArgumentError.placeholderProductionValue(flag: "app-group", value: trimmed)
+    }
+    return trimmed
+}
+
+private func isValidReverseDNSIdentifier(_ value: String) -> Bool {
+    let labels = value.split(separator: ".", omittingEmptySubsequences: false)
+    guard labels.count >= 2 else {
+        return false
+    }
+    return labels.allSatisfy { label in
+        guard
+            let first = label.first,
+            let last = label.last,
+            first.isLetter || first.isNumber,
+            last.isLetter || last.isNumber
+        else {
+            return false
+        }
+        return label.allSatisfy { character in
+            character.isLetter || character.isNumber || character == "-"
+        }
     }
 }
 
