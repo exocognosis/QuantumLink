@@ -59,6 +59,12 @@ class WindowsReleaseWorkflowContractTest < Minitest::Test
     ]
   end
 
+  def test_workflow_pins_msvc_linker_after_ruby_setup
+    assert_includes @workflow, "Pin the MSVC linker for Rust"
+    assert_includes @workflow, "RUSTC_LINKER=$msvcLink"
+    assert_includes @workflow, 'Where-Object { $_.Source -match "\\\\MSVC\\\\" }'
+  end
+
   def test_installer_readme_manual_wix_build_builds_msi_as_x64
     block = manual_fallback_powershell_block
 
