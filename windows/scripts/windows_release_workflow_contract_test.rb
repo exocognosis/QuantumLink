@@ -61,7 +61,7 @@ class WindowsReleaseWorkflowContractTest < Minitest::Test
 
   def test_workflow_pins_msvc_linker_after_ruby_setup
     assert_includes @workflow, "Pin the MSVC linker for Rust"
-    assert_includes @workflow, "RUSTC_LINKER=$msvcLink"
+    assert_includes @workflow, "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$msvcLink"
     assert_includes @workflow, 'Where-Object { $_.Source -match "\\\\MSVC\\\\" }'
   end
 
