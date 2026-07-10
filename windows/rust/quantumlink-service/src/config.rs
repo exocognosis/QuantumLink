@@ -181,6 +181,17 @@ pub fn validate_configuration(config: &TunnelConfiguration) -> Result<(), String
     if config.mtu < 576 {
         return Err("MTU must be at least 576 bytes".into());
     }
+    if !config.crypto.rekey_after_seconds.is_finite()
+        || config.crypto.rekey_after_seconds < 1.0
+        || config.crypto.rekey_after_seconds.ceil() > u64::MAX as f64
+    {
+        return Err(
+            "crypto.rekeyAfterSeconds must be a finite value of at least one second".into(),
+        );
+    }
+    if config.crypto.rekey_after_bytes == 0 {
+        return Err("crypto.rekeyAfterBytes must be greater than zero".into());
+    }
     config
         .overlay_ipv4_address
         .parse::<Ipv4Addr>()
@@ -390,6 +401,19 @@ mod tests {
         config.dns_servers = vec!["not-an-ip".to_string()];
         let error = validate_configuration(&config).unwrap_err();
         assert!(error.contains("DNS server"));
+    }
+
+    #[test]
+    fn validation_rejects_invalid_packet_session_rotation_policy() {
+        let mut config = privacy::default_tunnel_configuration();
+        config.crypto.rekey_after_seconds = f64::NAN;
+        let error = validate_configuration(&config).unwrap_err();
+        assert!(error.contains("rekeyAfterSeconds"));
+
+        config.crypto.rekey_after_seconds = 3_600.0;
+        config.crypto.rekey_after_bytes = 0;
+        let error = validate_configuration(&config).unwrap_err();
+        assert!(error.contains("rekeyAfterBytes"));
     }
 
     #[test]

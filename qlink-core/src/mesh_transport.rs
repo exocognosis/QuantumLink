@@ -31,7 +31,7 @@
 use crate::quic_transport::QuicEndpoint;
 use crate::{
     carrier_transport::CarrierSession,
-    crypto::DeviceKeypair,
+    crypto::{shake256_xof, DeviceKeypair},
     discovery::{now_unix, CandidateEndpoint, CandidateType, PeerRecord, UnsignedPeerRecord},
     dytallix_identity::{
         verify_inbound_registry_assertion, DytallixIdentityRegistry, DytallixRegistryLookupConfig,
@@ -54,11 +54,11 @@ use crate::{
     pqc_frame::PqcFrameProtector,
     pqc_session_wire::run_pqc_session_responder,
     rendezvous::RendezvousClient,
-    session_crypto::PqcSessionContext,
+    session_crypto::{derive_packet_session_binding, PqcSessionContext, PqcSessionRole},
     traversal::HOST_PRIORITY,
 };
 #[cfg(not(feature = "dev-quic-carrier"))]
-use crate::{carrier_transport::NativeUdpSession, mesh_connection::native_udp_carrier_binding};
+use crate::{carrier_transport::NativeUdpListener, mesh_connection::native_udp_carrier_binding};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -76,6 +76,118 @@ use tokio::{
     sync::{mpsc, Mutex as TokioMutex},
     task::JoinHandle,
 };
+
+const DEFAULT_PACKET_SESSION_LIFETIME_SECONDS: u64 = 3_600;
+const DEFAULT_PACKET_SESSION_REKEY_AFTER_BYTES: u64 = 1_073_741_824;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PacketSessionDirection {
+    Outbound,
+    Inbound,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct PacketSessionLease {
+    pub peer_id: String,
+    pub direction: PacketSessionDirection,
+    pub generation: u64,
+    pub transcript_binding: [u8; 32],
+    pub expires_at_unix: u64,
+    pub rekey_after_bytes: u64,
+}
+
+impl std::fmt::Debug for PacketSessionLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PacketSessionLease")
+            .field("peer_id", &self.peer_id)
+            .field("direction", &self.direction)
+            .field("generation", &self.generation)
+            .field("transcript_binding", &"[redacted]")
+            .field("expires_at_unix", &self.expires_at_unix)
+            .field("rekey_after_bytes", &self.rekey_after_bytes)
+            .finish()
+    }
+}
+
+impl PacketSessionLease {
+    fn is_current(&self) -> bool {
+        self.expires_at_unix > now_unix()
+    }
+}
+
+fn next_packet_session_generation(counter: &AtomicU64) -> Option<u64> {
+    counter
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            current.checked_add(1)
+        })
+        .ok()
+        .and_then(|previous| previous.checked_add(1))
+}
+
+fn packet_session_lease(
+    peer_id: String,
+    direction: PacketSessionDirection,
+    generation: u64,
+    authenticated_binding: [u8; 32],
+    lifetime_seconds: u64,
+    rekey_after_bytes: u64,
+) -> PacketSessionLease {
+    let expires_at_unix = now_unix().saturating_add(lifetime_seconds);
+    let direction_label = match direction {
+        PacketSessionDirection::Outbound => b"outbound".as_slice(),
+        PacketSessionDirection::Inbound => b"inbound".as_slice(),
+    };
+    let generation_bytes = generation.to_be_bytes();
+    let expiry_bytes = expires_at_unix.to_be_bytes();
+    let byte_limit_bytes = rekey_after_bytes.to_be_bytes();
+    let transcript_binding = shake256_xof::<32>(
+        b"QuantumLink packet session readiness lease v1",
+        &[
+            &authenticated_binding,
+            peer_id.as_bytes(),
+            direction_label,
+            &generation_bytes,
+            &expiry_bytes,
+            &byte_limit_bytes,
+        ],
+    );
+    PacketSessionLease {
+        peer_id,
+        direction,
+        generation,
+        transcript_binding,
+        expires_at_unix,
+        rekey_after_bytes,
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub enum PacketSessionEvent {
+    Ready(PacketSessionLease),
+    Cleared {
+        peer_id: String,
+        direction: PacketSessionDirection,
+        generation: u64,
+    },
+}
+
+impl std::fmt::Debug for PacketSessionEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ready(lease) => f.debug_tuple("Ready").field(lease).finish(),
+            Self::Cleared {
+                peer_id,
+                direction,
+                generation,
+            } => f
+                .debug_struct("Cleared")
+                .field("peer_id", peer_id)
+                .field("direction", direction)
+                .field("generation", generation)
+                .finish(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MeshTransportState {
@@ -345,6 +457,7 @@ struct SharedState {
     send_failures: AtomicU64,
     receive_failures: AtomicU64,
     reconnect_count: AtomicU64,
+    packet_session: StdMutex<Option<PacketSessionLease>>,
 }
 
 impl SharedState {
@@ -361,6 +474,7 @@ impl SharedState {
             send_failures: AtomicU64::new(0),
             receive_failures: AtomicU64::new(0),
             reconnect_count: AtomicU64::new(0),
+            packet_session: StdMutex::new(None),
         }
     }
 
@@ -418,6 +532,33 @@ impl SharedState {
             .lock()
             .map(|guard| *guard)
             .unwrap_or_default()
+    }
+
+    fn publish_packet_session(&self, session: PacketSessionLease) {
+        if let Ok(mut guard) = self.packet_session.lock() {
+            *guard = Some(session);
+        }
+    }
+
+    fn current_packet_session(&self) -> Option<PacketSessionLease> {
+        self.packet_session
+            .lock()
+            .ok()?
+            .as_ref()
+            .filter(|session| session.is_current())
+            .cloned()
+    }
+
+    fn clear_packet_session(&self, generation: u64) -> Option<PacketSessionLease> {
+        let mut guard = self.packet_session.lock().ok()?;
+        if guard.as_ref().map(|session| session.generation) != Some(generation) {
+            return None;
+        }
+        guard.take()
+    }
+
+    fn take_packet_session(&self) -> Option<PacketSessionLease> {
+        self.packet_session.lock().ok()?.take()
     }
 
     /// Per-peer metrics only. Transport-level fields like
@@ -488,6 +629,14 @@ pub struct MeshTransportConfig {
     pub reconnect_initial_backoff_ms: u64,
     #[serde(default = "default_reconnect_max_backoff_ms")]
     pub reconnect_max_backoff_ms: u64,
+    /// Maximum authenticated packet-session lifetime before a fresh PQC
+    /// handshake is required.
+    #[serde(default = "default_packet_session_lifetime_seconds")]
+    pub packet_session_lifetime_seconds: u64,
+    /// Maximum protected payload bytes across the live session before a fresh
+    /// PQC handshake is required.
+    #[serde(default = "default_packet_session_rekey_after_bytes")]
+    pub packet_session_rekey_after_bytes: u64,
     /// Optional bind address for the OpenMetrics HTTP endpoint. When set,
     /// the transport spawns the metrics exporter on this address and
     /// publishes its live state at `GET /metrics` in OpenMetrics text
@@ -550,8 +699,28 @@ fn default_reconnect_initial_backoff_ms() -> u64 {
 fn default_reconnect_max_backoff_ms() -> u64 {
     30_000
 }
+fn default_packet_session_lifetime_seconds() -> u64 {
+    DEFAULT_PACKET_SESSION_LIFETIME_SECONDS
+}
+fn default_packet_session_rekey_after_bytes() -> u64 {
+    DEFAULT_PACKET_SESSION_REKEY_AFTER_BYTES
+}
 fn default_mesh_trust_policy() -> MeshTrustPolicy {
     MeshTrustPolicy::DevelopmentOptional
+}
+
+fn validate_packet_session_policy(config: &MeshTransportConfig) -> Result<()> {
+    if config.packet_session_lifetime_seconds == 0 {
+        return Err(QlinkError::Protocol(
+            "packet_session_lifetime_seconds must be greater than zero".into(),
+        ));
+    }
+    if config.packet_session_rekey_after_bytes == 0 {
+        return Err(QlinkError::Protocol(
+            "packet_session_rekey_after_bytes must be greater than zero".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_public_dytallix_registry_pins(
@@ -598,6 +767,7 @@ fn validate_public_dytallix_registry_pins(
 pub struct InboundFrame {
     pub peer_id: String,
     pub frame: Vec<u8>,
+    pub packet_session: PacketSessionLease,
 }
 
 /// Per-peer session state held inside `MeshTransportHandle`. Each entry
@@ -608,6 +778,7 @@ struct PerPeerSession {
     event_tx: mpsc::UnboundedSender<NetworkEvent>,
     shutdown_tx: mpsc::UnboundedSender<()>,
     shared: Arc<SharedState>,
+    packet_session_event_tx: mpsc::UnboundedSender<PacketSessionEvent>,
     manager_task: Option<JoinHandle<()>>,
 }
 
@@ -615,6 +786,24 @@ impl PerPeerSession {
     /// Tears down this peer's session. Called both when the operator
     /// removes the peer and when the whole transport is dropped.
     fn shutdown(&mut self) {
+        if let Some(session) = self.shared.take_packet_session() {
+            let peer_id = session.peer_id.clone();
+            let generation = session.generation;
+            let _ = self
+                .packet_session_event_tx
+                .send(PacketSessionEvent::Cleared {
+                    peer_id: session.peer_id,
+                    direction: session.direction,
+                    generation,
+                });
+            let _ = self
+                .packet_session_event_tx
+                .send(PacketSessionEvent::Cleared {
+                    peer_id,
+                    direction: PacketSessionDirection::Inbound,
+                    generation,
+                });
+        }
         let _ = self.shutdown_tx.send(());
         if let Some(handle) = self.manager_task.take() {
             handle.abort();
@@ -649,6 +838,11 @@ pub struct MeshTransportHandle {
     /// received frames here (wrapped with the source peer ID).
     inbound_tx: mpsc::UnboundedSender<InboundFrame>,
     inbound_rx: TokioMutex<mpsc::UnboundedReceiver<InboundFrame>>,
+    packet_session_generation: Arc<AtomicU64>,
+    packet_session_event_tx: mpsc::UnboundedSender<PacketSessionEvent>,
+    packet_session_event_rx: TokioMutex<mpsc::UnboundedReceiver<PacketSessionEvent>>,
+    packet_session_lifetime_seconds: u64,
+    packet_session_rekey_after_bytes: u64,
     /// Transport-level counters that aren't per-peer (today: just the
     /// network-event count).
     aggregate: Arc<AggregateState>,
@@ -701,6 +895,7 @@ impl MeshTransportHandle {
         config: MeshTransportConfig,
         local_device_keypair: Option<Arc<DeviceKeypair>>,
     ) -> Result<Self> {
+        validate_packet_session_policy(&config)?;
         if let Some(local_device_keypair) = local_device_keypair.as_ref() {
             let keypair_peer_id = local_device_keypair.public_key().peer_id();
             if keypair_peer_id != config.local_peer_id {
@@ -815,6 +1010,9 @@ impl MeshTransportHandle {
         let aggregate = Arc::new(AggregateState::new());
         let blocked_peer_history = Arc::new(BlockedPeerHistory::new());
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<InboundFrame>();
+        let packet_session_generation = Arc::new(AtomicU64::new(0));
+        let (packet_session_event_tx, packet_session_event_rx) =
+            mpsc::unbounded_channel::<PacketSessionEvent>();
         let peers: Arc<StdMutex<HashMap<String, PerPeerSession>>> =
             Arc::new(StdMutex::new(HashMap::new()));
 
@@ -843,6 +1041,8 @@ impl MeshTransportHandle {
                 let local_addr = responder_local_addr
                     .expect("native UDP responder local address must exist when enabled");
                 let inbound_tx_responder = inbound_tx.clone();
+                let packet_session_generation_responder = packet_session_generation.clone();
+                let packet_session_event_tx_responder = packet_session_event_tx.clone();
                 let blocked_peer_history_responder = blocked_peer_history.clone();
                 Some(runtime.spawn(run_native_udp_responder_loop(
                     socket,
@@ -854,7 +1054,11 @@ impl MeshTransportHandle {
                     inbound_mesh_trust_policy,
                     inbound_identity_registry_lookup,
                     inbound_tx_responder,
+                    packet_session_generation_responder,
+                    packet_session_event_tx_responder,
                     blocked_peer_history_responder,
+                    config.packet_session_lifetime_seconds,
+                    config.packet_session_rekey_after_bytes,
                 )))
             }
             None => None,
@@ -868,6 +1072,11 @@ impl MeshTransportHandle {
             default_peer_id: StdMutex::new(Some(config.remote_peer_id.clone())),
             inbound_tx,
             inbound_rx: TokioMutex::new(inbound_rx),
+            packet_session_generation,
+            packet_session_event_tx,
+            packet_session_event_rx: TokioMutex::new(packet_session_event_rx),
+            packet_session_lifetime_seconds: config.packet_session_lifetime_seconds,
+            packet_session_rekey_after_bytes: config.packet_session_rekey_after_bytes,
             aggregate,
             blocked_peer_history,
             metrics_endpoint: StdMutex::new(metrics_endpoint),
@@ -886,6 +1095,7 @@ impl MeshTransportHandle {
         config: MeshTransportConfig,
         local_device_keypair: Option<Arc<DeviceKeypair>>,
     ) -> Result<Self> {
+        validate_packet_session_policy(&config)?;
         if let Some(local_device_keypair) = local_device_keypair.as_ref() {
             let keypair_peer_id = local_device_keypair.public_key().peer_id();
             if keypair_peer_id != config.local_peer_id {
@@ -1026,6 +1236,9 @@ impl MeshTransportHandle {
         let aggregate = Arc::new(AggregateState::new());
         let blocked_peer_history = Arc::new(BlockedPeerHistory::new());
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<InboundFrame>();
+        let packet_session_generation = Arc::new(AtomicU64::new(0));
+        let (packet_session_event_tx, packet_session_event_rx) =
+            mpsc::unbounded_channel::<PacketSessionEvent>();
         let peers: Arc<StdMutex<HashMap<String, PerPeerSession>>> =
             Arc::new(StdMutex::new(HashMap::new()));
 
@@ -1064,6 +1277,8 @@ impl MeshTransportHandle {
                     .clone()
                     .expect("server certificate DER must exist when responder is enabled");
                 let inbound_tx_responder = inbound_tx.clone();
+                let packet_session_generation_responder = packet_session_generation.clone();
+                let packet_session_event_tx_responder = packet_session_event_tx.clone();
                 let blocked_peer_history_responder = blocked_peer_history.clone();
                 let task = runtime.spawn(run_responder_loop(
                     endpoint,
@@ -1075,7 +1290,11 @@ impl MeshTransportHandle {
                     inbound_mesh_trust_policy,
                     inbound_identity_registry_lookup,
                     inbound_tx_responder,
+                    packet_session_generation_responder,
+                    packet_session_event_tx_responder,
                     blocked_peer_history_responder,
+                    config.packet_session_lifetime_seconds,
+                    config.packet_session_rekey_after_bytes,
                 ));
                 Some(task)
             }
@@ -1090,6 +1309,11 @@ impl MeshTransportHandle {
             default_peer_id: StdMutex::new(Some(config.remote_peer_id.clone())),
             inbound_tx,
             inbound_rx: TokioMutex::new(inbound_rx),
+            packet_session_generation,
+            packet_session_event_tx,
+            packet_session_event_rx: TokioMutex::new(packet_session_event_rx),
+            packet_session_lifetime_seconds: config.packet_session_lifetime_seconds,
+            packet_session_rekey_after_bytes: config.packet_session_rekey_after_bytes,
             aggregate,
             blocked_peer_history,
             metrics_endpoint: StdMutex::new(metrics_endpoint),
@@ -1270,7 +1494,11 @@ impl MeshTransportHandle {
             shutdown_rx,
             shared.clone(),
             self.backoff,
+            self.packet_session_generation.clone(),
+            self.packet_session_event_tx.clone(),
             self.blocked_peer_history.clone(),
+            self.packet_session_lifetime_seconds,
+            self.packet_session_rekey_after_bytes,
         ));
 
         peers.insert(
@@ -1280,6 +1508,7 @@ impl MeshTransportHandle {
                 event_tx,
                 shutdown_tx,
                 shared,
+                packet_session_event_tx: self.packet_session_event_tx.clone(),
                 manager_task: Some(manager_task),
             },
         );
@@ -1314,6 +1543,54 @@ impl MeshTransportHandle {
             .lock()
             .map(|peers| peers.keys().cloned().collect())
             .unwrap_or_default()
+    }
+
+    /// Replaces the legacy/default packet peer. The packet core is
+    /// intentionally single-peer, so the replacement clears the previous
+    /// lease before the new manager can publish readiness.
+    pub fn replace_default_peer(&self, remote_peer_id: &str) -> Result<()> {
+        let existing = self.default_peer_id_or_err().ok();
+        if existing.as_deref() == Some(remote_peer_id) {
+            return Ok(());
+        }
+        if let Some(existing) = existing {
+            self.remove_peer(&existing);
+        }
+        self.add_peer(remote_peer_id)?;
+        *self
+            .default_peer_id
+            .lock()
+            .map_err(|_| QlinkError::Protocol("default peer id mutex poisoned".into()))? =
+            Some(remote_peer_id.to_string());
+        Ok(())
+    }
+
+    /// Returns the exact authenticated lease for the selected outbound peer.
+    /// Multi-peer maps are rejected because `PacketTunnelCore` has one route
+    /// target and cannot safely infer which peer owns a protected packet.
+    pub fn default_packet_session(&self) -> Result<Option<PacketSessionLease>> {
+        let default = self.default_peer_id_or_err()?;
+        let peers = self
+            .peers
+            .lock()
+            .map_err(|_| QlinkError::Protocol("mesh transport peers mutex poisoned".into()))?;
+        if peers.len() != 1 {
+            return Err(QlinkError::Protocol(format!(
+                "single-peer packet routing requires exactly one mesh peer; found {}",
+                peers.len()
+            )));
+        }
+        let session = peers.get(&default).ok_or_else(|| {
+            QlinkError::Protocol(format!(
+                "default packet peer {default} is not an active mesh peer"
+            ))
+        })?;
+        Ok(session.shared.current_packet_session())
+    }
+
+    pub fn try_receive_packet_session_event(&self) -> Option<PacketSessionEvent> {
+        let mut rx = self.packet_session_event_rx.try_lock().ok()?;
+        rx.try_recv().ok()
     }
 
     /// Snapshot of retained trust/ACL rejection history. Entries are
@@ -1577,10 +1854,15 @@ async fn run_native_udp_responder_loop(
     mesh_trust_policy: MeshTrustPolicy,
     identity_registry_lookup: Option<Arc<dyn IdentityRegistryLookup>>,
     inbound_tx: mpsc::UnboundedSender<InboundFrame>,
+    packet_session_generation: Arc<AtomicU64>,
+    packet_session_event_tx: mpsc::UnboundedSender<PacketSessionEvent>,
     _blocked_peer_history: Arc<BlockedPeerHistory>,
+    packet_session_lifetime_seconds: u64,
+    packet_session_rekey_after_bytes: u64,
 ) {
+    let listener = NativeUdpListener::new(socket);
     loop {
-        let (session, _remote_addr) = match NativeUdpSession::accept_on(socket).await {
+        let (session, _remote_addr) = match listener.accept().await {
             Ok(accepted) => accepted,
             Err(error) => {
                 tracing::warn!(?error, "native UDP responder stopped");
@@ -1595,6 +1877,8 @@ async fn run_native_udp_responder_loop(
         let acl = inbound_acl.clone();
         let identity_registry_lookup = identity_registry_lookup.clone();
         let inbound_tx = inbound_tx.clone();
+        let packet_session_generation = packet_session_generation.clone();
+        let packet_session_event_tx = packet_session_event_tx.clone();
         tokio::spawn(async move {
             let acl_ref = acl.as_deref();
             let evaluation = receive_and_evaluate_inbound(
@@ -1649,9 +1933,9 @@ async fn run_native_udp_responder_loop(
 
                     let peer_id = assertion.peer_id;
                     let pqc_context = PqcSessionContext::new(
-                        mesh_id,
+                        mesh_id.clone(),
                         peer_id.clone(),
-                        local_peer_id,
+                        local_peer_id.clone(),
                         carrier_binding,
                     );
                     let handshake_timeout = pqc_responder_handshake_timeout();
@@ -1685,30 +1969,72 @@ async fn run_native_udp_responder_loop(
                             return;
                         }
                     };
+                    let authenticated_binding = derive_packet_session_binding(
+                        &session_keys.suite,
+                        &session_keys.handshake_hash,
+                        &mesh_id,
+                        &peer_id,
+                        &local_peer_id,
+                        PqcSessionRole::Responder,
+                    );
+                    let Some(generation) =
+                        next_packet_session_generation(&packet_session_generation)
+                    else {
+                        session.close(b"");
+                        return;
+                    };
+                    let packet_session = packet_session_lease(
+                        peer_id.clone(),
+                        PacketSessionDirection::Inbound,
+                        generation,
+                        authenticated_binding,
+                        packet_session_lifetime_seconds,
+                        packet_session_rekey_after_bytes,
+                    );
+                    let _ = packet_session_event_tx
+                        .send(PacketSessionEvent::Ready(packet_session.clone()));
                     let mut frame_protector = PqcFrameProtector::new(session_keys);
-                    while let Ok(protected_frame) = session.receive_frame().await {
+                    let deadline = tokio::time::Instant::now()
+                        + Duration::from_secs(packet_session_lifetime_seconds);
+                    let mut protected_bytes = 0_u64;
+                    loop {
+                        let protected_frame = tokio::select! {
+                            received = session.receive_frame() => match received {
+                                Ok(frame) => frame,
+                                Err(_) => break,
+                            },
+                            _ = tokio::time::sleep_until(deadline) => break,
+                        };
+                        protected_bytes =
+                            protected_bytes.saturating_add(protected_frame.len() as u64);
                         let frame = match frame_protector.open(&protected_frame) {
                             Ok(frame) => frame,
-                            Err(_) => {
-                                session.close(b"");
-                                return;
-                            }
+                            Err(_) => break,
                         };
                         let inbound_frame = InboundFrame {
                             peer_id: peer_id.clone(),
                             frame,
+                            packet_session: packet_session.clone(),
                         };
                         if inbound_tx.send(inbound_frame).is_err() {
                             break;
                         }
+                        if protected_bytes >= packet_session.rekey_after_bytes {
+                            break;
+                        }
                     }
+                    let _ = packet_session_event_tx.send(PacketSessionEvent::Cleared {
+                        peer_id,
+                        direction: PacketSessionDirection::Inbound,
+                        generation,
+                    });
+                    session.close(b"");
                 }
                 _ => {
                     session.close(b"");
                 }
             }
         });
-        break;
     }
 }
 
@@ -1723,7 +2049,11 @@ async fn run_responder_loop(
     mesh_trust_policy: MeshTrustPolicy,
     identity_registry_lookup: Option<Arc<dyn IdentityRegistryLookup>>,
     inbound_tx: mpsc::UnboundedSender<InboundFrame>,
+    packet_session_generation: Arc<AtomicU64>,
+    packet_session_event_tx: mpsc::UnboundedSender<PacketSessionEvent>,
     _blocked_peer_history: Arc<BlockedPeerHistory>,
+    packet_session_lifetime_seconds: u64,
+    packet_session_rekey_after_bytes: u64,
 ) {
     loop {
         let session = match server.accept_one().await {
@@ -1738,6 +2068,8 @@ async fn run_responder_loop(
         let acl = inbound_acl.clone();
         let identity_registry_lookup = identity_registry_lookup.clone();
         let inbound_tx = inbound_tx.clone();
+        let packet_session_generation = packet_session_generation.clone();
+        let packet_session_event_tx = packet_session_event_tx.clone();
         tokio::spawn(async move {
             let acl_ref = acl.as_deref();
             let evaluation = receive_and_evaluate_inbound(
@@ -1792,9 +2124,9 @@ async fn run_responder_loop(
 
                     let peer_id = assertion.peer_id;
                     let pqc_context = PqcSessionContext::new(
-                        mesh_id,
+                        mesh_id.clone(),
                         peer_id.clone(),
-                        local_peer_id,
+                        local_peer_id.clone(),
                         carrier_binding,
                     );
                     let handshake_timeout = pqc_responder_handshake_timeout();
@@ -1828,26 +2160,66 @@ async fn run_responder_loop(
                             return;
                         }
                     };
+                    let authenticated_binding = derive_packet_session_binding(
+                        &session_keys.suite,
+                        &session_keys.handshake_hash,
+                        &mesh_id,
+                        &peer_id,
+                        &local_peer_id,
+                        PqcSessionRole::Responder,
+                    );
+                    let Some(generation) =
+                        next_packet_session_generation(&packet_session_generation)
+                    else {
+                        session.close(b"");
+                        return;
+                    };
+                    let packet_session = packet_session_lease(
+                        peer_id.clone(),
+                        PacketSessionDirection::Inbound,
+                        generation,
+                        authenticated_binding,
+                        packet_session_lifetime_seconds,
+                        packet_session_rekey_after_bytes,
+                    );
+                    let _ = packet_session_event_tx
+                        .send(PacketSessionEvent::Ready(packet_session.clone()));
                     let mut frame_protector = PqcFrameProtector::new(session_keys);
-                    while let Ok(protected_frame) = session.receive_frame().await {
+                    let deadline = tokio::time::Instant::now()
+                        + Duration::from_secs(packet_session_lifetime_seconds);
+                    let mut protected_bytes = 0_u64;
+                    loop {
+                        let protected_frame = tokio::select! {
+                            received = session.receive_frame() => match received {
+                                Ok(frame) => frame,
+                                Err(_) => break,
+                            },
+                            _ = tokio::time::sleep_until(deadline) => break,
+                        };
+                        protected_bytes =
+                            protected_bytes.saturating_add(protected_frame.len() as u64);
                         let frame = match frame_protector.open(&protected_frame) {
                             Ok(frame) => frame,
-                            Err(_) => {
-                                session.close(b"");
-                                return;
-                            }
+                            Err(_) => break,
                         };
                         let inbound_frame = InboundFrame {
                             peer_id: peer_id.clone(),
                             frame,
+                            packet_session: packet_session.clone(),
                         };
                         if inbound_tx.send(inbound_frame).is_err() {
-                            // Receiver dropped — the transport handle is
-                            // gone or being torn down; nothing useful to
-                            // do here.
+                            break;
+                        }
+                        if protected_bytes >= packet_session.rekey_after_bytes {
                             break;
                         }
                     }
+                    let _ = packet_session_event_tx.send(PacketSessionEvent::Cleared {
+                        peer_id,
+                        direction: PacketSessionDirection::Inbound,
+                        generation,
+                    });
+                    session.close(b"");
                 }
                 _ => {
                     // Closing without a reason is intentional: echoing
@@ -2041,7 +2413,11 @@ async fn run_session_manager(
     mut shutdown_rx: mpsc::UnboundedReceiver<()>,
     shared: Arc<SharedState>,
     backoff: BackoffConfig,
+    packet_session_generation: Arc<AtomicU64>,
+    packet_session_event_tx: mpsc::UnboundedSender<PacketSessionEvent>,
     blocked_peer_history: Arc<BlockedPeerHistory>,
+    packet_session_lifetime_seconds: u64,
+    packet_session_rekey_after_bytes: u64,
 ) {
     let mut first_attempt = true;
     let mut consecutive_failures: u32 = 0;
@@ -2103,41 +2479,89 @@ async fn run_session_manager(
             }
         };
 
+        let Some(generation) = next_packet_session_generation(&packet_session_generation) else {
+            shared.set_last_error(Some("packet session generation exhausted".to_string()));
+            shared.set_state(MeshTransportState::Failed);
+            link.close(b"packet session generation exhausted");
+            return;
+        };
+        let packet_session = packet_session_lease(
+            remote_peer_id.clone(),
+            PacketSessionDirection::Outbound,
+            generation,
+            link.packet_session_binding(),
+            packet_session_lifetime_seconds,
+            packet_session_rekey_after_bytes,
+        );
+        let manager_carries_inbound =
+            path_kind == PathKind::Relay || cfg!(feature = "dev-quic-carrier");
+        let inbound_packet_session = manager_carries_inbound.then(|| {
+            packet_session_lease(
+                remote_peer_id.clone(),
+                PacketSessionDirection::Inbound,
+                generation,
+                link.packet_session_binding(),
+                packet_session_lifetime_seconds,
+                packet_session_rekey_after_bytes,
+            )
+        });
+        shared.publish_packet_session(packet_session.clone());
+        let _ = packet_session_event_tx.send(PacketSessionEvent::Ready(packet_session.clone()));
+        if let Some(inbound_packet_session) = inbound_packet_session.as_ref() {
+            let _ = packet_session_event_tx
+                .send(PacketSessionEvent::Ready(inbound_packet_session.clone()));
+        }
         shared.set_path_kind(Some(path_kind));
         shared.set_state(MeshTransportState::Ready);
 
         // Drive the link until it dies or we get an event that demands
         // reconnect.
-        let need_reconnect = loop {
+        enum SessionLoopExit {
+            Reconnect,
+            Stop,
+        }
+        let rotation_deadline =
+            tokio::time::Instant::now() + Duration::from_secs(packet_session_lifetime_seconds);
+        let mut session_bytes = 0_u64;
+        let exit = loop {
             tokio::select! {
                 outbound = outbound_rx.recv() => {
-                    let Some(frame) = outbound else { return; };
+                    let Some(frame) = outbound else { break SessionLoopExit::Stop; };
+                    let frame_len = frame.len() as u64;
                     if let Err(error) = link.send_frame(frame).await {
                         shared.send_failures.fetch_add(1, Ordering::Relaxed);
                         shared.set_last_error(Some(error.to_string()));
-                        break true; // link dead, retry connect
+                        break SessionLoopExit::Reconnect;
                     }
+                    session_bytes = session_bytes.saturating_add(frame_len);
                 }
                 inbound = link.receive_frame() => {
                     match inbound {
                         Ok(frame) => {
+                            let Some(inbound_packet_session) = inbound_packet_session.as_ref() else {
+                                shared.receive_failures.fetch_add(1, Ordering::Relaxed);
+                                shared.set_last_error(Some(
+                                    "unexpected inbound frame on direct outbound session".to_string(),
+                                ));
+                                break SessionLoopExit::Reconnect;
+                            };
                             let len = frame.len() as u64;
                             shared.frames_received.fetch_add(1, Ordering::Relaxed);
                             shared.bytes_received.fetch_add(len, Ordering::Relaxed);
                             let envelope = InboundFrame {
                                 peer_id: remote_peer_id.clone(),
                                 frame,
+                                packet_session: inbound_packet_session.clone(),
                             };
                             if inbound_tx.send(envelope).is_err() {
-                                // Swift dropped the receiver — handle is
-                                // dying; let the manager exit on next event.
-                                return;
+                                break SessionLoopExit::Stop;
                             }
+                            session_bytes = session_bytes.saturating_add(len);
                         }
                         Err(error) => {
                             shared.receive_failures.fetch_add(1, Ordering::Relaxed);
                             shared.set_last_error(Some(error.to_string()));
-                            break true; // link dead, retry connect
+                            break SessionLoopExit::Reconnect;
                         }
                     }
                 }
@@ -2145,29 +2569,51 @@ async fn run_session_manager(
                     match event {
                         Some(NetworkEvent::PathChanged) | Some(NetworkEvent::PostWake) => {
                             connector.handle_network_event(NetworkEvent::PathChanged);
-                            break true;
+                            break SessionLoopExit::Reconnect;
                         }
                         Some(NetworkEvent::ReachabilityChanged { reachable: true }) => {
                             // Back online: re-probe to validate the path.
-                            break true;
+                            break SessionLoopExit::Reconnect;
                         }
                         Some(_) => {
                             // PreSleep / Offline: keep the link, just record.
                         }
-                        None => return, // event channel dropped
+                        None => break SessionLoopExit::Stop,
                     }
                 }
                 _ = shutdown_rx.recv() => {
-                    link.close(b"transport shutdown");
-                    shared.set_state(MeshTransportState::Stopped);
-                    return;
+                    break SessionLoopExit::Stop;
                 }
+                _ = tokio::time::sleep_until(rotation_deadline) => {
+                    break SessionLoopExit::Reconnect;
+                }
+            }
+            if session_bytes >= packet_session.rekey_after_bytes {
+                break SessionLoopExit::Reconnect;
             }
         };
 
-        link.close(b"reconnecting");
-        if !need_reconnect {
-            return;
+        if let Some(cleared) = shared.clear_packet_session(generation) {
+            let _ = packet_session_event_tx.send(PacketSessionEvent::Cleared {
+                peer_id: cleared.peer_id,
+                direction: cleared.direction,
+                generation: cleared.generation,
+            });
+            if inbound_packet_session.is_some() {
+                let _ = packet_session_event_tx.send(PacketSessionEvent::Cleared {
+                    peer_id: remote_peer_id.clone(),
+                    direction: PacketSessionDirection::Inbound,
+                    generation,
+                });
+            }
+        }
+        match exit {
+            SessionLoopExit::Reconnect => link.close(b"reconnecting"),
+            SessionLoopExit::Stop => {
+                link.close(b"transport shutdown");
+                shared.set_state(MeshTransportState::Stopped);
+                return;
+            }
         }
     }
 }
@@ -2179,7 +2625,7 @@ mod native_udp_tests {
     use std::time::Instant;
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn publish_self_then_two_peers_round_trip_via_native_udp() {
+    async fn publish_self_then_two_peers_exchange_and_rotate_authenticated_sessions() {
         let rendezvous = spawn_dev_rendezvous().await.unwrap();
         let rendezvous_url = rendezvous.local_addr().to_string();
         let key_a = Arc::new(DeviceKeypair::generate().unwrap());
@@ -2193,10 +2639,9 @@ mod native_udp_tests {
             let rendezvous_url = rendezvous_url.clone();
             let key_a = key_a.clone();
             move || {
-                MeshTransportHandle::new_with_keypair(
-                    test_config(&peer_a, &peer_b, &rendezvous_url),
-                    Some(key_a),
-                )
+                let mut config = test_config(&peer_a, &peer_b, &rendezvous_url);
+                config.packet_session_rekey_after_bytes = 64;
+                MeshTransportHandle::new_with_keypair(config, Some(key_a))
             }
         })
         .await
@@ -2208,10 +2653,9 @@ mod native_udp_tests {
             let rendezvous_url = rendezvous_url.clone();
             let key_b = key_b.clone();
             move || {
-                MeshTransportHandle::new_with_keypair(
-                    test_config(&peer_b, &peer_a, &rendezvous_url),
-                    Some(key_b),
-                )
+                let mut config = test_config(&peer_b, &peer_a, &rendezvous_url);
+                config.packet_session_rekey_after_bytes = 64;
+                MeshTransportHandle::new_with_keypair(config, Some(key_b))
             }
         })
         .await
@@ -2227,9 +2671,16 @@ mod native_udp_tests {
             .await
             .unwrap();
 
-        handle_a
-            .send_frame_to(&peer_b, b"native-udp-handle-frame".to_vec())
-            .unwrap();
+        let lease_a = wait_for_outbound_lease(&handle_a, None).await;
+        let lease_b = wait_for_outbound_lease(&handle_b, None).await;
+        assert_eq!(lease_a.direction, PacketSessionDirection::Outbound);
+        assert_eq!(lease_b.direction, PacketSessionDirection::Outbound);
+        assert_ne!(lease_a.transcript_binding, [0; 32]);
+        assert_ne!(lease_b.transcript_binding, [0; 32]);
+        assert_eq!(handle_a.peer_path_kind_code(&peer_b), Some(1));
+
+        let frame_a = vec![0x41; 96];
+        handle_a.send_frame_to(&peer_b, frame_a.clone()).unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(3);
         let received = loop {
@@ -2243,8 +2694,63 @@ mod native_udp_tests {
         };
 
         assert_eq!(received.peer_id, peer_a);
-        assert_eq!(received.frame, b"native-udp-handle-frame");
-        assert_eq!(handle_a.peer_path_kind_code(&peer_b), Some(1));
+        assert_eq!(received.frame, frame_a);
+        assert_eq!(
+            received.packet_session.direction,
+            PacketSessionDirection::Inbound
+        );
+        assert_ne!(received.packet_session.transcript_binding, [0; 32]);
+
+        let rotated_a = wait_for_outbound_lease(&handle_a, Some(lease_a.generation)).await;
+        assert!(rotated_a.generation > lease_a.generation);
+
+        let frame_b = vec![0x42; 96];
+        handle_b.send_frame_to(&peer_a, frame_b.clone()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let received = loop {
+            if let Some(frame) = handle_a.try_receive_frame_from_any() {
+                break frame;
+            }
+            if Instant::now() >= deadline {
+                panic!("timed out waiting for reverse native UDP inbound frame");
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        assert_eq!(received.peer_id, peer_b);
+        assert_eq!(received.frame, frame_b);
+        assert_eq!(
+            received.packet_session.direction,
+            PacketSessionDirection::Inbound
+        );
+
+        let rotated_b = wait_for_outbound_lease(&handle_b, Some(lease_b.generation)).await;
+        assert!(rotated_b.generation > lease_b.generation);
+    }
+
+    async fn wait_for_outbound_lease(
+        handle: &MeshTransportHandle,
+        generation_greater_than: Option<u64>,
+    ) -> PacketSessionLease {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(Some(lease)) = handle.default_packet_session() {
+                if generation_greater_than.is_none_or(|generation| lease.generation > generation) {
+                    return lease;
+                }
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "timed out waiting for authenticated outbound packet session; state={} metrics={:?} error={:?}",
+                    handle.state_code(),
+                    handle.metrics(),
+                    handle
+                        .default_peer_id_or_err()
+                        .ok()
+                        .and_then(|peer_id| handle.peer_last_error(&peer_id))
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     }
 
     #[test]
@@ -2294,6 +2800,8 @@ mod native_udp_tests {
             enable_ice: false,
             reconnect_initial_backoff_ms: 100,
             reconnect_max_backoff_ms: 1_000,
+            packet_session_lifetime_seconds: DEFAULT_PACKET_SESSION_LIFETIME_SECONDS,
+            packet_session_rekey_after_bytes: DEFAULT_PACKET_SESSION_REKEY_AFTER_BYTES,
             metrics_endpoint_bind_addr: None,
             inbound_acl: None,
             disable_inbound_responder: false,
@@ -2799,6 +3307,8 @@ mod tests {
             enable_ice: false,
             reconnect_initial_backoff_ms: 60_000,
             reconnect_max_backoff_ms: 60_000,
+            packet_session_lifetime_seconds: DEFAULT_PACKET_SESSION_LIFETIME_SECONDS,
+            packet_session_rekey_after_bytes: DEFAULT_PACKET_SESSION_REKEY_AFTER_BYTES,
             metrics_endpoint_bind_addr: None,
             inbound_acl: None,
             disable_inbound_responder: true,
@@ -2828,6 +3338,8 @@ mod tests {
             enable_ice: false,
             reconnect_initial_backoff_ms: 60_000,
             reconnect_max_backoff_ms: 60_000,
+            packet_session_lifetime_seconds: DEFAULT_PACKET_SESSION_LIFETIME_SECONDS,
+            packet_session_rekey_after_bytes: DEFAULT_PACKET_SESSION_REKEY_AFTER_BYTES,
             metrics_endpoint_bind_addr: None,
             inbound_acl: None,
             disable_inbound_responder: true,
@@ -2902,6 +3414,8 @@ mod tests {
                     enable_ice: false,
                     reconnect_initial_backoff_ms: 250,
                     reconnect_max_backoff_ms: 30_000,
+                    packet_session_lifetime_seconds: DEFAULT_PACKET_SESSION_LIFETIME_SECONDS,
+                    packet_session_rekey_after_bytes: DEFAULT_PACKET_SESSION_REKEY_AFTER_BYTES,
                     metrics_endpoint_bind_addr: None,
                     inbound_acl: None,
                     disable_inbound_responder: true,
@@ -2977,6 +3491,8 @@ mod tests {
                     // before any retry kicks in.
                     reconnect_initial_backoff_ms: 60_000,
                     reconnect_max_backoff_ms: 60_000,
+                    packet_session_lifetime_seconds: DEFAULT_PACKET_SESSION_LIFETIME_SECONDS,
+                    packet_session_rekey_after_bytes: DEFAULT_PACKET_SESSION_REKEY_AFTER_BYTES,
                     metrics_endpoint_bind_addr: None,
                     inbound_acl: None,
                     disable_inbound_responder: true,
@@ -3031,6 +3547,8 @@ mod tests {
                     // Initial 50ms doubles to 100ms then plateaus at 200ms.
                     reconnect_initial_backoff_ms: 50,
                     reconnect_max_backoff_ms: 200,
+                    packet_session_lifetime_seconds: DEFAULT_PACKET_SESSION_LIFETIME_SECONDS,
+                    packet_session_rekey_after_bytes: DEFAULT_PACKET_SESSION_REKEY_AFTER_BYTES,
                     metrics_endpoint_bind_addr: None,
                     inbound_acl: None,
                     disable_inbound_responder: true,
@@ -3126,6 +3644,8 @@ mod tests {
                     enable_ice: false,
                     reconnect_initial_backoff_ms: 250,
                     reconnect_max_backoff_ms: 30_000,
+                    packet_session_lifetime_seconds: DEFAULT_PACKET_SESSION_LIFETIME_SECONDS,
+                    packet_session_rekey_after_bytes: DEFAULT_PACKET_SESSION_REKEY_AFTER_BYTES,
                     metrics_endpoint_bind_addr: Some("127.0.0.1:0".to_string()),
                     inbound_acl: None,
                     disable_inbound_responder: true,
@@ -3242,6 +3762,8 @@ mod tests {
                     // should cut that short and force an immediate retry.
                     reconnect_initial_backoff_ms: 5_000,
                     reconnect_max_backoff_ms: 5_000,
+                    packet_session_lifetime_seconds: DEFAULT_PACKET_SESSION_LIFETIME_SECONDS,
+                    packet_session_rekey_after_bytes: DEFAULT_PACKET_SESSION_REKEY_AFTER_BYTES,
                     metrics_endpoint_bind_addr: None,
                     inbound_acl: None,
                     disable_inbound_responder: true,
@@ -3373,6 +3895,8 @@ mod tests {
                     enable_ice: false,
                     reconnect_initial_backoff_ms: 250,
                     reconnect_max_backoff_ms: 30_000,
+                    packet_session_lifetime_seconds: DEFAULT_PACKET_SESSION_LIFETIME_SECONDS,
+                    packet_session_rekey_after_bytes: DEFAULT_PACKET_SESSION_REKEY_AFTER_BYTES,
                     metrics_endpoint_bind_addr: None,
                     inbound_acl: None,
                     disable_inbound_responder: true,
@@ -3513,6 +4037,8 @@ mod tests {
                     enable_ice: false,
                     reconnect_initial_backoff_ms: 250,
                     reconnect_max_backoff_ms: 30_000,
+                    packet_session_lifetime_seconds: DEFAULT_PACKET_SESSION_LIFETIME_SECONDS,
+                    packet_session_rekey_after_bytes: DEFAULT_PACKET_SESSION_REKEY_AFTER_BYTES,
                     metrics_endpoint_bind_addr: None,
                     inbound_acl: None,
                     disable_inbound_responder: true,
@@ -3577,6 +4103,8 @@ mod tests {
                     enable_ice: false,
                     reconnect_initial_backoff_ms: 5_000, // long enough that natural retry won't fire
                     reconnect_max_backoff_ms: 5_000,
+                    packet_session_lifetime_seconds: DEFAULT_PACKET_SESSION_LIFETIME_SECONDS,
+                    packet_session_rekey_after_bytes: DEFAULT_PACKET_SESSION_REKEY_AFTER_BYTES,
                     metrics_endpoint_bind_addr: None,
                     inbound_acl: None,
                     disable_inbound_responder: true,
@@ -3676,6 +4204,8 @@ mod tests {
                         enable_ice: false,
                         reconnect_initial_backoff_ms: 60_000,
                         reconnect_max_backoff_ms: 60_000,
+                        packet_session_lifetime_seconds: DEFAULT_PACKET_SESSION_LIFETIME_SECONDS,
+                        packet_session_rekey_after_bytes: DEFAULT_PACKET_SESSION_REKEY_AFTER_BYTES,
                         metrics_endpoint_bind_addr: None,
                         inbound_acl: None,
                         disable_inbound_responder: true,
@@ -3744,6 +4274,8 @@ mod tests {
                     enable_ice: false,
                     reconnect_initial_backoff_ms: 60_000,
                     reconnect_max_backoff_ms: 60_000,
+                    packet_session_lifetime_seconds: DEFAULT_PACKET_SESSION_LIFETIME_SECONDS,
+                    packet_session_rekey_after_bytes: DEFAULT_PACKET_SESSION_REKEY_AFTER_BYTES,
                     metrics_endpoint_bind_addr: None,
                     inbound_acl,
                     disable_inbound_responder: false,

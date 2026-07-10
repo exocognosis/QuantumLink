@@ -79,6 +79,25 @@ class WindowsReleaseWorkflowContractTest < Minitest::Test
     ]
   end
 
+  def test_installer_runs_elevated_fail_closed_wfp_cleanup_after_service_stop
+    assert_match(
+      %r{<CustomAction Id="CleanupQuantumLinkWfp"\s+FileRef="ServiceExe"\s+ExeCommand="wfp-cleanup"\s+Execute="deferred"\s+Impersonate="no"\s+Return="check" />}m,
+      @installer_wxs
+    )
+    assert_match(
+      %r{<Custom Action="CleanupQuantumLinkWfp"\s+After="StopServices"\s+Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />}m,
+      @installer_wxs
+    )
+  end
+
+  def test_installer_docs_define_strict_wfp_probe_cleanup_and_upgrade_contract
+    assert_includes @installer_readme, "quantumlink-service.exe\" wfp-probe"
+    assert_includes @installer_readme, "quantumlink-service.exe\" wfp-cleanup"
+    assert_includes @installer_readme, "FWPM_FILTER_FLAG_BOOTTIME"
+    assert_includes @installer_readme, "FWPM_FILTER_FLAG_PERSISTENT"
+    assert_match(/Major upgrades intentionally skip the uninstall cleanup action/i, @installer_readme)
+  end
+
   def test_workflow_declares_manual_install_validation_inputs
     inputs = workflow_dispatch_inputs
 

@@ -1,0 +1,101 @@
+{
+  "schemaVersion": 1,
+  "evidenceKind": "windowsProductionValidationMatrixContract",
+  "retentionDays": 30,
+  "maxEvidenceBytes": 262144,
+  "maxMeasurementBytes": 1048576,
+  "maxSourceEvidenceBytes": 131072,
+  "maxArtifactVerificationBytes": 131072,
+  "maxReleaseArtifactBytes": 536870912,
+  "artifactNamePrefix": "quantumlink-windows-production-validation",
+  "externalHarness": "C:\\QuantumLinkValidation\\Invoke-QuantumLinkValidation.ps1",
+  "externalHarnessSha256": "",
+  "requiredRunnerLabels": ["self-hosted", "windows", "x64", "quantumlink-validation-harness-v1"],
+  "intendedControlPlaneHosts": [
+    "rv.quantumlinkvpn.com",
+    "relay.quantumlinkvpn.com"
+  ],
+  "lastAuditedPrerequisites": [
+    {
+      "id": "self_hosted_runners",
+      "status": "blocked",
+      "reason": "GitHub reported zero self-hosted runners on 2026-07-09."
+    },
+    {
+      "id": "authenticode_inputs",
+      "status": "blocked",
+      "reason": "WINDOWS_SIGNING_CERT_PFX_BASE64, WINDOWS_SIGNING_CERT_PASSWORD, and WINDOWS_SIGNING_TIMESTAMP_URL were not configured on 2026-07-09."
+    },
+    {
+      "id": "control_plane_dns",
+      "status": "blocked",
+      "reason": "The intended rendezvous and relay hosts did not resolve on 2026-07-09."
+    }
+  ],
+  "lanes": [
+    {
+      "id": "windows-10-22h2-vm",
+      "displayName": "Windows 10 22H2 VM",
+      "labels": ["self-hosted", "windows", "x64", "quantumlink-win10-22h2-vm"],
+      "prerequisiteLabels": ["quantumlink-topology-single-host-vm"],
+      "timeoutMinutes": 90,
+      "requiredChecks": ["authenticode_valid", "clean_install", "first_run", "service_start", "pipe_handshake", "adapter_created", "route_dns_owned", "direct_connect", "uninstall_clean"]
+    },
+    {
+      "id": "windows-11-x64-vm",
+      "displayName": "Windows 11 x64 VM",
+      "labels": ["self-hosted", "windows", "x64", "quantumlink-win11-x64-vm"],
+      "prerequisiteLabels": ["quantumlink-topology-single-host-vm"],
+      "timeoutMinutes": 90,
+      "requiredChecks": ["authenticode_valid", "clean_install", "first_run", "service_start", "pipe_handshake", "adapter_created", "route_dns_owned", "direct_connect", "uninstall_clean"]
+    },
+    {
+      "id": "windows-physical-x64",
+      "displayName": "Physical Windows x64",
+      "labels": ["self-hosted", "windows", "x64", "quantumlink-physical-x64"],
+      "prerequisiteLabels": ["quantumlink-topology-physical-host"],
+      "timeoutMinutes": 120,
+      "requiredChecks": ["authenticode_valid", "clean_install", "sleep_wake", "network_switch", "service_restart", "route_dns_cleanup", "direct_connect", "uninstall_clean"]
+    },
+    {
+      "id": "two-host-direct",
+      "displayName": "Two-host direct",
+      "labels": ["self-hosted", "windows", "x64", "quantumlink-two-host-direct"],
+      "prerequisiteLabels": ["quantumlink-topology-two-host-direct"],
+      "timeoutMinutes": 120,
+      "requiredChecks": ["authenticode_valid", "two_hosts_bound", "mutual_identity_verified", "direct_path_selected", "bidirectional_payload", "reconnect"]
+    },
+    {
+      "id": "hostile-nat-relay",
+      "displayName": "Hostile NAT relay",
+      "labels": ["self-hosted", "windows", "x64", "quantumlink-hostile-nat-relay"],
+      "prerequisiteLabels": ["quantumlink-topology-hostile-nat-relay"],
+      "timeoutMinutes": 120,
+      "requiredChecks": ["authenticode_valid", "two_hosts_bound", "direct_path_denied", "relay_path_selected", "relay_tls_verified", "bidirectional_payload", "relay_revocation"]
+    },
+    {
+      "id": "leak-service-crash-strict-wfp",
+      "displayName": "Leak, service crash, and strict WFP",
+      "labels": ["self-hosted", "windows", "x64", "quantumlink-wfp-strict"],
+      "prerequisiteLabels": ["quantumlink-topology-strict-wfp"],
+      "timeoutMinutes": 120,
+      "requiredChecks": ["authenticode_valid", "strict_wfp_enabled", "protected_prefix_no_leak", "dns_no_leak", "service_crash_fail_closed", "boot_fail_closed", "wfp_cleanup"]
+    },
+    {
+      "id": "upgrade-rollback-uninstall",
+      "displayName": "Upgrade, rollback, and uninstall",
+      "labels": ["self-hosted", "windows", "x64", "quantumlink-upgrade-rollback"],
+      "prerequisiteLabels": ["quantumlink-topology-upgrade-rollback"],
+      "timeoutMinutes": 120,
+      "requiredChecks": ["authenticode_valid", "prior_signed_msi_verified", "upgrade_preserves_configuration", "rollback_restores_prior_version", "uninstall_removes_service", "uninstall_removes_routes", "uninstall_removes_wfp"]
+    },
+    {
+      "id": "macos-windows-interop",
+      "displayName": "macOS-Windows interop",
+      "labels": ["self-hosted", "windows", "x64", "quantumlink-macos-windows-interop"],
+      "prerequisiteLabels": ["quantumlink-topology-macos-windows-interop"],
+      "timeoutMinutes": 120,
+      "requiredChecks": ["authenticode_valid", "macos_host_bound", "windows_host_bound", "mutual_identity_verified", "windows_to_macos_payload", "macos_to_windows_payload", "reconnect"]
+    }
+  ]
+}

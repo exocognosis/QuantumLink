@@ -1,9 +1,8 @@
 # Windows Production Release Readiness
 
 Date: 2026-07-09
-Branch: `codex/windows-production-grade-closeout`
-Baseline commit: `f8ec6d5135672415cfb9d514e9456f50c68b3cbd`
-Worktree: clean at ledger creation
+Branch: `codex/windows-production-finalization`
+Baseline commit: `76cf0283ccccc7514c55b43c387bc382fc97acd2`
 Target: Windows x64 IPv4-overlay private/public mesh
 
 This ledger is the production gate for the Windows release. The beta
@@ -26,9 +25,9 @@ this file are closed.
 | Wintun provenance | Blocked | Pinned official Wintun URL/SHA, signed `wintun.dll`, bundled license evidence | Missing official source proof, signature proof, or license file |
 | Clean install and first run | Blocked | Windows 10 22H2 VM, Windows 11 x64 VM, and physical x64 validation reports | Install, service start, pipe handshake, adapter creation, route/DNS setup, or first connect fails |
 | Privileged service boundary | Blocked | Service security validation report covering LocalSystem service, install paths, ProgramData ACLs, DPAPI, and named-pipe ACL | Any writable privileged binary path, weak ProgramData/secrets ACL, or unrestricted production pipe policy |
-| WFP kill switch | Blocked | Fail-closed and strict-mode validation reports plus protected-prefix packet captures | Protected-prefix traffic leaks, strict mode starts without WFP, or service-crash posture is undocumented |
+| WFP kill switch | Blocked | Signed fail-closed and strict-mode host reports, BFE object inventory, reboot/service-crash proof, and protected-prefix packet captures | Protected-prefix traffic leaks, persistent objects fail to survive/reconcile, cleanup mutates non-product objects, or host evidence is absent |
 | Route and DNS ownership | Blocked | Route/DNS validation report for overlay address, protected prefixes, DNS, MTU, cleanup, sleep/wake, and network switch | Orphan routes, DNS leakage, failed cleanup, or unrecoverable network churn |
-| Packet-session key readiness | Blocked | Unit/integration tests proving packets do not leave before authenticated peer-session material exists | Static development key use, cross-peer decrypt acceptance, or plaintext packet emission |
+| Packet-session key readiness | Blocked | Local authenticated two-handle rotation tests plus signed Windows/Wintun two-host evidence | Readiness installs without an authenticated handshake, stale generation clears current state, rotation fails, cross-peer acceptance occurs, or Windows-host evidence is absent |
 | Dytallix public identity policy | Blocked | Public mesh rejection reports for missing, revoked, suspended, mismatched, and stake/reputation-failed records | Public mesh can operate with identity enforcement disabled or stale invalid registry state |
 | Rendezvous and relay production profile | Blocked | `windows/docs/rendezvous-relay-production.md`, `windows/docs/production-evidence.md`, `windows/validation/rendezvous-relay-production-evidence.json`, and production config validation covering auth, TLS, TTL, retention, revocation, monitoring, and incident rollback | Unauthenticated rendezvous/relay, missing TLS, missing retention/revocation policy, excessive metadata exposure, missing sidecar manifest, or blocked sidecar verifier output |
 | Diagnostics and support bundle privacy | Blocked | Redaction test report and elevated raw-export audit evidence | Peer IDs, wallet addresses, endpoints, routes, DNS, SSIDs, external IPs, or packet captures leak in default diagnostics |
@@ -62,33 +61,59 @@ run URL, release asset name, or manually archived validation bundle.
 | Dytallix public mesh rejection report | Pending |
 | Diagnostics redaction report | `windows/docs/diagnostics-support-bundle.md`; Rust redaction tests pass, Windows UI/host audit Pending |
 | Upgrade/repair/rollback/uninstall report | Pending |
+| Production validation matrix contract | `windows/validation/contracts/windows-production-validation-matrix.json` |
+| Production validation workflow | `.github/workflows/windows-production-validation.yml` |
+| Production validation preflight plan | Pending GitHub Actions run |
 
 ## Task 4 Packet-Session Evidence
 
-Local code evidence now covers the packet-session fail-closed default:
+Local code evidence now covers live authenticated packet-session installation:
 
 - `TunnelConfiguration::packet_core_config_json()` emits
   `requirePeerSession=true` for public, identity-required, or
   rendezvous-backed Windows mesh packet-core construction. Explicit
   local loopback/development smoke config remains exempt so it can test
   packet encode/decode without claiming production key readiness.
+- Successful authenticated PQC handshakes publish redacted,
+  direction-specific readiness leases bound to the transcript, peer ids,
+  role, generation, expiry, and byte limit. Traffic keys remain exclusively
+  inside `PqcFrameProtector`.
+- The Windows engine installs ready/cleared events into separate inbound and
+  outbound packet-core slots. Stale directional clears cannot remove a newer
+  generation, and multi-peer packet routing is rejected as ambiguous.
+- `CryptoPolicy.rekeyAfterSeconds` and `rekeyAfterBytes` drive session
+  rotation. The native UDP listener accepts successive authenticated
+  sessions on the stable responder socket.
 - `PacketTunnelCore` and the Windows pump drop protected packets when an
-  authenticated peer-session key is unavailable, increment fail-closed
-  counters, and emit no transport frame.
+  authenticated peer session is unavailable, expired, or over its byte
+  budget, increment fail-closed counters, and emit no transport frame.
 - Windows service status and diagnostics expose only operator-safe
   readiness fields (`peerSessionKeyAvailable=false`,
   `peerSessionKeyState=unavailable`) without peer IDs, key material, or
   transport failure details.
-- Windows does not yet expose a real authenticated packet-session
-  install source to the service. Local echo/development transport does
-  not satisfy the production gate and no static development packet key
-  is used.
+- A two-handle native UDP test proves bidirectional authenticated payloads and
+  fresh generations after forced byte-limit rotation. Local
+  echo/development transport remains outside the production gate.
 
 The packet-session key readiness gate remains **Blocked** until a
-Windows-host validation report proves that a live two-peer mesh installs
-authenticated peer-session metadata, protected packets flow only after
-that state is ready, decrypt failures are counted, and no plaintext is
-written to Wintun.
+signed Windows-host validation report proves the same path through Wintun on
+two physical/VM hosts, including forced rotation, reconnect, decrypt failure,
+service restart, and no plaintext emission.
+
+## Strict WFP Lifecycle Evidence
+
+The repository now implements separate boot-time and persistent strict blocks,
+a persistent provider/sublayer linked to `QuantumLinkService`, dynamic permits
+bound to a nonzero Wintun LUID, transactional owned-object reconciliation,
+read-only probing, explicit elevated cleanup, and major-upgrade preservation.
+Service startup reconciles persisted strict routes before reporting Running,
+and cleanup refuses incompatible provider/sublayer metadata. Local
+lifecycle/ownership tests and installer contracts pass.
+
+The gate remains **Blocked** until signed Windows hosts prove BFE inventory,
+boot-to-persistent transition, service-crash survival, stale-LUID
+reconciliation, protected-prefix and DNS no-leak captures, upgrade/rollback,
+uninstall cleanup, and preservation of unrelated WFP objects.
 
 ## Rendezvous/Relay Production Evidence
 
@@ -115,6 +140,23 @@ until every required control has passing redacted evidence.
 Passing evidence must be fresh, control-specific, digest-bound to distinct JSON
 proof files, bound to the exact release commit/ref and deployment endpoint set,
 and preserved inside the checksummed release artifact set.
+
+`windows/deployment/rendezvous-relay-production.template.json` is the
+blocked-by-default deployment contract. The generator only emits passing
+control evidence from explicit measured assertions with source SHA-256
+bindings; it cannot convert placeholders or contract-only data into a pass.
+
+## Production Host Matrix
+
+`.github/workflows/windows-production-validation.yml` preflights the exact
+release commit/ref, signed artifact inventory, signing inputs, control-plane
+DNS, and live self-hosted runner labels. It schedules only lanes whose
+prerequisites exist; otherwise it uploads a bounded blocked plan without
+hanging. The contract defines Windows 10 22H2 VM, Windows 11 x64 VM, physical
+x64, two-host direct, hostile-NAT relay, strict-WFP leak/crash,
+upgrade/rollback/uninstall, and macOS-Windows interop lanes. Passing lane
+evidence must be measured by the provisioned host harness and digest-bound to
+the signed MSI and release manifest.
 
 ## Automated Windows Validation Evidence
 

@@ -30,7 +30,7 @@ open. Source references are to the QuantumLinkOS repository.
 |------------------|--------------------|-------|
 | `NEPacketTunnelProvider` packet flow | Wintun session ring | `win/wintun_adapter.rs` |
 | `NEIPv4Settings`/`NEDNSSettings` | IP Helper route/DNS programming; `netsh` is an explicit development fallback | `win/routes.rs` |
-| NetworkExtension route ownership (kill switch layer 1) | WFP block+permit filters; `failClosed` is dynamic-session, `strict` plans persistent boot-time coverage | `win/wfp.rs` |
+| NetworkExtension route ownership (kill switch layer 1) | WFP block+permit filters; `failClosed` is dynamic-session, `strict` uses separate boot-time and persistent blocks plus Wintun-LUID permits | `win/wfp.rs` |
 | Keychain | DPAPI machine-scope blobs in ACL'd ProgramData | `win/dpapi.rs` |
 | `NWPathMonitor` | `NotifyIpInterfaceChange` + `NotifyNetworkConnectivityHintChange` | `win/netmon.rs` |
 | NSWorkspace sleep/wake | `SERVICE_CONTROL_POWEREVENT` | `win/service.rs` |
@@ -59,12 +59,12 @@ Production closeout status for these gaps is tracked in
 `production-release-readiness.md`; until the matching production gate has
 passing evidence, the gap remains a release blocker.
 
-1. **Strict WFP persistence install**: the service now has a tested
-   persistent boot-time filter plan for strict deployments, including
-   block+permit tunnel-interface coverage at ALE auth connect v4 and
-   outbound IP packet v4. Production runtime currently refuses strict
-   startup instead of falling back to dynamic filters; install/uninstall
-   must still prove persistent filter creation and cleanup on Windows.
+1. **Strict WFP host proof**: the service implements product-owned
+   persistent provider/sublayer state, separate boot-time and persistent
+   blocks, dynamic Wintun-LUID permits, transactional reconciliation,
+   probing, and elevated uninstall cleanup. Signed Windows-host runs must
+   still prove boot, service-crash, stale-LUID, upgrade, rollback,
+   uninstall, no-leak, and third-party-object preservation behavior.
 2. **Route manager validation**: production default is IP Helper.
    `netsh` remains only as an explicit development fallback with a
    diagnostic, and Windows CI/hardware validation must prove the IP

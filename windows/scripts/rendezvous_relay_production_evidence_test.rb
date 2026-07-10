@@ -10,9 +10,11 @@ require "tmpdir"
 
 class RendezvousRelayProductionEvidenceTest < Minitest::Test
   SCRIPT_PATH = File.expand_path("verify-rendezvous-relay-production-evidence.rb", __dir__)
+  GENERATOR_PATH = File.expand_path("generate-rendezvous-relay-production-evidence.rb", __dir__)
   COMMIT_SHA = "a" * 40
   RELEASE_REF = "refs/tags/v1.0.0"
   DEPLOYMENT_ID = "qlink-control-plane-2026-07-09"
+  MAX_SOURCE_BYTES = 1_048_576
 
   REQUIRED_ASSERTIONS = {
     "tls" => %w[tls_enabled certificate_valid rotation_tested],
@@ -37,6 +39,7 @@ class RendezvousRelayProductionEvidenceTest < Minitest::Test
       "rendezvousEndpoints" => @rendezvous_endpoints,
       "relayEndpoints" => @relay_endpoints
     }))
+    write_source_evidence
     write_control_evidence
   end
 
@@ -53,6 +56,7 @@ class RendezvousRelayProductionEvidenceTest < Minitest::Test
     assert_equal true, report.fetch("valid")
     assert_equal true, report.fetch("productionEvidenceReady")
     assert_equal 11, report.fetch("controlEvidence").length
+    assert_equal 35, report.fetch("controlEvidence").sum { |entry| entry.fetch("sources").length }
     assert_empty report.fetch("blockers")
     assert_empty report.fetch("failures")
   end
@@ -173,6 +177,186 @@ class RendezvousRelayProductionEvidenceTest < Minitest::Test
     assert_includes report.fetch("failures"), "rendezvous/relay control tls missing passing assertion: certificate_valid"
   end
 
+  def test_blocked_control_proof_remains_structurally_valid
+    proof_path = File.join(@tmpdir, control_path("tls"))
+    proof = JSON.parse(File.read(proof_path))
+    proof["status"] = "blocked"
+    proof["assertions"].each do |assertion|
+      assertion.replace("name" => assertion.fetch("name"), "status" => "blocked", "measured" => false)
+    end
+    File.write(proof_path, "#{JSON.pretty_generate(proof)}\n")
+
+    manifest = write_manifest("blocked-control.json") do |value|
+      entry = value.fetch("rendezvousRelay").fetch("controls").find { |item| item["control"] == "tls" }
+      entry["status"] = "blocked"
+      entry["sha256"] = Digest::SHA256.file(proof_path).hexdigest
+    end
+    stdout, stderr, status = run_verifier(manifest, require_ready: false)
+    report = JSON.parse(stdout)
+
+    assert status.success?, stderr
+    assert_equal true, report.fetch("valid")
+    assert_equal false, report.fetch("productionEvidenceReady")
+    assert_includes report.fetch("blockers"), "rendezvous/relay control tls status is blocked"
+  end
+
+  def test_invented_hashes_and_unmeasured_assertions_cannot_claim_readiness
+    tls_path = File.join(@tmpdir, control_path("tls"))
+    tls = JSON.parse(File.read(tls_path))
+    tls.fetch("assertions").first["sourceSha256"] = "f" * 64
+    File.write(tls_path, "#{JSON.pretty_generate(tls)}\n")
+
+    authentication_path = File.join(@tmpdir, control_path("authentication"))
+    authentication = JSON.parse(File.read(authentication_path))
+    authentication.fetch("assertions").first["measured"] = false
+    File.write(authentication_path, "#{JSON.pretty_generate(authentication)}\n")
+
+    manifest = write_manifest("self-attested.json") do |value|
+      controls = value.fetch("rendezvousRelay").fetch("controls")
+      controls.find { |item| item["control"] == "tls" }["sha256"] = Digest::SHA256.file(tls_path).hexdigest
+      controls.find { |item| item["control"] == "authentication" }["sha256"] = Digest::SHA256.file(authentication_path).hexdigest
+    end
+    stdout, _stderr, status = run_verifier(manifest)
+    report = JSON.parse(stdout)
+
+    refute status.success?
+    assert_equal false, report.fetch("valid")
+    assert_equal false, report.fetch("productionEvidenceReady")
+    assert report.fetch("failures").any? { |message| message.include?("source SHA-256 does not match") }
+    assert report.fetch("failures").any? { |message| message.include?("must be explicitly measured") }
+  end
+
+  def test_passing_assertions_cannot_share_a_source_evidence_file
+    proof_path = File.join(@tmpdir, control_path("tls"))
+    proof = JSON.parse(File.read(proof_path))
+    assertions = proof.fetch("assertions")
+    assertions[1]["source"] = assertions[0].fetch("source")
+    assertions[1]["sourceSha256"] = assertions[0].fetch("sourceSha256")
+    File.write(proof_path, "#{JSON.pretty_generate(proof)}\n")
+
+    manifest = write_manifest("shared-source.json") do |value|
+      entry = value.fetch("rendezvousRelay").fetch("controls").find { |item| item["control"] == "tls" }
+      entry["sha256"] = Digest::SHA256.file(proof_path).hexdigest
+    end
+    stdout, _stderr, status = run_verifier(manifest)
+    report = JSON.parse(stdout)
+
+    refute status.success?
+    assert_equal false, report.fetch("productionEvidenceReady")
+    assert report.fetch("failures").any? { |message| message.include?("must use a distinct source evidence file") }
+  end
+
+  def test_source_evidence_must_be_fresh
+    source_pathname = File.join(@tmpdir, source_path("tls", "tls_enabled"))
+    source = JSON.parse(File.read(source_pathname))
+    source["generatedAt"] = (Time.now.utc - (8 * 24 * 60 * 60)).iso8601
+    File.write(source_pathname, "#{JSON.pretty_generate(source)}\n")
+
+    proof_path = File.join(@tmpdir, control_path("tls"))
+    proof = JSON.parse(File.read(proof_path))
+    proof.fetch("assertions").first["sourceSha256"] = Digest::SHA256.file(source_pathname).hexdigest
+    File.write(proof_path, "#{JSON.pretty_generate(proof)}\n")
+    manifest = write_manifest("stale-source.json") do |value|
+      entry = value.fetch("rendezvousRelay").fetch("controls").find { |item| item["control"] == "tls" }
+      entry["sha256"] = Digest::SHA256.file(proof_path).hexdigest
+    end
+
+    stdout, _stderr, status = run_verifier(manifest)
+    report = JSON.parse(stdout)
+    refute status.success?
+    assert_equal false, report.fetch("productionEvidenceReady")
+    assert report.fetch("failures").any? { |message| message.include?("source generatedAt is older than 604800 seconds") }
+  end
+
+  def test_source_evidence_is_bounded
+    source_pathname = File.join(@tmpdir, source_path("tls", "tls_enabled"))
+    File.open(source_pathname, "wb") do |file|
+      file.write("{\"padding\":\"")
+      file.write("a" * MAX_SOURCE_BYTES)
+      file.write("\"}\n")
+    end
+
+    proof_path = File.join(@tmpdir, control_path("tls"))
+    proof = JSON.parse(File.read(proof_path))
+    proof.fetch("assertions").first["sourceSha256"] = Digest::SHA256.file(source_pathname).hexdigest
+    File.write(proof_path, "#{JSON.pretty_generate(proof)}\n")
+    manifest = write_manifest("oversized-source.json") do |value|
+      entry = value.fetch("rendezvousRelay").fetch("controls").find { |item| item["control"] == "tls" }
+      entry["sha256"] = Digest::SHA256.file(proof_path).hexdigest
+    end
+
+    stdout, _stderr, status = run_verifier(manifest)
+    report = JSON.parse(stdout)
+    refute status.success?
+    assert_equal false, report.fetch("productionEvidenceReady")
+    assert report.fetch("failures").any? { |message| message.include?("source evidence exceeds #{MAX_SOURCE_BYTES} bytes") }
+  end
+
+  def test_generator_hashes_and_preserves_bound_source_evidence
+    contract = write_contract
+    measurements = write_measurements("measurements.json", include_sources: true)
+    stdout, stderr, status = invoke_generator(contract, measurements)
+    result = JSON.parse(stdout)
+
+    assert status.success?, stderr
+    assert_equal true, result.fetch("productionEvidenceReady")
+    proof = JSON.parse(File.read(File.join(@tmpdir, control_path("tls"))))
+    assertion = proof.fetch("assertions").find { |item| item["name"] == "tls_enabled" }
+    assert_equal source_path("tls", "tls_enabled"), assertion.fetch("source")
+    assert_equal Digest::SHA256.file(File.join(@tmpdir, assertion.fetch("source"))).hexdigest,
+                 assertion.fetch("sourceSha256")
+
+    verifier_stdout, verifier_stderr, verifier_status = run_verifier(result.fetch("manifest"))
+    verifier_report = JSON.parse(verifier_stdout)
+    assert verifier_status.success?, verifier_stderr
+    assert_equal true, verifier_report.fetch("productionEvidenceReady")
+  end
+
+  def test_generator_does_not_accept_invented_hashes_without_source_files
+    contract = write_contract
+    measurements = write_measurements("invented-measurements.json", include_sources: false)
+    stdout, stderr, status = invoke_generator(contract, measurements)
+    result = JSON.parse(stdout)
+
+    assert status.success?, stderr
+    assert_equal false, result.fetch("productionEvidenceReady")
+    assert_equal "blocked", result.fetch("status")
+    proof = JSON.parse(File.read(File.join(@tmpdir, control_path("tls"))))
+    proof.fetch("assertions").each do |assertion|
+      assert_equal false, assertion.fetch("measured")
+      refute assertion.key?("source")
+      refute assertion.key?("sourceSha256")
+    end
+  end
+
+  def test_generator_rejects_source_evidence_with_wrong_assertion_binding
+    source = File.join(@tmpdir, source_path("tls", "tls_enabled"))
+    value = JSON.parse(File.read(source))
+    value["assertion"] = "certificate_valid"
+    File.write(source, "#{JSON.pretty_generate(value)}\n")
+
+    contract = write_contract
+    measurements = write_measurements("wrong-binding-measurements.json", include_sources: true)
+    _stdout, stderr, status = invoke_generator(contract, measurements)
+
+    refute status.success?
+    assert_includes stderr, "source evidence for tls/tls_enabled assertion does not match"
+  end
+
+  def test_generator_rejects_claimed_source_digest_that_does_not_match_file
+    contract = write_contract
+    measurements = write_measurements("wrong-digest-measurements.json", include_sources: true)
+    path = File.join(@tmpdir, measurements)
+    value = JSON.parse(File.read(path))
+    value.fetch("controls").first.fetch("assertions").first["sourceSha256"] = "f" * 64
+    File.write(path, "#{JSON.pretty_generate(value)}\n")
+
+    _stdout, stderr, status = invoke_generator(contract, measurements)
+
+    refute status.success?
+    assert_includes stderr, "source evidence for tls/tls_enabled sourceSha256 does not match the source file"
+  end
+
   def test_stale_and_future_evidence_fail
     stale_path = control_path("tls")
     stale = JSON.parse(File.read(File.join(@tmpdir, stale_path)))
@@ -218,8 +402,48 @@ class RendezvousRelayProductionEvidenceTest < Minitest::Test
     invoke(*args, manifest)
   end
 
+  def invoke_generator(contract, measurements)
+    Open3.capture3(
+      "ruby", GENERATOR_PATH,
+      "--repo-root", @tmpdir,
+      "--contract", contract,
+      "--measurements", measurements,
+      "--expected-sha", COMMIT_SHA,
+      "--expected-ref", RELEASE_REF,
+      chdir: @tmpdir
+    )
+  end
+
   def control_path(control)
     "windows/validation/rendezvous-relay/#{control}.json"
+  end
+
+  def source_path(control, assertion)
+    "windows/validation/rendezvous-relay-sources/#{control}/#{assertion}.json"
+  end
+
+  def write_source_evidence
+    REQUIRED_ASSERTIONS.each do |control, assertions|
+      assertions.each do |assertion|
+        path = File.join(@tmpdir, source_path(control, assertion))
+        FileUtils.mkdir_p(File.dirname(path))
+        proof = {
+          "schemaVersion" => 1,
+          "evidenceKind" => "windowsRendezvousRelayAssertionSourceEvidence",
+          "control" => control,
+          "assertion" => assertion,
+          "status" => "pass",
+          "measured" => true,
+          "generatedAt" => @generated_at,
+          "deploymentId" => DEPLOYMENT_ID,
+          "releaseCommitSha" => COMMIT_SHA,
+          "releaseRef" => RELEASE_REF,
+          "endpointSetSha256" => @endpoint_digest,
+          "redacted" => true
+        }
+        File.write(path, "#{JSON.pretty_generate(proof)}\n")
+      end
+    end
   end
 
   def write_control_evidence
@@ -237,10 +461,80 @@ class RendezvousRelayProductionEvidenceTest < Minitest::Test
         "releaseRef" => RELEASE_REF,
         "endpointSetSha256" => @endpoint_digest,
         "redacted" => true,
-        "assertions" => assertions.map { |name| { "name" => name, "status" => "pass" } }
+        "assertions" => assertions.map do |name|
+          source = source_path(control, name)
+          {
+            "name" => name,
+            "status" => "pass",
+            "measured" => true,
+            "source" => source,
+            "sourceSha256" => Digest::SHA256.file(File.join(@tmpdir, source)).hexdigest
+          }
+        end
       }
       File.write(path, "#{JSON.pretty_generate(proof)}\n")
     end
+  end
+
+  def write_contract
+    relative = "windows/deployment/rendezvous-relay-production.json"
+    path = File.join(@tmpdir, relative)
+    FileUtils.mkdir_p(File.dirname(path))
+    contract = {
+      "schemaVersion" => 1,
+      "evidenceKind" => "windowsRendezvousRelayDeploymentContract",
+      "status" => "pass",
+      "release" => { "commitSha" => COMMIT_SHA, "ref" => RELEASE_REF },
+      "deployment" => { "id" => DEPLOYMENT_ID, "status" => "pass" },
+      "rendezvousEndpoints" => @rendezvous_endpoints,
+      "relayEndpoints" => @relay_endpoints,
+      "prerequisites" => [
+        { "id" => "production_measurements", "status" => "pass", "reason" => "Measured production evidence supplied." }
+      ],
+      "output" => {
+        "manifest" => "windows/validation/generated-production-evidence.json",
+        "controlDirectory" => "windows/validation/rendezvous-relay",
+        "digestManifest" => "windows/validation/generated-production-evidence-digests.json",
+        "checksums" => "windows/validation/generated-production-evidence-SHA256SUMS.txt"
+      }
+    }
+    File.write(path, "#{JSON.pretty_generate(contract)}\n")
+    relative
+  end
+
+  def write_measurements(name, include_sources:)
+    relative = "windows/validation/#{name}"
+    path = File.join(@tmpdir, relative)
+    FileUtils.mkdir_p(File.dirname(path))
+    measurement = {
+      "schemaVersion" => 1,
+      "evidenceKind" => "windowsRendezvousRelayMeasuredControls",
+      "measurementKind" => "measured",
+      "release" => { "commitSha" => COMMIT_SHA, "ref" => RELEASE_REF },
+      "deploymentId" => DEPLOYMENT_ID,
+      "endpointSetSha256" => @endpoint_digest,
+      "controls" => REQUIRED_ASSERTIONS.map do |control, assertions|
+        {
+          "control" => control,
+          "status" => "pass",
+          "assertions" => assertions.map do |assertion|
+            item = {
+              "name" => assertion,
+              "status" => "pass",
+              "measured" => true,
+              "sourceSha256" => "f" * 64
+            }
+            if include_sources
+              item["source"] = source_path(control, assertion)
+              item.delete("sourceSha256")
+            end
+            item
+          end
+        }
+      end
+    }
+    File.write(path, "#{JSON.pretty_generate(measurement)}\n")
+    relative
   end
 
   def write_manifest(name)

@@ -1,0 +1,370 @@
+name: Windows Production Validation Matrix
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_commit_sha:
+        description: "Exact 40-character release commit to validate; must equal the dispatched workflow commit."
+        type: string
+        required: true
+      expected_ref:
+        description: "Exact refs/heads/... or refs/tags/... release ref; must equal the dispatched workflow ref."
+        type: string
+        required: true
+      release_run_id:
+        description: "Successful Windows Release workflow run containing the signed artifact."
+        type: string
+        required: true
+      signed_artifact_name:
+        description: "Exact artifact name from release_run_id."
+        type: string
+        required: true
+      signed_msi_path:
+        description: "Forward-slash relative path to the signed MSI inside the downloaded artifact."
+        type: string
+        required: true
+      signed_msi_sha256:
+        description: "Expected lowercase SHA-256 for the signed MSI."
+        type: string
+        required: true
+      release_manifest_path:
+        description: "Forward-slash relative path to windows-release-manifest.json inside the artifact."
+        type: string
+        required: true
+      release_manifest_sha256:
+        description: "Expected lowercase SHA-256 for windows-release-manifest.json."
+        type: string
+        required: true
+
+permissions:
+  actions: read
+  contents: read
+
+env:
+  EXPECTED_SHA: ${{ inputs.expected_commit_sha }}
+  EXPECTED_REF: ${{ inputs.expected_ref }}
+  RELEASE_RUN_ID: ${{ inputs.release_run_id }}
+  SIGNED_ARTIFACT_NAME: ${{ inputs.signed_artifact_name }}
+  SIGNED_MSI_PATH: ${{ inputs.signed_msi_path }}
+  SIGNED_MSI_SHA256: ${{ inputs.signed_msi_sha256 }}
+  RELEASE_MANIFEST_PATH: ${{ inputs.release_manifest_path }}
+  RELEASE_MANIFEST_SHA256: ${{ inputs.release_manifest_sha256 }}
+
+concurrency:
+  group: windows-production-validation-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    name: Production validation preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      has_jobs: ${{ steps.matrix.outputs.has_jobs }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+
+      - name: Read authenticated runner and release inventories
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.WINDOWS_RUNNER_INVENTORY_TOKEN }}
+        run: |
+          set -u
+          output=windows/build/validation/matrix-preflight
+          mkdir -p "$output"
+
+          unavailable_runners='{"inventoryAvailable":false,"runners":[]}'
+          unavailable_run='{"inventoryAvailable":false}'
+          unavailable_artifacts='{"inventoryAvailable":false,"artifacts":[]}'
+          printf '%s\n' "$unavailable_runners" > "$output/runners.json"
+          printf '%s\n' "$unavailable_run" > "$output/release-run.json"
+          printf '%s\n' "$unavailable_artifacts" > "$output/artifacts.json"
+
+          if [[ -z "$GH_TOKEN" || ! "$RELEASE_RUN_ID" =~ ^[0-9]+$ ]]; then
+            exit 0
+          fi
+
+          if gh api "repos/$GITHUB_REPOSITORY/actions/runners?per_page=100" > runners-response.json 2>/dev/null; then
+            jq '. + {inventoryAvailable: true}' runners-response.json > "$output/runners.json"
+          fi
+          if gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RELEASE_RUN_ID" > release-run-response.json 2>/dev/null; then
+            jq '. + {inventoryAvailable: true}' release-run-response.json > "$output/release-run.json"
+          fi
+          if gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RELEASE_RUN_ID/artifacts?per_page=100" > artifacts-response.json 2>/dev/null; then
+            jq '. + {inventoryAvailable: true}' artifacts-response.json > "$output/artifacts.json"
+          fi
+
+      - name: Generate fail-closed matrix plan
+        shell: bash
+        env:
+          RUNNER_INVENTORY_TOKEN_CONFIGURED: ${{ secrets.WINDOWS_RUNNER_INVENTORY_TOKEN != '' }}
+          SIGNING_SECRETS_CONFIGURED: ${{ secrets.WINDOWS_SIGNING_CERT_PFX_BASE64 != '' && secrets.WINDOWS_SIGNING_CERT_PASSWORD != '' && secrets.WINDOWS_SIGNING_TIMESTAMP_URL != '' }}
+        run: |
+          set -u
+          ruby windows/scripts/plan-windows-validation-matrix.rb \
+            --config windows/validation/contracts/windows-production-validation-matrix.json \
+            --runner-inventory windows/build/validation/matrix-preflight/runners.json \
+            --release-run-inventory windows/build/validation/matrix-preflight/release-run.json \
+            --artifact-inventory windows/build/validation/matrix-preflight/artifacts.json \
+            --expected-sha "$EXPECTED_SHA" \
+            --expected-ref "$EXPECTED_REF" \
+            --actual-sha "$GITHUB_SHA" \
+            --actual-ref "$GITHUB_REF" \
+            --release-run-id "$RELEASE_RUN_ID" \
+            --signed-artifact-name "$SIGNED_ARTIFACT_NAME" \
+            --runner-inventory-token-configured "$RUNNER_INVENTORY_TOKEN_CONFIGURED" \
+            --signing-secrets-configured "$SIGNING_SECRETS_CONFIGURED" \
+            --output windows/build/validation/matrix-preflight/windows-production-validation-plan.json
+
+      - name: Publish bounded matrix outputs
+        id: matrix
+        shell: bash
+        run: |
+          plan=windows/build/validation/matrix-preflight/windows-production-validation-plan.json
+          matrix="$(jq -c '{include: [.lanes[] | select(.status == "scheduled") | {lane: .id, display_name: .displayName, labels: .labels, timeout_minutes: .timeoutMinutes, artifact_name: .artifactName}]}' "$plan")"
+          count="$(jq -r '.scheduledCount' "$plan")"
+          printf 'matrix=%s\n' "$matrix" >> "$GITHUB_OUTPUT"
+          if [[ "$count" -gt 0 ]]; then
+            printf 'has_jobs=true\n' >> "$GITHUB_OUTPUT"
+          else
+            printf 'has_jobs=false\n' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload blocked or scheduled preflight evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: quantumlink-windows-production-validation-plan-${{ github.run_id }}
+          path: windows/build/validation/matrix-preflight/windows-production-validation-plan.json
+          if-no-files-found: error
+          retention-days: 30
+
+  validate:
+    name: ${{ matrix.display_name }}
+    needs: preflight
+    if: needs.preflight.outputs.has_jobs == 'true'
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix: ${{ fromJSON(needs.preflight.outputs.matrix) }}
+    runs-on: ${{ matrix.labels }}
+    timeout-minutes: ${{ matrix.timeout_minutes }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.EXPECTED_SHA }}
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+
+      - name: Download exact signed release artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: ${{ env.SIGNED_ARTIFACT_NAME }}
+          path: ${{ runner.temp }}/quantumlink-signed-release
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ env.RELEASE_RUN_ID }}
+
+      - name: Verify checkout binding
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $actualSha = (git rev-parse HEAD).Trim()
+          if ($actualSha -ne $env:EXPECTED_SHA -or $env:GITHUB_SHA -ne $env:EXPECTED_SHA) {
+            throw "Checked-out commit does not match the exact requested release commit."
+          }
+          if ($env:GITHUB_REF -ne $env:EXPECTED_REF) {
+            throw "Workflow ref does not match the exact requested release ref."
+          }
+
+      - name: Independently verify signed MSI and release manifest
+        shell: pwsh
+        env:
+          LANE: ${{ matrix.lane }}
+          ARTIFACT_ROOT: ${{ runner.temp }}/quantumlink-signed-release
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          function Resolve-SafeArtifactPath([string]$Root, [string]$Relative, [string]$Field) {
+            if ([string]::IsNullOrWhiteSpace($Relative) -or $Relative.Contains("\") -or [IO.Path]::IsPathRooted($Relative)) {
+              throw "$Field must be a non-empty forward-slash relative path."
+            }
+            $parts = $Relative.Split('/')
+            if ($parts | Where-Object { $_ -eq "" -or $_ -eq "." -or $_ -eq ".." }) {
+              throw "$Field contains an unsafe path segment."
+            }
+            $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd([IO.Path]::DirectorySeparatorChar)
+            $candidate = [IO.Path]::GetFullPath((Join-Path $rootFull ($parts -join [IO.Path]::DirectorySeparatorChar)))
+            if (-not $candidate.StartsWith($rootFull + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+              throw "$Field resolves outside the artifact root."
+            }
+            return $candidate
+          }
+
+          $reportPath = Join-Path $env:RUNNER_TEMP "quantumlink-$env:LANE-artifact-verification.json"
+          $failures = @()
+          $msi = Resolve-SafeArtifactPath $env:ARTIFACT_ROOT $env:SIGNED_MSI_PATH "signed MSI path"
+          $manifestPath = Resolve-SafeArtifactPath $env:ARTIFACT_ROOT $env:RELEASE_MANIFEST_PATH "release manifest path"
+          $msiSha = $null
+          $manifestSha = $null
+          $validMsiContainer = $false
+          $signatureStatus = $null
+          $timestampPresent = $false
+          $manifestValid = $false
+          $releaseBound = $false
+          $artifactHashBound = $false
+
+          if (-not (Test-Path -LiteralPath $msi -PathType Leaf)) {
+            $failures += "signed MSI is missing"
+          } else {
+            $msiSha = (Get-FileHash -LiteralPath $msi -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($msiSha -cne $env:SIGNED_MSI_SHA256) { $failures += "signed MSI SHA-256 does not match" }
+            $bytes = [IO.File]::ReadAllBytes($msi)
+            if ($bytes.Length -ge 8) {
+              $validMsiContainer = ([BitConverter]::ToString($bytes[0..7]).Replace("-", "") -ceq "D0CF11E0A1B11AE1")
+            }
+            if (-not $validMsiContainer) { $failures += "signed MSI is not an MSI compound-file container" }
+            $signature = Get-AuthenticodeSignature -LiteralPath $msi -ErrorAction Stop
+            $signatureStatus = [string]$signature.Status
+            if ($signatureStatus -cne "Valid") { $failures += "MSI Authenticode signature is not Valid" }
+            $timestampCertificate = $null
+            if ($null -ne $signature.PSObject.Properties["TimeStamperCertificate"]) {
+              $timestampCertificate = $signature.TimeStamperCertificate
+            } elseif ($null -ne $signature.PSObject.Properties["TimestampCertificate"]) {
+              $timestampCertificate = $signature.TimestampCertificate
+            }
+            $timestampPresent = $null -ne $timestampCertificate
+            if (-not $timestampPresent) { $failures += "MSI Authenticode timestamp is missing" }
+          }
+
+          if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+            $failures += "release manifest is missing"
+          } else {
+            $manifestSha = (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($manifestSha -cne $env:RELEASE_MANIFEST_SHA256) { $failures += "release manifest SHA-256 does not match" }
+            try {
+              $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json -ErrorAction Stop
+              $manifestValid = $true
+              $releaseBound = ([string]$manifest.sha -ceq $env:EXPECTED_SHA) -and
+                ([string]$manifest.ref -ceq $env:EXPECTED_REF) -and
+                ([string]$manifest.runId -ceq $env:RELEASE_RUN_ID)
+              if (-not $releaseBound) { $failures += "release manifest does not exactly bind the release" }
+              $matches = @($manifest.artifacts | Where-Object {
+                ([string]$_.name -ceq [IO.Path]::GetFileName($msi)) -and
+                ([string]$_.sha256 -ceq $msiSha) -and
+                ([long]$_.lengthBytes -eq (Get-Item -LiteralPath $msi).Length)
+              })
+              $artifactHashBound = $matches.Count -eq 1
+              if (-not $artifactHashBound) { $failures += "release manifest does not bind the selected MSI hash and length exactly once" }
+            } catch {
+              $failures += "release manifest is invalid JSON"
+            }
+          }
+
+          $report = [ordered]@{
+            schemaVersion = 1
+            evidenceKind = "windowsProductionArtifactVerification"
+            status = if ($failures.Count -eq 0) { "pass" } else { "fail" }
+            lane = $env:LANE
+            release = [ordered]@{ commitSha = $env:EXPECTED_SHA; ref = $env:EXPECTED_REF; releaseRunId = $env:RELEASE_RUN_ID }
+            artifacts = [ordered]@{
+              signedMsi = [ordered]@{ path = $env:SIGNED_MSI_PATH; sha256 = $msiSha; digestMatched = $msiSha -ceq $env:SIGNED_MSI_SHA256; validMsiContainer = $validMsiContainer; authenticodeStatus = $signatureStatus; timestampPresent = $timestampPresent }
+              releaseManifest = [ordered]@{ path = $env:RELEASE_MANIFEST_PATH; sha256 = $manifestSha; digestMatched = $manifestSha -ceq $env:RELEASE_MANIFEST_SHA256; validJson = $manifestValid; releaseBound = $releaseBound; artifactHashBound = $artifactHashBound }
+            }
+            failures = @($failures)
+          }
+          $json = $report | ConvertTo-Json -Depth 8
+          [IO.File]::WriteAllText($reportPath, $json + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
+          if ($failures.Count -ne 0) { throw ($failures -join "; ") }
+
+      - name: Verify and invoke pinned validation harness
+        shell: pwsh
+        env:
+          LANE: ${{ matrix.lane }}
+          ARTIFACT_ROOT: ${{ runner.temp }}/quantumlink-signed-release
+        run: |
+          $ErrorActionPreference = "Stop"
+          $measurementDirectory = Join-Path $env:RUNNER_TEMP "quantumlink-$env:LANE-measurement"
+          Remove-Item -LiteralPath $measurementDirectory -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $measurementDirectory -Force | Out-Null
+          $measurement = Join-Path $measurementDirectory "measurement.json"
+          $artifactVerification = Join-Path $env:RUNNER_TEMP "quantumlink-$env:LANE-artifact-verification.json"
+          $contract = Get-Content -LiteralPath "windows\validation\contracts\windows-production-validation-matrix.json" -Raw | ConvertFrom-Json
+          $hook = [string]$contract.externalHarness
+          $expectedHarnessSha = [string]$contract.externalHarnessSha256
+          if ($expectedHarnessSha -cnotmatch '^[0-9a-f]{64}$') { throw "External harness SHA-256 is not pinned by the contract." }
+          if (-not (Test-Path -LiteralPath $hook -PathType Leaf)) { throw "Pinned external validation harness is unavailable." }
+          $actualHarnessSha = (Get-FileHash -LiteralPath $hook -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualHarnessSha -cne $expectedHarnessSha) { throw "External validation harness SHA-256 does not match the contract." }
+
+          $msi = Join-Path $env:ARTIFACT_ROOT ($env:SIGNED_MSI_PATH -replace '/', '\')
+          $manifest = Join-Path $env:ARTIFACT_ROOT ($env:RELEASE_MANIFEST_PATH -replace '/', '\')
+          & $hook `
+            -Lane $env:LANE `
+            -SignedMsiPath $msi `
+            -ReleaseManifestPath $manifest `
+            -ExpectedCommitSha $env:EXPECTED_SHA `
+            -ExpectedRef $env:EXPECTED_REF `
+            -ReleaseRunId $env:RELEASE_RUN_ID `
+            -HarnessSha256 $actualHarnessSha `
+            -ArtifactVerificationPath $artifactVerification `
+            -OutputPath $measurement *> $null
+          if ($LASTEXITCODE -ne 0) { throw "External validation harness failed with exit code $LASTEXITCODE." }
+
+      - name: Generate bounded lane evidence bundle
+        if: always()
+        shell: pwsh
+        env:
+          LANE: ${{ matrix.lane }}
+          ARTIFACT_ROOT: ${{ runner.temp }}/quantumlink-signed-release
+        run: |
+          $ErrorActionPreference = "Stop"
+          $outputDirectory = "windows\build\validation\matrix\$env:LANE"
+          New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
+          ruby windows/scripts/generate-windows-validation-matrix-evidence.rb `
+            --config windows/validation/contracts/windows-production-validation-matrix.json `
+            --lane $env:LANE `
+            --expected-sha $env:EXPECTED_SHA `
+            --expected-ref $env:EXPECTED_REF `
+            --release-run-id $env:RELEASE_RUN_ID `
+            --artifact-root $env:ARTIFACT_ROOT `
+            --signed-msi-path $env:SIGNED_MSI_PATH `
+            --signed-msi-sha256 $env:SIGNED_MSI_SHA256 `
+            --release-manifest-path $env:RELEASE_MANIFEST_PATH `
+            --release-manifest-sha256 $env:RELEASE_MANIFEST_SHA256 `
+            --artifact-verification (Join-Path $env:RUNNER_TEMP "quantumlink-$env:LANE-artifact-verification.json") `
+            --measurement (Join-Path $env:RUNNER_TEMP "quantumlink-$env:LANE-measurement\measurement.json") `
+            --output (Join-Path $outputDirectory "evidence.json")
+
+      - name: Upload bounded JSON lane evidence bundle
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact_name }}-${{ github.run_id }}
+          path: windows/build/validation/matrix/${{ matrix.lane }}/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Require measured passing lane evidence
+        if: always()
+        shell: pwsh
+        env:
+          LANE: ${{ matrix.lane }}
+        run: |
+          ruby windows/scripts/verify-windows-validation-matrix-evidence.rb `
+            --require-pass `
+            --config windows/validation/contracts/windows-production-validation-matrix.json `
+            --lane $env:LANE `
+            --expected-sha $env:EXPECTED_SHA `
+            --expected-ref $env:EXPECTED_REF `
+            --release-run-id $env:RELEASE_RUN_ID `
+            --signed-msi-sha256 $env:SIGNED_MSI_SHA256 `
+            --release-manifest-sha256 $env:RELEASE_MANIFEST_SHA256 `
+            "windows/build/validation/matrix/$env:LANE/evidence.json"

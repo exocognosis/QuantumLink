@@ -31,9 +31,9 @@ use qlink_core::crypto::DeviceKeypair;
 use qlink_core::mesh_connection::NetworkEvent;
 use qlink_core::mesh_transport::{
     peer_trust_failure_code_label, peer_trust_failure_summary, MeshTransportConfig,
-    MeshTransportHandle,
+    MeshTransportHandle, PacketSessionDirection, PacketSessionEvent, PacketSessionLease,
 };
-use qlink_core::packet_core::PacketTunnelCore;
+use qlink_core::packet_core::{InstalledPeerSession, PacketTunnelCore, PeerSessionDirection};
 use quantumlink_proto::models::{
     ConnectionPhase, DytallixPeerTrustSummary, KillSwitchPolicy, MeshMetrics, MeshTrustPolicy,
     PathType, PeerIdentity, PeerStatus, TunnelConfiguration, TunnelStatus, TunnelTransportMetrics,
@@ -48,6 +48,7 @@ use thiserror::Error;
 const PUMP_READ_TIMEOUT: Duration = Duration::from_millis(250);
 const INBOUND_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const WATCHDOG_CADENCE: Duration = Duration::from_secs(1);
+const UNCONFIGURED_PEER_ID: &str = "qlink_unconfigured";
 
 #[derive(Debug, Error)]
 pub enum EngineError {
@@ -163,7 +164,9 @@ impl ActiveTransport {
     fn is_ready(&self) -> bool {
         match self {
             // 1 == MeshTransportState::Ready
-            ActiveTransport::Mesh(handle) => handle.state_code() == 1,
+            ActiveTransport::Mesh(handle) => {
+                handle.state_code() == 1 && matches!(handle.default_packet_session(), Ok(Some(_)))
+            }
             ActiveTransport::LocalEcho(_) => true,
         }
     }
@@ -176,6 +179,17 @@ struct TransportSink {
 impl TransportFrameSink for TransportSink {
     fn is_ready(&self) -> bool {
         self.transport.is_ready()
+    }
+
+    fn installed_peer_session(&self) -> Option<InstalledPeerSession> {
+        let ActiveTransport::Mesh(handle) = self.transport.as_ref() else {
+            return None;
+        };
+        handle
+            .default_packet_session()
+            .ok()
+            .flatten()
+            .map(installed_peer_session)
     }
 
     fn send_transport_frame(&self, frame: Vec<u8>) -> Result<(), PumpError> {
@@ -438,13 +452,15 @@ impl TunnelEngine {
             "localPeerId": keypair.public_key().peer_id(),
             // Peers are added dynamically via add_peer; the primary slot
             // uses the same sentinel qlinkctl uses pre-configuration.
-            "remotePeerId": "qlink_unconfigured",
+            "remotePeerId": UNCONFIGURED_PEER_ID,
             "rendezvousUrl": rendezvous_url,
             "relayUrl": config.relay_servers.first(),
             "bindAddr": "0.0.0.0:0",
             "peerStorePath": peer_store_path.to_string_lossy(),
             "peerStoreKeyB64": base64::engine::general_purpose::STANDARD.encode(peer_store_key),
             "meshTrustPolicy": config.effective_mesh_trust_policy(),
+            "packetSessionLifetimeSeconds": config.crypto.rekey_after_seconds.ceil() as u64,
+            "packetSessionRekeyAfterBytes": config.crypto.rekey_after_bytes,
         });
         if let Some(identity) = config.dytallix_identity.as_ref() {
             mesh_config_json["dytallixIdentity"] = serde_json::json!({
@@ -471,6 +487,7 @@ impl TunnelEngine {
             for thread in session.threads.drain(..) {
                 let _ = thread.join();
             }
+            session.pump.lock().unwrap().clear_all_peer_sessions();
             // Routes go first, then the kill-switch filters, so no
             // plaintext window opens between the two.
             if let Err(error) = self.platform.teardown(&session.adapter, &session.config) {
@@ -491,7 +508,22 @@ impl TunnelEngine {
             return Err(EngineError::Platform("not connected".into()));
         };
         match session.transport.as_ref() {
-            ActiveTransport::Mesh(handle) => handle.add_peer(peer_id).map_err(EngineError::Core),
+            ActiveTransport::Mesh(handle) => {
+                let configured: Vec<String> = handle
+                    .peer_ids()
+                    .into_iter()
+                    .filter(|existing| existing != UNCONFIGURED_PEER_ID)
+                    .collect();
+                if configured.iter().any(|existing| existing != peer_id) {
+                    return Err(EngineError::Config(
+                        "Windows packet routing supports exactly one authenticated mesh peer"
+                            .into(),
+                    ));
+                }
+                handle
+                    .replace_default_peer(peer_id)
+                    .map_err(EngineError::Core)
+            }
             ActiveTransport::LocalEcho(_) => Err(EngineError::Platform(
                 "local echo transport has no peers".into(),
             )),
@@ -545,8 +577,18 @@ impl TunnelEngine {
             };
             status.pump = Some(session.pump.lock().unwrap().counters().as_proto());
             if session.config.requires_packet_peer_session() {
-                status.peer_session_key_available = false;
-                status.peer_session_key_state = "unavailable".to_string();
+                let available = match session.transport.as_ref() {
+                    ActiveTransport::Mesh(handle) => {
+                        matches!(handle.default_packet_session(), Ok(Some(_)))
+                    }
+                    ActiveTransport::LocalEcho(_) => false,
+                };
+                status.peer_session_key_available = available;
+                status.peer_session_key_state = if available {
+                    "authenticated".to_string()
+                } else {
+                    "unavailable".to_string()
+                };
             } else {
                 status.peer_session_key_available = true;
                 status.peer_session_key_state = "notRequired".to_string();
@@ -670,6 +712,7 @@ fn spawn_outbound_loop(
                 transport: Arc::clone(&transport),
             };
             while !stop.load(Ordering::SeqCst) {
+                apply_packet_session_events(&transport, &pump);
                 match adapter.receive(PUMP_READ_TIMEOUT) {
                     Ok(Some(packet)) => {
                         let family = protocol_family_for_packet(&packet);
@@ -696,21 +739,31 @@ fn spawn_inbound_loop(
         .name("qlink-pump-in".into())
         .spawn(move || {
             while !stop.load(Ordering::SeqCst) {
-                let inbound: Option<(Vec<u8>, Option<String>)> = match transport.as_ref() {
-                    ActiveTransport::Mesh(handle) => handle
-                        .try_receive_frame_from_any()
-                        .map(|frame| (frame.frame, Some(frame.peer_id))),
-                    ActiveTransport::LocalEcho(queue) => {
-                        queue.lock().unwrap().pop_front().map(|frame| (frame, None))
-                    }
-                };
-                let Some((frame, peer_id)) = inbound else {
+                apply_packet_session_events(&transport, &pump);
+                let inbound: Option<(Vec<u8>, Option<String>, Option<InstalledPeerSession>)> =
+                    match transport.as_ref() {
+                        ActiveTransport::Mesh(handle) => {
+                            handle.try_receive_frame_from_any().map(|frame| {
+                                (
+                                    frame.frame,
+                                    Some(frame.peer_id),
+                                    Some(installed_peer_session(frame.packet_session)),
+                                )
+                            })
+                        }
+                        ActiveTransport::LocalEcho(queue) => queue
+                            .lock()
+                            .unwrap()
+                            .pop_front()
+                            .map(|frame| (frame, None, None)),
+                    };
+                let Some((frame, peer_id, peer_session)) = inbound else {
                     std::thread::sleep(INBOUND_POLL_INTERVAL);
                     continue;
                 };
                 let mut pump = pump.lock().unwrap();
                 if pump
-                    .accept_transport_frame(&frame, peer_id.as_deref(), None)
+                    .accept_transport_frame(&frame, peer_id.as_deref(), peer_session)
                     .is_ok()
                 {
                     while let Some(packet) = pump.pop_tunnel_packet() {
@@ -722,6 +775,48 @@ fn spawn_inbound_loop(
             }
         })
         .expect("spawn inbound pump thread")
+}
+
+fn installed_peer_session(session: PacketSessionLease) -> InstalledPeerSession {
+    InstalledPeerSession {
+        peer_id: session.peer_id,
+        direction: match session.direction {
+            PacketSessionDirection::Outbound => PeerSessionDirection::Outbound,
+            PacketSessionDirection::Inbound => PeerSessionDirection::Inbound,
+        },
+        generation: session.generation,
+        transcript_binding: session.transcript_binding,
+        expires_at_unix: session.expires_at_unix,
+        rekey_after_bytes: session.rekey_after_bytes,
+    }
+}
+
+fn apply_packet_session_events(
+    transport: &ActiveTransport,
+    pump: &Mutex<TunnelPacketPump<PacketTunnelCore>>,
+) {
+    let ActiveTransport::Mesh(handle) = transport else {
+        return;
+    };
+    while let Some(event) = handle.try_receive_packet_session_event() {
+        let mut pump = pump.lock().unwrap();
+        match event {
+            PacketSessionEvent::Ready(session) => {
+                pump.install_peer_session(installed_peer_session(session));
+            }
+            PacketSessionEvent::Cleared {
+                peer_id,
+                direction,
+                generation,
+            } => {
+                let direction = match direction {
+                    PacketSessionDirection::Outbound => PeerSessionDirection::Outbound,
+                    PacketSessionDirection::Inbound => PeerSessionDirection::Inbound,
+                };
+                pump.clear_peer_session(&peer_id, direction, generation);
+            }
+        }
+    }
 }
 
 /// Strict-mode watchdog: tears nothing down itself — it flips the stop

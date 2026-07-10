@@ -6,9 +6,8 @@
   - install service binary + qlink_core.dll + wintun.dll + UI app
   - register and start the QuantumLinkService Windows service
   - create %ProgramData%\QuantumLink with a SYSTEM/Administrators ACL
-  - uninstall cleanup: stop+delete service (dynamic WFP filters and the
-    Wintun adapter disappear with the service process; routes are
-    removed by the service during disconnect)
+  - uninstall cleanup: stop+delete service, then fail the uninstall if
+    product-owned persistent WFP cleanup fails
 
   Build (on Windows):
     Install the pinned WiX 6.0.2 dotnet tool first.
@@ -91,5 +90,21 @@
       <ComponentRef Id="UiBinary" />
       <ComponentRef Id="StateDir" />
     </Feature>
+
+    <!-- The service is stopped first so its dynamic tunnel permits are gone.
+         The installed executable still exists here, and deferred/no-impersonate
+         runs cleanup as LocalSystem. A nonzero exit blocks uninstall. Major
+         upgrades preserve strict blocks for the incoming service to reconcile. -->
+    <CustomAction Id="CleanupQuantumLinkWfp"
+                  FileRef="ServiceExe"
+                  ExeCommand="wfp-cleanup"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="check" />
+    <InstallExecuteSequence>
+      <Custom Action="CleanupQuantumLinkWfp"
+              After="StopServices"
+              Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+    </InstallExecuteSequence>
   </Package>
 </Wix>
