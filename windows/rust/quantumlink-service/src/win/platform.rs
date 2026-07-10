@@ -38,14 +38,21 @@ impl PlatformNetwork for WindowsPlatform {
         // interface.
         let mut guard = self.kill_switch.lock().unwrap();
         if let Some(config_routes) = guard.as_ref().map(|g| g.protected_routes().to_vec()) {
-            if let Some(current) = guard.as_mut() {
-                current.revoke_strict_tunnel_permits();
-            }
-            *guard = Some(KillSwitchGuard::engage_with_policy(
+            let previous = guard.take();
+            drop(previous);
+            let result = KillSwitchGuard::engage_with_policy(
                 &config_routes,
                 adapter.luid(),
                 config.kill_switch,
-            )?);
+            );
+            match result {
+                Ok(next) => *guard = Some(next),
+                Err(error) => {
+                    adapter.shutdown();
+                    *self.adapter_luid.lock().unwrap() = None;
+                    return Err(error);
+                }
+            }
         }
         Ok(Arc::new(adapter))
     }

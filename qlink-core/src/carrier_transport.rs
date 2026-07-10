@@ -3,6 +3,7 @@ use crate::error::{QlinkError, Result};
 use crate::quic_transport::QuicDatagramSession;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    io::ErrorKind,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -10,6 +11,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use tokio::sync::Notify;
 use tokio::{
     net::UdpSocket,
     sync::{mpsc, Mutex},
@@ -100,7 +102,9 @@ pub struct NativeUdpSession {
     socket: Arc<UdpSocket>,
     remote_addr: Option<SocketAddr>,
     listener_rx: Option<Arc<Mutex<mpsc::Receiver<Vec<u8>>>>>,
-    listener_sessions: Option<Arc<Mutex<HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>>>>,
+    listener_generation: Option<u64>,
+    listener_sessions: Option<Arc<Mutex<HashMap<SocketAddr, ListenerSession>>>>,
+    listener_shutdown: Option<Arc<Notify>>,
     recv_lock: Arc<Mutex<()>>,
     pending_frames: Arc<Mutex<VecDeque<Vec<u8>>>>,
     pending_authenticated: Arc<Mutex<VecDeque<Vec<u8>>>>,
@@ -109,28 +113,48 @@ pub struct NativeUdpSession {
     next_message_id: Arc<AtomicU64>,
 }
 
+#[derive(Debug)]
+struct ListenerSession {
+    generation: u64,
+    sender: mpsc::Sender<Vec<u8>>,
+}
+
 /// Multiplexes successive native UDP sessions on one stable responder socket.
 /// Each remote address receives a bounded queue and an independent session
 /// object; malformed datagrams never allocate a session.
 pub struct NativeUdpListener {
     accept_rx: Mutex<mpsc::Receiver<(NativeUdpSession, SocketAddr)>>,
+    shutdown: Arc<Notify>,
     dispatcher: JoinHandle<()>,
 }
 
 impl NativeUdpListener {
     pub fn new(socket: UdpSocket) -> Self {
         let socket = Arc::new(socket);
-        let sessions = Arc::new(Mutex::new(
-            HashMap::<SocketAddr, mpsc::Sender<Vec<u8>>>::new(),
-        ));
+        let sessions = Arc::new(Mutex::new(HashMap::<SocketAddr, ListenerSession>::new()));
+        let generation_counter = Arc::new(AtomicU64::new(0));
+        let shutdown = Arc::new(Notify::new());
         let (accept_tx, accept_rx) = mpsc::channel(LISTENER_ACCEPT_QUEUE_DEPTH);
         let dispatcher_socket = socket.clone();
         let dispatcher_sessions = sessions.clone();
+        let dispatcher_generation_counter = generation_counter.clone();
+        let dispatcher_shutdown = shutdown.clone();
         let dispatcher = tokio::spawn(async move {
             let mut buffer = vec![0_u8; MAX_UDP_DATAGRAM_LEN + 1];
             loop {
-                let Ok((len, peer_addr)) = dispatcher_socket.recv_from(&mut buffer).await else {
-                    break;
+                let (len, peer_addr) = match dispatcher_socket.recv_from(&mut buffer).await {
+                    Ok(value) => value,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            ErrorKind::ConnectionReset
+                                | ErrorKind::Interrupted
+                                | ErrorKind::WouldBlock
+                        ) || error.raw_os_error() == Some(10054) =>
+                    {
+                        continue;
+                    }
+                    Err(_) => break,
                 };
                 if len > MAX_UDP_DATAGRAM_LEN {
                     continue;
@@ -141,14 +165,20 @@ impl NativeUdpListener {
                 };
 
                 let mut sessions_guard = dispatcher_sessions.lock().await;
-                if let Some(sender) = sessions_guard.get(&peer_addr).cloned() {
-                    if sender.try_send(bytes.clone()).is_ok() {
+                if let Some(entry) = sessions_guard.get(&peer_addr) {
+                    let generation = entry.generation;
+                    if entry.sender.try_send(bytes.clone()).is_ok() {
                         if datagram.kind == DatagramKind::Close {
                             sessions_guard.remove(&peer_addr);
                         }
                         continue;
                     } else {
-                        sessions_guard.remove(&peer_addr);
+                        let stale = sessions_guard
+                            .get(&peer_addr)
+                            .is_some_and(|current| current.generation == generation);
+                        if stale {
+                            sessions_guard.remove(&peer_addr);
+                        }
                     }
                 }
                 if datagram.kind == DatagramKind::Close
@@ -161,20 +191,35 @@ impl NativeUdpListener {
                 if session_tx.try_send(bytes).is_err() {
                     continue;
                 }
-                sessions_guard.insert(peer_addr, session_tx);
+                let generation = dispatcher_generation_counter.fetch_add(1, Ordering::SeqCst) + 1;
+                sessions_guard.insert(
+                    peer_addr,
+                    ListenerSession {
+                        generation,
+                        sender: session_tx,
+                    },
+                );
                 let session = NativeUdpSession::from_listener(
                     dispatcher_socket.clone(),
                     peer_addr,
+                    generation,
                     session_rx,
                     dispatcher_sessions.clone(),
+                    dispatcher_shutdown.clone(),
                 );
                 if accept_tx.try_send((session, peer_addr)).is_err() {
-                    sessions_guard.remove(&peer_addr);
+                    if sessions_guard
+                        .get(&peer_addr)
+                        .is_some_and(|current| current.generation == generation)
+                    {
+                        sessions_guard.remove(&peer_addr);
+                    }
                 }
             }
         });
         Self {
             accept_rx: Mutex::new(accept_rx),
+            shutdown,
             dispatcher,
         }
     }
@@ -187,10 +232,15 @@ impl NativeUdpListener {
             .await
             .ok_or_else(|| QlinkError::Protocol("native UDP listener stopped".into()))
     }
+
+    pub fn shutdown_signal(&self) -> Arc<Notify> {
+        self.shutdown.clone()
+    }
 }
 
 impl Drop for NativeUdpListener {
     fn drop(&mut self) {
+        self.shutdown.notify_waiters();
         self.dispatcher.abort();
     }
 }
@@ -353,6 +403,8 @@ impl NativeUdpSession {
             socket: Arc::new(socket),
             remote_addr: None,
             listener_rx: None,
+            listener_generation: None,
+            listener_shutdown: None,
             listener_sessions: None,
             recv_lock: Arc::new(Mutex::new(())),
             pending_frames: Arc::new(Mutex::new(VecDeque::new())),
@@ -366,14 +418,18 @@ impl NativeUdpSession {
     fn from_listener(
         socket: Arc<UdpSocket>,
         remote_addr: SocketAddr,
+        generation: u64,
         listener_rx: mpsc::Receiver<Vec<u8>>,
-        listener_sessions: Arc<Mutex<HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>>>,
+        listener_sessions: Arc<Mutex<HashMap<SocketAddr, ListenerSession>>>,
+        listener_shutdown: Arc<Notify>,
     ) -> Self {
         Self {
             socket,
             remote_addr: Some(remote_addr),
             listener_rx: Some(Arc::new(Mutex::new(listener_rx))),
+            listener_generation: Some(generation),
             listener_sessions: Some(listener_sessions),
+            listener_shutdown: Some(listener_shutdown),
             recv_lock: Arc::new(Mutex::new(())),
             pending_frames: Arc::new(Mutex::new(VecDeque::new())),
             pending_authenticated: Arc::new(Mutex::new(VecDeque::new())),
@@ -426,7 +482,12 @@ impl NativeUdpSession {
             let _ = self.socket.try_send_to(&datagram, remote_addr);
             if let Some(sessions) = self.listener_sessions.as_ref() {
                 if let Ok(mut sessions) = sessions.try_lock() {
-                    sessions.remove(&remote_addr);
+                    if sessions
+                        .get(&remote_addr)
+                        .is_some_and(|entry| Some(entry.generation) == self.listener_generation)
+                    {
+                        sessions.remove(&remote_addr);
+                    }
                 }
             }
         } else {
@@ -506,12 +567,17 @@ impl NativeUdpSession {
 
     async fn receive_datagram(&self) -> Result<CarrierDatagram> {
         if let Some(listener_rx) = self.listener_rx.as_ref() {
-            let bytes = listener_rx
-                .lock()
-                .await
-                .recv()
-                .await
-                .ok_or_else(|| QlinkError::Protocol("native UDP carrier closed".into()))?;
+            let bytes = if let Some(shutdown) = self.listener_shutdown.as_ref() {
+                tokio::select! {
+                    bytes = async {
+                        listener_rx.lock().await.recv().await
+                    } => bytes,
+                    _ = shutdown.notified() => None,
+                }
+            } else {
+                listener_rx.lock().await.recv().await
+            }
+            .ok_or_else(|| QlinkError::Protocol("native UDP carrier closed".into()))?;
             return decode_datagram(&bytes);
         }
         let mut buf = vec![0_u8; MAX_UDP_DATAGRAM_LEN + 1];

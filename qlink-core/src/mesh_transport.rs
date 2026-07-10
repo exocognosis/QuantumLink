@@ -836,8 +836,8 @@ pub struct MeshTransportHandle {
     default_peer_id: StdMutex<Option<String>>,
     /// Shared inbound channel: every per-peer session manager forwards
     /// received frames here (wrapped with the source peer ID).
-    inbound_tx: mpsc::UnboundedSender<InboundFrame>,
-    inbound_rx: TokioMutex<mpsc::UnboundedReceiver<InboundFrame>>,
+    inbound_tx: mpsc::Sender<InboundFrame>,
+    inbound_rx: TokioMutex<mpsc::Receiver<InboundFrame>>,
     packet_session_generation: Arc<AtomicU64>,
     packet_session_event_tx: mpsc::UnboundedSender<PacketSessionEvent>,
     packet_session_event_rx: TokioMutex<mpsc::UnboundedReceiver<PacketSessionEvent>>,
@@ -1009,7 +1009,7 @@ impl MeshTransportHandle {
 
         let aggregate = Arc::new(AggregateState::new());
         let blocked_peer_history = Arc::new(BlockedPeerHistory::new());
-        let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<InboundFrame>();
+        let (inbound_tx, inbound_rx) = mpsc::channel::<InboundFrame>(1024);
         let packet_session_generation = Arc::new(AtomicU64::new(0));
         let (packet_session_event_tx, packet_session_event_rx) =
             mpsc::unbounded_channel::<PacketSessionEvent>();
@@ -1235,7 +1235,7 @@ impl MeshTransportHandle {
 
         let aggregate = Arc::new(AggregateState::new());
         let blocked_peer_history = Arc::new(BlockedPeerHistory::new());
-        let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<InboundFrame>();
+        let (inbound_tx, inbound_rx) = mpsc::channel::<InboundFrame>(1024);
         let packet_session_generation = Arc::new(AtomicU64::new(0));
         let (packet_session_event_tx, packet_session_event_rx) =
             mpsc::unbounded_channel::<PacketSessionEvent>();
@@ -1853,7 +1853,7 @@ async fn run_native_udp_responder_loop(
     inbound_acl: Option<Arc<PeerAcl>>,
     mesh_trust_policy: MeshTrustPolicy,
     identity_registry_lookup: Option<Arc<dyn IdentityRegistryLookup>>,
-    inbound_tx: mpsc::UnboundedSender<InboundFrame>,
+    inbound_tx: mpsc::Sender<InboundFrame>,
     packet_session_generation: Arc<AtomicU64>,
     packet_session_event_tx: mpsc::UnboundedSender<PacketSessionEvent>,
     _blocked_peer_history: Arc<BlockedPeerHistory>,
@@ -2016,7 +2016,7 @@ async fn run_native_udp_responder_loop(
                             frame,
                             packet_session: packet_session.clone(),
                         };
-                        if inbound_tx.send(inbound_frame).is_err() {
+                        if inbound_tx.send(inbound_frame).await.is_err() {
                             break;
                         }
                         if protected_bytes >= packet_session.rekey_after_bytes {
@@ -2048,7 +2048,7 @@ async fn run_responder_loop(
     inbound_acl: Option<Arc<PeerAcl>>,
     mesh_trust_policy: MeshTrustPolicy,
     identity_registry_lookup: Option<Arc<dyn IdentityRegistryLookup>>,
-    inbound_tx: mpsc::UnboundedSender<InboundFrame>,
+    inbound_tx: mpsc::Sender<InboundFrame>,
     packet_session_generation: Arc<AtomicU64>,
     packet_session_event_tx: mpsc::UnboundedSender<PacketSessionEvent>,
     _blocked_peer_history: Arc<BlockedPeerHistory>,
@@ -2207,7 +2207,7 @@ async fn run_responder_loop(
                             frame,
                             packet_session: packet_session.clone(),
                         };
-                        if inbound_tx.send(inbound_frame).is_err() {
+                        if inbound_tx.send(inbound_frame).await.is_err() {
                             break;
                         }
                         if protected_bytes >= packet_session.rekey_after_bytes {
@@ -2408,7 +2408,7 @@ async fn run_session_manager(
     connector: Arc<MeshConnector>,
     remote_peer_id: String,
     mut outbound_rx: mpsc::UnboundedReceiver<Vec<u8>>,
-    inbound_tx: mpsc::UnboundedSender<InboundFrame>,
+    inbound_tx: mpsc::Sender<InboundFrame>,
     mut event_rx: mpsc::UnboundedReceiver<NetworkEvent>,
     mut shutdown_rx: mpsc::UnboundedReceiver<()>,
     shared: Arc<SharedState>,
@@ -2553,7 +2553,7 @@ async fn run_session_manager(
                                 frame,
                                 packet_session: inbound_packet_session.clone(),
                             };
-                            if inbound_tx.send(envelope).is_err() {
+                            if inbound_tx.send(envelope).await.is_err() {
                                 break SessionLoopExit::Stop;
                             }
                             session_bytes = session_bytes.saturating_add(len);

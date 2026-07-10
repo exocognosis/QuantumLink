@@ -346,10 +346,14 @@ impl KillSwitchGuard {
     fn engage_dynamic(plan: WfpFilterPlan) -> Result<Self, EngineError> {
         let owner_engine = WfpEngine::open(false)?;
         ensure_owner_objects(&owner_engine)?;
+        // Persistent/foreign-session filters must be reconciled from the
+        // non-dynamic owner session. Dynamic permit filters are installed in
+        // their own session below so BFE removes them with that session.
+        reconcile_filters(&owner_engine, &[])?;
         drop(owner_engine);
 
         let engine = WfpEngine::open(true)?;
-        reconcile_filters(&engine, &plan.filters)?;
+        add_filters_transaction(&engine, &plan.filters)?;
         Ok(Self {
             _permit_engine: Some(engine),
             mode: WfpFilterMode::FailClosed,
