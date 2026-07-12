@@ -276,6 +276,23 @@ guarded_install_file "BINDIR target" "$QLINKCTL_SRC" "$DESTDIR$BINDIR/qlinkctl" 
 
 guarded_mkdir "CONFIG_DIR target" "$DESTDIR$CONFIG_DIR" 0750
 guarded_mkdir "STATE_DIR target" "$DESTDIR$STATE_DIR" 0750
+
+# Steam-safe bypass policy and per-game routing profiles. qlinkd loads these
+# from CONFIG_DIR at startup to enforce and disclose which traffic bypasses the
+# tunnel. They are optional: when the source tree ships them they are installed,
+# and when absent the daemon falls back to built-in production-safe defaults.
+if [ -e "$STEAMOS_ROOT/config/steam-bypass.toml" ]; then
+    guarded_mkdir "GAMES_DIR target" "$DESTDIR$CONFIG_DIR/games" 0750
+    guarded_install_file "steam-safe bypass policy" \
+        "$STEAMOS_ROOT/config/steam-bypass.toml" \
+        "$DESTDIR$CONFIG_DIR/steam-bypass.toml" 0644
+    for profile in "$STEAMOS_ROOT"/config/games/*.toml; do
+        [ -e "$profile" ] || continue
+        guarded_install_file "game profile" \
+            "$profile" \
+            "$DESTDIR$CONFIG_DIR/games/$(basename "$profile")" 0644
+    done
+fi
 UNIT_TMP="$(mktemp)"
 rewrite_unit_paths "$UNIT_SRC" "$UNIT_TMP"
 guarded_install_file "SYSD_UNIT_DIR target" "$UNIT_TMP" "$DESTDIR$SYSD_UNIT_DIR/$UNIT_NAME" 0644

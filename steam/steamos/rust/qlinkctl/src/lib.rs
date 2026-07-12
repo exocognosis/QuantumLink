@@ -62,7 +62,7 @@ pub fn format_guide() -> String {
         "- Route security-sensitive reports through SECURITY.md and keep secrets, wallet seeds, tokens, and raw packet payloads out of tickets.",
         "",
         "Steam-safe routing",
-        "- Steam-safe traffic bypass keeps Steam account, store, wallet, checkout, inventory, marketplace, launcher, and embedded browser traffic off QuantumLink by default.",
+        "{{STEAM_SAFE_BYPASS}}",
         "- QuantumLink protects selected game or party traffic through explicit game profile routing and keeps the default route off the VPN by default.",
         "- Activated mode owns qlink0, overlay routes, and qlink nftables state; teardown removes only owned state.",
         "- Validate Steam launch options, LAN discovery, voice chat, and anti-cheat behavior per title before broad use.",
@@ -72,6 +72,32 @@ pub fn format_guide() -> String {
         "- Local dry-run planning, packet I/O initialization, or transport ready: no status is not proof of protected peer traffic.",
     ]
     .join("\n")
+    .replace("{{STEAM_SAFE_BYPASS}}", &steam_safe_bypass_sentence())
+}
+
+/// Builds the Steam-safe disclosure line from the shared `qlink-game` bypass
+/// policy so the operator guide and the daemon's enforced policy stay in sync.
+fn steam_safe_bypass_sentence() -> String {
+    let policy = qlink_game::profile::SteamBypassPolicy::default();
+    format!(
+        "- Steam-safe traffic bypass keeps {} traffic off QuantumLink by default (policy default action: {}).",
+        format_bypass_categories(policy.bypass_categories()),
+        policy.default_action()
+    )
+}
+
+/// Renders bypass category slugs (`embedded_browser`) as a readable,
+/// comma-and-`and` joined phrase (`... launcher, embedded browser, ...`).
+fn format_bypass_categories(categories: &[String]) -> String {
+    let readable: Vec<String> = categories
+        .iter()
+        .map(|category| category.replace('_', " "))
+        .collect();
+    match readable.split_last() {
+        None => "no Steam".to_string(),
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{}, and {last}", rest.join(", ")),
+    }
 }
 
 pub fn format_onboarding_checklist(status: &DaemonStatus, peer_store: &PeerStore) -> String {
@@ -881,6 +907,28 @@ mod tests {
         assert!(guide.contains("Deck validation"));
         assert!(guide.contains("transport ready"));
         assert!(guide.contains("pre-production"));
+    }
+
+    #[test]
+    fn steam_safe_disclosure_is_derived_from_the_shared_bypass_policy() {
+        let guide = format_guide();
+        // Every category the daemon enforces must appear in the operator
+        // disclosure — including `updates` and `login`, which the previous
+        // hardcoded sentence omitted. The guide is now generated from the same
+        // `qlink-game` policy the daemon validates against.
+        let policy = qlink_game::profile::SteamBypassPolicy::default();
+        for category in policy.bypass_categories() {
+            let readable = category.replace('_', " ");
+            assert!(
+                guide.contains(&readable),
+                "guide should disclose bypass category '{readable}'"
+            );
+        }
+        assert!(guide.contains("embedded browser"));
+        assert!(guide.contains("updates"));
+        assert!(guide.contains("login"));
+        assert!(guide.contains("policy default action: bypass"));
+        assert!(!guide.contains("{{STEAM_SAFE_BYPASS}}"));
     }
 
     #[test]
