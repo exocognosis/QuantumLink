@@ -38,6 +38,14 @@ public struct MeshTransportConfiguration: Codable, Equatable, Sendable {
     /// envelope; without it the file is plaintext JSON. Mint via
     /// `PeerStoreKey.loadOrGenerateBase64()`.
     public let peerStoreKeyB64: String?
+    /// Mesh trust policy, mirrors Rust `mesh_trust_policy`. `nil` lets the core
+    /// default (development_optional). Set `.publicRequired` for public meshes.
+    public let meshTrustPolicy: MeshTrustPolicy?
+    /// On-chain registry lookup config, mirrors Rust `dytallix_identity`. When
+    /// set on a `.publicRequired` mesh the core builds a live registry and fails
+    /// closed on peers without an active record. Compose via
+    /// `applyingDiscoveryIdentity` / `enforcingDytallixIdentity`.
+    public let dytallixIdentity: DytallixIdentityConfiguration?
 
     public init(
         meshID: String,
@@ -51,7 +59,9 @@ public struct MeshTransportConfiguration: Codable, Equatable, Sendable {
         probePacingMs: UInt64 = 50,
         enableICE: Bool = false,
         peerStorePath: String? = nil,
-        peerStoreKeyB64: String? = nil
+        peerStoreKeyB64: String? = nil,
+        meshTrustPolicy: MeshTrustPolicy? = nil,
+        dytallixIdentity: DytallixIdentityConfiguration? = nil
     ) {
         self.meshID = meshID
         self.localPeerID = localPeerID
@@ -65,6 +75,8 @@ public struct MeshTransportConfiguration: Codable, Equatable, Sendable {
         self.enableICE = enableICE
         self.peerStorePath = peerStorePath
         self.peerStoreKeyB64 = peerStoreKeyB64
+        self.meshTrustPolicy = meshTrustPolicy
+        self.dytallixIdentity = dytallixIdentity
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -80,6 +92,8 @@ public struct MeshTransportConfiguration: Codable, Equatable, Sendable {
         case enableICE = "enableIce"
         case peerStorePath = "peerStorePath"
         case peerStoreKeyB64 = "peerStoreKeyB64"
+        case meshTrustPolicy
+        case dytallixIdentity
     }
 }
 

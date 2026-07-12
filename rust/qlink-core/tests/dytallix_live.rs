@@ -82,6 +82,27 @@ fn public_mesh_example_config_enables_registry_enforcement() {
     assert_eq!(identity.endpoint, DEFAULT_ENDPOINT);
 }
 
+/// Cross-language contract (no network): the exact JSON the Swift
+/// `MeshTransportConfiguration` emits (via `applyingDiscoveryIdentity`, mode
+/// `.publicWallet`, policy `.publicRequired`) must deserialize into a Rust
+/// `MeshTransportConfig` that enforces the public policy. Swift includes
+/// `publishWalletAddress` (accepted + ignored by the core's deny_unknown_fields
+/// deserializer) and omits networkId/chainId (→ None). Regenerate the literal
+/// with the `swiftcheck` scratch encoder if the Swift Codable changes.
+#[test]
+fn swift_encoded_public_mesh_config_enforces_registry() {
+    let swift_json = r#"{"bindAddr":"0.0.0.0:0","directProbeTimeoutMs":750,"dytallixIdentity":{"allowedRpcEndpoints":[],"contractAddress":"0xbcb5cf5abb50333ee4bfde91f21bbcc24828673d","endpoint":"https://dytallix.com","publishWalletAddress":true},"enableIce":true,"localPeerId":"qlink_local","meshId":"quantumlink-public","meshTrustPolicy":"public_required","overallDeadlineMs":3000,"probePacingMs":50,"remotePeerId":"qlink_remote","rendezvousUrl":"rv.example:9471"}"#;
+    let config: MeshTransportConfig = serde_json::from_str(swift_json)
+        .expect("Rust must parse the Swift-emitted MeshTransportConfig JSON");
+    assert_eq!(config.mesh_trust_policy, MeshTrustPolicy::PublicRequired);
+    let identity = config
+        .dytallix_identity
+        .as_ref()
+        .expect("dytallixIdentity present");
+    assert_eq!(identity.contract_address, DEFAULT_CONTRACT);
+    assert_eq!(identity.endpoint, DEFAULT_ENDPOINT);
+}
+
 /// A live, deployed, queryable contract answers a `get_node` for an unknown
 /// peer with a well-formed "no such node" (`Ok(None)`) rather than a transport
 /// or JSON error. Proves the ported registry code talks to the real on-chain
