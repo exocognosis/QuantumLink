@@ -15,7 +15,8 @@
 use qlink_core::crypto::DeviceKeypair;
 use qlink_core::discovery::{CandidateEndpoint, CandidateType, PeerRecord, UnsignedPeerRecord};
 use qlink_core::dytallix_identity::{
-    verify_registry_binding, DytallixIdentityRegistry, DytallixRegistryLookupConfig, MeshTrustPolicy,
+    verify_registry_binding, DytallixIdentityRegistry, DytallixRegistryLookupConfig,
+    MeshTrustPolicy,
 };
 use qlink_core::mesh_transport::MeshTransportConfig;
 
@@ -125,8 +126,12 @@ async fn live_public_mesh_rejects_unregistered_peer() {
 
     // Public mesh: no active registry record -> fail closed.
     assert!(
-        verify_registry_binding(&record, registry_record.as_ref(), MeshTrustPolicy::PublicRequired)
-            .is_err(),
+        verify_registry_binding(
+            &record,
+            registry_record.as_ref(),
+            MeshTrustPolicy::PublicRequired
+        )
+        .is_err(),
         "public mesh must reject an unregistered peer (fail closed)"
     );
 
