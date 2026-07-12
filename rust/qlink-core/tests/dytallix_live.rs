@@ -41,7 +41,10 @@ async fn live_registry_lookup_unknown_peer_returns_none() {
 
     // Valid peer_id shape (`qlink_` prefix) but not registered on-chain, so the
     // contract returns "no such node" rather than an "invalid peer id" reject.
-    match registry.lookup("qlink_liveprobeNonexistentPeer00000000").await {
+    match registry
+        .lookup("qlink_liveprobeNonexistentPeer00000000")
+        .await
+    {
         Ok(None) => {}
         Ok(Some(record)) => panic!("unexpectedly found a registered node: {record:?}"),
         Err(err) => panic!("live registry lookup failed (contract unreachable?): {err}"),
