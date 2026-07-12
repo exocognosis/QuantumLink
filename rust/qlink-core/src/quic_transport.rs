@@ -1,6 +1,9 @@
 use crate::error::{QlinkError, Result};
 use bytes::Bytes;
-use quinn::{ClientConfig, Connection, Endpoint, ServerConfig, TransportConfig};
+use quinn::{
+    crypto::rustls::{QuicClientConfig, QuicServerConfig},
+    ClientConfig, Connection, Endpoint, ServerConfig, TransportConfig,
+};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::{net::SocketAddr, sync::Arc};
 
@@ -199,8 +202,21 @@ fn dev_server_config() -> Result<(ServerConfig, QuicCertificate)> {
         .map_err(|err| QlinkError::Crypto(format!("failed to generate QUIC certificate: {err}")))?;
     let cert_der = CertificateDer::from(cert.cert);
     let private_key = PrivateKeyDer::Pkcs8(cert.signing_key.serialize_der().into());
-    let mut server_config = ServerConfig::with_single_cert(vec![cert_der.clone()], private_key)
+    let rustls_config = rustls::ServerConfig::builder_with_provider(qlink_tls_provider())
+        .with_safe_default_protocol_versions()
+        .map_err(|err| {
+            QlinkError::Crypto(format!(
+                "failed to configure QUIC server protocol versions: {err}"
+            ))
+        })?
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der.clone()], private_key)
         .map_err(|err| QlinkError::Crypto(format!("failed to configure QUIC server: {err}")))?;
+    let mut server_config = ServerConfig::with_crypto(Arc::new(
+        QuicServerConfig::try_from(rustls_config).map_err(|err| {
+            QlinkError::Crypto(format!("failed to configure QUIC server crypto: {err}"))
+        })?,
+    ));
 
     let mut transport_config = TransportConfig::default();
     transport_config
@@ -224,14 +240,32 @@ fn client_config(trusted_certificates: &[QuicCertificate]) -> Result<ClientConfi
         })?;
     }
 
-    let mut client_config = ClientConfig::with_root_certificates(Arc::new(roots))
-        .map_err(|err| QlinkError::Crypto(format!("failed to configure QUIC client: {err}")))?;
+    let rustls_config = rustls::ClientConfig::builder_with_provider(qlink_tls_provider())
+        .with_safe_default_protocol_versions()
+        .map_err(|err| {
+            QlinkError::Crypto(format!(
+                "failed to configure QUIC client protocol versions: {err}"
+            ))
+        })?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let mut client_config = ClientConfig::new(Arc::new(
+        QuicClientConfig::try_from(rustls_config)
+            .map_err(|err| QlinkError::Crypto(format!("failed to configure QUIC client: {err}")))?,
+    ));
+
     let mut transport_config = TransportConfig::default();
     transport_config
         .datagram_receive_buffer_size(Some(4 * 1024 * 1024))
         .datagram_send_buffer_size(4 * 1024 * 1024);
     client_config.transport_config(Arc::new(transport_config));
     Ok(client_config)
+}
+
+fn qlink_tls_provider() -> Arc<rustls::crypto::CryptoProvider> {
+    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+    provider.kx_groups = vec![rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768];
+    Arc::new(provider)
 }
 
 #[cfg(test)]
@@ -291,6 +325,18 @@ mod tests {
             require_peer_session: false,
         })
         .unwrap()
+    }
+
+    #[test]
+    fn tls_provider_is_strictly_hybrid_ml_kem() {
+        let provider = qlink_tls_provider();
+        let groups: Vec<_> = provider
+            .kx_groups
+            .iter()
+            .map(|group| group.name())
+            .collect();
+
+        assert_eq!(groups, vec![rustls::NamedGroup::X25519MLKEM768]);
     }
 
     fn test_ipv4_packet(destination: [u8; 4]) -> Vec<u8> {
