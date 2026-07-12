@@ -1,6 +1,10 @@
 pub mod data_plane;
+pub mod game;
+pub mod identity;
+pub mod mesh_runtime;
 
 use data_plane::{packet_core_from_parts, BoxedTunDevice, DataPlaneError, DataPlaneRuntime};
+use game::SteamBypassSummary;
 use qlink_core::dytallix_identity::{
     evaluate_dytallix_policy_status, DytallixPolicyStatus, MeshTrustPolicy,
 };
@@ -25,10 +29,17 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(unix)]
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+#[cfg(unix)]
+use identity::load_or_generate_device_identity;
+#[cfg(unix)]
+use mesh_runtime::{build_daemon_mesh_transport, DaemonMeshTransport};
 
 #[cfg(unix)]
 const MAX_CONTROL_REQUEST_BYTES: usize = 1024;
@@ -101,6 +112,18 @@ impl Default for DaemonPaths {
             state_dir: PathBuf::from("/var/lib/quantumlink"),
             socket: PathBuf::from("/run/quantumlink/qlinkd.sock"),
         }
+    }
+}
+
+impl DaemonPaths {
+    /// Directory holding the operator config and the Steam-safe policy files
+    /// (`steam-bypass.toml`, `games/*.toml`). Derived from the config file's
+    /// parent, falling back to the packaged default location.
+    pub fn config_dir(&self) -> PathBuf {
+        self.config_file
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("/etc/quantumlink"))
     }
 }
 
@@ -522,16 +545,19 @@ pub struct DaemonEngine {
     paths: DaemonPaths,
     runtime: DaemonRuntimeState,
     data_plane: Option<EngineDataPlaneRuntime>,
+    steam_bypass: SteamBypassSummary,
 }
 
 impl DaemonEngine {
     pub fn new(config: DaemonConfig, paths: DaemonPaths) -> Self {
         let runtime = DaemonRuntimeState::idle(config.kill_switch);
+        let steam_bypass = SteamBypassSummary::load(&paths.config_dir(), &config);
         Self {
             config,
             paths,
             runtime,
             data_plane: None,
+            steam_bypass,
         }
     }
 
@@ -545,11 +571,13 @@ impl DaemonEngine {
             network: NetworkRuntimeState::planned(&config, &plan),
             data_plane: DataPlaneStatus::not_started(),
         };
+        let steam_bypass = SteamBypassSummary::load(&paths.config_dir(), &config);
         Ok(Self {
             config,
             paths,
             runtime,
             data_plane: None,
+            steam_bypass,
         })
     }
 
@@ -574,6 +602,17 @@ impl DaemonEngine {
 
     pub fn paths(&self) -> &DaemonPaths {
         &self.paths
+    }
+
+    /// The daemon's Steam-safe bypass posture, loaded from the config
+    /// directory. Surfaced in the resident banner and to `qlinkctl doctor`.
+    pub fn steam_bypass(&self) -> &SteamBypassSummary {
+        &self.steam_bypass
+    }
+
+    /// `true` once packet I/O has been started (network activated + TUN open).
+    pub fn data_plane_active(&self) -> bool {
+        self.data_plane.is_some()
     }
 
     pub fn mark_preparing(&mut self) {
@@ -1098,7 +1137,7 @@ fn write_control_error(stream: &mut UnixStream, message: &str) -> std::io::Resul
     stream.write_all(b"\n")
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 fn serve_status_streams<I>(streams: I, engine: &DaemonEngine) -> std::io::Result<()>
 where
     I: IntoIterator<Item = std::io::Result<UnixStream>>,
@@ -1116,8 +1155,43 @@ where
     Ok(())
 }
 
+/// Idle poll interval for the resident event loop. Bounds control-socket and
+/// shutdown-signal latency when neither the TUN nor the transport has work.
+#[cfg(unix)]
+const RESIDENT_IDLE_POLL: Duration = Duration::from_millis(5);
+
+#[cfg(unix)]
+static RESIDENT_SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+#[cfg(unix)]
+extern "C" fn handle_shutdown_signal(_signal: libc::c_int) {
+    RESIDENT_SHUTDOWN.store(true, Ordering::SeqCst);
+}
+
+#[cfg(unix)]
+fn install_shutdown_signal_handlers() {
+    // Async-signal-safe: the handler only flips an atomic. systemd stops the
+    // unit with SIGTERM; a foreground operator uses Ctrl-C (SIGINT).
+    unsafe {
+        libc::signal(libc::SIGTERM, handle_shutdown_signal as usize);
+        libc::signal(libc::SIGINT, handle_shutdown_signal as usize);
+    }
+}
+
+/// Runs the resident daemon: binds the control socket, builds the live mesh
+/// transport, and drives the bidirectional packet pump until a shutdown signal
+/// (SIGTERM/SIGINT) arrives.
 #[cfg(unix)]
 pub fn run_resident(engine: DaemonEngine) -> std::io::Result<()> {
+    install_shutdown_signal_handlers();
+    run_resident_until(engine, &RESIDENT_SHUTDOWN)
+}
+
+/// Resident daemon body with an injectable shutdown flag (tests drive it
+/// directly). Binds and secures the control socket, then serves the resident
+/// loop until `shutdown` is set.
+#[cfg(unix)]
+pub fn run_resident_until(mut engine: DaemonEngine, shutdown: &AtomicBool) -> std::io::Result<()> {
     let socket = engine.paths().socket.clone();
     if let Some(parent) = socket.parent() {
         std::fs::create_dir_all(parent)?;
@@ -1128,7 +1202,131 @@ pub fn run_resident(engine: DaemonEngine) -> std::io::Result<()> {
 
     let listener = UnixListener::bind(&socket)?;
     apply_local_control_socket_acl(&socket)?;
-    serve_status_streams(listener.incoming(), &engine)
+    listener.set_nonblocking(true)?;
+
+    eprintln!("qlinkd resident: {}", engine.steam_bypass().banner());
+    if let Some(warning) = engine.steam_bypass().alignment_warning.clone() {
+        eprintln!("qlinkd steam-safe warning: {warning}");
+    }
+
+    let transport = build_resident_transport(&engine);
+    if let Some(transport) = &transport {
+        eprintln!("qlinkd data-plane transport: {}", transport.describe());
+    } else if engine.data_plane_active() {
+        eprintln!(
+            "qlinkd data plane active but transport unavailable; protected traffic fails closed"
+        );
+    }
+
+    let result = serve_resident_loop(&mut engine, transport, &listener, shutdown);
+    let _ = std::fs::remove_file(&socket);
+    result
+}
+
+/// The resident event loop: pump the data plane and serve the control socket
+/// each tick, sleeping briefly only when a tick did no work. Exits when
+/// `shutdown` is set, shutting the transport down on the way out.
+#[cfg(unix)]
+pub fn serve_resident_loop(
+    engine: &mut DaemonEngine,
+    mut transport: Option<DaemonMeshTransport>,
+    listener: &UnixListener,
+    shutdown: &AtomicBool,
+) -> std::io::Result<()> {
+    let mut buffer = vec![0_u8; DATA_PLANE_MTU];
+    let mut result = Ok(());
+    while !shutdown.load(Ordering::SeqCst) {
+        match pump_and_serve_once(engine, transport.as_mut(), listener, &mut buffer) {
+            Ok(did_work) => {
+                if !did_work {
+                    std::thread::sleep(RESIDENT_IDLE_POLL);
+                }
+            }
+            Err(error) => {
+                result = Err(error);
+                break;
+            }
+        }
+    }
+    if let Some(transport) = &transport {
+        transport.shutdown();
+    }
+    result
+}
+
+/// Builds the live mesh transport for the resident data plane. Returns `None`
+/// when the data plane is inactive (dry-run resident) or transport construction
+/// fails — in the failure case the pump keeps running and fails closed, exactly
+/// as when no peer session is available.
+#[cfg(unix)]
+fn build_resident_transport(engine: &DaemonEngine) -> Option<DaemonMeshTransport> {
+    if !engine.data_plane_active() {
+        return None;
+    }
+    let identity = match load_or_generate_device_identity(&engine.paths().state_dir) {
+        Ok(identity) => identity,
+        Err(error) => {
+            eprintln!("qlinkd device identity unavailable; data plane fails closed: {error}");
+            return None;
+        }
+    };
+    match build_daemon_mesh_transport(engine.config(), &identity, &engine.paths().state_dir) {
+        Ok(transport) => Some(transport),
+        Err(error) => {
+            eprintln!("qlinkd mesh transport init failed; data plane fails closed: {error}");
+            None
+        }
+    }
+}
+
+/// One resident tick: drive the outbound (TUN → transport) and inbound
+/// (transport → TUN) pumps once each, then accept at most one pending control
+/// connection. Returns `true` when any work happened, so the caller can avoid
+/// sleeping under load. Never blocks: the TUN and control socket are
+/// non-blocking and pump errors are logged without tearing down the loop.
+#[cfg(unix)]
+pub fn pump_and_serve_once(
+    engine: &mut DaemonEngine,
+    transport: Option<&mut DaemonMeshTransport>,
+    listener: &UnixListener,
+    buffer: &mut [u8],
+) -> std::io::Result<bool> {
+    let mut did_work = false;
+
+    if let Some(transport) = transport {
+        if let Some(runtime) = engine.data_plane_runtime_mut() {
+            match runtime.pump_tun_to_transport_once(&mut *transport, buffer) {
+                Ok(result) => {
+                    if result.observed_packets > 0 {
+                        did_work = true;
+                    }
+                }
+                Err(error) => eprintln!("qlinkd outbound pump error: {error}"),
+            }
+            match runtime.pump_transport_to_tun_once(&mut *transport) {
+                Ok(result) => {
+                    if result.accepted_packets > 0 || result.emitted_packets > 0 {
+                        did_work = true;
+                    }
+                }
+                Err(error) => eprintln!("qlinkd inbound pump error: {error}"),
+            }
+        }
+    }
+
+    match listener.accept() {
+        Ok((stream, _addr)) => {
+            stream.set_nonblocking(false)?;
+            if let Err(error) = serve_status_stream(stream, engine) {
+                eprintln!("qlinkd client error: {error}");
+            }
+            did_work = true;
+        }
+        Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+        Err(error) => return Err(error),
+    }
+
+    Ok(did_work)
 }
 
 #[cfg(unix)]
@@ -2166,5 +2364,138 @@ mod tests {
         assert_eq!(error.kind(), ErrorKind::InvalidData);
         assert!(error.to_string().contains("invalid qlinkd config"));
         assert!(error.to_string().contains("interfaceName"));
+    }
+
+    #[cfg(unix)]
+    fn activated_engine_with_loopback(paths: DaemonPaths) -> DaemonEngine {
+        let mut engine = DaemonEngine::try_new(DaemonConfig::default(), paths)
+            .expect("default config should produce a network plan");
+        let mut network_executor = RecordingNetworkExecutor::default();
+        let mut nftables_executor = RecordingNftablesExecutor::default();
+        engine
+            .activate_network_with(&mut network_executor, &mut nftables_executor)
+            .expect("fake executors should apply");
+        let tun = LoopbackTunDevice::new(TunDeviceConfig::new("qlink0", 1280));
+        engine
+            .start_data_plane_with(tun)
+            .expect("activated network should allow packet I/O");
+        engine
+    }
+
+    #[cfg(unix)]
+    fn protected_ipv4_packet(destination: [u8; 4]) -> Vec<u8> {
+        let mut packet = vec![0_u8; 20];
+        packet[0] = 0x45;
+        packet[3] = 20;
+        packet[8] = 64;
+        packet[9] = 17;
+        packet[12..16].copy_from_slice(&[100, 64, 0, 2]);
+        packet[16..20].copy_from_slice(&destination);
+        packet
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pump_and_serve_once_round_trips_protected_packet_through_local_echo() {
+        use qlink_linux::TunPacketIo;
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut engine = activated_engine_with_loopback(test_paths(&temp));
+        let mut transport = DaemonMeshTransport::local_echo();
+        let listener = UnixListener::bind(temp.path().join("tick.sock")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut buffer = vec![0_u8; DATA_PLANE_MTU];
+
+        let packet = protected_ipv4_packet([100, 64, 0, 9]);
+        engine
+            .data_plane_runtime_mut()
+            .unwrap()
+            .tun_mut()
+            .write_packet(&packet)
+            .unwrap();
+
+        // Outbound tick: TUN -> pump -> transport. Work happened, and the data
+        // plane now reports a ready, peer-session-backed transport.
+        let did_work =
+            pump_and_serve_once(&mut engine, Some(&mut transport), &listener, &mut buffer).unwrap();
+        assert!(did_work);
+        let status = engine.status();
+        assert_eq!(status.data_plane.state, DataPlaneState::Ready);
+        assert!(status.data_plane.transport_ready);
+        assert!(status.data_plane.peer_session_ready);
+        assert_eq!(
+            status.data_plane.transport_path,
+            Some(qlink_proto::PathKind::Direct)
+        );
+
+        // Inbound tick: transport -> pump -> TUN. The original packet is
+        // restored into the loopback device.
+        pump_and_serve_once(&mut engine, Some(&mut transport), &listener, &mut buffer).unwrap();
+        let len = engine
+            .data_plane_runtime_mut()
+            .unwrap()
+            .tun_mut()
+            .read_packet(&mut buffer)
+            .unwrap();
+        assert_eq!(len, packet.len());
+        assert_eq!(&buffer[16..20], &packet[16..20]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pump_and_serve_once_serves_status_over_control_socket() {
+        use std::io::{Read, Write};
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut engine = DaemonEngine::new(DaemonConfig::default(), test_paths(&temp));
+        let socket_path = temp.path().join("control.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut buffer = vec![0_u8; DATA_PLANE_MTU];
+
+        let mut client = UnixStream::connect(&socket_path).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        client.write_all(b"status\n").unwrap();
+
+        // No transport: the tick still accepts and serves the control request.
+        let did_work = pump_and_serve_once(&mut engine, None, &listener, &mut buffer).unwrap();
+        assert!(did_work);
+
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        assert!(response.contains(r#""phase":"idle""#));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pump_and_serve_once_idle_reports_no_work() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut engine = activated_engine_with_loopback(test_paths(&temp));
+        let mut transport = DaemonMeshTransport::local_echo();
+        let listener = UnixListener::bind(temp.path().join("idle.sock")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut buffer = vec![0_u8; DATA_PLANE_MTU];
+
+        // Nothing queued on the TUN, no client connected: a tick does no work.
+        let did_work =
+            pump_and_serve_once(&mut engine, Some(&mut transport), &listener, &mut buffer).unwrap();
+        assert!(!did_work);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn serve_resident_loop_exits_when_shutdown_is_set() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut engine = DaemonEngine::new(DaemonConfig::default(), test_paths(&temp));
+        let listener = UnixListener::bind(temp.path().join("loop.sock")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let shutdown = AtomicBool::new(true);
+        let transport = Some(DaemonMeshTransport::local_echo());
+
+        // Pre-set shutdown: the loop must return promptly and shut the
+        // transport down without blocking.
+        serve_resident_loop(&mut engine, transport, &listener, &shutdown).unwrap();
     }
 }
