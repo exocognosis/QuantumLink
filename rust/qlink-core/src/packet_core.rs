@@ -1,25 +1,24 @@
 use crate::{
     crypto::{validate_suite_name, SUITE_FIPS203},
     error::{QlinkError, Result},
+    replay::ReplayWindow,
     routing::{RouteMode, RoutePolicy},
 };
-use chacha20poly1305::{
-    aead::{Aead, KeyInit, Payload},
-    ChaCha20Poly1305, Key, Nonce,
-};
-use hkdf::Hkdf;
 use serde::Deserialize;
-use sha2::Sha256;
-use std::{collections::VecDeque, net::Ipv4Addr};
+use std::{
+    collections::VecDeque,
+    net::Ipv4Addr,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
-const FRAME_MAGIC: &[u8; 6] = b"QLENC1";
+const FRAME_MAGIC: &[u8; 6] = b"QLPKT1";
 const FRAME_HEADER_LEN: usize = 6 + 8 + 2 + 4;
-const FRAME_TAG_LEN: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PacketDisposition {
     QueuedForTransport,
     DroppedUnprotected,
+    DroppedPeerSessionUnavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,12 +35,25 @@ pub struct PacketCoreMetrics {
     pub transport_frames_in: u64,
     pub dropped_unprotected: u64,
     pub dropped_malformed: u64,
+    pub dropped_peer_session_unavailable: u64,
+    pub dropped_replay: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledPeerSession {
+    pub peer_id: String,
+    pub expires_at_unix: u64,
+    pub rekey_after_packets: u64,
 }
 
 #[derive(Debug)]
 pub struct PacketTunnelCore {
     policy: RoutePolicy,
-    frame_crypto: FrameCrypto,
+    frame_codec: PacketFrameCodec,
+    require_peer_session: bool,
+    peer_session: Option<InstalledPeerSession>,
+    peer_session_packets: u64,
+    replay_window: ReplayWindow,
     next_packet_number: u64,
     transport_outbox: VecDeque<Vec<u8>>,
     tunnel_outbox: VecDeque<TunnelPacket>,
@@ -60,6 +72,8 @@ pub struct PacketTunnelCoreConfig {
     pub mtu: usize,
     #[serde(default)]
     pub crypto: Option<FfiCryptoPolicy>,
+    #[serde(default)]
+    pub require_peer_session: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -111,11 +125,15 @@ impl PacketTunnelCore {
             .as_ref()
             .map(|crypto| crypto.suite.as_str())
             .unwrap_or(SUITE_FIPS203);
-        let frame_crypto = FrameCrypto::new(suite)?;
+        let frame_codec = PacketFrameCodec::new(suite)?;
 
         Ok(Self {
             policy,
-            frame_crypto,
+            frame_codec,
+            require_peer_session: config.require_peer_session,
+            peer_session: None,
+            peer_session_packets: 0,
+            replay_window: ReplayWindow::new(),
             next_packet_number: 1,
             transport_outbox: VecDeque::new(),
             tunnel_outbox: VecDeque::new(),
@@ -126,6 +144,27 @@ impl PacketTunnelCore {
     pub fn from_json(bytes: &[u8]) -> Result<Self> {
         let config = serde_json::from_slice(bytes)?;
         Self::new(config)
+    }
+
+    pub fn install_peer_session(&mut self, session: InstalledPeerSession) {
+        if self.peer_session.as_ref() == Some(&session) {
+            return;
+        }
+        self.peer_session = Some(session);
+        self.peer_session_packets = 0;
+    }
+
+    pub fn clear_peer_session(&mut self) {
+        self.peer_session = None;
+        self.peer_session_packets = 0;
+    }
+
+    pub fn peer_session_ready(&self) -> bool {
+        self.peer_session_block_reason().is_none()
+    }
+
+    pub fn peer_session_error(&self) -> Option<String> {
+        self.peer_session_block_reason()
     }
 
     pub fn submit_tunnel_packet(
@@ -147,15 +186,25 @@ impl PacketTunnelCore {
             return Ok(PacketDisposition::DroppedUnprotected);
         }
 
+        if self.require_peer_session {
+            if self.peer_session_block_reason().is_some() {
+                self.metrics.dropped_peer_session_unavailable += 1;
+                return Ok(PacketDisposition::DroppedPeerSessionUnavailable);
+            }
+        }
+
         let mut normalized_packet = packet.to_vec();
         normalize_ipv4_packet(&mut normalized_packet)?;
 
-        let frame = self.frame_crypto.encode_transport_frame(
+        let frame = self.frame_codec.encode_transport_frame(
             self.next_packet_number,
             protocol_family,
             &normalized_packet,
         )?;
         self.next_packet_number += 1;
+        if self.require_peer_session {
+            self.peer_session_packets += 1;
+        }
         self.metrics.transport_frames_out += 1;
         self.transport_outbox.push_back(frame);
         Ok(PacketDisposition::QueuedForTransport)
@@ -166,14 +215,27 @@ impl PacketTunnelCore {
     }
 
     pub fn accept_transport_frame(&mut self, frame: &[u8]) -> Result<()> {
-        let (_packet_number, protocol_family, packet) =
-            match self.frame_crypto.decode_transport_frame(frame) {
+        if self.require_peer_session {
+            if let Some(reason) = self.peer_session_block_reason() {
+                self.metrics.dropped_peer_session_unavailable += 1;
+                return Err(QlinkError::Protocol(reason));
+            }
+        }
+
+        let (packet_number, protocol_family, packet) =
+            match self.frame_codec.decode_transport_frame(frame) {
                 Ok(decoded) => decoded,
                 Err(error) => {
                     self.metrics.dropped_malformed += 1;
                     return Err(error);
                 }
             };
+        if !self.replay_window.observe(packet_number) {
+            self.metrics.dropped_replay += 1;
+            return Err(QlinkError::Protocol(
+                "replayed transport frame rejected".into(),
+            ));
+        }
         self.metrics.transport_frames_in += 1;
         self.metrics.packets_to_tunnel += 1;
         self.tunnel_outbox.push_back(TunnelPacket {
@@ -190,6 +252,35 @@ impl PacketTunnelCore {
     pub fn metrics(&self) -> PacketCoreMetrics {
         self.metrics.clone()
     }
+
+    fn peer_session_block_reason(&self) -> Option<String> {
+        if !self.require_peer_session {
+            return None;
+        }
+        let Some(session) = self.peer_session.as_ref() else {
+            return Some("authenticated peer session keys are not installed".to_string());
+        };
+        let now = now_unix_seconds();
+        if session.expires_at_unix <= now {
+            return Some(format!("peer session for {} is expired", session.peer_id));
+        }
+        if session.rekey_after_packets > 0
+            && self.peer_session_packets >= session.rekey_after_packets
+        {
+            return Some(format!(
+                "peer session for {} requires rekey",
+                session.peer_id
+            ));
+        }
+        None
+    }
+}
+
+fn now_unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
 }
 
 fn default_route_mode() -> FfiRouteMode {
@@ -257,31 +348,12 @@ fn ipv4_header_checksum(header: &[u8]) -> u16 {
 }
 
 #[derive(Debug, Clone)]
-struct FrameCrypto {
-    suite: String,
-    key: [u8; 32],
-    nonce_prefix: [u8; 4],
-}
+struct PacketFrameCodec;
 
-impl FrameCrypto {
+impl PacketFrameCodec {
     fn new(suite: &str) -> Result<Self> {
         validate_suite_name(suite)?;
-
-        let hkdf = Hkdf::<Sha256>::new(Some(b"QuantumLink packet frame AEAD v1"), suite.as_bytes());
-        let mut output = [0_u8; 36];
-        hkdf.expand(b"packet-frame-key", &mut output)
-            .map_err(|_| QlinkError::Crypto("packet frame HKDF expand failed".into()))?;
-
-        let mut key = [0_u8; 32];
-        key.copy_from_slice(&output[..32]);
-        let mut nonce_prefix = [0_u8; 4];
-        nonce_prefix.copy_from_slice(&output[32..]);
-
-        Ok(Self {
-            suite: suite.to_string(),
-            key,
-            nonce_prefix,
-        })
+        Ok(Self)
     }
 
     fn encode_transport_frame(
@@ -292,39 +364,15 @@ impl FrameCrypto {
     ) -> Result<Vec<u8>> {
         let family = u16::try_from(protocol_family)
             .map_err(|_| QlinkError::Protocol("protocol family does not fit in frame".into()))?;
-        let ciphertext_len = packet
-            .len()
-            .checked_add(FRAME_TAG_LEN)
-            .ok_or_else(|| QlinkError::Protocol("packet is too large for frame".into()))?;
-        let ciphertext_len = u32::try_from(ciphertext_len)
+        let packet_len = u32::try_from(packet.len())
             .map_err(|_| QlinkError::Protocol("packet is too large for frame".into()))?;
 
-        let mut header = Vec::with_capacity(FRAME_HEADER_LEN);
-        header.extend_from_slice(FRAME_MAGIC);
-        header.extend_from_slice(&packet_number.to_be_bytes());
-        header.extend_from_slice(&family.to_be_bytes());
-        header.extend_from_slice(&ciphertext_len.to_be_bytes());
-
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&self.key));
-        let nonce = self.nonce(packet_number);
-        let ciphertext = cipher
-            .encrypt(
-                Nonce::from_slice(&nonce),
-                Payload {
-                    msg: packet,
-                    aad: &header,
-                },
-            )
-            .map_err(|_| QlinkError::Crypto("packet frame encryption failed".into()))?;
-        if ciphertext.len() != ciphertext_len as usize {
-            return Err(QlinkError::Crypto(
-                "packet frame ciphertext length mismatch".into(),
-            ));
-        }
-
-        let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + ciphertext.len());
-        frame.extend_from_slice(&header);
-        frame.extend_from_slice(&ciphertext);
+        let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + packet.len());
+        frame.extend_from_slice(FRAME_MAGIC);
+        frame.extend_from_slice(&packet_number.to_be_bytes());
+        frame.extend_from_slice(&family.to_be_bytes());
+        frame.extend_from_slice(&packet_len.to_be_bytes());
+        frame.extend_from_slice(packet);
         Ok(frame)
     }
 
@@ -345,41 +393,21 @@ impl FrameCrypto {
 
         let mut len = [0_u8; 4];
         len.copy_from_slice(&frame[16..20]);
-        let ciphertext_len = u32::from_be_bytes(len) as usize;
+        let packet_len = u32::from_be_bytes(len) as usize;
 
-        let ciphertext_start = FRAME_HEADER_LEN;
-        let ciphertext_end = ciphertext_start + ciphertext_len;
-        if frame.len() != ciphertext_end {
+        let packet_start = FRAME_HEADER_LEN;
+        let packet_end = packet_start + packet_len;
+        if frame.len() != packet_end {
             return Err(QlinkError::Protocol(
                 "transport frame length mismatch".into(),
             ));
         }
 
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&self.key));
-        let nonce = self.nonce(packet_number);
-        let packet = cipher
-            .decrypt(
-                Nonce::from_slice(&nonce),
-                Payload {
-                    msg: &frame[ciphertext_start..ciphertext_end],
-                    aad: &frame[..FRAME_HEADER_LEN],
-                },
-            )
-            .map_err(|_| {
-                QlinkError::Crypto(format!(
-                    "packet frame authentication failed for suite {}",
-                    self.suite
-                ))
-            })?;
-
-        Ok((packet_number, u16::from_be_bytes(family) as u32, packet))
-    }
-
-    fn nonce(&self, packet_number: u64) -> [u8; 12] {
-        let mut nonce = [0_u8; 12];
-        nonce[..4].copy_from_slice(&self.nonce_prefix);
-        nonce[4..].copy_from_slice(&packet_number.to_be_bytes());
-        nonce
+        Ok((
+            packet_number,
+            u16::from_be_bytes(family) as u32,
+            frame[packet_start..packet_end].to_vec(),
+        ))
     }
 }
 
@@ -399,7 +427,12 @@ mod tests {
         );
 
         let frame = core.pop_transport_frame().unwrap();
-        assert!(!contains_subslice(&frame, &packet));
+        let mut expected_packet = packet.clone();
+        normalize_ipv4_packet(&mut expected_packet).unwrap();
+        assert!(
+            contains_subslice(&frame, &expected_packet),
+            "packet core must not apply a classical inner packet cipher; PQC mesh frame protection owns transport secrecy"
+        );
 
         core.accept_transport_frame(&frame).unwrap();
         let restored = core.pop_tunnel_packet().unwrap();
@@ -425,21 +458,75 @@ mod tests {
     }
 
     #[test]
-    fn tampered_transport_frame_is_rejected() {
+    fn malformed_transport_frame_is_rejected() {
         let mut core = test_core(SUITE_FIPS204);
         let packet = test_ipv4_packet([100, 127, 0, 10]);
         core.submit_tunnel_packet(2, &packet).unwrap();
 
         let mut frame = core.pop_transport_frame().unwrap();
-        let last = frame.last_mut().unwrap();
-        *last ^= 0x01;
+        frame.pop();
 
         assert!(core.accept_transport_frame(&frame).is_err());
         assert!(core.pop_tunnel_packet().is_none());
     }
 
     #[test]
-    fn selected_pqc_suite_changes_transport_frame_encryption() {
+    fn malformed_transport_frames_are_rejected_without_queueing_packets() {
+        let packet = test_ipv4_packet([100, 127, 0, 10]);
+        let mut sender = test_core(SUITE_FIPS203);
+        sender.submit_tunnel_packet(2, &packet).unwrap();
+        let valid = sender.pop_transport_frame().unwrap();
+
+        let mut bad_magic = valid.clone();
+        bad_magic[0] ^= 0xff;
+
+        let mut trailing_byte = valid.clone();
+        trailing_byte.push(0);
+
+        let mut truncated_packet = valid.clone();
+        truncated_packet.pop();
+
+        let mut length_too_large = valid.clone();
+        length_too_large[FRAME_HEADER_LEN - 4..FRAME_HEADER_LEN]
+            .copy_from_slice(&u32::MAX.to_be_bytes());
+
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            ("empty", Vec::new()),
+            (
+                "short header",
+                valid[..FRAME_HEADER_LEN.saturating_sub(1)].to_vec(),
+            ),
+            ("bad magic", bad_magic),
+            ("trailing byte", trailing_byte),
+            ("truncated packet", truncated_packet),
+            ("length too large", length_too_large),
+        ];
+
+        for (name, frame) in cases {
+            let mut receiver = test_core(SUITE_FIPS203);
+            assert!(
+                receiver.accept_transport_frame(&frame).is_err(),
+                "{name} frame should be rejected"
+            );
+            assert!(
+                receiver.pop_tunnel_packet().is_none(),
+                "{name} frame must not queue a packet"
+            );
+            assert_eq!(
+                receiver.metrics().transport_frames_in,
+                0,
+                "{name} frame must not count as accepted"
+            );
+            assert_eq!(
+                receiver.metrics().dropped_malformed,
+                1,
+                "{name} frame should increment malformed drops"
+            );
+        }
+    }
+
+    #[test]
+    fn selected_pqc_suite_does_not_change_packet_frame_codec() {
         let packet = test_ipv4_packet([100, 127, 0, 10]);
         let mut fips203 = test_core(SUITE_FIPS203);
         let mut fips205 = test_core(SUITE_FIPS205);
@@ -449,16 +536,16 @@ mod tests {
 
         let fips203_frame = fips203.pop_transport_frame().unwrap();
         let fips205_frame = fips205.pop_transport_frame().unwrap();
+        let mut expected_packet = packet.clone();
+        normalize_ipv4_packet(&mut expected_packet).unwrap();
 
-        assert_ne!(fips203_frame, fips205_frame);
-        assert!(!contains_subslice(&fips203_frame, &packet));
-        assert!(!contains_subslice(&fips205_frame, &packet));
-
-        assert!(fips203.accept_transport_frame(&fips205_frame).is_err());
+        assert_eq!(fips203_frame, fips205_frame);
+        assert!(contains_subslice(&fips203_frame, &expected_packet));
+        fips203.accept_transport_frame(&fips205_frame).unwrap();
     }
 
     #[test]
-    fn packet_metadata_is_normalized_before_transport_encryption() {
+    fn packet_metadata_is_normalized_before_transport_framing() {
         let mut core = test_core(SUITE_FIPS203);
         let mut packet = test_ipv4_packet([100, 127, 0, 10]);
         packet[1] = 0xff;
@@ -487,9 +574,73 @@ mod tests {
             crypto: Some(FfiCryptoPolicy {
                 suite: "QLINK-UNKNOWN-v1".to_string(),
             }),
+            require_peer_session: false,
         };
 
         assert!(PacketTunnelCore::new(config).is_err());
+    }
+
+    #[test]
+    fn protected_packet_drops_when_peer_session_is_required_but_missing() {
+        let mut core = test_core_requiring_peer_session();
+        let packet = test_ipv4_packet([100, 127, 0, 10]);
+
+        assert_eq!(
+            core.submit_tunnel_packet(2, &packet).unwrap(),
+            PacketDisposition::DroppedPeerSessionUnavailable
+        );
+
+        assert!(core.pop_transport_frame().is_none());
+        assert!(!core.peer_session_ready());
+        assert!(core
+            .peer_session_error()
+            .unwrap()
+            .contains("peer session keys are not installed"));
+        assert_eq!(core.metrics().dropped_peer_session_unavailable, 1);
+    }
+
+    #[test]
+    fn installed_peer_session_allows_packet_until_rekey_boundary() {
+        let mut core = test_core_requiring_peer_session();
+        core.install_peer_session(InstalledPeerSession {
+            peer_id: "peer-a".to_string(),
+            expires_at_unix: now_unix_seconds() + 60,
+            rekey_after_packets: 1,
+        });
+        let packet = test_ipv4_packet([100, 127, 0, 10]);
+
+        assert_eq!(
+            core.submit_tunnel_packet(2, &packet).unwrap(),
+            PacketDisposition::QueuedForTransport
+        );
+        assert!(core.pop_transport_frame().is_some());
+        assert_eq!(
+            core.submit_tunnel_packet(2, &packet).unwrap(),
+            PacketDisposition::DroppedPeerSessionUnavailable
+        );
+
+        assert!(core
+            .peer_session_error()
+            .unwrap()
+            .contains("requires rekey"));
+        assert_eq!(core.metrics().transport_frames_out, 1);
+        assert_eq!(core.metrics().dropped_peer_session_unavailable, 1);
+    }
+
+    #[test]
+    fn replayed_transport_frame_is_rejected() {
+        let packet = test_ipv4_packet([100, 127, 0, 10]);
+        let mut sender = test_core(SUITE_FIPS203);
+        sender.submit_tunnel_packet(2, &packet).unwrap();
+        let frame = sender.pop_transport_frame().unwrap();
+        let mut receiver = test_core(SUITE_FIPS203);
+
+        receiver.accept_transport_frame(&frame).unwrap();
+        let error = receiver.accept_transport_frame(&frame).unwrap_err();
+
+        assert!(error.to_string().contains("replayed transport frame"));
+        assert_eq!(receiver.metrics().transport_frames_in, 1);
+        assert_eq!(receiver.metrics().dropped_replay, 1);
     }
 
     fn test_core(suite: &str) -> PacketTunnelCore {
@@ -501,6 +652,21 @@ mod tests {
             crypto: Some(FfiCryptoPolicy {
                 suite: suite.to_string(),
             }),
+            require_peer_session: false,
+        })
+        .unwrap()
+    }
+
+    fn test_core_requiring_peer_session() -> PacketTunnelCore {
+        PacketTunnelCore::new(PacketTunnelCoreConfig {
+            protected_routes: vec!["100.127.0.0/16".to_string()],
+            excluded_routes: vec![],
+            route_mode: FfiRouteMode::SplitTunnel,
+            mtu: 1280,
+            crypto: Some(FfiCryptoPolicy {
+                suite: SUITE_FIPS203.to_string(),
+            }),
+            require_peer_session: true,
         })
         .unwrap()
     }

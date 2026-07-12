@@ -32,11 +32,11 @@ public enum PQCAlgorithm: String, Codable, CaseIterable, Hashable, Identifiable,
     public var suiteIdentifier: String {
         switch self {
         case .fips203:
-            "QLINK-FIPS203-MLKEM768-HKDFSHA256-v1"
+            "QLINK-FIPS203-MLKEM768-SHAKE256-v1"
         case .fips204:
-            "QLINK-FIPS204-MLDSA65-HKDFSHA256-v1"
+            "QLINK-FIPS204-MLDSA65-SHAKE256-v1"
         case .fips205:
-            "QLINK-FIPS205-SLHDSA-SHA2-128S-HKDFSHA256-v1"
+            "QLINK-FIPS205-SLHDSA-SHAKE128S-SHAKE256-v1"
         }
     }
 

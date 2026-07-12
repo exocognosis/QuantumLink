@@ -16,7 +16,7 @@ use std::{
 use tokio::runtime::Runtime;
 
 static VERSION: &[u8] = b"0.1.0\0";
-static SUITE: &[u8] = b"QLINK-FIPS203-MLKEM768-HKDFSHA256-v1\0";
+static SUITE: &[u8] = b"QLINK-FIPS203-MLKEM768-SHAKE256-v1\0";
 
 pub struct QlinkTunnelCoreHandle {
     core: Mutex<PacketTunnelCore>,
@@ -130,7 +130,10 @@ pub unsafe extern "C" fn qlink_tunnel_core_submit_packet(
 
     match core.submit_tunnel_packet(protocol_family, packet) {
         Ok(PacketDisposition::QueuedForTransport) => 1,
-        Ok(PacketDisposition::DroppedUnprotected) => 0,
+        Ok(
+            PacketDisposition::DroppedUnprotected
+            | PacketDisposition::DroppedPeerSessionUnavailable,
+        ) => 0,
         Err(_) => -1,
     }
 }

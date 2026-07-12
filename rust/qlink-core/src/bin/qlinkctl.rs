@@ -876,6 +876,7 @@ fn dev_packet_core() -> qlink_core::Result<PacketTunnelCore> {
         route_mode: FfiRouteMode::SplitTunnel,
         mtu: 1280,
         crypto: None,
+        require_peer_session: false,
     })
 }
 
