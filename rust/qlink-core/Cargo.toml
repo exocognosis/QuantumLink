@@ -31,6 +31,7 @@ getrandom = "0.3"
 hex = "0.4"
 hkdf = "0.12"
 hmac = "0.12"
+md-5 = "0.10"
 mdns-sd = { version = "0.13", default-features = false, features = ["async"] }
 ml-dsa = { version = "0.1.0-rc.8", features = ["zeroize"] }
 ml-kem = { version = "0.3.0-rc.2", features = ["getrandom", "zeroize"] }
