@@ -707,15 +707,6 @@ dependencies = [
 
 [[package]]
 name = "flume"
-version = "0.11.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "da0e4dd2a88388a1f4ccc7c9ce104604dab68d9f408dc34cd45823d5a9069095"
-dependencies = [
- "spin",
-]
-
-[[package]]
-name = "flume"
 version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e139bc46ca777eb5efaf62df0ab8cc5fd400866427e56c68b22e414e53bd3be"
@@ -1379,7 +1370,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fb75febbe5fa1837a52fdbd1c735e168286c5c645fc2ddd31526f65c49941c2e"
 dependencies = [
  "fastrand",
- "flume 0.12.0",
+ "flume",
  "if-addrs",
  "mio",
  "socket-pktinfo",
@@ -1745,7 +1736,7 @@ dependencies = [
  "criterion",
  "dytallix-core",
  "dytallix-sdk",
- "flume 0.11.1",
+ "flume",
  "getrandom 0.4.3",
  "hex",
  "hmac 0.12.1",
