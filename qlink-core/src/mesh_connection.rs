@@ -2170,46 +2170,51 @@ mod tests {
     ) -> tokio::task::JoinHandle<()> {
         let local_peer_id = responder_keypair.public_key().peer_id();
         tokio::spawn(async move {
-            let _ = RelayResponderListener::run(&relay_addr, local_peer_id.clone(), move |session| {
-                let responder_keypair = responder_keypair.clone();
-                let server_cert_der = server_cert_der.clone();
-                let local_peer_id = local_peer_id.clone();
-                let frame_tx = frame_tx.clone();
-                tokio::spawn(async move {
-                    let session = CarrierSession::from(session);
-                    let Ok((InboundDecision::Accepted, assertion)) = receive_and_evaluate_inbound(
-                        &session,
-                        MESH_ID,
-                        DEFAULT_INBOUND_ASSERTION_MAX_AGE_SECONDS,
-                        None,
-                    )
-                    .await
-                    else {
-                        session.close(b"");
-                        return;
-                    };
-                    let context = PqcSessionContext::new(
-                        MESH_ID,
-                        assertion.peer_id,
-                        local_peer_id,
-                        server_cert_der,
-                    );
-                    let Ok(session_keys) =
-                        run_pqc_session_responder(&session, context, responder_keypair.as_ref())
+            let _ =
+                RelayResponderListener::run(&relay_addr, local_peer_id.clone(), move |session| {
+                    let responder_keypair = responder_keypair.clone();
+                    let server_cert_der = server_cert_der.clone();
+                    let local_peer_id = local_peer_id.clone();
+                    let frame_tx = frame_tx.clone();
+                    tokio::spawn(async move {
+                        let session = CarrierSession::from(session);
+                        let Ok((InboundDecision::Accepted, assertion)) =
+                            receive_and_evaluate_inbound(
+                                &session,
+                                MESH_ID,
+                                DEFAULT_INBOUND_ASSERTION_MAX_AGE_SECONDS,
+                                None,
+                            )
                             .await
-                    else {
-                        session.close(b"");
-                        return;
-                    };
-                    let mut protector = PqcFrameProtector::new(session_keys);
-                    if let Ok(protected) = session.receive_frame().await {
-                        if let Ok(plaintext) = protector.open(&protected) {
-                            let _ = frame_tx.send(plaintext);
+                        else {
+                            session.close(b"");
+                            return;
+                        };
+                        let context = PqcSessionContext::new(
+                            MESH_ID,
+                            assertion.peer_id,
+                            local_peer_id,
+                            server_cert_der,
+                        );
+                        let Ok(session_keys) = run_pqc_session_responder(
+                            &session,
+                            context,
+                            responder_keypair.as_ref(),
+                        )
+                        .await
+                        else {
+                            session.close(b"");
+                            return;
+                        };
+                        let mut protector = PqcFrameProtector::new(session_keys);
+                        if let Ok(protected) = session.receive_frame().await {
+                            if let Ok(plaintext) = protector.open(&protected) {
+                                let _ = frame_tx.send(plaintext);
+                            }
                         }
-                    }
-                });
-            })
-            .await;
+                    });
+                })
+                .await;
         })
     }
 

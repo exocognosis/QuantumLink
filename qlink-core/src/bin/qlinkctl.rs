@@ -1,4 +1,9 @@
+#[cfg(feature = "dev-quic-carrier")]
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use clap::{Parser, Subcommand};
+#[cfg(feature = "dev-quic-carrier")]
+use qlink_core::relay::RelayMessage;
+use qlink_core::{crypto::SessionKeys, pqc_frame::PqcFrameProtector};
 use qlink_core::{
     crypto::{answer_handshake, start_handshake, DeviceKeypair},
     discovery::{CandidateEndpoint, CandidateType, PeerRecord, UnsignedPeerRecord},
@@ -15,11 +20,9 @@ use qlink_core::{
 use qlink_core::{
     quic_transport::QuicEndpoint, relay::spawn_dev_relay, rendezvous::spawn_dev_rendezvous,
 };
-use qlink_core::{
-    crypto::SessionKeys,
-    pqc_frame::PqcFrameProtector,
-};
 use serde::Serialize;
+#[cfg(feature = "dev-quic-carrier")]
+use std::collections::HashMap;
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
@@ -27,17 +30,11 @@ use std::{
 };
 use tokio::net::UdpSocket;
 #[cfg(feature = "dev-quic-carrier")]
-use std::collections::HashMap;
-#[cfg(feature = "dev-quic-carrier")]
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{tcp::OwnedWriteHalf, TcpListener, TcpStream},
     sync::Mutex as TokioMutex,
 };
-#[cfg(feature = "dev-quic-carrier")]
-use qlink_core::relay::RelayMessage;
-#[cfg(feature = "dev-quic-carrier")]
-use base64::{engine::general_purpose::STANDARD, Engine as _};
 
 #[derive(Debug, Parser)]
 #[command(name = "qlinkctl")]
@@ -381,7 +378,10 @@ async fn main() -> qlink_core::Result<()> {
                 run.frames_sent as f64
             };
             println!("frames_per_sec={frames_per_sec:.1}");
-            println!("stream_bytes={}", run.frames_sent * payload.as_bytes().len() as u64);
+            println!(
+                "stream_bytes={}",
+                run.frames_sent * payload.as_bytes().len() as u64
+            );
             println!("total_elapsed_ms={}", outcome.total_elapsed.as_millis());
         }
         Command::ChannelAttack { scenario } => {
@@ -891,9 +891,7 @@ async fn run_mesh_connect_demo(scenario: &str) -> qlink_core::Result<()> {
             let cert = handle
                 .server_certificate_der()
                 .ok_or_else(|| {
-                    qlink_core::QlinkError::Protocol(
-                        "responder handle missing certificate".into(),
-                    )
+                    qlink_core::QlinkError::Protocol("responder handle missing certificate".into())
                 })?
                 .to_vec();
             let endpoints = if scenario == "direct" {
@@ -1078,12 +1076,22 @@ fn crypto_attack_battery() -> qlink_core::Result<Vec<AttackRow>> {
         let n = p.len();
         p[n - 1] ^= 0x01;
     })?);
-    rows.push(reject_row("tamper-ciphertext", "pqc-frame", &plaintext, |p| {
-        p[19] ^= 0x01; // first ciphertext byte (FRAME_HEADER_LEN = 19)
-    })?);
-    rows.push(reject_row("tamper-header-counter", "pqc-frame", &plaintext, |p| {
-        p[7] ^= 0x01; // high counter byte — stays non-zero, tag covers the header
-    })?);
+    rows.push(reject_row(
+        "tamper-ciphertext",
+        "pqc-frame",
+        &plaintext,
+        |p| {
+            p[19] ^= 0x01; // first ciphertext byte (FRAME_HEADER_LEN = 19)
+        },
+    )?);
+    rows.push(reject_row(
+        "tamper-header-counter",
+        "pqc-frame",
+        &plaintext,
+        |p| {
+            p[7] ^= 0x01; // high counter byte — stays non-zero, tag covers the header
+        },
+    )?);
     rows.push(reject_row("bad-magic", "pqc-frame", &plaintext, |p| {
         p[0] ^= 0xFF;
     })?);
@@ -1099,9 +1107,14 @@ fn crypto_attack_battery() -> qlink_core::Result<Vec<AttackRow>> {
         let n = p.len();
         p.truncate(n - 16);
     })?);
-    rows.push(reject_row("inflate-length", "pqc-frame", &plaintext, |p| {
-        p[15] = 0xFF; // high byte of the ciphertext-length field
-    })?);
+    rows.push(reject_row(
+        "inflate-length",
+        "pqc-frame",
+        &plaintext,
+        |p| {
+            p[15] = 0xFF; // high byte of the ciphertext-length field
+        },
+    )?);
 
     // Replay: an exact retransmit of a valid frame must be dropped.
     {

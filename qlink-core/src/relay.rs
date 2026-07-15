@@ -433,9 +433,7 @@ impl RelayResponderListener {
         F: FnMut(RelayCarrierSession),
     {
         let client = RelayClient::connect(server, local_peer_id.clone()).await?;
-        let RelayClient {
-            reader, writer, ..
-        } = client;
+        let RelayClient { reader, writer, .. } = client;
         let writer = Arc::new(Mutex::new(writer));
         let mut reader = reader;
         let mut sessions: HashMap<String, mpsc::UnboundedSender<Vec<u8>>> = HashMap::new();
@@ -469,7 +467,10 @@ impl RelayResponderListener {
                 .unwrap_or(false);
             if has_live_session {
                 // Existing session for this peer — forward the payload to it.
-                let _ = sessions.get(&source).expect("checked present").send(payload);
+                let _ = sessions
+                    .get(&source)
+                    .expect("checked present")
+                    .send(payload);
             } else {
                 // New (or ended) source peer — mint a fresh responder session.
                 sessions.remove(&source);
@@ -627,7 +628,9 @@ mod tests {
                     let done = done_tx.clone();
                     tokio::spawn(async move {
                         let session = CarrierSession::from(session);
-                        let keys = run_pqc_session_responder(&session, ctx, &key).await.unwrap();
+                        let keys = run_pqc_session_responder(&session, ctx, &key)
+                            .await
+                            .unwrap();
                         let mut protector = PqcFrameProtector::new(keys);
                         // Receive the initiator's protected frame, verify it.
                         let protected = session.receive_frame().await.unwrap();
@@ -643,9 +646,13 @@ mod tests {
         // Give the responder a moment to register with the relay.
         tokio::time::sleep(Duration::from_millis(150)).await;
 
-        let session = RelayCarrierSession::connect_initiator(&addr, initiator_id.clone(), responder_id.clone())
-            .await
-            .unwrap();
+        let session = RelayCarrierSession::connect_initiator(
+            &addr,
+            initiator_id.clone(),
+            responder_id.clone(),
+        )
+        .await
+        .unwrap();
         let session = CarrierSession::from(session);
         let ctx = PqcSessionContext::new(
             mesh_id.clone(),

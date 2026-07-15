@@ -641,7 +641,8 @@ pub unsafe extern "C" fn qlink_dytallix_ensure_wallet(
     let wallet_name = if wallet_name_len == 0 {
         None
     } else {
-        match borrowed_slice(wallet_name_ptr, wallet_name_len).and_then(|b| str::from_utf8(b).ok()) {
+        match borrowed_slice(wallet_name_ptr, wallet_name_len).and_then(|b| str::from_utf8(b).ok())
+        {
             Some(name) => Some(name.to_string()),
             None => return false,
         }
