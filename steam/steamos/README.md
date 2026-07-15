@@ -92,7 +92,7 @@ transport ready: no
 packet counters: observed=0 queued=0 dropped=0 emitted=0 accepted=0 rejected=0 transportErrors=0
 ```
 
-`data-plane state: starting` with `transport ready: no` is expected until an authenticated peer session is installed on a live peer transport/rendezvous path. It means the local TUN packet I/O runtime initialized, not that protected traffic is already flowing to remote peers.
+The resident daemon builds a live mesh transport and drives the bidirectional packet pump, so with the local-echo development transport (no rendezvous configured) the data plane reaches `ready`. On a real `MeshTransportHandle`, `data-plane state: starting` with `transport ready: no` is expected until an authenticated peer session is installed into packet-frame encryption on the live transport — the shared cross-platform gap the macOS and Windows silos also carry. It means the local TUN packet I/O runtime and transport are wired, not that protected traffic is already flowing to remote peers.
 
 ## Runtime Modes
 
@@ -137,7 +137,7 @@ SteamOS may remount the root filesystem read-only after system updates. Re-run t
 - Linux creates a dedicated TUN interface, currently documented as `qlink0`.
 - Protected game/party routes use the overlay range `100.64.0.0/10`.
 - `qlinkd` owns route setup, nftables fail-closed policy, peer state, profile application, and the local packet-pump boundary; the packaged service plans network changes until explicitly started with `--activate-network`, then records ownership for `--deactivate-network` cleanup.
-- The packet pump uses shared `qlink-core` packet framing and replay protection. Peer-transport selection and full Deck runtime validation remain separate gates.
+- The packet pump uses shared `qlink-core` packet framing and replay protection, and the resident daemon drives it against a live `DaemonMeshTransport` (shared `qlink-core` mesh transport, or a local-echo development transport when no rendezvous is configured). Peer-session-key installation over the real transport and full Deck runtime validation remain separate gates.
 - Rendezvous services publish and look up short-lived signed peer records.
 - Peers attempt direct QUIC paths first, with optional ICE/STUN helpers as the traversal layer matures.
 - Relay services are fallback paths for hostile NAT or intentionally hidden paths.

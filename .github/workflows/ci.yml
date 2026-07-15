@@ -37,6 +37,13 @@ jobs:
           cargo check -p qlink-core --bin qlinkctl --no-default-features --features native-udp-carrier
       - name: Rust dev QUIC carrier tests
         run: cargo test -p qlink-core --lib --no-default-features --features dev-quic-carrier -- --nocapture
+      - name: Rust TURN relay client (off-by-default feature)
+        # turn.rs is excluded from every other job (default and dev-quic-carrier
+        # builds don't compile it); this exercises it under its own feature.
+        # Direct-dependency purity of the default build is enforced separately by
+        # the pqc_policy_tests manifest check above.
+        run: |
+          cargo test -p qlink-core --lib turn:: --features turn-relay -- --nocapture
 
   macos:
     name: macOS silo (Swift + XCFramework)

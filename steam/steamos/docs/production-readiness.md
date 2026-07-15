@@ -13,9 +13,9 @@
 
 | Gate | Status | Evidence |
 |---|---|---|
-| Live TUN to peer transport | Blocked | Local bridge tests pass on 2026-06-30 (`cargo test -p qlinkd live_mesh_transport -- --nocapture`), but production still requires a two-Deck packet roundtrip evidence directory under `../validation/deck/<timestamp>/` |
+| Live TUN to peer transport | Blocked | The resident daemon now builds a live `DaemonMeshTransport` (shared `qlink-core` `MeshTransportHandle`, or a local-echo dev transport when no rendezvous is configured) from a persistent device identity and drives the bidirectional pump in `pump_and_serve_once`. On-device local-echo roundtrip proven 2026-07-12 (`cargo test -p qlinkd pump_and_serve_once_round_trips_protected_packet_through_local_echo -- --nocapture`); earlier bridge tests still pass (`cargo test -p qlinkd live_mesh_transport`). Production still requires a two-Deck packet roundtrip evidence directory under `../validation/deck/<timestamp>/`, and peer-session-key installation into packet-frame encryption over the real transport remains the shared cross-platform gap (the mesh variant fails closed, matching macOS/Windows) |
 | Production packet-session keys | Passed | Codex local automation on 2026-06-30: `cargo test -p qlink-core packet` and `cargo test -p qlinkd packet_session_keys -- --nocapture`; fail-closed missing/stale session coverage passed |
-| Steam-safe bypass | Blocked | Local profile tests pass on 2026-06-30 (`cargo test -p qlink-game steam_bypass -- --nocapture`), but real Deck route-leak evidence for Steam account/store/wallet/update/login categories is still required |
+| Steam-safe bypass | Blocked | The `qlink-game` policy is no longer orphaned: `qlinkd` loads it into `SteamBypassSummary` at startup, validates the protected overlay CIDR against the policy, and logs the posture; `qlinkctl`'s operator guide derives its Steam-safe disclosure from the same policy so enforcement and disclosure share one source. Verified 2026-07-12 (`cargo test -p qlinkd game::`, `cargo test -p qlinkctl steam_safe_disclosure`). Local profile tests still pass (`cargo test -p qlink-game steam_bypass`). Real Deck route-leak evidence for Steam account/store/wallet/update/login categories is still required |
 | nftables rollback | Passed | Codex local automation on 2026-06-30: `cargo test -p qlink-linux network_lifecycle -- --nocapture`; fake-executor rollback and owned-record retry paths passed |
 | Private invite peer lifecycle | Passed | Codex local automation on 2026-06-30: `cargo test -p qlinkd peer_lifecycle -- --nocapture` and `cargo test -p qlinkctl`; invite import, revoke, expiry, peer trust output, and 0600 peer-store checks passed |
 | Public Dytallix policy | Blocked | Shared-core status policy tests pass locally, but live public registry accept/reject evidence for missing, revoked, suspended, mismatched, stale, unavailable, and active records is not linked; sidecar schema/verifier: [`production-evidence.md`](production-evidence.md), [`../scripts/verify-production-evidence.sh`](../scripts/verify-production-evidence.sh) |
@@ -58,6 +58,43 @@
 - Added `steam/steamos/scripts/steamos-rc-dry-run.sh` to run a signed SteamOS RC package dry run that requires production signing material, a release public key, and non-hardware evidence before asserting `nonHardwareProductionReady`.
 - Added focused tests for collector failures, forbidden evidence markers, blocked-but-valid evidence, and signed RC dry-run behavior where local OpenSSL supports Ed25519 key generation.
 - Decision: No-Go remains unchanged until real public Dytallix evidence, active rendezvous/relay evidence, production signing material, and real Steam Deck validation evidence are linked.
+
+## 2026-07-12 Resident Data Plane + Game Layer Wiring
+
+Brings the SteamOS silo to the same wiring maturity as the macOS and Windows
+silos: the resident daemon runs a live packet pump against a real mesh transport
+(not just in tests), the daemon owns a persistent device identity, and the
+Steam-safe game layer is wired into the daemon and CLI instead of shipping as an
+orphaned crate.
+
+- Host class: local macOS development host with fake TUN (`LoopbackTunDevice`),
+  the local-echo dev transport, and fake network executors; no Steam Deck
+  hardware was attached and no real rendezvous/relay network was contacted.
+- Added `qlinkd::identity`: a persistent `0600` ML-DSA device keypair + peer
+  store key under the state directory (the SteamOS analogue of the Windows DPAPI
+  secret store and the macOS Keychain), which the mesh transport requires.
+- Added `qlinkd::mesh_runtime::DaemonMeshTransport`: the SteamOS counterpart of
+  the Windows `ActiveTransport`, wrapping the shared `qlink-core`
+  `MeshTransportHandle` behind the existing `MeshFrameTransport` contract, with a
+  local-echo development transport when no rendezvous server is configured.
+- Rewrote `run_resident` so the daemon builds the transport and drives the
+  bidirectional packet pump (`pump_and_serve_once`) concurrently with the control
+  socket, with SIGTERM/SIGINT-driven clean shutdown. Previously the resident loop
+  only served status and never moved packets.
+- Set the production Linux TUN non-blocking so the single-threaded resident pump
+  cannot stall on an idle interface (`qlink-linux`).
+- Wired `qlink-game` into `qlinkd` (Steam-safe bypass policy validation, host
+  selection) and `qlinkctl` (policy-derived disclosure); installer now places
+  `steam-bypass.toml` and `games/*.toml` under `/etc/quantumlink`.
+- Passed: `cargo test -p qlinkd -p qlink-game -p qlink-linux -p qlinkctl -p qlink-proto`
+  (all green; adds device-identity, mesh-transport, resident-pump, and
+  game-wiring coverage).
+- Passed: `bash steam/steamos/tests/install-steamos-test.sh` (now also asserts
+  the bypass policy and game profiles are installed).
+- Decision: No-Go is unchanged. This work raises local/code maturity to parity
+  with the other silos; it does not provide two-Deck hardware evidence, live
+  rendezvous/relay evidence, public Dytallix registry evidence, production
+  signing, or peer-session-key installation over the real transport.
 
 ## Go / No-Go Rule
 

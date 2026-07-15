@@ -26,6 +26,12 @@ const IFF_TUN: i16 = 0x0001;
 const IFF_NO_PI: i16 = 0x1000;
 #[cfg(unix)]
 const TUNSETIFF: c_ulong = 0x400454ca;
+#[cfg(unix)]
+const F_GETFL: c_int = 3;
+#[cfg(unix)]
+const F_SETFL: c_int = 4;
+#[cfg(unix)]
+const O_NONBLOCK: c_int = 0o4000;
 
 pub trait TunPacketIo {
     fn config(&self) -> &TunDeviceConfig;
@@ -174,6 +180,10 @@ impl TunDeviceOpener for RealTunOpener {
             .write(true)
             .open(request.path)?;
         configure_linux_tun(file.as_raw_fd(), &request.config.name, request.flags)?;
+        // Non-blocking reads let the resident daemon poll the TUN in its
+        // single-threaded pump loop without stalling the control socket when no
+        // packet is queued. The data plane treats `WouldBlock` as an idle tick.
+        set_nonblocking(file.as_raw_fd())?;
         Ok(file)
     }
 }
@@ -294,8 +304,22 @@ impl IfReq {
 }
 
 #[cfg(unix)]
+#[cfg(unix)]
+fn set_nonblocking(fd: RawFd) -> io::Result<()> {
+    let flags = unsafe { fcntl(fd, F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let result = unsafe { fcntl(fd, F_SETFL, flags | O_NONBLOCK) };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 unsafe extern "C" {
     fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
+    fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
 }
 
 #[cfg(unix)]
