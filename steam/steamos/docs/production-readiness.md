@@ -51,6 +51,14 @@
 - Extended package, release verification, and the SteamOS release workflow so `production-evidence-manifest.json` is included in sidecar artifacts when provided and `verify-report.json` exposes `nonHardwareProductionEvidenceValidated` plus `nonHardwareProductionReady` without asserting full `productionReady`.
 - Decision: No-Go remains unchanged until production signing, active rendezvous/relay evidence, public Dytallix registry evidence, and real Steam Deck validation evidence are linked.
 
+## 2026-07-10 Non-Hardware Evidence Collection Slice
+
+- Host class: local development host with fixture-based evidence bundles; no Steam Deck hardware was attached and no live endpoint evidence is claimed.
+- Added `steam/steamos/scripts/collect-production-evidence.sh` to generate the non-hardware production evidence manifest from a redacted operator evidence bundle with referenced evidence-file SHA-256 digests.
+- Added `steam/steamos/scripts/steamos-rc-dry-run.sh` to run a signed SteamOS RC package dry run that requires production signing material, a release public key, and non-hardware evidence before asserting `nonHardwareProductionReady`.
+- Added focused tests for collector failures, forbidden evidence markers, blocked-but-valid evidence, and signed RC dry-run behavior where local OpenSSL supports Ed25519 key generation.
+- Decision: No-Go remains unchanged until real public Dytallix evidence, active rendezvous/relay evidence, production signing material, and real Steam Deck validation evidence are linked.
+
 ## 2026-07-12 Resident Data Plane + Game Layer Wiring
 
 Brings the SteamOS silo to the same wiring maturity as the macOS and Windows
