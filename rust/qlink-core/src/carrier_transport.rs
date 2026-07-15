@@ -31,6 +31,10 @@ pub enum CarrierSession {
     #[cfg(feature = "dev-quic-carrier")]
     Quic(QuicDatagramSession),
     NativeUdp(NativeUdpSession),
+    /// Tunneled through a relay server (NAT-traversal fallback). The relay only
+    /// forwards opaque blobs; the end-to-end PQC session runs on top identically
+    /// to the direct carriers.
+    Relay(crate::relay::RelayCarrierSession),
 }
 
 impl CarrierSession {
@@ -39,6 +43,7 @@ impl CarrierSession {
             #[cfg(feature = "dev-quic-carrier")]
             Self::Quic(session) => session.send_frame(frame).await,
             Self::NativeUdp(session) => session.send_frame(frame).await,
+            Self::Relay(session) => session.send_frame(frame).await,
         }
     }
 
@@ -47,6 +52,7 @@ impl CarrierSession {
             #[cfg(feature = "dev-quic-carrier")]
             Self::Quic(session) => session.receive_frame().await,
             Self::NativeUdp(session) => session.receive_frame().await,
+            Self::Relay(session) => session.receive_frame().await,
         }
     }
 
@@ -55,6 +61,7 @@ impl CarrierSession {
             #[cfg(feature = "dev-quic-carrier")]
             Self::Quic(session) => session.send_authenticated_message(payload).await,
             Self::NativeUdp(session) => session.send_authenticated_message(payload).await,
+            Self::Relay(session) => session.send_authenticated_message(payload).await,
         }
     }
 
@@ -63,6 +70,7 @@ impl CarrierSession {
             #[cfg(feature = "dev-quic-carrier")]
             Self::Quic(session) => session.receive_authenticated_message(max_size).await,
             Self::NativeUdp(session) => session.receive_authenticated_message(max_size).await,
+            Self::Relay(session) => session.receive_authenticated_message(max_size).await,
         }
     }
 
@@ -71,6 +79,7 @@ impl CarrierSession {
             #[cfg(feature = "dev-quic-carrier")]
             Self::Quic(session) => session.close(reason),
             Self::NativeUdp(session) => session.close(reason),
+            Self::Relay(session) => session.close(reason),
         }
     }
 }
@@ -85,6 +94,12 @@ impl From<QuicDatagramSession> for CarrierSession {
 impl From<NativeUdpSession> for CarrierSession {
     fn from(session: NativeUdpSession) -> Self {
         Self::NativeUdp(session)
+    }
+}
+
+impl From<crate::relay::RelayCarrierSession> for CarrierSession {
+    fn from(session: crate::relay::RelayCarrierSession) -> Self {
+        Self::Relay(session)
     }
 }
 

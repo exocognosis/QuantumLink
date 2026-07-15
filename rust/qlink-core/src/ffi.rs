@@ -1,5 +1,6 @@
 use crate::{
     crypto::DeviceKeypair,
+    dytallix_identity::{ensure_dytallix_enrollment_wallet, DytallixRegistryConfig},
     mesh_connection::NetworkEvent,
     mesh_transport::{MeshTransportConfig, MeshTransportHandle, MeshTransportState},
     packet_core::{PacketDisposition, PacketTunnelCore},
@@ -653,6 +654,64 @@ pub unsafe extern "C" fn qlink_device_keypair_peer_id(
 }
 
 // ===================================================================
+// Dytallix enrollment wallet
+// ===================================================================
+
+/// Ensures a Dytallix enrollment wallet exists in the keystore at
+/// `keystore_path`, generating + activating one if absent. On success writes a
+/// newline-delimited `key=value` summary (`wallet_name`, `wallet_address`,
+/// `created_wallet`) to `out` and returns true; the buffer is caller-owned and
+/// must be freed with `qlink_owned_buffer_free`. An empty `wallet_name_len`
+/// means "use the active/default wallet". `endpoint` + `contract` are validated
+/// into the registry config but only the keystore is touched here — no network.
+#[no_mangle]
+pub unsafe extern "C" fn qlink_dytallix_ensure_wallet(
+    endpoint_ptr: *const u8,
+    endpoint_len: usize,
+    contract_ptr: *const u8,
+    contract_len: usize,
+    keystore_path_ptr: *const u8,
+    keystore_path_len: usize,
+    wallet_name_ptr: *const u8,
+    wallet_name_len: usize,
+    out: *mut QlinkOwnedBuffer,
+) -> bool {
+    let Some(out) = out.as_mut() else {
+        return false;
+    };
+    let (Some(endpoint), Some(contract), Some(keystore_path)) = (
+        borrowed_slice(endpoint_ptr, endpoint_len).and_then(|b| str::from_utf8(b).ok()),
+        borrowed_slice(contract_ptr, contract_len).and_then(|b| str::from_utf8(b).ok()),
+        borrowed_slice(keystore_path_ptr, keystore_path_len).and_then(|b| str::from_utf8(b).ok()),
+    ) else {
+        return false;
+    };
+    let wallet_name = if wallet_name_len == 0 {
+        None
+    } else {
+        match borrowed_slice(wallet_name_ptr, wallet_name_len).and_then(|b| str::from_utf8(b).ok()) {
+            Some(name) => Some(name.to_string()),
+            None => return false,
+        }
+    };
+
+    let config = match DytallixRegistryConfig::new(endpoint, contract, keystore_path, wallet_name) {
+        Ok(config) => config,
+        Err(_) => return false,
+    };
+    let wallet = match ensure_dytallix_enrollment_wallet(&config) {
+        Ok(wallet) => wallet,
+        Err(_) => return false,
+    };
+    let summary = format!(
+        "wallet_name={}\nwallet_address={}\ncreated_wallet={}\n",
+        wallet.wallet_name, wallet.wallet_address, wallet.created_wallet
+    );
+    *out = owned_buffer_from_vec(summary.into_bytes());
+    true
+}
+
+// ===================================================================
 // Mesh transport — keypair-aware constructor + multi-peer control.
 // ===================================================================
 
@@ -981,6 +1040,51 @@ pub unsafe extern "C" fn qlink_mesh_transport_send_frame_to(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ensure_wallet_ffi_generates_dytallix_address() {
+        let dir = std::env::temp_dir().join(format!(
+            "qlink-wallet-ffi-test-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let keystore = dir.join("keystore.json");
+        let keystore_str = keystore.to_str().unwrap();
+        let endpoint = "https://dytallix.com";
+        let contract = "0xbcb5cf5abb50333ee4bfde91f21bbcc24828673d";
+        let mut out = QlinkOwnedBuffer {
+            ptr: std::ptr::null_mut(),
+            len: 0,
+            cap: 0,
+        };
+        let ok = unsafe {
+            qlink_dytallix_ensure_wallet(
+                endpoint.as_ptr(),
+                endpoint.len(),
+                contract.as_ptr(),
+                contract.len(),
+                keystore_str.as_ptr(),
+                keystore_str.len(),
+                std::ptr::null(),
+                0,
+                &mut out,
+            )
+        };
+        assert!(ok, "ensure_wallet returned false");
+        let summary =
+            unsafe { String::from_utf8(slice::from_raw_parts(out.ptr, out.len).to_vec()).unwrap() };
+        unsafe { qlink_owned_buffer_free(out) };
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            summary.contains("wallet_address=dytallix1"),
+            "expected a dytallix1 address, got: {summary}"
+        );
+        assert!(
+            summary.contains("created_wallet=true"),
+            "expected created_wallet=true, got: {summary}"
+        );
+    }
 
     #[test]
     fn ffi_core_round_trips_transport_frame() {
