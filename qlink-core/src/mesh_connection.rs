@@ -20,6 +20,7 @@ use crate::{
     peer_store::{InMemoryPeerStore, PeerStore},
     pqc_frame::PqcFrameProtector,
     pqc_session_wire::run_pqc_session_initiator,
+    relay::RelayCarrierSession,
     rendezvous::RendezvousClient,
     session_crypto::PqcSessionContext,
     traversal::{candidate_socket_addr, HOST_PRIORITY},
@@ -305,22 +306,34 @@ pub struct DirectLink {
     frame_protector: PqcFrameProtector,
 }
 
+/// Relay-tunneled link. Same protected-frame data plane as [`DirectLink`] but
+/// keyed by the remote peer id (there is no direct socket address) and carrying
+/// a relay-backed [`CarrierSession`].
+pub struct RelayLink {
+    pub remote_peer_id: String,
+    session: CarrierSession,
+    frame_protector: PqcFrameProtector,
+}
+
 pub struct MeshLink {
     inner: MeshLinkInner,
 }
 
 enum MeshLinkInner {
     Direct(DirectLink),
+    Relay(RelayLink),
 }
 
 impl std::fmt::Debug for MeshLink {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            MeshLink {
-                inner: MeshLinkInner::Direct(link),
-            } => f
+        match &self.inner {
+            MeshLinkInner::Direct(link) => f
                 .debug_struct("MeshLink::Direct")
                 .field("remote_addr", &link.remote_addr)
+                .finish(),
+            MeshLinkInner::Relay(link) => f
+                .debug_struct("MeshLink::Relay")
+                .field("remote_peer_id", &link.remote_peer_id)
                 .finish(),
         }
     }
@@ -333,15 +346,26 @@ impl MeshLink {
         }
     }
 
+    fn relay(link: RelayLink) -> Self {
+        Self {
+            inner: MeshLinkInner::Relay(link),
+        }
+    }
+
     pub fn path_kind(&self) -> PathKind {
         match &self.inner {
             MeshLinkInner::Direct(_) => PathKind::Direct,
+            MeshLinkInner::Relay(_) => PathKind::Relay,
         }
     }
 
     pub async fn send_frame(&mut self, frame: Vec<u8>) -> Result<()> {
         match &mut self.inner {
             MeshLinkInner::Direct(link) => {
+                let protected = link.frame_protector.protect(&frame)?;
+                link.session.send_frame(protected).await
+            }
+            MeshLinkInner::Relay(link) => {
                 let protected = link.frame_protector.protect(&frame)?;
                 link.session.send_frame(protected).await
             }
@@ -354,12 +378,18 @@ impl MeshLink {
                 let protected = link.session.receive_frame().await?;
                 link.frame_protector.open(&protected)
             }
+            MeshLinkInner::Relay(link) => {
+                let protected = link.session.receive_frame().await?;
+                link.frame_protector.open(&protected)
+            }
         }
     }
 
     pub fn close(&self, reason: &[u8]) {
-        let MeshLinkInner::Direct(link) = &self.inner;
-        link.session.close(reason);
+        match &self.inner {
+            MeshLinkInner::Direct(link) => link.session.close(reason),
+            MeshLinkInner::Relay(link) => link.session.close(reason),
+        }
     }
 }
 
@@ -1151,21 +1181,118 @@ impl MeshConnector {
                     self.cache.invalidate(remote_peer_id);
                 }
 
-                let detail = latest_probe_failure_summary(&attempts)
-                    .map(|summary| format!("; last direct failure: {summary}"))
-                    .unwrap_or_default();
-                let Some(server) = self.config.relay_server.as_ref() else {
+                let Some(server) = self.config.relay_server.clone() else {
+                    let detail = latest_probe_failure_summary(&attempts)
+                        .map(|summary| format!("; last direct failure: {summary}"))
+                        .unwrap_or_default();
                     return Err(QlinkError::Protocol(format!(
                         "no direct candidate for peer {remote_peer_id} succeeded{detail} and no relay server is configured"
                     )));
                 };
 
-                Err(QlinkError::Protocol(format!(
-                    "relay PQC session is required for peer {remote_peer_id}; \
-                     raw relay fallback via {server} is disabled{detail}"
-                )))
+                self.connect_via_relay(
+                    remote_peer_id,
+                    &server,
+                    record.body.device_certificate_der.clone(),
+                    started,
+                    attempts,
+                    used_cached_path,
+                    registry_decision,
+                    peer_record_source,
+                )
+                .await
             }
         }
+    }
+
+    /// Relay fallback: when no direct candidate reaches the peer, tunnel the
+    /// end-to-end PQC session through the configured relay. The relay only
+    /// forwards opaque blobs — the signed inbound assertion, the ML-KEM/ML-DSA
+    /// handshake, and the frame protection all run over it exactly as on the
+    /// direct carrier, bound to the responder's published certificate DER, so a
+    /// malicious relay can neither read nor forge traffic. This preserves the
+    /// fail-closed guarantee (raw, unauthenticated relay is never used) while
+    /// completing the connection.
+    #[allow(clippy::too_many_arguments)]
+    async fn connect_via_relay(
+        &self,
+        remote_peer_id: &str,
+        server: &str,
+        responder_certificate_der: Vec<u8>,
+        started: Instant,
+        attempts: Vec<ProbeAttempt>,
+        used_cached_path: bool,
+        registry_decision: RegistryDecision,
+        peer_record_source: PeerRecordSource,
+    ) -> Result<(MeshLink, ConnectionOutcome)> {
+        let local_keypair = self.config.local_device_keypair.as_ref().ok_or_else(|| {
+            QlinkError::Protocol(format!(
+                "relay PQC session requires local_device_keypair for peer {remote_peer_id}"
+            ))
+        })?;
+        if responder_certificate_der.is_empty() {
+            return Err(QlinkError::Protocol(format!(
+                "relay PQC session for peer {remote_peer_id} requires a published device certificate to bind the session"
+            )));
+        }
+
+        let mesh_id = self.config.mesh_id.clone();
+        let local_peer_id = self.config.local_peer_id.clone();
+        // Same ordering as the direct carrier: connect + register, signed
+        // inbound assertion, then the app-layer PQC session bound to the
+        // responder's certificate. Bounded by the overall deadline so a silent
+        // relay (no responder registered) fails closed instead of hanging.
+        let establish = async {
+            let relay_session = RelayCarrierSession::connect_initiator(
+                server,
+                local_peer_id.clone(),
+                remote_peer_id.to_string(),
+            )
+            .await?;
+            let session = CarrierSession::from(relay_session);
+            send_inbound_assertion(&session, local_keypair.as_ref(), &mesh_id).await?;
+            let pqc_context = PqcSessionContext::new(
+                mesh_id.clone(),
+                local_peer_id.clone(),
+                remote_peer_id.to_string(),
+                responder_certificate_der,
+            );
+            let session_keys =
+                run_pqc_session_initiator(&session, pqc_context, local_keypair.as_ref()).await?;
+            Ok::<_, QlinkError>((session, session_keys))
+        };
+
+        let (session, session_keys) =
+            match tokio::time::timeout(self.config.overall_deadline, establish).await {
+                Ok(Ok(pair)) => pair,
+                Ok(Err(error)) => {
+                    return Err(QlinkError::Protocol(format!(
+                        "relay PQC session to peer {remote_peer_id} failed: {error}"
+                    )));
+                }
+                Err(_) => {
+                    return Err(QlinkError::Protocol(format!(
+                        "relay PQC session to peer {remote_peer_id} timed out"
+                    )));
+                }
+            };
+
+        let outcome = ConnectionOutcome {
+            remote_peer_id: remote_peer_id.to_string(),
+            path_kind: PathKind::Relay,
+            remote_addr: None,
+            attempts,
+            total_elapsed: started.elapsed(),
+            used_cached_path,
+            registry_decision,
+            peer_record_source,
+        };
+        let link = MeshLink::relay(RelayLink {
+            remote_peer_id: remote_peer_id.to_string(),
+            session,
+            frame_protector: PqcFrameProtector::new(session_keys),
+        });
+        Ok((link, outcome))
     }
 
     /// Runs paced parallel connectivity checks across the provided candidate
@@ -1970,7 +2097,7 @@ mod tests {
         },
         pqc_session_wire::run_pqc_session_responder,
         quic_transport::QuicEndpoint,
-        relay::spawn_dev_relay,
+        relay::{spawn_dev_relay, RelayResponderListener},
         rendezvous::spawn_dev_rendezvous,
         session_crypto::PqcSessionContext,
     };
@@ -2029,6 +2156,138 @@ mod tests {
                 }
             }
         })
+    }
+
+    /// Relay analogue of `spawn_pqc_drain_accept_loop`: registers with the relay
+    /// under the responder's peer id, and for each inbound source peer runs the
+    /// inbound-assertion + PQC-responder handshake, then decrypts one frame and
+    /// forwards the plaintext to `frame_tx`.
+    fn spawn_relay_pqc_responder(
+        relay_addr: String,
+        responder_keypair: Arc<DeviceKeypair>,
+        server_cert_der: Vec<u8>,
+        frame_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    ) -> tokio::task::JoinHandle<()> {
+        let local_peer_id = responder_keypair.public_key().peer_id();
+        tokio::spawn(async move {
+            let _ =
+                RelayResponderListener::run(&relay_addr, local_peer_id.clone(), move |session| {
+                    let responder_keypair = responder_keypair.clone();
+                    let server_cert_der = server_cert_der.clone();
+                    let local_peer_id = local_peer_id.clone();
+                    let frame_tx = frame_tx.clone();
+                    tokio::spawn(async move {
+                        let session = CarrierSession::from(session);
+                        let Ok((InboundDecision::Accepted, assertion)) =
+                            receive_and_evaluate_inbound(
+                                &session,
+                                MESH_ID,
+                                DEFAULT_INBOUND_ASSERTION_MAX_AGE_SECONDS,
+                                None,
+                            )
+                            .await
+                        else {
+                            session.close(b"");
+                            return;
+                        };
+                        let context = PqcSessionContext::new(
+                            MESH_ID,
+                            assertion.peer_id,
+                            local_peer_id,
+                            server_cert_der,
+                        );
+                        let Ok(session_keys) = run_pqc_session_responder(
+                            &session,
+                            context,
+                            responder_keypair.as_ref(),
+                        )
+                        .await
+                        else {
+                            session.close(b"");
+                            return;
+                        };
+                        let mut protector = PqcFrameProtector::new(session_keys);
+                        if let Ok(protected) = session.receive_frame().await {
+                            if let Ok(plaintext) = protector.open(&protected) {
+                                let _ = frame_tx.send(plaintext);
+                            }
+                        }
+                    });
+                })
+                .await;
+        })
+    }
+
+    #[tokio::test]
+    async fn relay_fallback_completes_with_pqc_session() {
+        let rendezvous = spawn_dev_rendezvous().await.unwrap();
+        let rendezvous_client = RendezvousClient::new(rendezvous.local_addr().to_string());
+        let relay = spawn_dev_relay().await.unwrap();
+        let relay_addr = relay.local_addr().to_string();
+
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let (server_endpoint, server_cert) = QuicEndpoint::server(bind).unwrap();
+        let server_cert_der = server_cert.as_der().to_vec();
+        // Direct is impossible: drop the server so the probe fails fast.
+        drop(server_endpoint);
+        let client_endpoint = QuicEndpoint::client(bind, &[server_cert]).unwrap();
+
+        let local_key = Arc::new(DeviceKeypair::generate().unwrap());
+        let remote_key = Arc::new(DeviceKeypair::generate().unwrap());
+        let remote_peer_id = remote_key.public_key().peer_id();
+
+        // Relay responder registered under the remote peer's id, bound to the
+        // same certificate the record publishes.
+        let (frame_tx, mut frame_rx) = tokio::sync::mpsc::unbounded_channel();
+        let _responder = spawn_relay_pqc_responder(
+            relay_addr.clone(),
+            remote_key.clone(),
+            server_cert_der.clone(),
+            frame_tx,
+        );
+        // Let the responder register with the relay before the connector dials.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Advertise only an unreachable direct candidate (port 1) so direct
+        // probing fails and the connector falls back to the relay.
+        let remote_record = signed_record_with_cert(
+            remote_key.as_ref(),
+            vec![CandidateEndpoint {
+                candidate_type: CandidateType::Host,
+                address: "127.0.0.1".to_string(),
+                port: 1,
+                priority: 120,
+            }],
+            1,
+            server_cert_der,
+        );
+        rendezvous_client
+            .publish(MESH_ID, remote_record)
+            .await
+            .unwrap();
+
+        let connector = MeshConnector::new(
+            MeshConnectorConfig::new(MESH_ID, local_key.public_key().peer_id())
+                .with_direct_probe_timeout(Duration::from_millis(150))
+                .with_overall_deadline(Duration::from_secs(3))
+                .with_relay_server(relay_addr)
+                .with_local_device_keypair(local_key),
+            rendezvous_client,
+            client_endpoint,
+        );
+
+        let (mut link, outcome) = connector.connect(&remote_peer_id).await.unwrap();
+        assert_eq!(link.path_kind(), PathKind::Relay);
+        assert_eq!(outcome.path_kind, PathKind::Relay);
+        assert_eq!(outcome.remote_addr, None);
+
+        // Data plane: a protected frame the responder must decrypt end-to-end.
+        link.send_frame(b"relay-frame".to_vec()).await.unwrap();
+        let received = tokio::time::timeout(Duration::from_secs(3), frame_rx.recv())
+            .await
+            .expect("responder did not receive the relayed frame")
+            .expect("frame channel closed");
+        assert_eq!(received, b"relay-frame");
     }
 
     #[tokio::test]

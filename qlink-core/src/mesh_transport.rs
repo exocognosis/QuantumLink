@@ -53,6 +53,7 @@ use crate::{
     },
     pqc_frame::PqcFrameProtector,
     pqc_session_wire::run_pqc_session_responder,
+    relay::RelayResponderListener,
     rendezvous::RendezvousClient,
     session_crypto::PqcSessionContext,
     traversal::HOST_PRIORITY,
@@ -451,12 +452,20 @@ struct PerPeerMetricsRaw {
 #[derive(Debug)]
 struct AggregateState {
     network_event_count: AtomicU64,
+    // Inbound-responder frames don't flow through a `self.peers` session
+    // (see `handle_inbound_session`), so their receive counts are tracked
+    // here and folded into the metrics snapshot alongside the per-peer
+    // totals. Without this, a pure responder always reports 0 received.
+    inbound_frames_received: AtomicU64,
+    inbound_bytes_received: AtomicU64,
 }
 
 impl AggregateState {
     fn new() -> Self {
         Self {
             network_event_count: AtomicU64::new(0),
+            inbound_frames_received: AtomicU64::new(0),
+            inbound_bytes_received: AtomicU64::new(0),
         }
     }
 }
@@ -671,6 +680,12 @@ pub struct MeshTransportHandle {
     /// Responder accept-loop task. Aborted on `Drop`. `None` when the
     /// responder is disabled via `disable_inbound_responder`.
     responder_task: StdMutex<Option<JoinHandle<()>>>,
+    /// Address to advertise in published peer records INSTEAD of
+    /// `responder_local_addr`. Lets a node behind a proxy/NAT (or a test
+    /// harness inserting an on-path element) publish a routable candidate
+    /// that differs from its actual bind address. `None` = advertise the
+    /// real bound address.
+    advertise_addr: StdMutex<Option<SocketAddr>>,
 }
 
 impl MeshTransportHandle {
@@ -874,6 +889,7 @@ impl MeshTransportHandle {
             server_certificate_der: None,
             responder_local_addr,
             responder_task: StdMutex::new(responder_task),
+            advertise_addr: StdMutex::new(None),
         };
 
         handle.add_peer(&config.remote_peer_id)?;
@@ -1052,6 +1068,7 @@ impl MeshTransportHandle {
         // identity + ACL evaluation, and routes accepted frames into
         // `inbound_tx` tagged with the verified peer_id. Disabled paths
         // simply skip the spawn.
+        let relay_registry_lookup = inbound_identity_registry_lookup.clone();
         let responder_task = match server_endpoint {
             Some(endpoint) => {
                 let inbound_acl = config.inbound_acl.clone().map(Arc::new);
@@ -1076,11 +1093,36 @@ impl MeshTransportHandle {
                     inbound_identity_registry_lookup,
                     inbound_tx_responder,
                     blocked_peer_history_responder,
+                    aggregate.clone(),
                 ));
                 Some(task)
             }
             None => None,
         };
+
+        // Also accept relay-fallback connections when a relay is configured and
+        // the responder is enabled (cert + keypair present): register with the
+        // relay under our peer id and run the same inbound handler per source
+        // peer. Lets peers that cannot reach us directly still connect. The task
+        // is aborted with the runtime on handle drop.
+        if let (Some(relay_url), Some(cert_der), Some(keypair)) = (
+            config.relay_url.clone(),
+            server_certificate_der.clone(),
+            local_device_keypair.clone(),
+        ) {
+            runtime.spawn(run_relay_responder_loop(
+                relay_url,
+                config.mesh_id.clone(),
+                config.local_peer_id.clone(),
+                keypair,
+                cert_der,
+                config.inbound_acl.clone().map(Arc::new),
+                inbound_mesh_trust_policy,
+                relay_registry_lookup,
+                inbound_tx.clone(),
+                aggregate.clone(),
+            ));
+        }
 
         let handle = Self {
             runtime: Some(runtime),
@@ -1096,6 +1138,7 @@ impl MeshTransportHandle {
             server_certificate_der,
             responder_local_addr,
             responder_task: StdMutex::new(responder_task),
+            advertise_addr: StdMutex::new(None),
         };
 
         // Auto-add the configured peer for back-compat with the
@@ -1130,6 +1173,15 @@ impl MeshTransportHandle {
     /// responder is disabled. Stable for the lifetime of the handle.
     pub fn responder_local_addr(&self) -> Option<SocketAddr> {
         self.responder_local_addr
+    }
+
+    /// Override the candidate address advertised by `publish_self`. Use when
+    /// the node is reached through a proxy/NAT whose public endpoint differs
+    /// from the local bind address.
+    pub fn set_advertise_addr(&self, addr: SocketAddr) {
+        if let Ok(mut guard) = self.advertise_addr.lock() {
+            *guard = Some(addr);
+        }
     }
 
     /// Synchronous wrapper for `publish_self` that drives the async
@@ -1208,10 +1260,16 @@ impl MeshTransportHandle {
         }
         let mesh_id = connector_config.mesh_id.clone();
 
+        let advertised = self
+            .advertise_addr
+            .lock()
+            .ok()
+            .and_then(|guard| *guard)
+            .unwrap_or(local_addr);
         let endpoints = vec![CandidateEndpoint {
             candidate_type: CandidateType::Host,
-            address: local_addr.ip().to_string(),
-            port: local_addr.port(),
+            address: advertised.ip().to_string(),
+            port: advertised.port(),
             priority: HOST_PRIORITY,
         }];
         let body = UnsignedPeerRecord::new(
@@ -1724,140 +1782,195 @@ async fn run_responder_loop(
     identity_registry_lookup: Option<Arc<dyn IdentityRegistryLookup>>,
     inbound_tx: mpsc::UnboundedSender<InboundFrame>,
     _blocked_peer_history: Arc<BlockedPeerHistory>,
+    aggregate: Arc<AggregateState>,
 ) {
     loop {
         let session = match server.accept_one().await {
             Ok(session) => session,
             Err(_) => break,
         };
-        let session = CarrierSession::from(session);
-        let mesh_id = expected_mesh_id.clone();
-        let local_peer_id = local_peer_id.clone();
-        let local_device_keypair = local_device_keypair.clone();
-        let carrier_binding = local_server_certificate_der.clone();
-        let acl = inbound_acl.clone();
-        let identity_registry_lookup = identity_registry_lookup.clone();
-        let inbound_tx = inbound_tx.clone();
-        tokio::spawn(async move {
-            let acl_ref = acl.as_deref();
-            let evaluation = receive_and_evaluate_inbound(
-                &session,
-                &mesh_id,
-                DEFAULT_INBOUND_ASSERTION_MAX_AGE_SECONDS,
-                acl_ref,
+        tokio::spawn(handle_inbound_session(
+            CarrierSession::from(session),
+            expected_mesh_id.clone(),
+            local_peer_id.clone(),
+            local_device_keypair.clone(),
+            local_server_certificate_der.clone(),
+            inbound_acl.clone(),
+            mesh_trust_policy,
+            identity_registry_lookup.clone(),
+            inbound_tx.clone(),
+            aggregate.clone(),
+        ));
+    }
+}
+
+/// Per-session inbound handler shared by the QUIC and relay responder loops.
+/// Verifies the peer's signed assertion + ACL, applies registry trust policy,
+/// runs the PQC responder handshake, then pumps decrypted frames into
+/// `inbound_tx` tagged with the verified peer_id. Carrier-agnostic: `session`
+/// may be a QUIC, native-UDP, or relay-tunneled `CarrierSession`.
+#[cfg(feature = "dev-quic-carrier")]
+#[allow(clippy::too_many_arguments)]
+async fn handle_inbound_session(
+    session: CarrierSession,
+    mesh_id: String,
+    local_peer_id: String,
+    local_device_keypair: Arc<DeviceKeypair>,
+    carrier_binding: Vec<u8>,
+    acl: Option<Arc<PeerAcl>>,
+    mesh_trust_policy: MeshTrustPolicy,
+    identity_registry_lookup: Option<Arc<dyn IdentityRegistryLookup>>,
+    inbound_tx: mpsc::UnboundedSender<InboundFrame>,
+    aggregate: Arc<AggregateState>,
+) {
+    let acl_ref = acl.as_deref();
+    let evaluation = receive_and_evaluate_inbound(
+        &session,
+        &mesh_id,
+        DEFAULT_INBOUND_ASSERTION_MAX_AGE_SECONDS,
+        acl_ref,
+    )
+    .await;
+    match evaluation {
+        Ok((InboundDecision::Accepted, assertion)) => {
+            let registry_record = match identity_registry_lookup.as_ref() {
+                Some(registry) => match registry.lookup(&assertion.peer_id).await {
+                    Ok(record) => record,
+                    Err(error) => match mesh_trust_policy {
+                        MeshTrustPolicy::PublicRequired => {
+                            tracing::warn!(
+                                peer_id = %assertion.peer_id,
+                                error = %error,
+                                "inbound identity registry lookup failed"
+                            );
+                            session.close(b"");
+                            return;
+                        }
+                        MeshTrustPolicy::PrivatePreferred
+                        | MeshTrustPolicy::DevelopmentOptional => {
+                            tracing::warn!(
+                                peer_id = %assertion.peer_id,
+                                error = %error,
+                                policy = ?mesh_trust_policy,
+                                "inbound identity registry lookup failed; continuing without registry verification"
+                            );
+                            None
+                        }
+                    },
+                },
+                None => None,
+            };
+            if let Err(error) = verify_inbound_registry_assertion(
+                &assertion,
+                registry_record.as_ref(),
+                mesh_trust_policy,
+            ) {
+                tracing::warn!(
+                    peer_id = %assertion.peer_id,
+                    error = %error,
+                    "inbound identity registry policy rejected assertion"
+                );
+                session.close(b"");
+                return;
+            }
+
+            let peer_id = assertion.peer_id;
+            let pqc_context =
+                PqcSessionContext::new(mesh_id, peer_id.clone(), local_peer_id, carrier_binding);
+            let handshake_timeout = pqc_responder_handshake_timeout();
+            let session_keys = match tokio::time::timeout(
+                handshake_timeout,
+                run_pqc_session_responder(&session, pqc_context, local_device_keypair.as_ref()),
             )
-            .await;
-            match evaluation {
-                Ok((InboundDecision::Accepted, assertion)) => {
-                    let registry_record = match identity_registry_lookup.as_ref() {
-                        Some(registry) => match registry.lookup(&assertion.peer_id).await {
-                            Ok(record) => record,
-                            Err(error) => match mesh_trust_policy {
-                                MeshTrustPolicy::PublicRequired => {
-                                    tracing::warn!(
-                                        peer_id = %assertion.peer_id,
-                                        error = %error,
-                                        "inbound identity registry lookup failed"
-                                    );
-                                    session.close(b"");
-                                    return;
-                                }
-                                MeshTrustPolicy::PrivatePreferred
-                                | MeshTrustPolicy::DevelopmentOptional => {
-                                    tracing::warn!(
-                                        peer_id = %assertion.peer_id,
-                                        error = %error,
-                                        policy = ?mesh_trust_policy,
-                                        "inbound identity registry lookup failed; continuing without registry verification"
-                                    );
-                                    None
-                                }
-                            },
-                        },
-                        None => None,
-                    };
-                    if let Err(error) = verify_inbound_registry_assertion(
-                        &assertion,
-                        registry_record.as_ref(),
-                        mesh_trust_policy,
-                    ) {
-                        tracing::warn!(
-                            peer_id = %assertion.peer_id,
-                            error = %error,
-                            "inbound identity registry policy rejected assertion"
-                        );
+            .await
+            {
+                Ok(Ok(session_keys)) => session_keys,
+                Ok(Err(error)) => {
+                    tracing::warn!(?error, peer_id = %peer_id, "inbound PQC session failed");
+                    session.close(b"");
+                    return;
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        timeout_ms = handshake_timeout.as_millis() as u64,
+                        peer_id = %peer_id,
+                        "inbound PQC session timed out"
+                    );
+                    session.close(b"");
+                    return;
+                }
+            };
+            let mut frame_protector = PqcFrameProtector::new(session_keys);
+            while let Ok(protected_frame) = session.receive_frame().await {
+                let frame = match frame_protector.open(&protected_frame) {
+                    Ok(frame) => frame,
+                    Err(_) => {
                         session.close(b"");
                         return;
                     }
-
-                    let peer_id = assertion.peer_id;
-                    let pqc_context = PqcSessionContext::new(
-                        mesh_id,
-                        peer_id.clone(),
-                        local_peer_id,
-                        carrier_binding,
-                    );
-                    let handshake_timeout = pqc_responder_handshake_timeout();
-                    let session_keys = match tokio::time::timeout(
-                        handshake_timeout,
-                        run_pqc_session_responder(
-                            &session,
-                            pqc_context,
-                            local_device_keypair.as_ref(),
-                        ),
-                    )
-                    .await
-                    {
-                        Ok(Ok(session_keys)) => session_keys,
-                        Ok(Err(error)) => {
-                            tracing::warn!(
-                                ?error,
-                                peer_id = %peer_id,
-                                "inbound PQC session failed"
-                            );
-                            session.close(b"");
-                            return;
-                        }
-                        Err(_) => {
-                            tracing::warn!(
-                                timeout_ms = handshake_timeout.as_millis() as u64,
-                                peer_id = %peer_id,
-                                "inbound PQC session timed out"
-                            );
-                            session.close(b"");
-                            return;
-                        }
-                    };
-                    let mut frame_protector = PqcFrameProtector::new(session_keys);
-                    while let Ok(protected_frame) = session.receive_frame().await {
-                        let frame = match frame_protector.open(&protected_frame) {
-                            Ok(frame) => frame,
-                            Err(_) => {
-                                session.close(b"");
-                                return;
-                            }
-                        };
-                        let inbound_frame = InboundFrame {
-                            peer_id: peer_id.clone(),
-                            frame,
-                        };
-                        if inbound_tx.send(inbound_frame).is_err() {
-                            // Receiver dropped — the transport handle is
-                            // gone or being torn down; nothing useful to
-                            // do here.
-                            break;
-                        }
-                    }
-                }
-                _ => {
-                    // Closing without a reason is intentional: echoing
-                    // the rejection (`acl: peer is on the deny list`)
-                    // would let an attacker probe the ACL contents. The
-                    // peer just sees a generic close.
-                    session.close(b"");
+                };
+                aggregate
+                    .inbound_frames_received
+                    .fetch_add(1, Ordering::Relaxed);
+                aggregate
+                    .inbound_bytes_received
+                    .fetch_add(frame.len() as u64, Ordering::Relaxed);
+                let inbound_frame = InboundFrame {
+                    peer_id: peer_id.clone(),
+                    frame,
+                };
+                if inbound_tx.send(inbound_frame).is_err() {
+                    // Receiver dropped — the transport handle is gone or being
+                    // torn down; nothing useful to do here.
+                    break;
                 }
             }
-        });
+        }
+        _ => {
+            // Closing without a reason is intentional: echoing the rejection
+            // (`acl: peer is on the deny list`) would let an attacker probe the
+            // ACL contents. The peer just sees a generic close.
+            session.close(b"");
+        }
+    }
+}
+
+/// Relay analogue of `run_responder_loop`: registers with the relay under the
+/// local peer id and, for each inbound source peer, runs `handle_inbound_session`
+/// over a relay-tunneled carrier. Lets a node accept relay-fallback connections
+/// from peers that cannot reach it directly. Runs until the relay connection
+/// drops (or the runtime shuts down).
+#[cfg(feature = "dev-quic-carrier")]
+#[allow(clippy::too_many_arguments)]
+async fn run_relay_responder_loop(
+    relay_url: String,
+    expected_mesh_id: String,
+    local_peer_id: String,
+    local_device_keypair: Arc<DeviceKeypair>,
+    local_server_certificate_der: Vec<u8>,
+    inbound_acl: Option<Arc<PeerAcl>>,
+    mesh_trust_policy: MeshTrustPolicy,
+    identity_registry_lookup: Option<Arc<dyn IdentityRegistryLookup>>,
+    inbound_tx: mpsc::UnboundedSender<InboundFrame>,
+    aggregate: Arc<AggregateState>,
+) {
+    let result = RelayResponderListener::run(&relay_url, local_peer_id.clone(), move |session| {
+        tokio::spawn(handle_inbound_session(
+            CarrierSession::from(session),
+            expected_mesh_id.clone(),
+            local_peer_id.clone(),
+            local_device_keypair.clone(),
+            local_server_certificate_der.clone(),
+            inbound_acl.clone(),
+            mesh_trust_policy,
+            identity_registry_lookup.clone(),
+            inbound_tx.clone(),
+            aggregate.clone(),
+        ));
+    })
+    .await;
+    if let Err(error) = result {
+        tracing::warn!(?error, "relay responder loop stopped");
     }
 }
 
@@ -1911,6 +2024,13 @@ fn mesh_transport_snapshot(
             path_kind_code = better_path_kind(path_kind_code, session_path);
         }
     }
+
+    // Fold in frames absorbed by the inbound responder path, which never
+    // registers a `self.peers` session and so is invisible to the per-peer
+    // loop above. Lets a pure responder (e.g. `publish-self`) report the
+    // real received counts a monitor scrapes.
+    totals.frames_received += aggregate.inbound_frames_received.load(Ordering::Relaxed);
+    totals.bytes_received += aggregate.inbound_bytes_received.load(Ordering::Relaxed);
 
     snapshot.push_gauge(
         "qlink_mesh_transport_peers",
