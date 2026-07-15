@@ -89,14 +89,15 @@ pub async fn build_direct_env(probe_ms: u64, deadline_ms: u64) -> DirectEnv {
     let publisher = RendezvousClient::new(rendezvous.local_addr().to_string());
     publisher.publish(MESH_ID, record).await.unwrap();
 
-    let local_key = DeviceKeypair::generate().unwrap();
+    let local_key = Arc::new(DeviceKeypair::generate().unwrap());
     let local_peer_id = local_key.public_key().peer_id();
     let connector = Arc::new(MeshConnector::new(
         MeshConnectorConfig::new(MESH_ID, local_peer_id)
             .with_direct_probe_timeout(Duration::from_millis(probe_ms))
             .with_overall_deadline(Duration::from_millis(deadline_ms))
             .with_probe_pacing(Duration::from_millis(50))
-            .with_relay_server(relay.local_addr().to_string()),
+            .with_relay_server(relay.local_addr().to_string())
+            .with_local_device_keypair(local_key.clone()),
         RendezvousClient::new(rendezvous.local_addr().to_string()),
         client_endpoint,
     ));
@@ -172,14 +173,15 @@ pub async fn build_direct_env_via_wan(
     let publisher = RendezvousClient::new(rendezvous.local_addr().to_string());
     publisher.publish(MESH_ID, record).await.unwrap();
 
-    let local_key = DeviceKeypair::generate().unwrap();
+    let local_key = Arc::new(DeviceKeypair::generate().unwrap());
     let local_peer_id = local_key.public_key().peer_id();
     let connector = Arc::new(MeshConnector::new(
         MeshConnectorConfig::new(MESH_ID, local_peer_id)
             .with_direct_probe_timeout(Duration::from_millis(probe_ms))
             .with_overall_deadline(Duration::from_millis(deadline_ms))
             .with_probe_pacing(Duration::from_millis(50))
-            .with_relay_server(relay.local_addr().to_string()),
+            .with_relay_server(relay.local_addr().to_string())
+            .with_local_device_keypair(local_key.clone()),
         RendezvousClient::new(rendezvous.local_addr().to_string()),
         client_endpoint,
     ));
@@ -235,13 +237,14 @@ pub async fn build_relay_only_env(probe_ms: u64, deadline_ms: u64) -> RelayOnlyE
     let publisher = RendezvousClient::new(rendezvous.local_addr().to_string());
     publisher.publish(MESH_ID, record).await.unwrap();
 
-    let local_key = DeviceKeypair::generate().unwrap();
+    let local_key = Arc::new(DeviceKeypair::generate().unwrap());
     let connector = Arc::new(MeshConnector::new(
         MeshConnectorConfig::new(MESH_ID, local_key.public_key().peer_id())
             .with_direct_probe_timeout(Duration::from_millis(probe_ms))
             .with_overall_deadline(Duration::from_millis(deadline_ms))
             .with_probe_pacing(Duration::from_millis(50))
-            .with_relay_server(relay.local_addr().to_string()),
+            .with_relay_server(relay.local_addr().to_string())
+            .with_local_device_keypair(local_key.clone()),
         RendezvousClient::new(rendezvous.local_addr().to_string()),
         client_endpoint,
     ));
@@ -302,13 +305,14 @@ pub async fn build_relay_only_env_via_wan(
     let publisher = RendezvousClient::new(rendezvous.local_addr().to_string());
     publisher.publish(MESH_ID, record).await.unwrap();
 
-    let local_key = DeviceKeypair::generate().unwrap();
+    let local_key = Arc::new(DeviceKeypair::generate().unwrap());
     let connector = Arc::new(MeshConnector::new(
         MeshConnectorConfig::new(MESH_ID, local_key.public_key().peer_id())
             .with_direct_probe_timeout(Duration::from_millis(probe_ms))
             .with_overall_deadline(Duration::from_millis(deadline_ms))
             .with_probe_pacing(Duration::from_millis(50))
-            .with_relay_server(relay.local_addr().to_string()),
+            .with_relay_server(relay.local_addr().to_string())
+            .with_local_device_keypair(local_key.clone()),
         RendezvousClient::new(rendezvous.local_addr().to_string()),
         client_endpoint,
     ));

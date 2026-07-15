@@ -151,7 +151,12 @@ impl RendezvousClient {
             .write_all(serde_json::to_string(&request)?.as_bytes())
             .await?;
         writer.write_all(b"\n").await?;
-        writer.shutdown().await?;
+        writer.flush().await?;
+        // Do NOT half-close the write half here. The server frames requests by
+        // newline and replies immediately, so a shutdown() is unnecessary — and
+        // over a real RTT it surfaces a premature EOF on the read half, so the
+        // response is never read and the socket is reset. `writer` stays in
+        // scope (connection open) until the response has been read.
 
         let mut reader = BufReader::new(reader);
         let mut line = String::new();
