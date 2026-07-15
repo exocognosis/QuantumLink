@@ -262,7 +262,9 @@ direct_send() {
 
 if [[ "$BUILD" -eq 1 ]]; then
   log "building qlinkctl release binary"
-  cargo build -p qlink-core --bin qlinkctl --release >> "$RUN_DIR/build.log" 2>&1
+  # dev-quic-carrier is required: without it direct-send / mesh-connect hit the
+  # "native UDP live mesh carrier is not wired yet" error in mesh_transport.rs.
+  cargo build -p qlink-core --bin qlinkctl --release --features dev-quic-carrier >> "$RUN_DIR/build.log" 2>&1
 fi
 
 if [[ ! -x "$QLINK_BIN" ]]; then
