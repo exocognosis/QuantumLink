@@ -184,6 +184,16 @@ pub async fn spawn_dev_stun() -> Result<DevStunServer> {
     Ok(DevStunServer { local_addr, task })
 }
 
+/// Binds a STUN binding server to `listen` (e.g. `0.0.0.0:3478`) and serves
+/// reflexive-address requests until the socket errors. Carries the same
+/// non-production caveats as [`DevStunServer`]; intended for testbeds that
+/// need a real public-facing STUN endpoint for NAT-traversal testing.
+pub async fn run_stun(listen: &str) -> Result<()> {
+    let socket = Arc::new(UdpSocket::bind(listen).await?);
+    serve_dev_stun(socket).await;
+    Ok(())
+}
+
 async fn serve_dev_stun(socket: Arc<UdpSocket>) {
     let mut buffer = vec![0_u8; 1500];
     loop {

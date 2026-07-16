@@ -13,7 +13,7 @@ use qlink_core::{
     mesh_transport::{MeshTransportConfig, MeshTransportHandle},
     relay::run_relay,
     rendezvous::{run_rendezvous, RendezvousClient},
-    stun::spawn_dev_stun,
+    stun::{gather_server_reflexive_candidate, run_stun, spawn_dev_stun},
     traversal::gather_local_candidates,
 };
 #[cfg(feature = "dev-quic-carrier")]
@@ -62,6 +62,22 @@ enum Command {
     Relay {
         #[arg(long, default_value = "127.0.0.1:9472")]
         listen: String,
+    },
+    /// Run a STUN binding server (reflects the client's public-facing
+    /// address as XOR-MAPPED-ADDRESS). Stand this up on a public host so
+    /// NATed clients can discover their server-reflexive candidate.
+    Stun {
+        #[arg(long, default_value = "0.0.0.0:3478")]
+        listen: String,
+    },
+    /// Client: send a STUN binding request to `--server` and print the
+    /// server-reflexive candidate (this host's public IP:port as seen from
+    /// the outside). Proves NAT reflexive-address discovery end-to-end.
+    StunGather {
+        #[arg(long)]
+        server: String,
+        #[arg(long, default_value = "0.0.0.0:0")]
+        bind_addr: String,
     },
     QuicLoopback,
     MeshLoopback,
@@ -244,6 +260,25 @@ async fn main() -> qlink_core::Result<()> {
         Command::Relay { listen } => {
             println!("relay_listen={listen}");
             run_relay(&listen).await?;
+        }
+        Command::Stun { listen } => {
+            println!("stun_listen={listen}");
+            run_stun(&listen).await?;
+        }
+        Command::StunGather { server, bind_addr } => {
+            let server_addr: SocketAddr = server.parse().map_err(|err| {
+                qlink_core::QlinkError::Protocol(format!("invalid --server: {err}"))
+            })?;
+            let bind: SocketAddr = bind_addr.parse().map_err(|err| {
+                qlink_core::QlinkError::Protocol(format!("invalid --bind-addr: {err}"))
+            })?;
+            let started = Instant::now();
+            let candidate = gather_server_reflexive_candidate(server_addr, bind).await?;
+            println!("stun_server={server}");
+            println!("reflexive_address={}", candidate.address);
+            println!("reflexive_port={}", candidate.port);
+            println!("candidate_type={:?}", candidate.candidate_type);
+            println!("elapsed_ms={}", started.elapsed().as_millis());
         }
         Command::QuicLoopback => {
             return Err(qlink_core::QlinkError::Protocol(
