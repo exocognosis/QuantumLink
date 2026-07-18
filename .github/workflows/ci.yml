@@ -71,11 +71,24 @@ jobs:
         working-directory: macos
         run: |
           swift run QuantumLinkSmoke validate-config --config ../config/mesh.example.json
+          preflight_log="$(mktemp)"
+          set +e
           swift run QuantumLinkSmoke preflight \
             --config ../config/mesh.example.json \
             --transport \
             --mode dev-quic-loopback \
-            --dylib "$PWD/../target/release/libqlink_core.dylib"
+            --dylib "$PWD/../target/release/libqlink_core.dylib" > "$preflight_log" 2>&1
+          preflight_status=$?
+          set -e
+          cat "$preflight_log"
+          if [[ "$preflight_status" -eq 0 ]]; then
+            echo "Expected dev QUIC loopback preflight to fail closed while transport is unavailable"
+            exit 1
+          fi
+          if ! grep -q "preflight_smoke_outcome=fail-closed" "$preflight_log"; then
+            echo "Expected preflight_smoke_outcome=fail-closed"
+            exit 1
+          fi
       - name: Rust XCFramework
         working-directory: macos
         run: ./scripts/build-rust-xcframework.sh

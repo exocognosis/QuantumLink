@@ -53,11 +53,11 @@ expect_fail swift run QuantumLinkSmoke preflight \
   --mode dev-quic-loopback \
   --dylib "$DYLIB"
 
-run "$REPO_ROOT/target/release/qlinkctl" simulate-handshake
-expect_fail "$REPO_ROOT/target/release/qlinkctl" quic-loopback
-expect_fail "$REPO_ROOT/target/release/qlinkctl" mesh-loopback
-expect_fail "$REPO_ROOT/target/release/qlinkctl" relay-loopback
-expect_fail "$REPO_ROOT/target/release/qlinkctl" relay-smoke
+run cargo run -p qlink-core --bin qlinkctl --release -- simulate-handshake
+expect_fail cargo run -p qlink-core --bin qlinkctl --release -- quic-loopback
+expect_fail cargo run -p qlink-core --bin qlinkctl --release -- mesh-loopback
+expect_fail cargo run -p qlink-core --bin qlinkctl --release -- relay-loopback
+expect_fail cargo run -p qlink-core --bin qlinkctl --release -- relay-smoke
 
 run "$ROOT/scripts/build-rust-xcframework.sh"
 run "$ROOT/scripts/package-dev-artifacts.sh"

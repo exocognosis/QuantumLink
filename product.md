@@ -167,8 +167,10 @@ Implemented or scaffolded behavior includes:
   dialing and inbound response use the native UDP carrier with app-layer PQC
   session establishment.
 - Optional dev-only QUIC DATAGRAM carrier transport behind `dev-quic-carrier`,
-  rendezvous lookup, direct probes, optional ICE, relay fallback, peer-store
+  rendezvous lookup, direct probes, optional ICE, PQC relay fallback, peer-store
   persistence, per-peer state, and network-event reconnect behavior.
+- Host/STUN candidate gathering is available in default builds, and TURN relay
+  candidate gathering is available behind the explicit `turn-relay` feature.
 - macOS SwiftUI app, `NEPacketTunnelProvider` scaffold, `QuantumLinkKit`,
   Keychain-backed identity paths, MDM payload templates, XcodeGen project, and
   packaging/release scripts.
@@ -180,8 +182,8 @@ Production gaps include:
 
 - Apple-granted Network Extension entitlements and production provisioning.
 - Developer ID signing, notarization, stapling, and Gatekeeper validation.
-- Full ICE/STUN/TURN candidate gathering and nomination for direct and relay
-  path selection.
+- Hardened public STUN/TURN/rendezvous/relay deployment and RFC-complete
+  nomination behavior against that deployed infrastructure.
 - Hardened public rendezvous and relay infrastructure.
 - Signed Sparkle/platform update pipeline paired with a post-quantum release
   manifest layer.

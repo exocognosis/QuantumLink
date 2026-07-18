@@ -30,9 +30,9 @@ This feature list is synchronized with the current repository implementation. It
 
 - Development rendezvous server and client.
 - Development relay server and client.
-- Quinn QUIC DATAGRAM loopback smoke path.
-- Mesh connector state machine for rendezvous lookup, direct candidate probes, relay fallback, last-good path caching, and reconnect handling.
-- Optional ICE/STUN helper paths for connectivity checks.
+- Native UDP carrier is the default mesh data-plane carrier; Quinn/rustls is feature-gated for legacy development.
+- Mesh connector state machine for rendezvous lookup, native direct candidate probes, PQC relay fallback, last-good path caching, and reconnect handling.
+- Optional ICE/STUN helper paths for connectivity checks, plus feature-gated TURN relay-candidate gathering.
 - File-backed peer store with optional ChaCha20-Poly1305 envelope encryption.
 - OpenMetrics endpoint support when explicitly configured.
 
@@ -46,8 +46,8 @@ This feature list is synchronized with the current repository implementation. It
 ## Not Production-Complete
 
 - Production peer-session key installation into packet-frame encryption.
-- Hardened public rendezvous and relay services.
-- Full public ICE/STUN/TURN deployment and nomination behavior.
+- Hardened public rendezvous, STUN, TURN, and relay services.
+- RFC-complete public ICE nomination behavior against deployed public infrastructure.
 - Notarized Developer ID app and tunnel extension bundle.
 - Managed Device Attestation and SSO integration.
 - Full post-quantum update manifest and release-signing layer.
