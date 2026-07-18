@@ -25,6 +25,8 @@ Implemented baseline:
 - Public peer-record minimization: clear aliases are replaced with sequence-rotating pseudonyms and rendezvous publication keeps relay candidates only by default.
 - Raw QUIC, raw relay, and legacy mesh loopback smoke paths fail closed unless an end-to-end app-layer PQC session exists.
 - Native UDP carrier with fragmented authenticated control-message support; default live mesh direct dialing and inbound response use this non-TLS carrier with the app-layer PQC session wire, and tests prove both sides establish matching ML-KEM/SHAKE keys.
+- Relay fallback is end-to-end PQC only: when direct native UDP probes fail, the connector can establish the same signed inbound assertion, ML-KEM session, and protected-frame path through the relay carrier. Raw unauthenticated relay fallback remains rejected.
+- Candidate gathering covers host and STUN server-reflexive candidates in default builds, plus TURN relay candidates when `turn-relay` is explicitly enabled. Gather failures are reported per server without suppressing lower-latency direct candidates.
 - Default `qlink-core` builds keep the legacy Quinn/rustls/rcgen carrier dependencies out of the compiled dependency graph; the dev QUIC carrier remains available only with `--features dev-quic-carrier`.
 
 Dytallix wallet and registry boundary:
@@ -68,7 +70,8 @@ regenerate `peers.json` after rolling the new build.
 
 Not yet production-complete:
 
-- Full ICE/STUN/TURN candidate gathering and nomination beyond local host/STUN parser scaffolding.
+- Public STUN/TURN/relay/rendezvous deployment hardening, including TLS, authentication policy, rate limits, abuse monitoring, revocation, retention controls, and infrastructure runbooks.
+- RFC-complete ICE nomination against deployed public infrastructure beyond the current deterministic candidate ordering and connectivity-check paths.
 - Notarized Developer ID app and extension bundles.
 - Managed Device Attestation and SSO integration.
 - Full update signing pipeline with a post-quantum manifest layer.

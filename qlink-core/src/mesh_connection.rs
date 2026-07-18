@@ -843,16 +843,23 @@ impl MeshConnector {
                 let detail = latest_probe_failure_summary(&attempts)
                     .map(|summary| format!("; last direct failure: {summary}"))
                     .unwrap_or_default();
-                let Some(server) = self.config.relay_server.as_ref() else {
+                let Some(server) = self.config.relay_server.clone() else {
                     return Err(QlinkError::Protocol(format!(
                         "no direct candidate for peer {remote_peer_id} succeeded{detail} and no relay server is configured"
                     )));
                 };
 
-                Err(QlinkError::Protocol(format!(
-                    "relay PQC session is required for peer {remote_peer_id}; \
-                     raw relay fallback via {server} is disabled{detail}"
-                )))
+                self.connect_via_relay(
+                    remote_peer_id,
+                    &server,
+                    record.body.device_certificate_der.clone(),
+                    started,
+                    attempts,
+                    used_cached_path,
+                    registry_decision,
+                    peer_record_source,
+                )
+                .await
             }
         }
     }
@@ -1952,6 +1959,7 @@ mod native_udp_live_mesh_tests {
             DEFAULT_INBOUND_ASSERTION_MAX_AGE_SECONDS,
         },
         pqc_session_wire::run_pqc_session_responder,
+        relay::{spawn_dev_relay, RelayResponderListener},
         rendezvous::spawn_dev_rendezvous,
     };
     use std::net::Ipv4Addr;
@@ -2035,6 +2043,110 @@ mod native_udp_live_mesh_tests {
         assert_eq!(opened, b"native-udp-ping");
     }
 
+    #[tokio::test]
+    async fn native_udp_relay_fallback_completes_with_pqc_session() {
+        let rendezvous = spawn_dev_rendezvous().await.unwrap();
+        let rendezvous_client = RendezvousClient::new(rendezvous.local_addr().to_string());
+        let relay = spawn_dev_relay().await.unwrap();
+        let relay_addr = relay.local_addr().to_string();
+
+        let local_key = Arc::new(DeviceKeypair::generate().unwrap());
+        let remote_key = Arc::new(DeviceKeypair::generate().unwrap());
+        let remote_peer_id = remote_key.public_key().peer_id();
+        let carrier_binding = b"native-udp-relay-responder-binding".to_vec();
+
+        let (frame_tx, mut frame_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let responder_addr = relay_addr.clone();
+        let responder_peer_id = remote_peer_id.clone();
+        let responder_key = remote_key.clone();
+        let responder_binding = carrier_binding.clone();
+        let _responder = tokio::spawn(async move {
+            let _ = RelayResponderListener::run(&responder_addr, responder_peer_id.clone(), {
+                move |session| {
+                    let responder_key = responder_key.clone();
+                    let responder_peer_id = responder_peer_id.clone();
+                    let responder_binding = responder_binding.clone();
+                    let frame_tx = frame_tx.clone();
+                    tokio::spawn(async move {
+                        let session = CarrierSession::from(session);
+                        let Ok((InboundDecision::Accepted, assertion)) =
+                            receive_and_evaluate_inbound(
+                                &session,
+                                MESH_ID,
+                                DEFAULT_INBOUND_ASSERTION_MAX_AGE_SECONDS,
+                                None,
+                            )
+                            .await
+                        else {
+                            session.close(b"");
+                            return;
+                        };
+                        let context = PqcSessionContext::new(
+                            MESH_ID,
+                            assertion.peer_id,
+                            responder_peer_id,
+                            responder_binding,
+                        );
+                        let Ok(session_keys) =
+                            run_pqc_session_responder(&session, context, responder_key.as_ref())
+                                .await
+                        else {
+                            session.close(b"");
+                            return;
+                        };
+                        let mut frame_protector = PqcFrameProtector::new(session_keys);
+                        if let Ok(protected) = session.receive_frame().await {
+                            if let Ok(opened) = frame_protector.open(&protected) {
+                                let _ = frame_tx.send(opened);
+                            }
+                        }
+                    });
+                }
+            })
+            .await;
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let remote_record = signed_record_with_cert(
+            remote_key.as_ref(),
+            vec![CandidateEndpoint {
+                candidate_type: CandidateType::Host,
+                address: "127.0.0.1".to_string(),
+                port: 1,
+                priority: 120,
+            }],
+            2,
+            carrier_binding,
+        );
+        rendezvous_client
+            .publish(MESH_ID, remote_record)
+            .await
+            .unwrap();
+
+        let connector = MeshConnector::new(
+            MeshConnectorConfig::new(MESH_ID, local_key.public_key().peer_id())
+                .with_direct_probe_timeout(Duration::from_millis(150))
+                .with_overall_deadline(Duration::from_secs(3))
+                .with_relay_server(relay_addr)
+                .with_local_device_keypair(local_key),
+            rendezvous_client,
+        );
+
+        let (mut link, outcome) = connector.connect(&remote_peer_id).await.unwrap();
+        assert_eq!(link.path_kind(), PathKind::Relay);
+        assert_eq!(outcome.path_kind, PathKind::Relay);
+        assert_eq!(outcome.remote_addr, None);
+
+        link.send_frame(b"native-relay-frame".to_vec())
+            .await
+            .unwrap();
+        let opened = tokio::time::timeout(Duration::from_secs(3), frame_rx.recv())
+            .await
+            .expect("responder did not receive the relayed frame")
+            .expect("frame channel closed");
+        assert_eq!(opened, b"native-relay-frame");
+    }
+
     #[test]
     fn direct_candidate_order_prefers_native_host_before_server_reflexive() {
         let ordered = order_direct_candidates(
@@ -2071,6 +2183,15 @@ mod native_udp_live_mesh_tests {
         endpoints: Vec<CandidateEndpoint>,
         sequence: u64,
     ) -> PeerRecord {
+        signed_record_with_cert(keypair, endpoints, sequence, Vec::new())
+    }
+
+    fn signed_record_with_cert(
+        keypair: &DeviceKeypair,
+        endpoints: Vec<CandidateEndpoint>,
+        sequence: u64,
+        carrier_binding: Vec<u8>,
+    ) -> PeerRecord {
         let body = UnsignedPeerRecord::new(
             MESH_ID,
             "native-udp-test-peer",
@@ -2079,7 +2200,8 @@ mod native_udp_live_mesh_tests {
             vec!["100.127.0.10/32".to_string()],
             60,
             sequence,
-        );
+        )
+        .with_device_certificate(carrier_binding);
         PeerRecord::signed(body, keypair).unwrap()
     }
 }

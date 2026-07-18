@@ -72,7 +72,7 @@ enum QuantumLinkSmoke {
                         print("preflight_transport_path=\(PathType.unavailable.rawValue)")
                         print("preflight_packet_round_trip=false")
                         print("preflight_smoke_outcome=fail-closed")
-                        return 0
+                        return 1
                     }
                     throw error
                 }
