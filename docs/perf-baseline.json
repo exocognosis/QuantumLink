@@ -1,79 +1,82 @@
 {
   "regression_threshold_pct": 20.0,
-  "captured_at": "2026-06-22",
-  "captured_on": "GitHub Actions macos-15 hosted runner on main commit e13448c51e4d5180d24e25c906b8b08f3d99ba15. This is the CI gate baseline; workstation numbers remain documented in perf-baseline.md for historical context.",
+  "captured_at": "2026-07-20",
+  "captured_on": "GitHub Actions macos-15 hosted runner, workflow run 29775985217, branch codex/public-infra-slo-20260720, commit ece070139949612fa7e6e6e9b7962cc14163a198. Refreshed after enabling authenticated inbound identity plus PQC responder paths in SLO fixtures.",
   "metrics": [
     {
       "name": "slo.direct_warm",
       "kind": "slo_p50_ms",
-      "value_ms": 3.3,
-      "regression_noise_floor_ms": 2.0
+      "value_ms": 6.9,
+      "regression_noise_floor_ms": 5.0
     },
     {
       "name": "slo.post_event_recovery",
       "kind": "slo_p50_ms",
-      "value_ms": 3.3,
-      "regression_noise_floor_ms": 2.0
+      "value_ms": 7.0,
+      "regression_noise_floor_ms": 5.0
     },
     {
       "name": "slo.relay_fallback",
       "kind": "slo_p50_ms",
-      "value_ms": 210.8
+      "value_ms": 223.7
     },
     {
       "name": "slo.direct_warm.lan",
       "kind": "slo_p50_ms",
-      "value_ms": 25.1
+      "value_ms": 193.5
     },
     {
       "name": "slo.direct_warm.cable",
       "kind": "slo_p50_ms",
-      "value_ms": 236.8
+      "value_ms": 1600.0
     },
     {
       "name": "slo.post_event_recovery.lan",
       "kind": "slo_p50_ms",
-      "value_ms": 25.6
+      "value_ms": 195.6
     },
     {
       "name": "slo.post_event_recovery.cable",
       "kind": "slo_p50_ms",
-      "value_ms": 218.8
+      "value_ms": 1500.0
     },
     {
       "name": "slo.relay_fallback.lan",
       "kind": "slo_p50_ms",
-      "value_ms": 210.9
+      "value_ms": 224.8
     },
     {
       "name": "slo.relay_fallback.cable",
       "kind": "slo_p50_ms",
-      "value_ms": 210.4
+      "value_ms": 224.0
     },
     {
       "name": "slo.relay_fallback.mobile-3g",
       "kind": "slo_p50_ms",
-      "value_ms": 511.0
+      "value_ms": 525.3
     },
     {
       "name": "connector/cold_direct_connect",
       "kind": "criterion_estimate",
-      "value_ms": 4.577
+      "value_ms": 7.101,
+      "regression_noise_floor_ms": 2.0
     },
     {
       "name": "connector/warm_direct_connect",
       "kind": "criterion_estimate",
-      "value_ms": 5.552
+      "value_ms": 7.078,
+      "regression_noise_floor_ms": 2.0
     },
     {
       "name": "connector/reconnect_post_event",
       "kind": "criterion_estimate",
-      "value_ms": 5.504
+      "value_ms": 7.047,
+      "regression_noise_floor_ms": 2.0
     },
     {
       "name": "ice/authenticated_check_round_trip",
       "kind": "criterion_estimate",
-      "value_ms": 0.049,
+      "value_ms": 0.042,
       "regression_noise_floor_ms": 0.1
     }
   ]

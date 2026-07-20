@@ -8,13 +8,19 @@
 #![allow(dead_code)]
 
 use qlink_core::{
+    carrier_transport::CarrierSession,
     crypto::DeviceKeypair,
     discovery::{CandidateEndpoint, CandidateType, PeerRecord, UnsignedPeerRecord},
     ice::IceCredentials,
+    inbound_identity::{
+        receive_and_evaluate_inbound, InboundDecision, DEFAULT_INBOUND_ASSERTION_MAX_AGE_SECONDS,
+    },
     mesh_connection::{MeshConnector, MeshConnectorConfig},
+    pqc_session_wire::run_pqc_session_responder,
     quic_transport::QuicEndpoint,
-    relay::spawn_dev_relay,
+    relay::{spawn_dev_relay, RelayResponderListener},
     rendezvous::{spawn_dev_rendezvous, RendezvousClient},
+    session_crypto::PqcSessionContext,
     synthetic_wan::{WanProfile, WanProxy},
 };
 use std::{
@@ -34,6 +40,7 @@ pub struct DirectEnv {
     _rendezvous: qlink_core::rendezvous::DevRendezvousServer,
     _relay: qlink_core::relay::DevRelayServer,
     _accept_loop: JoinHandle<()>,
+    _relay_responder: JoinHandle<()>,
     /// Held when the environment is running through a synthetic WAN
     /// proxy. Drop tears down the forwarding tasks. `None` for plain
     /// loopback environments.
@@ -43,33 +50,26 @@ pub struct DirectEnv {
 pub async fn build_direct_env(probe_ms: u64, deadline_ms: u64) -> DirectEnv {
     let rendezvous = spawn_dev_rendezvous().await.unwrap();
     let relay = spawn_dev_relay().await.unwrap();
+    let relay_addr = relay.local_addr().to_string();
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
     let (server_endpoint, server_cert) = QuicEndpoint::server(bind).unwrap();
     let server_addr = server_endpoint.local_addr().unwrap();
     let server_cert_der = server_cert.as_der().to_vec();
+    let remote_key = Arc::new(DeviceKeypair::generate().unwrap());
+    let remote_peer_id = remote_key.public_key().peer_id();
     // Empty trust list — connector uses per-connect cert pulled from the
     // signed peer record below.
     let client_endpoint = QuicEndpoint::client(bind, &[]).unwrap();
     drop(server_cert);
 
-    // Accept loop: each incoming QUIC connection just reads frames so the
-    // handshake completes; bench measurements stop at "connector returns a
-    // live MeshLink", which already implies a successful QUIC handshake.
-    let accept_loop = tokio::spawn(async move {
-        loop {
-            match server_endpoint.accept_one().await {
-                Ok(session) => {
-                    tokio::spawn(async move {
-                        let _ = session.receive_frame().await;
-                    });
-                }
-                Err(_) => break,
-            }
-        }
-    });
+    let accept_loop =
+        spawn_pqc_drain_accept_loop(server_endpoint, remote_key.clone(), server_cert_der.clone());
+    let relay_responder = spawn_relay_pqc_responder(
+        relay_addr.clone(),
+        remote_key.clone(),
+        server_cert_der.clone(),
+    );
 
-    let remote_key = DeviceKeypair::generate().unwrap();
-    let remote_peer_id = remote_key.public_key().peer_id();
     let unsigned = UnsignedPeerRecord::new(
         MESH_ID,
         "bench-remote",
@@ -85,7 +85,7 @@ pub async fn build_direct_env(probe_ms: u64, deadline_ms: u64) -> DirectEnv {
         1,
     )
     .with_device_certificate(server_cert_der);
-    let record = PeerRecord::signed(unsigned, &remote_key).unwrap();
+    let record = PeerRecord::signed(unsigned, remote_key.as_ref()).unwrap();
     let publisher = RendezvousClient::new(rendezvous.local_addr().to_string());
     publisher.publish(MESH_ID, record).await.unwrap();
 
@@ -96,7 +96,7 @@ pub async fn build_direct_env(probe_ms: u64, deadline_ms: u64) -> DirectEnv {
             .with_direct_probe_timeout(Duration::from_millis(probe_ms))
             .with_overall_deadline(Duration::from_millis(deadline_ms))
             .with_probe_pacing(Duration::from_millis(50))
-            .with_relay_server(relay.local_addr().to_string())
+            .with_relay_server(relay_addr)
             .with_local_device_keypair(local_key.clone()),
         RendezvousClient::new(rendezvous.local_addr().to_string()),
         client_endpoint,
@@ -108,6 +108,7 @@ pub async fn build_direct_env(probe_ms: u64, deadline_ms: u64) -> DirectEnv {
         _rendezvous: rendezvous,
         _relay: relay,
         _accept_loop: accept_loop,
+        _relay_responder: relay_responder,
         _wan_proxy: None,
     }
 }
@@ -126,10 +127,13 @@ pub async fn build_direct_env_via_wan(
 ) -> DirectEnv {
     let rendezvous = spawn_dev_rendezvous().await.unwrap();
     let relay = spawn_dev_relay().await.unwrap();
+    let relay_addr = relay.local_addr().to_string();
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
     let (server_endpoint, server_cert) = QuicEndpoint::server(bind).unwrap();
     let server_addr = server_endpoint.local_addr().unwrap();
     let server_cert_der = server_cert.as_der().to_vec();
+    let remote_key = Arc::new(DeviceKeypair::generate().unwrap());
+    let remote_peer_id = remote_key.public_key().peer_id();
     let client_endpoint = QuicEndpoint::client(bind, &[]).unwrap();
     drop(server_cert);
 
@@ -139,21 +143,14 @@ pub async fn build_direct_env_via_wan(
     let wan_proxy = WanProxy::between(server_addr, profile).await.unwrap();
     let advertised_addr = wan_proxy.client_facing_addr();
 
-    let accept_loop = tokio::spawn(async move {
-        loop {
-            match server_endpoint.accept_one().await {
-                Ok(session) => {
-                    tokio::spawn(async move {
-                        let _ = session.receive_frame().await;
-                    });
-                }
-                Err(_) => break,
-            }
-        }
-    });
+    let accept_loop =
+        spawn_pqc_drain_accept_loop(server_endpoint, remote_key.clone(), server_cert_der.clone());
+    let relay_responder = spawn_relay_pqc_responder(
+        relay_addr.clone(),
+        remote_key.clone(),
+        server_cert_der.clone(),
+    );
 
-    let remote_key = DeviceKeypair::generate().unwrap();
-    let remote_peer_id = remote_key.public_key().peer_id();
     let unsigned = UnsignedPeerRecord::new(
         MESH_ID,
         "bench-remote-wan",
@@ -169,7 +166,7 @@ pub async fn build_direct_env_via_wan(
         1,
     )
     .with_device_certificate(server_cert_der);
-    let record = PeerRecord::signed(unsigned, &remote_key).unwrap();
+    let record = PeerRecord::signed(unsigned, remote_key.as_ref()).unwrap();
     let publisher = RendezvousClient::new(rendezvous.local_addr().to_string());
     publisher.publish(MESH_ID, record).await.unwrap();
 
@@ -180,7 +177,7 @@ pub async fn build_direct_env_via_wan(
             .with_direct_probe_timeout(Duration::from_millis(probe_ms))
             .with_overall_deadline(Duration::from_millis(deadline_ms))
             .with_probe_pacing(Duration::from_millis(50))
-            .with_relay_server(relay.local_addr().to_string())
+            .with_relay_server(relay_addr)
             .with_local_device_keypair(local_key.clone()),
         RendezvousClient::new(rendezvous.local_addr().to_string()),
         client_endpoint,
@@ -192,6 +189,7 @@ pub async fn build_direct_env_via_wan(
         _rendezvous: rendezvous,
         _relay: relay,
         _accept_loop: accept_loop,
+        _relay_responder: relay_responder,
         _wan_proxy: Some(wan_proxy),
     }
 }
@@ -201,6 +199,8 @@ pub struct RelayOnlyEnv {
     pub remote_peer_id: String,
     _rendezvous: qlink_core::rendezvous::DevRendezvousServer,
     _relay: qlink_core::relay::DevRelayServer,
+    _relay_responder: JoinHandle<()>,
+    _wan_proxy: Option<WanProxy>,
 }
 
 /// Environment where the advertised host candidate is unreachable, forcing
@@ -210,22 +210,29 @@ pub struct RelayOnlyEnv {
 pub async fn build_relay_only_env(probe_ms: u64, deadline_ms: u64) -> RelayOnlyEnv {
     let rendezvous = spawn_dev_rendezvous().await.unwrap();
     let relay = spawn_dev_relay().await.unwrap();
+    let relay_addr = relay.local_addr().to_string();
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
     let (_unused_server, server_cert) = QuicEndpoint::server(bind).unwrap();
     let server_cert_der = server_cert.as_der().to_vec();
     let client_endpoint = QuicEndpoint::client(bind, &[]).unwrap();
 
-    let remote_key = DeviceKeypair::generate().unwrap();
+    let remote_key = Arc::new(DeviceKeypair::generate().unwrap());
     let remote_peer_id = remote_key.public_key().peer_id();
+    let relay_responder = spawn_relay_pqc_responder(
+        relay_addr.clone(),
+        remote_key.clone(),
+        server_cert_der.clone(),
+    );
     let unsigned = UnsignedPeerRecord::new(
         MESH_ID,
         "bench-remote-relay",
         remote_key.public_key(),
         vec![CandidateEndpoint {
-            // RFC 5737 TEST-NET-1 — guaranteed unreachable.
+            // Fast local refusal: the SLO measures relay activation, not
+            // route-level timeout behavior for unroutable documentation IPs.
             candidate_type: CandidateType::Host,
-            address: "192.0.2.1".to_string(),
-            port: 4433,
+            address: "127.0.0.1".to_string(),
+            port: 1,
             priority: 120,
         }],
         vec!["100.127.0.20/32".to_string()],
@@ -233,9 +240,10 @@ pub async fn build_relay_only_env(probe_ms: u64, deadline_ms: u64) -> RelayOnlyE
         1,
     )
     .with_device_certificate(server_cert_der);
-    let record = PeerRecord::signed(unsigned, &remote_key).unwrap();
+    let record = PeerRecord::signed(unsigned, remote_key.as_ref()).unwrap();
     let publisher = RendezvousClient::new(rendezvous.local_addr().to_string());
     publisher.publish(MESH_ID, record).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
 
     let local_key = Arc::new(DeviceKeypair::generate().unwrap());
     let connector = Arc::new(MeshConnector::new(
@@ -243,7 +251,7 @@ pub async fn build_relay_only_env(probe_ms: u64, deadline_ms: u64) -> RelayOnlyE
             .with_direct_probe_timeout(Duration::from_millis(probe_ms))
             .with_overall_deadline(Duration::from_millis(deadline_ms))
             .with_probe_pacing(Duration::from_millis(50))
-            .with_relay_server(relay.local_addr().to_string())
+            .with_relay_server(relay_addr)
             .with_local_device_keypair(local_key.clone()),
         RendezvousClient::new(rendezvous.local_addr().to_string()),
         client_endpoint,
@@ -254,6 +262,8 @@ pub async fn build_relay_only_env(probe_ms: u64, deadline_ms: u64) -> RelayOnlyE
         remote_peer_id,
         _rendezvous: rendezvous,
         _relay: relay,
+        _relay_responder: relay_responder,
+        _wan_proxy: None,
     }
 }
 
@@ -279,13 +289,19 @@ pub async fn build_relay_only_env_via_wan(
 
     let rendezvous = spawn_dev_rendezvous().await.unwrap();
     let relay = spawn_dev_relay().await.unwrap();
+    let relay_addr = relay.local_addr().to_string();
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
     let (_unused_server, server_cert) = QuicEndpoint::server(bind).unwrap();
     let server_cert_der = server_cert.as_der().to_vec();
     let client_endpoint = QuicEndpoint::client(bind, &[]).unwrap();
 
-    let remote_key = DeviceKeypair::generate().unwrap();
+    let remote_key = Arc::new(DeviceKeypair::generate().unwrap());
     let remote_peer_id = remote_key.public_key().peer_id();
+    let relay_responder = spawn_relay_pqc_responder(
+        relay_addr.clone(),
+        remote_key.clone(),
+        server_cert_der.clone(),
+    );
     let unsigned = UnsignedPeerRecord::new(
         MESH_ID,
         "bench-remote-relay-wan",
@@ -301,9 +317,10 @@ pub async fn build_relay_only_env_via_wan(
         1,
     )
     .with_device_certificate(server_cert_der);
-    let record = PeerRecord::signed(unsigned, &remote_key).unwrap();
+    let record = PeerRecord::signed(unsigned, remote_key.as_ref()).unwrap();
     let publisher = RendezvousClient::new(rendezvous.local_addr().to_string());
     publisher.publish(MESH_ID, record).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
 
     let local_key = Arc::new(DeviceKeypair::generate().unwrap());
     let connector = Arc::new(MeshConnector::new(
@@ -311,23 +328,112 @@ pub async fn build_relay_only_env_via_wan(
             .with_direct_probe_timeout(Duration::from_millis(probe_ms))
             .with_overall_deadline(Duration::from_millis(deadline_ms))
             .with_probe_pacing(Duration::from_millis(50))
-            .with_relay_server(relay.local_addr().to_string())
+            .with_relay_server(relay_addr)
             .with_local_device_keypair(local_key.clone()),
         RendezvousClient::new(rendezvous.local_addr().to_string()),
         client_endpoint,
     ));
-
-    // Keep the proxy alive in the closure-captured scope. We don't have
-    // a field for it on RelayOnlyEnv, so leak it — bench environments
-    // are short-lived.
-    Box::leak(Box::new(wan_proxy));
 
     RelayOnlyEnv {
         connector,
         remote_peer_id,
         _rendezvous: rendezvous,
         _relay: relay,
+        _relay_responder: relay_responder,
+        _wan_proxy: Some(wan_proxy),
     }
+}
+
+fn spawn_pqc_drain_accept_loop(
+    server_endpoint: QuicEndpoint,
+    responder_keypair: Arc<DeviceKeypair>,
+    server_cert_der: Vec<u8>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            match server_endpoint.accept_one().await {
+                Ok(session) => {
+                    let session = CarrierSession::from(session);
+                    let responder_keypair = responder_keypair.clone();
+                    let server_cert_der = server_cert_der.clone();
+                    tokio::spawn(async move {
+                        let Ok((InboundDecision::Accepted, assertion)) =
+                            receive_and_evaluate_inbound(
+                                &session,
+                                MESH_ID,
+                                DEFAULT_INBOUND_ASSERTION_MAX_AGE_SECONDS,
+                                None,
+                            )
+                            .await
+                        else {
+                            session.close(b"");
+                            return;
+                        };
+                        let context = PqcSessionContext::new(
+                            MESH_ID,
+                            assertion.peer_id,
+                            responder_keypair.public_key().peer_id(),
+                            server_cert_der,
+                        );
+                        if run_pqc_session_responder(&session, context, responder_keypair.as_ref())
+                            .await
+                            .is_err()
+                        {
+                            session.close(b"");
+                            return;
+                        }
+                        // Bench scenarios stop at connection establishment.
+                        // Returning here drops this responder-side session so
+                        // repeated connects from the same local peer get a
+                        // fresh demux session instead of reusing stale state.
+                    });
+                }
+                Err(_) => break,
+            }
+        }
+    })
+}
+
+fn spawn_relay_pqc_responder(
+    relay_addr: String,
+    responder_keypair: Arc<DeviceKeypair>,
+    server_cert_der: Vec<u8>,
+) -> JoinHandle<()> {
+    let local_peer_id = responder_keypair.public_key().peer_id();
+    tokio::spawn(async move {
+        let _ = RelayResponderListener::run(&relay_addr, local_peer_id.clone(), move |session| {
+            let responder_keypair = responder_keypair.clone();
+            let server_cert_der = server_cert_der.clone();
+            let local_peer_id = local_peer_id.clone();
+            tokio::spawn(async move {
+                let session = CarrierSession::from(session);
+                let Ok((InboundDecision::Accepted, assertion)) = receive_and_evaluate_inbound(
+                    &session,
+                    MESH_ID,
+                    DEFAULT_INBOUND_ASSERTION_MAX_AGE_SECONDS,
+                    None,
+                )
+                .await
+                else {
+                    session.close(b"");
+                    return;
+                };
+                let context = PqcSessionContext::new(
+                    MESH_ID,
+                    assertion.peer_id,
+                    local_peer_id,
+                    server_cert_der,
+                );
+                if run_pqc_session_responder(&session, context, responder_keypair.as_ref())
+                    .await
+                    .is_err()
+                {
+                    session.close(b"");
+                }
+            });
+        })
+        .await;
+    })
 }
 
 /// Helper for SLO scenario harnesses: collects N samples, returns sorted

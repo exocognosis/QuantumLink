@@ -3,6 +3,8 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use clap::{Parser, Subcommand};
 #[cfg(feature = "dev-quic-carrier")]
 use qlink_core::relay::RelayMessage;
+#[cfg(feature = "turn-relay")]
+use qlink_core::turn::{gather_relay_candidate, TurnCredentials};
 use qlink_core::{crypto::SessionKeys, pqc_frame::PqcFrameProtector};
 use qlink_core::{
     crypto::{answer_handshake, start_handshake, DeviceKeypair},
@@ -78,6 +80,22 @@ enum Command {
         server: String,
         #[arg(long, default_value = "0.0.0.0:0")]
         bind_addr: String,
+    },
+    /// Client: allocate a relay candidate from a TURN server. This subcommand
+    /// exists only in `--features turn-relay` builds because standard TURN
+    /// long-term auth requires HMAC-SHA1 + MD5 protocol framing.
+    #[cfg(feature = "turn-relay")]
+    TurnGather {
+        #[arg(long)]
+        server: String,
+        #[arg(long, default_value = "0.0.0.0:0")]
+        bind_addr: String,
+        #[arg(long)]
+        username: Option<String>,
+        #[arg(long)]
+        password: Option<String>,
+        #[arg(long)]
+        realm: Option<String>,
     },
     QuicLoopback,
     MeshLoopback,
@@ -165,6 +183,11 @@ enum Command {
         payload: String,
         #[arg(long, default_value_t = 5_000)]
         timeout_ms: u64,
+        /// Direct-probe budget before relay fallback. Defaults to
+        /// `--timeout-ms`; set lower when intentionally proving relay
+        /// activation against an unreachable direct candidate.
+        #[arg(long)]
+        direct_probe_timeout_ms: Option<u64>,
         #[arg(long)]
         keyfile: Option<String>,
         /// Number of frames to stream over the one established session.
@@ -280,6 +303,43 @@ async fn main() -> qlink_core::Result<()> {
             println!("candidate_type={:?}", candidate.candidate_type);
             println!("elapsed_ms={}", started.elapsed().as_millis());
         }
+        #[cfg(feature = "turn-relay")]
+        Command::TurnGather {
+            server,
+            bind_addr,
+            username,
+            password,
+            realm,
+        } => {
+            let server_addr: SocketAddr = server.parse().map_err(|err| {
+                qlink_core::QlinkError::Protocol(format!("invalid --server: {err}"))
+            })?;
+            let bind: SocketAddr = bind_addr.parse().map_err(|err| {
+                qlink_core::QlinkError::Protocol(format!("invalid --bind-addr: {err}"))
+            })?;
+            let credentials = match (username, password) {
+                (Some(username), Some(password)) => {
+                    let credentials = TurnCredentials::new(username, password);
+                    Some(match realm {
+                        Some(realm) => credentials.with_realm(realm),
+                        None => credentials,
+                    })
+                }
+                (None, None) => None,
+                _ => {
+                    return Err(qlink_core::QlinkError::Protocol(
+                        "TURN credentials require both --username and --password".into(),
+                    ))
+                }
+            };
+            let started = Instant::now();
+            let candidate = gather_relay_candidate(server_addr, bind, credentials).await?;
+            println!("turn_server={server}");
+            println!("relayed_address={}", candidate.address);
+            println!("relayed_port={}", candidate.port);
+            println!("candidate_type={:?}", candidate.candidate_type);
+            println!("elapsed_ms={}", started.elapsed().as_millis());
+        }
         Command::QuicLoopback => {
             return Err(qlink_core::QlinkError::Protocol(
                 "quic-loopback is disabled because raw Quinn DATAGRAM bypasses the app-layer PQC frame session".into(),
@@ -366,6 +426,7 @@ async fn main() -> qlink_core::Result<()> {
             bind_addr,
             payload,
             timeout_ms,
+            direct_probe_timeout_ms,
             keyfile,
             count,
             interval_ms,
@@ -379,6 +440,7 @@ async fn main() -> qlink_core::Result<()> {
                 keyfile.as_deref(),
                 payload.as_bytes(),
                 timeout_ms,
+                direct_probe_timeout_ms,
                 count,
                 interval_ms,
                 relay.as_deref(),
@@ -436,6 +498,7 @@ async fn run_direct_send(
     keyfile: Option<&str>,
     payload: &[u8],
     timeout_ms: u64,
+    direct_probe_timeout_ms: Option<u64>,
 ) -> qlink_core::Result<ConnectionOutcome> {
     run_direct_send_detailed(
         rendezvous_url,
@@ -445,6 +508,7 @@ async fn run_direct_send(
         keyfile,
         payload,
         timeout_ms,
+        direct_probe_timeout_ms,
         1,
         0,
         None,
@@ -502,6 +566,7 @@ async fn run_direct_send_detailed(
     keyfile: Option<&str>,
     payload: &[u8],
     timeout_ms: u64,
+    direct_probe_timeout_ms: Option<u64>,
     count: u64,
     interval_ms: u64,
     relay: Option<&str>,
@@ -513,10 +578,11 @@ async fn run_direct_send_detailed(
         .map_err(|err| qlink_core::QlinkError::Protocol(format!("invalid bind_addr: {err}")))?;
     let rendezvous_client = RendezvousClient::new(rendezvous_url.to_string());
     let timeout = Duration::from_millis(timeout_ms);
+    let direct_probe_timeout = Duration::from_millis(direct_probe_timeout_ms.unwrap_or(timeout_ms));
     let mut connector_config = MeshConnectorConfig::new(mesh_id.to_string(), local_peer_id)
         .with_local_device_keypair(keypair)
         .with_overall_deadline(timeout)
-        .with_direct_probe_timeout(timeout)
+        .with_direct_probe_timeout(direct_probe_timeout)
         .with_probe_pacing(Duration::from_millis(50));
     if let Some(relay_url) = relay {
         connector_config = connector_config.with_relay_server(relay_url.to_string());
@@ -561,6 +627,7 @@ async fn run_direct_send_detailed(
     keyfile: Option<&str>,
     payload: &[u8],
     timeout_ms: u64,
+    direct_probe_timeout_ms: Option<u64>,
     count: u64,
     interval_ms: u64,
     relay: Option<&str>,
@@ -573,13 +640,11 @@ async fn run_direct_send_detailed(
     let client_endpoint = QuicEndpoint::client(bind_addr, &[])?;
     let rendezvous_client = RendezvousClient::new(rendezvous_url.to_string());
     let timeout = Duration::from_millis(timeout_ms);
+    let direct_probe_timeout = Duration::from_millis(direct_probe_timeout_ms.unwrap_or(timeout_ms));
     let mut connector_config = MeshConnectorConfig::new(mesh_id.to_string(), local_peer_id)
         .with_local_device_keypair(keypair)
         .with_overall_deadline(timeout)
-        // Let --timeout-ms fully control the direct probe. The old 1500ms
-        // cap is fine on a LAN but too tight for a real WAN path, where the
-        // PQC + QUIC handshake spans several ~100ms+ round trips.
-        .with_direct_probe_timeout(timeout)
+        .with_direct_probe_timeout(direct_probe_timeout)
         .with_probe_pacing(Duration::from_millis(50));
     // With a relay configured, a failed/unreachable direct probe falls back to
     // the relay path (mesh mode). Without it, direct is the only path.
@@ -1701,6 +1766,7 @@ mod tests {
             None,
             b"direct-test-frame",
             5_000,
+            None,
         )
         .await
         .unwrap();
@@ -1785,6 +1851,7 @@ mod native_udp_tests {
             None,
             b"native-direct-test-frame",
             5_000,
+            None,
         )
         .await
         .unwrap();
