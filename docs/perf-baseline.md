@@ -8,15 +8,14 @@ two in sync when refreshing.
 ## Methodology
 
 - **Hardware**: The CI regression gate uses a GitHub Actions `macos-15`
-  hosted-runner baseline captured on 2026-06-22 from `main` commit
-  `e13448c51e4d5180d24e25c906b8b08f3d99ba15`. Earlier Apple Silicon
-  developer-workstation numbers are preserved in git history, but this
-  file now records the hosted-runner values that drive CI pass/fail
-  decisions. Compare CI output to CI baselines; compare local workstation
-  output to local history.
-- **Surface**: loopback only. Real WAN numbers will be higher because of
-  network RTT, but if the loopback baseline ever exceeds an SLO, no real
-  network will save us.
+  hosted-runner baseline captured on 2026-07-20 from workflow run
+  `29775985217` on commit `ece070139949612fa7e6e6e9b7962cc14163a198`.
+  The refresh followed a benchmark-fixture upgrade that now runs signed
+  inbound identity plus app-layer PQC responder handshakes.
+- **Surface**: loopback SLO assertions plus synthetic WAN measurement rows.
+  Real public-network numbers will vary by RTT, loss, and relay placement,
+  but if the loopback baseline ever exceeds an SLO, no real network will
+  save us.
 - **Crypto**: ML-KEM-768 KEM + ML-DSA-65 signatures
   (FIPS 203 / 204 suites). ICE checks use HMAC-SHA1 short-term credentials
   per RFC 8445.
@@ -48,17 +47,20 @@ From `product.md` § "Performance, failure modes, and open questions":
 
 | Scenario | n | p50 | p90 | p99 | max | SLO | Margin |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| `slo.direct_warm` | 30 | **3.3 ms** | 4.1 ms | 4.2 ms | 4.2 ms | 300 ms | 91× |
-| `slo.post_event_recovery` | 30 | **3.3 ms** | 3.7 ms | 3.9 ms | 3.9 ms | 1000 ms | 303× |
-| `slo.relay_fallback` | 30 | **210.8 ms** | 216.6 ms | 218.3 ms | 218.3 ms | 2000 ms | 9.5× |
+| `slo.direct_warm` | 30 | **6.9 ms** | 7.7 ms | 9.2 ms | 9.2 ms | 300 ms | 43× |
+| `slo.post_event_recovery` | 30 | **7.0 ms** | 7.9 ms | 8.4 ms | 8.4 ms | 1000 ms | 143× |
+| `slo.relay_fallback` | 30 | **223.7 ms** | 231.4 ms | 241.0 ms | 241.0 ms | 2000 ms | 8.9× |
 
 The relay-fallback p50 is dominated by the configured 200 ms direct probe
 timeout: the connector waits the full probe budget on the unreachable
-TEST-NET-1 candidate before opening the relay. To bring real-world fallback
-under 200 ms the probe budget needs to drop, which trades against false
-fallbacks on slow-but-working networks. v1 chose 750 ms direct / 200 ms in
-the relay-fallback scenario; production may want to tune this per
-deployment policy.
+loopback candidate before opening the relay. The fixture uses a fast local
+refusal (`127.0.0.1:1`) so the SLO measures relay activation and the
+end-to-end PQC relay session rather than route-level timeout behavior for
+unroutable documentation IPs. To bring real-world fallback under 200 ms the
+probe budget needs to drop, which trades against false fallbacks on
+slow-but-working networks. v1 chose 750 ms direct / 200 ms in the
+relay-fallback scenario; production may want to tune this per deployment
+policy.
 
 ### Connector micro-benches — `cargo bench --bench connector`
 
@@ -68,9 +70,9 @@ HTML report artifact, but they are not part of the committed gate baseline.
 
 | Bench | Lower | Estimate | Upper |
 |---|---:|---:|---:|
-| `cold_direct_connect` | n/a | **4.577 ms** | n/a |
-| `warm_direct_connect` | n/a | **5.552 ms** | n/a |
-| `reconnect_post_event` | n/a | **5.504 ms** | n/a |
+| `cold_direct_connect` | n/a | **7.101 ms** | n/a |
+| `warm_direct_connect` | n/a | **7.078 ms** | n/a |
+| `reconnect_post_event` | n/a | **7.047 ms** | n/a |
 
 Cold and warm connect look almost identical at this scale because the
 loopback path's dominant cost is the QUIC + ML-KEM handshake, not the
@@ -82,7 +84,7 @@ discovery RTT entirely.
 
 | Bench | Lower | Estimate | Upper |
 |---|---:|---:|---:|
-| `authenticated_check_round_trip` | n/a | **49.00 µs** | n/a |
+| `authenticated_check_round_trip` | n/a | **42.00 µs** | n/a |
 
 This is the authenticated STUN binding-request floor: send → wait → verify
 FINGERPRINT + MESSAGE-INTEGRITY. Real ICE checks add network RTT and
@@ -121,37 +123,36 @@ injects per-direction delay, jitter, and loss.
 
 | Profile | Direct success rate | p50 | p90 | p99 | SLO |
 |---|---:|---:|---:|---:|---:|
-| `lan` | 15/15 | **25.1 ms** | 30.3 ms | 33.2 ms | ✓ |
-| `cable` | 15/15 | **236.8 ms** | 256.8 ms | 272.2 ms | ✓ |
-| `mobile-3g` | 1/15 | **1.8 s** | 1.8 s | 1.8 s | ✗ |
+| `lan` | 15/15 | **193.5 ms** | 212.3 ms | 223.2 ms | ✓ |
+| `cable` | 15/15 | **1.6 s** | 1.6 s | 1.6 s | ✗ |
+| `mobile-3g` | 0/15 | **3.0 s** | 3.0 s | 3.0 s | ✗ |
 
-The 3G profile blows the SLO and falls back to relay 14 of 15 attempts.
-That's expected: 1% packet loss + 250 ms RTT means QUIC handshake
-retransmits push past the configured 1.75-second probe budget on a
-substantial fraction of attempts. Operators on degraded mobile should
-expect either relay fallback or noticeably higher direct-connect
-latency. The product.md SLO is anchored at "warm discovery" implying
-better network conditions — degraded-mobile is the wrong baseline for
-the spec target, but the measurement is what it is.
+These rows now exercise the same signed inbound identity and app-layer
+PQC responder setup used by live links. Cable succeeds directly but misses
+the loopback-anchored product SLO; mobile-3g falls back to relay after the
+wider measurement probe budget. Operators should treat relay fallback as
+normal on degraded mobile and should tune direct-probe policy per deployment
+before promising sub-300 ms WAN direct setup.
 
 ### Post-event recovery (SLO target: < 1 s p50)
 
 | Profile | Direct success rate | p50 | p90 | p99 | SLO |
 |---|---:|---:|---:|---:|---:|
-| `lan` | 15/15 | **25.6 ms** | 29.3 ms | 29.7 ms | ✓ |
-| `cable` | 15/15 | **218.8 ms** | 235.3 ms | 253.7 ms | ✓ |
-| `mobile-3g` | 1/15 | **1.8 s** | 1.8 s | 1.8 s | ✗ |
+| `lan` | 15/15 | **195.6 ms** | 234.1 ms | 247.4 ms | ✓ |
+| `cable` | 15/15 | **1.5 s** | 1.6 s | 1.6 s | ✗ |
+| `mobile-3g` | 0/15 | **3.0 s** | 3.0 s | 3.0 s | ✗ |
 
-Same shape as direct-warm. Recovery on cable is ~219 ms, well within
-the SLO. 3G fails the SLO for the same retransmission-budget reason.
+Same shape as direct-warm. LAN recovery stays inside the SLO after a
+network event; cable and degraded mobile are honest WAN measurements, not
+loopback-SLO proofs.
 
 ### Relay-fallback activation (SLO target: < 2 s p50)
 
 | Profile | p50 | p90 | p99 | SLO |
 |---|---:|---:|---:|---:|
-| `lan` | **210.9 ms** | 215.1 ms | 216.7 ms | ✓ |
-| `cable` | **210.4 ms** | 216.6 ms | 217.5 ms | ✓ |
-| `mobile-3g` | **511.0 ms** | 517.5 ms | 518.5 ms | ✓ |
+| `lan` | **224.8 ms** | 231.4 ms | 235.2 ms | ✓ |
+| `cable` | **224.0 ms** | 235.4 ms | 235.6 ms | ✓ |
+| `mobile-3g` | **525.3 ms** | 532.5 ms | 545.0 ms | ✓ |
 
 Relay fallback comfortably beats the SLO across all profiles. The p50
 tracks the configured direct-probe timeout (200 ms for `lan`/`cable`,
@@ -185,10 +186,11 @@ regresses past the baseline's `regression_threshold_pct` (currently
 `20.0`) fails the `Performance` workflow. Baseline rows may also
 declare `regression_noise_floor_ms`; when present, a metric must exceed
 both the percentage threshold and that absolute millisecond floor before
-the row is treated as regressed. The current CI baseline uses a 2 ms
-floor for the two sub-5 ms loopback SLO rows and a 0.1 ms floor for
-the sub-millisecond ICE micro-benchmark, where hosted-runner jitter is
-larger than the protocol signal being measured.
+the row is treated as regressed. The current CI baseline uses a 5 ms
+floor for the two small loopback SLO rows, a 2 ms floor for connector
+microbench rows, and a 0.1 ms floor for the sub-millisecond ICE
+micro-benchmark, where hosted-runner jitter is larger than the protocol
+signal being measured.
 
 ```sh
 # Locally, after running the bench suites:
@@ -196,6 +198,7 @@ cargo build -p qlink-core --bin perfgate --release
 target/release/perfgate \
   --baseline docs/perf-baseline.json \
   --slo-log build/perf-slos.log \
+  --slo-log build/perf-slos-wan.log \
   --criterion-dir target/criterion
 ```
 
@@ -209,9 +212,9 @@ non-zero.
 
 When an intentional perf change moves a metric past the threshold:
 
-1. Re-run the affected bench suite in GitHub Actions, or download the
-   artifact from the CI run. Use local workstation runs only for local
-   workstation trend analysis, not for the CI gate baseline.
+1. Prefer a GitHub Actions `macos-15` run or downloaded CI artifact. A local
+   workstation refresh is acceptable only during a fixture transition and
+   should be replaced with hosted-runner numbers after the next green run.
 2. Update the corresponding row in `perf-baseline.json`.
 3. Update the matching numbers in the tables below so humans reading
    the doc and the machine reading the JSON agree.

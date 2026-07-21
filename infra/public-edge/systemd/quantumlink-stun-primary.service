@@ -1,0 +1,29 @@
+[Unit]
+Description=QuantumLink STUN service primary port
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/quantumlink/public-edge.env
+ExecStart=${QLINK_BIN} stun --listen ${QLINK_STUN_PRIMARY_LISTEN}
+Restart=always
+RestartSec=3
+User=quantumlink
+Group=quantumlink
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/quantumlink /var/log/quantumlink
+CapabilityBoundingSet=
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,29 @@
+# coturn production-candidate template for QuantumLink TURN allocation probes.
+# Render placeholders from /etc/quantumlink/public-edge.env before installing.
+#
+# QuantumLink's in-repo TURN code currently gathers relay candidates only; data
+# relay still uses the QuantumLink PQC relay. Keep coturn enabled for public ICE
+# and NAT classification proof, not as the app data-plane carrier.
+
+listening-port=3478
+tls-listening-port=5349
+listening-ip=${QLINK_TURN_LISTENING_IP}
+external-ip=${QLINK_TURN_EXTERNAL_IP}
+realm=${QLINK_TURN_REALM}
+server-name=${QLINK_TURN_REALM}
+
+fingerprint
+lt-cred-mech
+user=${QLINK_TURN_USER}:${QLINK_TURN_PASSWORD}
+stale-nonce=600
+
+min-port=${QLINK_TURN_MIN_PORT}
+max-port=${QLINK_TURN_MAX_PORT}
+
+no-loopback-peers
+no-multicast-peers
+no-cli
+no-tlsv1
+no-tlsv1_1
+log-file=/var/log/turnserver/turnserver.log
+simple-log

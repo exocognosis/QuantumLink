@@ -27,6 +27,9 @@ Implemented baseline:
 - Native UDP carrier with fragmented authenticated control-message support; default live mesh direct dialing and inbound response use this non-TLS carrier with the app-layer PQC session wire, and tests prove both sides establish matching ML-KEM/SHAKE keys.
 - Relay fallback is end-to-end PQC only: when direct native UDP probes fail, the connector can establish the same signed inbound assertion, ML-KEM session, and protected-frame path through the relay carrier. Raw unauthenticated relay fallback remains rejected.
 - Candidate gathering covers host and STUN server-reflexive candidates in default builds, plus TURN relay candidates when `turn-relay` is explicitly enabled. Gather failures are reported per server without suppressing lower-latency direct candidates.
+- A public-edge deployment runbook and smoke harness cover allowlisted
+  rendezvous, STUN, TURN allocation, and end-to-end PQC relay-fallback proof
+  while open-internet rendezvous/relay TLS/auth remains unfinished.
 - Default `qlink-core` builds keep the legacy Quinn/rustls/rcgen carrier dependencies out of the compiled dependency graph; the dev QUIC carrier remains available only with `--features dev-quic-carrier`.
 
 Dytallix wallet and registry boundary:
@@ -70,7 +73,7 @@ regenerate `peers.json` after rolling the new build.
 
 Not yet production-complete:
 
-- Public STUN/TURN/relay/rendezvous deployment hardening, including TLS, authentication policy, rate limits, abuse monitoring, revocation, retention controls, and infrastructure runbooks.
+- Open-internet rendezvous/QuantumLink-relay TLS, authentication policy, rate limits, abuse monitoring, revocation, and retention controls beyond the current allowlisted/tunneled public-edge runbook.
 - RFC-complete ICE nomination against deployed public infrastructure beyond the current deterministic candidate ordering and connectivity-check paths.
 - Notarized Developer ID app and extension bundles.
 - Managed Device Attestation and SSO integration.
@@ -81,6 +84,6 @@ Not yet production-complete:
 - Removal of every classical primitive from every build/tooling path. Default `qlink-core` builds should exclude the dev Quinn/rustls/aws-lc/ring carrier graph, but optional dev-carrier builds, platform signing/redaction helpers, and lockfile contents remain outside a full zero-classical claim.
 - Full anonymity guarantees. QuantumLink minimizes app/control-plane metadata by default, but outer transport IPs, relay timing, account context, and endpoint behavior can still identify users unless a future relay/egress architecture is built specifically for that threat model.
 
-The development rendezvous and relay binaries are local protocol tools. Do not expose them on the public internet without adding TLS, authentication policy, rate limits, abuse monitoring, durable revocation, retention controls, and production Dytallix registry pinning for public meshes.
+The development rendezvous and relay binaries are local protocol tools. Do not expose them to the open internet without adding TLS, authentication policy, rate limits, abuse monitoring, durable revocation, retention controls, and production Dytallix registry pinning for public meshes. For public validation before those controls land, use the allowlisted/tunneled edge runbook in `public-infra-runbook.md`.
 
 For repository-scoped reviewer guides, see `../THREAT_MODEL.md` and `../QUANTUM_THREATS.md`.
