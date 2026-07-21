@@ -25,5 +25,7 @@ no-multicast-peers
 no-cli
 no-tlsv1
 no-tlsv1_1
+cert=${QLINK_TURN_CERT}
+pkey=${QLINK_TURN_PKEY}
 log-file=/var/log/turnserver/turnserver.log
 simple-log

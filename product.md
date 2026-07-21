@@ -32,9 +32,9 @@ endpoints, or session keys on-chain.
 QuantumLink is source-ready for local protocol, client, packaging, and platform
 development. It is not yet a production VPN bundle. Production release still
 requires platform signing, Apple Network Extension entitlement approval for
-macOS, hardened public rendezvous/relay infrastructure, production peer-session
-key installation into packet-frame encryption, release update signing, and
-real-hardware validation across supported platforms.
+macOS, hardened public rendezvous/relay infrastructure, platform/FFI wiring for
+authenticated packet-session readiness and observability, release update signing,
+and real-hardware validation across supported platforms.
 
 ## Product goals
 

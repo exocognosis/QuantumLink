@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=/etc/quantumlink/public-edge.env
-ExecStart=${QLINK_BIN} relay --listen ${QLINK_RELAY_LISTEN}
+ExecStart=/opt/quantumlink/bin/qlinkctl relay --listen ${QLINK_RELAY_LISTEN}
 Restart=always
 RestartSec=3
 User=quantumlink

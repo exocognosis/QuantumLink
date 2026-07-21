@@ -114,6 +114,18 @@ wait_peer_id() {
   return 1
 }
 
+wait_log_pattern() {
+  local file="$1"
+  local pattern="$2"
+  for _ in {1..100}; do
+    if grep -Eq "$pattern" "$file" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
 require_endpoint() {
   local value="$1"
   local name="$2"
@@ -187,7 +199,7 @@ fi
 log "starting responder registered with public relay"
 RESPONDER_LOG="$RUN_DIR/responder.log"
 RESPONDER_KEY="$RUN_DIR/responder.seed"
-"$BIN" publish-self \
+publish_args=(publish-self
   --rendezvous "$RENDEZVOUS" \
   --mesh-id "$MESH_ID" \
   --bind-addr "$RESPONDER_BIND" \
@@ -195,10 +207,26 @@ RESPONDER_KEY="$RUN_DIR/responder.seed"
   --relay "$RELAY" \
   --ttl-seconds 60 \
   --keyfile "$RESPONDER_KEY" \
-  > "$RESPONDER_LOG" 2>&1 &
+  --stun "$STUN")
+if [[ -n "$TURN" ]]; then
+  publish_args+=(--turn "$TURN")
+  if [[ -n "$TURN_USERNAME" || -n "$TURN_PASSWORD" ]]; then
+    publish_args+=(--turn-username "$TURN_USERNAME" --turn-password "$TURN_PASSWORD")
+  fi
+  if [[ -n "$TURN_REALM" ]]; then
+    publish_args+=(--turn-realm "$TURN_REALM")
+  fi
+fi
+"$BIN" "${publish_args[@]}" > "$RESPONDER_LOG" 2>&1 &
 PIDS+=("$!")
 REMOTE_PEER="$(wait_peer_id "$RESPONDER_LOG")" \
   || die "responder did not print a local_peer_id"
+wait_log_pattern "$RESPONDER_LOG" '^published_candidate\[[0-9]+\]_type=ServerReflexive$' \
+  || die "published record did not include a server-reflexive candidate"
+if [[ -n "$TURN" ]]; then
+  wait_log_pattern "$RESPONDER_LOG" '^published_candidate\[[0-9]+\]_type=Relay$' \
+    || die "published record did not include a TURN relay candidate"
+fi
 
 log "forcing relay fallback to peer $REMOTE_PEER"
 "$BIN" direct-send \
@@ -230,6 +258,13 @@ if [[ -f "$RUN_DIR/turn-gather.log" ]]; then
   turn_addr="$(sed -n 's/^relayed_address=//p' "$RUN_DIR/turn-gather.log" | tail -1)"
   turn_port="$(sed -n 's/^relayed_port=//p' "$RUN_DIR/turn-gather.log" | tail -1)"
 fi
+published_candidate_count="$(sed -n 's/^published_candidate_count=//p' "$RESPONDER_LOG" | head -1)"
+published_candidate_types="$(
+  awk -F= '/^published_candidate\[[0-9]+\]_type=/ {print $2}' "$RESPONDER_LOG" \
+    | paste -sd, -
+)"
+self_publish_stun_failures="$(sed -n 's/^stun_failure_count=//p' "$RESPONDER_LOG" | head -1)"
+self_publish_turn_failures="$(sed -n 's/^turn_failure_count=//p' "$RESPONDER_LOG" | head -1)"
 
 git_sha="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
 EVIDENCE="$RUN_DIR/evidence.json"
@@ -248,6 +283,10 @@ cat > "$EVIDENCE" <<EOF
   "direct_probe_timeout_ms": $DIRECT_PROBE_TIMEOUT_MS,
   "stun_reflexive": "$stun_addr:$stun_port",
   "turn_relayed": "$turn_addr:$turn_port",
+  "published_candidate_count": ${published_candidate_count:-0},
+  "published_candidate_types": "$published_candidate_types",
+  "self_publish_stun_failures": ${self_publish_stun_failures:-0},
+  "self_publish_turn_failures": ${self_publish_turn_failures:-0},
   "selected_path": "$selected_path",
   "frames_sent": $frames_sent,
   "total_elapsed_ms": ${total_elapsed_ms:-0}
