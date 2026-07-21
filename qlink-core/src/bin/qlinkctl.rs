@@ -4,7 +4,9 @@ use clap::{Parser, Subcommand};
 #[cfg(feature = "dev-quic-carrier")]
 use qlink_core::relay::RelayMessage;
 #[cfg(feature = "turn-relay")]
-use qlink_core::turn::{gather_relay_candidate, TurnCredentials};
+use qlink_core::traversal::gather_ice_candidates;
+#[cfg(feature = "turn-relay")]
+use qlink_core::turn::{gather_relay_candidate, TurnCredentials, TurnServer};
 use qlink_core::{crypto::SessionKeys, pqc_frame::PqcFrameProtector};
 use qlink_core::{
     crypto::{answer_handshake, start_handshake, DeviceKeypair},
@@ -167,6 +169,23 @@ enum Command {
         /// be reached over both the direct and relay paths.
         #[arg(long)]
         relay: Option<String>,
+        /// STUN server used to gather server-reflexive candidates before each
+        /// signed record publish. Repeat to probe multiple public edges.
+        #[arg(long = "stun")]
+        stun_servers: Vec<String>,
+        /// TURN server used to gather relay candidates before each signed
+        /// record publish. Requires a build with `--features turn-relay`.
+        #[arg(long = "turn")]
+        turn_servers: Vec<String>,
+        /// TURN long-term auth username applied to each configured TURN server.
+        #[arg(long)]
+        turn_username: Option<String>,
+        /// TURN long-term auth password applied to each configured TURN server.
+        #[arg(long)]
+        turn_password: Option<String>,
+        /// Optional TURN auth realm. Omit to learn it from the 401 challenge.
+        #[arg(long)]
+        turn_realm: Option<String>,
     },
     /// Connect directly to a published peer through rendezvous and send one
     /// frame over the selected mesh path.
@@ -404,6 +423,11 @@ async fn main() -> qlink_core::Result<()> {
             metrics_addr,
             advertise_addr,
             relay,
+            stun_servers,
+            turn_servers,
+            turn_username,
+            turn_password,
+            turn_realm,
         } => {
             run_publish_self(
                 &rendezvous,
@@ -416,6 +440,11 @@ async fn main() -> qlink_core::Result<()> {
                 metrics_addr.as_deref(),
                 advertise_addr.as_deref(),
                 relay.as_deref(),
+                &stun_servers,
+                &turn_servers,
+                turn_username.as_deref(),
+                turn_password.as_deref(),
+                turn_realm.as_deref(),
             )
             .await?;
         }
@@ -697,9 +726,29 @@ async fn run_publish_self(
     metrics_addr: Option<&str>,
     advertise_addr: Option<&str>,
     relay: Option<&str>,
+    stun_server_args: &[String],
+    turn_server_args: &[String],
+    turn_username: Option<&str>,
+    turn_password: Option<&str>,
+    turn_realm: Option<&str>,
 ) -> qlink_core::Result<()> {
     let keypair = Arc::new(load_or_generate_keypair(keyfile)?);
     let local_peer_id = keypair.public_key().peer_id();
+    let stun_servers = parse_socket_addr_args("--stun", stun_server_args)?;
+    #[cfg(feature = "turn-relay")]
+    let turn_servers =
+        configured_turn_servers(turn_server_args, turn_username, turn_password, turn_realm)?;
+    #[cfg(not(feature = "turn-relay"))]
+    if !turn_server_args.is_empty()
+        || turn_username.is_some()
+        || turn_password.is_some()
+        || turn_realm.is_some()
+    {
+        return Err(qlink_core::QlinkError::Protocol(
+            "publish-self TURN candidate gathering requires a build with --features turn-relay"
+                .into(),
+        ));
+    }
 
     // Construction needs to live outside the async runtime context
     // (it spins up its own internal tokio runtime); spawn_blocking
@@ -748,19 +797,30 @@ async fn run_publish_self(
     let responder_addr = handle
         .responder_local_addr()
         .ok_or_else(|| qlink_core::QlinkError::Protocol("responder_local_addr missing".into()))?;
-    if let Some(advertise) = advertise_addr {
+    let advertised_addr = if let Some(advertise) = advertise_addr {
         let parsed: SocketAddr = advertise.parse().map_err(|err| {
             qlink_core::QlinkError::Protocol(format!("invalid advertise_addr: {err}"))
         })?;
         handle.set_advertise_addr(parsed);
-    }
+        parsed
+    } else {
+        responder_addr
+    };
     println!("local_peer_id={local_peer_id}");
     println!("responder_addr={responder_addr}");
     if let Some(advertise) = advertise_addr {
         println!("advertise_addr={advertise}");
     }
+    println!("candidate_gather_addr={advertised_addr}");
     println!("mesh_id={mesh_id}");
     println!("rendezvous_url={rendezvous_url}");
+    for server in &stun_servers {
+        println!("stun_server={server}");
+    }
+    #[cfg(feature = "turn-relay")]
+    for server in &turn_servers {
+        println!("turn_server={}", server.addr);
+    }
     if let Some(metrics) = metrics_addr {
         println!("metrics_endpoint={metrics}");
     }
@@ -770,12 +830,22 @@ async fn run_publish_self(
     // peer-record convention used elsewhere in the crate.
     let mut sequence: u64 = 1;
     loop {
+        #[cfg(feature = "turn-relay")]
+        let (gathered_candidates, gather_report) = if turn_servers.is_empty() {
+            gather_local_candidates(advertised_addr, &stun_servers).await
+        } else {
+            gather_ice_candidates(advertised_addr, &stun_servers, &turn_servers).await
+        };
+        #[cfg(not(feature = "turn-relay"))]
+        let (gathered_candidates, gather_report) =
+            gather_local_candidates(advertised_addr, &stun_servers).await;
         let record = handle
-            .publish_self(
+            .publish_self_with_extra_candidates(
                 keypair.as_ref(),
                 rendezvous_url,
                 ttl_seconds,
                 sequence,
+                gathered_candidates,
                 vec![],
             )
             .await?;
@@ -783,6 +853,27 @@ async fn run_publish_self(
             "published sequence={sequence} expires_at_unix={}",
             record.body.expires_at_unix
         );
+        println!("published_candidate_count={}", record.body.endpoints.len());
+        for (index, candidate) in record.body.endpoints.iter().enumerate() {
+            println!(
+                "published_candidate[{index}]_type={:?}",
+                candidate.candidate_type
+            );
+            println!("published_candidate[{index}]_address={}", candidate.address);
+            println!("published_candidate[{index}]_port={}", candidate.port);
+            println!(
+                "published_candidate[{index}]_priority={}",
+                candidate.priority
+            );
+        }
+        println!("stun_failure_count={}", gather_report.stun_failures.len());
+        for (server, error) in &gather_report.stun_failures {
+            println!("stun_failure[{server}]={error}");
+        }
+        println!("turn_failure_count={}", gather_report.turn_failures.len());
+        for (server, error) in &gather_report.turn_failures {
+            println!("turn_failure[{server}]={error}");
+        }
         if once {
             return Ok(());
         }
@@ -793,6 +884,54 @@ async fn run_publish_self(
         let sleep_secs = ttl_seconds.saturating_div(2).max(1);
         tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
     }
+}
+
+fn parse_socket_addr_arg(label: &str, value: &str) -> qlink_core::Result<SocketAddr> {
+    value
+        .parse()
+        .map_err(|err| qlink_core::QlinkError::Protocol(format!("invalid {label}: {err}")))
+}
+
+fn parse_socket_addr_args(label: &str, values: &[String]) -> qlink_core::Result<Vec<SocketAddr>> {
+    values
+        .iter()
+        .map(|value| parse_socket_addr_arg(label, value))
+        .collect()
+}
+
+#[cfg(feature = "turn-relay")]
+fn configured_turn_servers(
+    values: &[String],
+    username: Option<&str>,
+    password: Option<&str>,
+    realm: Option<&str>,
+) -> qlink_core::Result<Vec<TurnServer>> {
+    let credentials = match (username, password) {
+        (Some(username), Some(password)) => {
+            let credentials = TurnCredentials::new(username, password);
+            Some(match realm {
+                Some(realm) => credentials.with_realm(realm),
+                None => credentials,
+            })
+        }
+        (None, None) => None,
+        _ => {
+            return Err(qlink_core::QlinkError::Protocol(
+                "TURN candidate gathering requires both --turn-username and --turn-password".into(),
+            ))
+        }
+    };
+
+    values
+        .iter()
+        .map(|value| {
+            let addr = parse_socket_addr_arg("--turn", value)?;
+            Ok(match credentials.clone() {
+                Some(credentials) => TurnServer::authenticated(addr, credentials),
+                None => TurnServer::open(addr),
+            })
+        })
+        .collect()
 }
 
 /// Loads a 32-byte ML-DSA seed from `keyfile` if provided + present,

@@ -23,8 +23,8 @@ This feature list is synchronized with the current repository implementation. It
 - Peer IDs derived from device public-key material.
 - Signed, expiring peer records for rendezvous publication.
 - Inbound identity assertions and optional peer ACL evaluation.
-- ChaCha20-Poly1305 packet-frame protection in the Rust packet core.
-- Monotonic packet-number replay window.
+- App-layer PQC frame protection using ML-KEM session keys, SHAKE256 masking/authentication, and replay rejection.
+- Packet-core route enforcement, packet metadata normalization, peer-session readiness gates, and monotonic packet-number replay window.
 
 ## Mesh and Transport
 
@@ -45,7 +45,7 @@ This feature list is synchronized with the current repository implementation. It
 
 ## Not Production-Complete
 
-- Production peer-session key installation into packet-frame encryption.
+- Platform/FFI production wiring that installs authenticated peer-session readiness into `PacketTunnelCore` and exposes peer-session/replay drop observability.
 - Hardened public rendezvous, STUN, TURN, and relay services.
 - RFC-complete public ICE nomination behavior against deployed public infrastructure.
 - Notarized Developer ID app and tunnel extension bundle.

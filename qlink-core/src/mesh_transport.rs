@@ -56,7 +56,7 @@ use crate::{
     relay::RelayResponderListener,
     rendezvous::RendezvousClient,
     session_crypto::PqcSessionContext,
-    traversal::HOST_PRIORITY,
+    traversal::{order_remote_candidates, HOST_PRIORITY},
 };
 #[cfg(not(feature = "dev-quic-carrier"))]
 use crate::{carrier_transport::NativeUdpSession, mesh_connection::native_udp_carrier_binding};
@@ -1151,6 +1151,32 @@ impl MeshTransportHandle {
     // (continued below — public API)
 }
 
+fn published_candidate_endpoints(
+    advertised: SocketAddr,
+    extra_candidates: Vec<CandidateEndpoint>,
+) -> Vec<CandidateEndpoint> {
+    let mut candidates = vec![CandidateEndpoint {
+        candidate_type: CandidateType::Host,
+        address: advertised.ip().to_string(),
+        port: advertised.port(),
+        priority: HOST_PRIORITY,
+    }];
+    candidates.extend(extra_candidates);
+
+    let mut unique: Vec<CandidateEndpoint> = Vec::new();
+    for candidate in candidates {
+        if unique.iter().any(|existing| {
+            existing.candidate_type == candidate.candidate_type
+                && existing.address == candidate.address
+                && existing.port == candidate.port
+        }) {
+            continue;
+        }
+        unique.push(candidate);
+    }
+    order_remote_candidates(&unique)
+}
+
 impl MeshTransportHandle {
     /// Local address of the OpenMetrics endpoint, when one is bound.
     pub fn metrics_endpoint_addr(&self) -> Option<SocketAddr> {
@@ -1239,6 +1265,30 @@ impl MeshTransportHandle {
         sequence: u64,
         overlay_routes: Vec<String>,
     ) -> Result<PeerRecord> {
+        self.publish_self_with_extra_candidates(
+            keypair,
+            rendezvous_url,
+            ttl_seconds,
+            sequence,
+            Vec::new(),
+            overlay_routes,
+        )
+        .await
+    }
+
+    /// Same as [`Self::publish_self`], but appends already-gathered
+    /// server-reflexive or relay candidates to the signed record. This is used
+    /// by operator tooling after STUN/TURN gathering while keeping the FFI
+    /// wrapper's stable publish signature intact.
+    pub async fn publish_self_with_extra_candidates(
+        &self,
+        keypair: &DeviceKeypair,
+        rendezvous_url: &str,
+        ttl_seconds: u64,
+        sequence: u64,
+        extra_candidates: Vec<CandidateEndpoint>,
+        overlay_routes: Vec<String>,
+    ) -> Result<PeerRecord> {
         let cert_der = self.server_certificate_der.clone().unwrap_or_default();
         let local_addr = self.responder_local_addr.ok_or_else(|| {
             QlinkError::Protocol(
@@ -1266,12 +1316,7 @@ impl MeshTransportHandle {
             .ok()
             .and_then(|guard| *guard)
             .unwrap_or(local_addr);
-        let endpoints = vec![CandidateEndpoint {
-            candidate_type: CandidateType::Host,
-            address: advertised.ip().to_string(),
-            port: advertised.port(),
-            priority: HOST_PRIORITY,
-        }];
+        let endpoints = published_candidate_endpoints(advertised, extra_candidates);
         let body = UnsignedPeerRecord::new(
             mesh_id.clone(),
             // The alias gets replaced inside `UnsignedPeerRecord::new`
@@ -4201,6 +4246,78 @@ mod tests {
             err.to_string().contains("does not match"),
             "error should explain the mismatch, got: {err}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn publish_self_includes_extra_ice_candidates_in_signed_record() {
+        let rendezvous = spawn_dev_rendezvous().await.unwrap();
+        let rendezvous_url = rendezvous.local_addr().to_string();
+        let local_key = Arc::new(DeviceKeypair::generate().unwrap());
+        let local_peer_id = local_key.public_key().peer_id();
+        let handle = build_handle_with_responder(
+            rendezvous_url.clone(),
+            local_peer_id.clone(),
+            "devmesh",
+            None,
+            Some(local_key.clone()),
+        )
+        .await;
+        handle.set_advertise_addr("127.0.0.1:44000".parse().unwrap());
+
+        let record = handle
+            .publish_self_with_extra_candidates(
+                local_key.as_ref(),
+                &rendezvous_url,
+                120,
+                1,
+                vec![
+                    CandidateEndpoint {
+                        candidate_type: CandidateType::ServerReflexive,
+                        address: "203.0.113.10".to_string(),
+                        port: 52000,
+                        priority: 1,
+                    },
+                    CandidateEndpoint {
+                        candidate_type: CandidateType::Relay,
+                        address: "198.51.100.20".to_string(),
+                        port: 3478,
+                        priority: u32::MAX,
+                    },
+                    CandidateEndpoint {
+                        candidate_type: CandidateType::ServerReflexive,
+                        address: "203.0.113.10".to_string(),
+                        port: 52000,
+                        priority: 1,
+                    },
+                ],
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        record.verify("devmesh").unwrap();
+        let types: Vec<CandidateType> = record
+            .body
+            .endpoints
+            .iter()
+            .map(|candidate| candidate.candidate_type.clone())
+            .collect();
+        assert_eq!(
+            types,
+            vec![
+                CandidateType::Host,
+                CandidateType::ServerReflexive,
+                CandidateType::Relay
+            ]
+        );
+        assert_eq!(record.body.endpoints.len(), 3);
+
+        let found = RendezvousClient::new(rendezvous_url)
+            .lookup("devmesh", &local_peer_id)
+            .await
+            .unwrap()
+            .expect("published record must be available");
+        assert_eq!(found.body.endpoints, record.body.endpoints);
     }
 
     #[tokio::test(flavor = "multi_thread")]
