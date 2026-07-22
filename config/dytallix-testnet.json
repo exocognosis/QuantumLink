@@ -1,0 +1,15 @@
+{
+  "_comment": "Canonical record of the QuantumLink node-registry contract deployed to the Dytallix public testnet on 2026-07-12. Consumed by DytallixRegistryLookupConfig/DytallixRegistryConfig (rust/qlink-core/src/dytallix_identity.rs) and, once ported, the Swift enrollment settings. Live-verified by rust/qlink-core/tests/dytallix_live.rs.",
+  "endpoint": "https://dytallix.com",
+  "contractAddress": "0xbcb5cf5abb50333ee4bfde91f21bbcc24828673d",
+  "networkId": null,
+  "chainId": null,
+  "allowedRpcEndpoints": ["https://dytallix.com"],
+  "deployment": {
+    "ownerDaddr": "dytallix13duzmpznsq0k5r62684kwp5y3uw4lmkl7rp5swmjl7964054lzvssdpvgg",
+    "deployTx": "0x05d828c9b85f8da422d60eb5e30bf30c0625866625199a5c195ff74ba035a3dc",
+    "deployedAt": "2026-07-12",
+    "contractName": "quantumlink-node-registry",
+    "contractVersion": 1
+  }
+}
