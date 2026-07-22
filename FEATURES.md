@@ -42,6 +42,7 @@ This feature list is synchronized with the current repository implementation. It
 - Local development app can run without a signed Network Extension by using simulated mesh state or development loopback transport.
 - Unsigned XcodeGen project scaffolding can be generated without Apple credentials.
 - The macOS development runtime installs, clears, and rotates packet-core peer-session readiness from the live default-peer mesh session, so protected packet flow fails closed until an authenticated peer session is available.
+- macOS connection profiles, managed configuration, and party-mesh invite flows can select a remote QuantumLink peer ID and carry it into the packet-session readiness gate.
 - Real packet tunnel execution requires Apple Network Extension entitlements, provisioning, signing, and notarization.
 - Enterprise rollout is designed around MDM, per-app VPN payloads, VPN On Demand rules, and extension preapproval.
 

@@ -9,6 +9,7 @@ public struct PartyMeshInvite: Codable, Equatable, Sendable {
 
   public let meshID: String
   public let hostAlias: String
+  public let hostPeerID: String?
   public let hostOverlayAddress: String
   public let rendezvousServers: [String]
   public let relayServers: [String]
@@ -19,6 +20,7 @@ public struct PartyMeshInvite: Codable, Equatable, Sendable {
   public init(
     meshID: String,
     hostAlias: String,
+    hostPeerID: String? = nil,
     hostOverlayAddress: String,
     rendezvousServers: [String],
     relayServers: [String],
@@ -28,6 +30,7 @@ public struct PartyMeshInvite: Codable, Equatable, Sendable {
   ) {
     self.meshID = meshID
     self.hostAlias = hostAlias
+    self.hostPeerID = Self.normalizedPeerID(hostPeerID)
     self.hostOverlayAddress = hostOverlayAddress
     self.rendezvousServers = rendezvousServers
     self.relayServers = relayServers
@@ -36,10 +39,15 @@ public struct PartyMeshInvite: Codable, Equatable, Sendable {
     self.meshTrustPolicy = meshTrustPolicy
   }
 
-  public init(configuration: TunnelConfiguration, gamePort: Int) {
+  public init(
+    configuration: TunnelConfiguration,
+    gamePort: Int,
+    hostPeerID: String? = nil
+  ) {
     self.init(
       meshID: configuration.meshID,
       hostAlias: configuration.deviceAlias,
+      hostPeerID: hostPeerID,
       hostOverlayAddress: configuration.overlayIPv4Address,
       rendezvousServers: configuration.rendezvousServers,
       relayServers: configuration.relayServers,
@@ -47,6 +55,27 @@ public struct PartyMeshInvite: Codable, Equatable, Sendable {
       identityMode: configuration.discoveryIdentityMode,
       meshTrustPolicy: configuration.meshTrustPolicy
     )
+  }
+
+  public init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    self.meshID = try container.decode(String.self, forKey: .meshID)
+    self.hostAlias = try container.decode(String.self, forKey: .hostAlias)
+    self.hostPeerID = Self.normalizedPeerID(
+      try container.decodeIfPresent(String.self, forKey: .hostPeerID)
+    )
+    self.hostOverlayAddress = try container.decode(String.self, forKey: .hostOverlayAddress)
+    self.rendezvousServers = try container.decode([String].self, forKey: .rendezvousServers)
+    self.relayServers = try container.decode([String].self, forKey: .relayServers)
+    self.gamePort = try container.decode(Int.self, forKey: .gamePort)
+    self.identityMode = try container.decodeIfPresent(
+      DiscoveryIdentityMode.self,
+      forKey: .identityMode
+    ) ?? .off
+    self.meshTrustPolicy = try container.decodeIfPresent(
+      MeshTrustPolicy.self,
+      forKey: .meshTrustPolicy
+    ) ?? .developmentOptional
   }
 
   public init(joinCode: String) throws {
@@ -91,6 +120,11 @@ public struct PartyMeshInvite: Codable, Equatable, Sendable {
     relayServers.isEmpty
       ? "Direct path required"
       : "Direct preferred, relay fallback available"
+  }
+
+  private static func normalizedPeerID(_ peerID: String?) -> String? {
+    let trimmed = peerID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    return trimmed.isEmpty ? nil : trimmed
   }
 }
 

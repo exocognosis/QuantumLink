@@ -45,14 +45,26 @@ public enum VNCAuthenticationMode: String, Codable, CaseIterable, Hashable, Iden
 public struct PeerDeviceProfile: Codable, Equatable, Hashable, Identifiable, Sendable {
     public var id: UUID
     public var alias: String
+    public var peerID: String
     public var endpointAddress: String
     public var overlayIPAddress: String
     public var role: PeerDeviceRole
     public var port: Int
 
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case alias
+        case peerID
+        case endpointAddress
+        case overlayIPAddress
+        case role
+        case port
+    }
+
     public init(
         id: UUID = UUID(),
         alias: String = "",
+        peerID: String = "",
         endpointAddress: String = "",
         overlayIPAddress: String = "",
         role: PeerDeviceRole = .peer,
@@ -60,10 +72,29 @@ public struct PeerDeviceProfile: Codable, Equatable, Hashable, Identifiable, Sen
     ) {
         self.id = id
         self.alias = alias
+        self.peerID = peerID
         self.endpointAddress = endpointAddress
         self.overlayIPAddress = overlayIPAddress
         self.role = role
         self.port = port
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try container.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        self.alias = try container.decodeIfPresent(String.self, forKey: .alias) ?? ""
+        self.peerID = try container.decodeIfPresent(String.self, forKey: .peerID) ?? ""
+        self.endpointAddress =
+            try container.decodeIfPresent(String.self, forKey: .endpointAddress) ?? ""
+        self.overlayIPAddress =
+            try container.decodeIfPresent(String.self, forKey: .overlayIPAddress) ?? ""
+        self.role = try container.decodeIfPresent(PeerDeviceRole.self, forKey: .role) ?? .peer
+        self.port = try container.decodeIfPresent(Int.self, forKey: .port) ?? 0
+    }
+
+    public var normalizedPeerID: String? {
+        let trimmed = peerID.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 }
 
@@ -90,6 +121,10 @@ public struct DeploymentProfileDetails: Codable, Equatable, Hashable, Sendable {
             .split { $0 == "," || $0 == "\n" || $0 == " " || $0 == "\t" }
             .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
+    }
+
+    public var selectedRemotePeerID: String? {
+        peerDevices.lazy.compactMap(\.normalizedPeerID).first
     }
 }
 
@@ -285,6 +320,9 @@ public struct ConnectionProfile: Codable, Equatable, Hashable, Identifiable, Sen
             if deploymentDetails.peerDevices.filter(\.hasEndpoint).isEmpty {
                 missing.append("Mesh peer")
             }
+            if deploymentDetails.selectedRemotePeerID == nil {
+                missing.append("Peer ID")
+            }
         case .localVPN:
             if deploymentDetails.localDevices.filter(\.hasEndpoint).isEmpty {
                 missing.append("LAN device")
@@ -376,6 +414,7 @@ private extension PeerDeviceProfile {
     var stableKeyComponent: String {
         [
             alias,
+            peerID,
             endpointAddress,
             overlayIPAddress,
             role.rawValue,
