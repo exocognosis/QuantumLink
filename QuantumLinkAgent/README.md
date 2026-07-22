@@ -62,7 +62,7 @@ The first implementation step should be a small Agent runtime crate or package t
 
 ## Initial integration points
 
-- Shared core: `rust/qlink-core`
+- Shared core: `qlink-core`
 - Identity source: Dytallix registry state through existing identity primitives
 - Platform surfaces: macOS, Windows, and SteamOS adapters can consume Agent recommendations later
 - Diagnostics: redacted support-bundle style evidence only
