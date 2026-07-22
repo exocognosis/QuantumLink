@@ -141,6 +141,7 @@ public final class TunnelPacketPump {
 
         var queued = 0
         var droppedUnprotected = 0
+        var droppedFailClosed = 0
         var failed = 0
         var emitted = 0
 
@@ -156,6 +157,9 @@ public final class TunnelPacketPump {
                 case .droppedUnprotected:
                     droppedUnprotected += 1
                     counters.droppedUnprotected += 1
+                case .droppedPeerSessionUnavailable:
+                    droppedFailClosed += 1
+                    counters.droppedFailClosed += 1
                 }
             } catch {
                 failed += 1
@@ -168,7 +172,7 @@ public final class TunnelPacketPump {
             packetsObserved: packets.count,
             queuedForTransport: queued,
             droppedUnprotected: droppedUnprotected,
-            droppedFailClosed: 0,
+            droppedFailClosed: droppedFailClosed,
             droppedKillSwitch: 0,
             failedSubmissions: failed,
             transportFramesEmitted: emitted

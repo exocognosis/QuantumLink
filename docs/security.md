@@ -22,11 +22,12 @@ Implemented baseline:
 - Fail-closed tunnel scaffold for protected routes when the data plane is unavailable.
 - Privacy-preserving defaults without a user-facing mode: overlay addresses in `100.64.0.0/10` allocated through a cryptographically seeded recursive permutation, pseudonymous mesh/device labels, no DNS search-domain default, redacted app/diagnostic network identifiers, and simulated peers that avoid hostnames or LAN endpoints.
 - Packet metadata normalization before packet-frame emission: DSCP/ECN is cleared, TTL is normalized, non-fragment IPv4 IDs are cleared, and IPv4 header checksums are recomputed.
+- Packet-session gating is observable through FFI metrics: peer-session-unavailable drops and replay drops are exposed to macOS, and the packet pump counts missing-session drops as fail-closed.
 - Public peer-record minimization: clear aliases are replaced with sequence-rotating pseudonyms and rendezvous publication keeps relay candidates only by default.
 - Raw QUIC, raw relay, and legacy mesh loopback smoke paths fail closed unless an end-to-end app-layer PQC session exists.
 - Native UDP carrier with fragmented authenticated control-message support; default live mesh direct dialing and inbound response use this non-TLS carrier with the app-layer PQC session wire, and tests prove both sides establish matching ML-KEM/SHAKE keys.
-- Relay fallback is end-to-end PQC only: when direct native UDP probes fail, the connector can establish the same signed inbound assertion, ML-KEM session, and protected-frame path through the relay carrier. Raw unauthenticated relay fallback remains rejected.
-- Candidate gathering covers host and STUN server-reflexive candidates in default builds, plus TURN relay candidates when `turn-relay` is explicitly enabled. Gather failures are reported per server without suppressing lower-latency direct candidates.
+- Relay fallback is end-to-end PQC only: when direct native UDP probes fail, the connector can establish the same signed inbound assertion, ML-KEM session, and protected-frame path through a configured or signed `quantum_link_relay` carrier candidate. Raw unauthenticated relay fallback remains rejected.
+- Candidate gathering covers host and STUN server-reflexive candidates in default builds, plus TURN relay candidates when `turn-relay` is explicitly enabled. Gather failures are reported per server without suppressing lower-latency direct candidates. TURN allocations remain distinct from the QuantumLink app-relay carrier.
 - A public-edge deployment runbook and smoke harness cover allowlisted
   rendezvous, STUN, TURN allocation, and end-to-end PQC relay-fallback proof
   while open-internet rendezvous/relay TLS/auth remains unfinished.

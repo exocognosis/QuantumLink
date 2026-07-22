@@ -55,6 +55,9 @@ pub const SERVER_REFLEXIVE_PRIORITY: u32 =
 pub const PEER_REFLEXIVE_PRIORITY: u32 =
     ice_priority(TYPE_PREF_PEER_REFLEXIVE, DEFAULT_LOCAL_PREF, COMPONENT_ID);
 pub const RELAY_PRIORITY: u32 = ice_priority(TYPE_PREF_RELAY, DEFAULT_LOCAL_PREF, COMPONENT_ID);
+/// Slightly prefer the QuantumLink app relay over generic TURN relay
+/// allocations when both are published in one signed record.
+pub const QUANTUM_LINK_RELAY_PRIORITY: u32 = RELAY_PRIORITY.saturating_add(1);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CandidatePair {
@@ -125,6 +128,15 @@ pub fn relay_candidate(address: SocketAddr) -> CandidateEndpoint {
         address: address.ip().to_string(),
         port: address.port(),
         priority: RELAY_PRIORITY,
+    }
+}
+
+pub fn quantum_link_relay_candidate(address: SocketAddr) -> CandidateEndpoint {
+    CandidateEndpoint {
+        candidate_type: CandidateType::QuantumLinkRelay,
+        address: address.ip().to_string(),
+        port: address.port(),
+        priority: QUANTUM_LINK_RELAY_PRIORITY,
     }
 }
 
@@ -239,8 +251,8 @@ fn host_candidate(addr: SocketAddr) -> CandidateEndpoint {
 pub fn order_remote_candidates(candidates: &[CandidateEndpoint]) -> Vec<CandidateEndpoint> {
     let mut sorted: Vec<CandidateEndpoint> = candidates.to_vec();
     sorted.sort_by(|a, b| {
-        let a_relay = matches!(a.candidate_type, CandidateType::Relay);
-        let b_relay = matches!(b.candidate_type, CandidateType::Relay);
+        let a_relay = is_relay_family_candidate(&a.candidate_type);
+        let b_relay = is_relay_family_candidate(&b.candidate_type);
         match (a_relay, b_relay) {
             (true, false) => std::cmp::Ordering::Greater,
             (false, true) => std::cmp::Ordering::Less,
@@ -248,6 +260,13 @@ pub fn order_remote_candidates(candidates: &[CandidateEndpoint]) -> Vec<Candidat
         }
     });
     sorted
+}
+
+fn is_relay_family_candidate(candidate_type: &CandidateType) -> bool {
+    matches!(
+        candidate_type,
+        CandidateType::Relay | CandidateType::QuantumLinkRelay
+    )
 }
 
 /// Validates a CandidateEndpoint enough to extract a `SocketAddr`.
@@ -286,6 +305,8 @@ mod tests {
         );
         assert_eq!(HOST_PRIORITY, expected);
         assert!(HOST_PRIORITY > SERVER_REFLEXIVE_PRIORITY);
+        assert!(SERVER_REFLEXIVE_PRIORITY > QUANTUM_LINK_RELAY_PRIORITY);
+        assert!(QUANTUM_LINK_RELAY_PRIORITY > RELAY_PRIORITY);
         assert!(SERVER_REFLEXIVE_PRIORITY > RELAY_PRIORITY);
     }
 
@@ -306,6 +327,7 @@ mod tests {
     fn order_remote_candidates_puts_relays_last() {
         let candidates = vec![
             relay_candidate("1.2.3.4:5".parse().unwrap()),
+            quantum_link_relay_candidate("1.2.3.5:9472".parse().unwrap()),
             CandidateEndpoint {
                 candidate_type: CandidateType::Host,
                 address: "1.2.3.4".to_string(),
@@ -322,7 +344,8 @@ mod tests {
         let ordered = order_remote_candidates(&candidates);
         assert_eq!(ordered[0].candidate_type, CandidateType::Host);
         assert_eq!(ordered[1].candidate_type, CandidateType::ServerReflexive);
-        assert_eq!(ordered[2].candidate_type, CandidateType::Relay);
+        assert_eq!(ordered[2].candidate_type, CandidateType::QuantumLinkRelay);
+        assert_eq!(ordered[3].candidate_type, CandidateType::Relay);
     }
 
     #[tokio::test]

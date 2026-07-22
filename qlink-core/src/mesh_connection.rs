@@ -843,15 +843,17 @@ impl MeshConnector {
                 let detail = latest_probe_failure_summary(&attempts)
                     .map(|summary| format!("; last direct failure: {summary}"))
                     .unwrap_or_default();
-                let Some(server) = self.config.relay_server.clone() else {
+                let relay_servers =
+                    relay_server_candidates(&all_endpoints, self.config.relay_server.as_deref());
+                if relay_servers.is_empty() {
                     return Err(QlinkError::Protocol(format!(
-                        "no direct candidate for peer {remote_peer_id} succeeded{detail} and no relay server is configured"
+                        "no direct candidate for peer {remote_peer_id} succeeded{detail} and no relay server is configured or published"
                     )));
-                };
+                }
 
-                self.connect_via_relay(
+                self.connect_via_relay_candidates(
                     remote_peer_id,
-                    &server,
+                    relay_servers,
                     record.body.device_certificate_der.clone(),
                     started,
                     attempts,
@@ -1188,18 +1190,20 @@ impl MeshConnector {
                     self.cache.invalidate(remote_peer_id);
                 }
 
-                let Some(server) = self.config.relay_server.clone() else {
-                    let detail = latest_probe_failure_summary(&attempts)
-                        .map(|summary| format!("; last direct failure: {summary}"))
-                        .unwrap_or_default();
+                let detail = latest_probe_failure_summary(&attempts)
+                    .map(|summary| format!("; last direct failure: {summary}"))
+                    .unwrap_or_default();
+                let relay_servers =
+                    relay_server_candidates(&all_endpoints, self.config.relay_server.as_deref());
+                if relay_servers.is_empty() {
                     return Err(QlinkError::Protocol(format!(
-                        "no direct candidate for peer {remote_peer_id} succeeded{detail} and no relay server is configured"
+                        "no direct candidate for peer {remote_peer_id} succeeded{detail} and no relay server is configured or published"
                     )));
-                };
+                }
 
-                self.connect_via_relay(
+                self.connect_via_relay_candidates(
                     remote_peer_id,
-                    &server,
+                    relay_servers,
                     record.body.device_certificate_der.clone(),
                     started,
                     attempts,
@@ -1220,6 +1224,45 @@ impl MeshConnector {
     /// malicious relay can neither read nor forge traffic. This preserves the
     /// fail-closed guarantee (raw, unauthenticated relay is never used) while
     /// completing the connection.
+    #[allow(clippy::too_many_arguments)]
+    async fn connect_via_relay_candidates(
+        &self,
+        remote_peer_id: &str,
+        servers: Vec<String>,
+        responder_certificate_der: Vec<u8>,
+        started: Instant,
+        attempts: Vec<ProbeAttempt>,
+        used_cached_path: bool,
+        registry_decision: RegistryDecision,
+        peer_record_source: PeerRecordSource,
+    ) -> Result<(MeshLink, ConnectionOutcome)> {
+        let mut failures: Vec<String> = Vec::new();
+
+        for server in servers {
+            match self
+                .connect_via_relay(
+                    remote_peer_id,
+                    &server,
+                    responder_certificate_der.clone(),
+                    started,
+                    attempts.clone(),
+                    used_cached_path,
+                    registry_decision,
+                    peer_record_source,
+                )
+                .await
+            {
+                Ok(result) => return Ok(result),
+                Err(error) => failures.push(format!("{server}: {error}")),
+            }
+        }
+
+        Err(QlinkError::Protocol(format!(
+            "relay PQC session to peer {remote_peer_id} failed for every configured or published QuantumLink relay candidate: {}",
+            failures.join("; ")
+        )))
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn connect_via_relay(
         &self,
@@ -1882,8 +1925,37 @@ fn direct_candidate_rank(candidate_type: &CandidateType) -> u8 {
     match candidate_type {
         CandidateType::Host => 0,
         CandidateType::ServerReflexive => 1,
-        CandidateType::Relay => 2,
+        CandidateType::QuantumLinkRelay | CandidateType::Relay => 2,
     }
+}
+
+fn relay_server_candidates(
+    endpoints: &[CandidateEndpoint],
+    configured_relay: Option<&str>,
+) -> Vec<String> {
+    let mut servers = Vec::new();
+    if let Some(configured) = configured_relay {
+        push_relay_server_candidate(&mut servers, configured);
+    }
+
+    for endpoint in endpoints
+        .iter()
+        .filter(|endpoint| endpoint.candidate_type == CandidateType::QuantumLinkRelay)
+    {
+        if let Ok(address) = candidate_socket_addr(endpoint) {
+            push_relay_server_candidate(&mut servers, &address.to_string());
+        }
+    }
+
+    servers
+}
+
+fn push_relay_server_candidate(servers: &mut Vec<String>, candidate: &str) {
+    let trimmed = candidate.trim();
+    if trimmed.is_empty() || servers.iter().any(|server| server == trimmed) {
+        return;
+    }
+    servers.push(trimmed.to_string());
 }
 
 fn direct_keypair_required_attempts(candidates: &[CandidateEndpoint]) -> Vec<ProbeAttempt> {
@@ -1961,6 +2033,7 @@ mod native_udp_live_mesh_tests {
         pqc_session_wire::run_pqc_session_responder,
         relay::{spawn_dev_relay, RelayResponderListener},
         rendezvous::spawn_dev_rendezvous,
+        traversal::quantum_link_relay_candidate,
     };
     use std::net::Ipv4Addr;
 
@@ -2145,6 +2218,115 @@ mod native_udp_live_mesh_tests {
             .expect("responder did not receive the relayed frame")
             .expect("frame channel closed");
         assert_eq!(opened, b"native-relay-frame");
+    }
+
+    #[tokio::test]
+    async fn native_udp_relay_fallback_uses_published_quantumlink_relay_candidate() {
+        let rendezvous = spawn_dev_rendezvous().await.unwrap();
+        let rendezvous_client = RendezvousClient::new(rendezvous.local_addr().to_string());
+        let relay = spawn_dev_relay().await.unwrap();
+        let relay_addr = relay.local_addr();
+
+        let local_key = Arc::new(DeviceKeypair::generate().unwrap());
+        let remote_key = Arc::new(DeviceKeypair::generate().unwrap());
+        let remote_peer_id = remote_key.public_key().peer_id();
+        let carrier_binding = b"native-udp-published-relay-binding".to_vec();
+
+        let (frame_tx, mut frame_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let responder_peer_id = remote_peer_id.clone();
+        let responder_key = remote_key.clone();
+        let responder_binding = carrier_binding.clone();
+        let _responder = tokio::spawn(async move {
+            let _ =
+                RelayResponderListener::run(&relay_addr.to_string(), responder_peer_id.clone(), {
+                    move |session| {
+                        let responder_key = responder_key.clone();
+                        let responder_peer_id = responder_peer_id.clone();
+                        let responder_binding = responder_binding.clone();
+                        let frame_tx = frame_tx.clone();
+                        tokio::spawn(async move {
+                            let session = CarrierSession::from(session);
+                            let Ok((InboundDecision::Accepted, assertion)) =
+                                receive_and_evaluate_inbound(
+                                    &session,
+                                    MESH_ID,
+                                    DEFAULT_INBOUND_ASSERTION_MAX_AGE_SECONDS,
+                                    None,
+                                )
+                                .await
+                            else {
+                                session.close(b"");
+                                return;
+                            };
+                            let context = PqcSessionContext::new(
+                                MESH_ID,
+                                assertion.peer_id,
+                                responder_peer_id,
+                                responder_binding,
+                            );
+                            let Ok(session_keys) = run_pqc_session_responder(
+                                &session,
+                                context,
+                                responder_key.as_ref(),
+                            )
+                            .await
+                            else {
+                                session.close(b"");
+                                return;
+                            };
+                            let mut frame_protector = PqcFrameProtector::new(session_keys);
+                            if let Ok(protected) = session.receive_frame().await {
+                                if let Ok(opened) = frame_protector.open(&protected) {
+                                    let _ = frame_tx.send(opened);
+                                }
+                            }
+                        });
+                    }
+                })
+                .await;
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let remote_record = signed_record_with_cert(
+            remote_key.as_ref(),
+            vec![
+                CandidateEndpoint {
+                    candidate_type: CandidateType::Host,
+                    address: "127.0.0.1".to_string(),
+                    port: 1,
+                    priority: 120,
+                },
+                quantum_link_relay_candidate(relay_addr),
+            ],
+            3,
+            carrier_binding,
+        );
+        rendezvous_client
+            .publish(MESH_ID, remote_record)
+            .await
+            .unwrap();
+
+        let connector = MeshConnector::new(
+            MeshConnectorConfig::new(MESH_ID, local_key.public_key().peer_id())
+                .with_direct_probe_timeout(Duration::from_millis(150))
+                .with_overall_deadline(Duration::from_secs(3))
+                .with_local_device_keypair(local_key),
+            rendezvous_client,
+        );
+
+        let (mut link, outcome) = connector.connect(&remote_peer_id).await.unwrap();
+        assert_eq!(link.path_kind(), PathKind::Relay);
+        assert_eq!(outcome.path_kind, PathKind::Relay);
+        assert_eq!(outcome.remote_addr, None);
+
+        link.send_frame(b"published-relay-frame".to_vec())
+            .await
+            .unwrap();
+        let opened = tokio::time::timeout(Duration::from_secs(3), frame_rx.recv())
+            .await
+            .expect("responder did not receive the published-relay frame")
+            .expect("frame channel closed");
+        assert_eq!(opened, b"published-relay-frame");
     }
 
     #[test]

@@ -17,7 +17,7 @@ The data plane is an L3 overlay. The packet tunnel provider configures a `utun` 
 The control plane is server-minimized, not server-free:
 
 - Rendezvous publishes short-lived signed peer records with sequence-rotating pseudonymous aliases.
-- Public rendezvous records publish relay candidates only by default so host and server-reflexive addresses are not advertised as location metadata.
+- Public rendezvous records can publish relay-family candidates only so host and server-reflexive addresses are not advertised as location metadata; QuantumLink app-relay endpoints are explicitly marked as `quantum_link_relay`.
 - Local mDNS discovery is an opt-in future adapter.
 - Private DHT support is intentionally not enabled by default.
 

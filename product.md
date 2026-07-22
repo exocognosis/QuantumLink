@@ -163,9 +163,15 @@ Implemented or scaffolded behavior includes:
 - App-layer PQC frame protection with replay rejection for direct mesh links.
 - Packet core framing and metadata normalization; the packet core is not a
   classical encryption boundary.
+- Packet-core FFI exposes authenticated peer-session install/clear/readiness
+  hooks plus peer-session-unavailable and replay-drop counters for macOS
+  observability.
 - Native UDP carrier session-wire test coverage; default live mesh direct
   dialing and inbound response use the native UDP carrier with app-layer PQC
   session establishment.
+- Configured QuantumLink relay URLs are signed into peer records as
+  `quantum_link_relay` candidates, and connectors consume those published
+  relay candidates after host/server-reflexive direct probes fail.
 - Optional dev-only QUIC DATAGRAM carrier transport behind `dev-quic-carrier`,
   rendezvous lookup, direct probes, optional ICE, PQC relay fallback, peer-store
   persistence, per-peer state, and network-event reconnect behavior.
@@ -182,9 +188,11 @@ Production gaps include:
 
 - Apple-granted Network Extension entitlements and production provisioning.
 - Developer ID signing, notarization, stapling, and Gatekeeper validation.
-- Hardened public STUN/TURN/rendezvous/relay deployment and RFC-complete
-  nomination behavior against that deployed infrastructure.
-- Hardened public rendezvous and relay infrastructure.
+- Runtime handoff from live mesh session establishment into packet-core
+  peer-session install/rotation for the Network Extension packet pump.
+- TURN relay-candidate data-plane consumption and RFC-complete ICE nomination
+  behavior against deployed public infrastructure.
+- Hardened public rendezvous and relay TLS/auth/rate-limit controls.
 - Signed Sparkle/platform update pipeline paired with a post-quantum release
   manifest layer.
 - Production Dytallix mainnet or hardened registry trust root for public

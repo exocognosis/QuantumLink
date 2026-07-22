@@ -56,7 +56,7 @@ use crate::{
     relay::RelayResponderListener,
     rendezvous::RendezvousClient,
     session_crypto::PqcSessionContext,
-    traversal::{order_remote_candidates, HOST_PRIORITY},
+    traversal::{order_remote_candidates, quantum_link_relay_candidate, HOST_PRIORITY},
 };
 #[cfg(not(feature = "dev-quic-carrier"))]
 use crate::{carrier_transport::NativeUdpSession, mesh_connection::native_udp_carrier_binding};
@@ -1316,7 +1316,14 @@ impl MeshTransportHandle {
             .ok()
             .and_then(|guard| *guard)
             .unwrap_or(local_addr);
-        let endpoints = published_candidate_endpoints(advertised, extra_candidates);
+        let mut candidates = extra_candidates;
+        if let Some(relay_server) = connector_config.relay_server.as_deref() {
+            let relay_addr: SocketAddr = relay_server.parse().map_err(|err| {
+                QlinkError::Protocol(format!("invalid configured relay_url: {err}"))
+            })?;
+            candidates.push(quantum_link_relay_candidate(relay_addr));
+        }
+        let endpoints = published_candidate_endpoints(advertised, candidates);
         let body = UnsignedPeerRecord::new(
             mesh_id.clone(),
             // The alias gets replaced inside `UnsignedPeerRecord::new`
@@ -2479,6 +2486,7 @@ mod tests {
         inbound_identity::send_inbound_assertion,
         pqc_session_wire::run_pqc_session_initiator,
         quic_transport::QuicCertificate,
+        relay::spawn_dev_relay,
         rendezvous::spawn_dev_rendezvous,
     };
     use std::{
@@ -4318,6 +4326,67 @@ mod tests {
             .unwrap()
             .expect("published record must be available");
         assert_eq!(found.body.endpoints, record.body.endpoints);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn publish_self_includes_configured_quantumlink_relay_candidate() {
+        let rendezvous = spawn_dev_rendezvous().await.unwrap();
+        let rendezvous_url = rendezvous.local_addr().to_string();
+        let relay = spawn_dev_relay().await.unwrap();
+        let relay_addr = relay.local_addr();
+        let relay_url = relay_addr.to_string();
+        let local_key = Arc::new(DeviceKeypair::generate().unwrap());
+        let local_peer_id = local_key.public_key().peer_id();
+
+        let handle = tokio::task::spawn_blocking({
+            let rendezvous_url = rendezvous_url.clone();
+            let relay_url = relay_url.clone();
+            let local_peer_id = local_peer_id.clone();
+            let local_key = local_key.clone();
+            move || {
+                MeshTransportHandle::new_with_keypair(
+                    MeshTransportConfig {
+                        mesh_id: "devmesh".to_string(),
+                        local_peer_id,
+                        remote_peer_id: "qlink_unused-for-this-test".to_string(),
+                        rendezvous_url,
+                        relay_url: Some(relay_url),
+                        bind_addr: "127.0.0.1:0".to_string(),
+                        overall_deadline_ms: 2_000,
+                        direct_probe_timeout_ms: 500,
+                        probe_pacing_ms: 50,
+                        enable_ice: false,
+                        reconnect_initial_backoff_ms: 60_000,
+                        reconnect_max_backoff_ms: 60_000,
+                        metrics_endpoint_bind_addr: None,
+                        inbound_acl: None,
+                        disable_inbound_responder: false,
+                        peer_store_path: None,
+                        peer_store_key_b64: None,
+                        mesh_trust_policy: MeshTrustPolicy::DevelopmentOptional,
+                        dytallix_identity: None,
+                    },
+                    Some(local_key),
+                )
+            }
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        let record = handle
+            .publish_self(local_key.as_ref(), &rendezvous_url, 120, 1, vec![])
+            .await
+            .unwrap();
+
+        let relay_candidate = record
+            .body
+            .endpoints
+            .iter()
+            .find(|candidate| candidate.candidate_type == CandidateType::QuantumLinkRelay)
+            .expect("configured relay_url must be published as a QuantumLink relay candidate");
+        assert_eq!(relay_candidate.address, relay_addr.ip().to_string());
+        assert_eq!(relay_candidate.port, relay_addr.port());
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -223,17 +223,18 @@ REMOTE_PEER="$(wait_peer_id "$RESPONDER_LOG")" \
   || die "responder did not print a local_peer_id"
 wait_log_pattern "$RESPONDER_LOG" '^published_candidate\[[0-9]+\]_type=ServerReflexive$' \
   || die "published record did not include a server-reflexive candidate"
+wait_log_pattern "$RESPONDER_LOG" '^published_candidate\[[0-9]+\]_type=QuantumLinkRelay$' \
+  || die "published record did not include a QuantumLink relay candidate"
 if [[ -n "$TURN" ]]; then
   wait_log_pattern "$RESPONDER_LOG" '^published_candidate\[[0-9]+\]_type=Relay$' \
     || die "published record did not include a TURN relay candidate"
 fi
 
-log "forcing relay fallback to peer $REMOTE_PEER"
+log "forcing published relay fallback to peer $REMOTE_PEER"
 "$BIN" direct-send \
   --rendezvous "$RENDEZVOUS" \
   --mesh-id "$MESH_ID" \
   --remote-peer-id "$REMOTE_PEER" \
-  --relay "$RELAY" \
   --bind-addr 0.0.0.0:0 \
   --payload public-infra-smoke \
   --count "$COUNT" \

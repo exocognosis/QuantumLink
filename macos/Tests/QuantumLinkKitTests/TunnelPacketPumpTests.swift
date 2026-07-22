@@ -85,6 +85,25 @@ final class TunnelPacketPumpTests: XCTestCase {
         XCTAssertEqual(pump.counters.droppedUnprotected, 1)
     }
 
+    func testCountsPeerSessionUnavailableAsFailClosedDrop() {
+        let adapter = RecordingTunnelCoreAdapter(
+            dispositions: [.droppedPeerSessionUnavailable],
+            frames: []
+        )
+        let pump = TunnelPacketPump(coreAdapter: adapter)
+
+        let result = pump.handlePackets(
+            [Data([0x45])],
+            protocolFamilies: [2],
+            transportSink: FailingTransportSink()
+        )
+
+        XCTAssertEqual(result.droppedFailClosed, 1)
+        XCTAssertEqual(result.droppedUnprotected, 0)
+        XCTAssertEqual(result.failedSubmissions, 0)
+        XCTAssertEqual(pump.counters.droppedFailClosed, 1)
+    }
+
     func testCountsTransportSinkFailures() {
         let adapter = RecordingTunnelCoreAdapter(
             dispositions: [.queuedForTransport],

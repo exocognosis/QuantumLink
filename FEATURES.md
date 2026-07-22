@@ -25,14 +25,15 @@ This feature list is synchronized with the current repository implementation. It
 - Inbound identity assertions and optional peer ACL evaluation.
 - App-layer PQC frame protection using ML-KEM session keys, SHAKE256 masking/authentication, and replay rejection.
 - Packet-core route enforcement, packet metadata normalization, peer-session readiness gates, and monotonic packet-number replay window.
+- macOS FFI hooks for packet-core peer-session install/clear/readiness plus peer-session and replay-drop metrics.
 
 ## Mesh and Transport
 
 - Development rendezvous server and client.
 - Development relay server and client.
 - Native UDP carrier is the default mesh data-plane carrier; Quinn/rustls is feature-gated for legacy development.
-- Mesh connector state machine for rendezvous lookup, native direct candidate probes, PQC relay fallback, last-good path caching, and reconnect handling.
-- Optional ICE/STUN helper paths for connectivity checks, plus feature-gated TURN relay-candidate gathering.
+- Mesh connector state machine for rendezvous lookup, native direct candidate probes, PQC relay fallback, published QuantumLink relay-candidate fallback, last-good path caching, and reconnect handling.
+- Optional ICE/STUN helper paths for connectivity checks, plus feature-gated TURN relay-candidate gathering. TURN relay allocations are gathered and signed, but the TURN data-plane adapter remains separate from the QuantumLink app-relay carrier.
 - File-backed peer store with optional ChaCha20-Poly1305 envelope encryption.
 - OpenMetrics endpoint support when explicitly configured.
 
@@ -45,9 +46,9 @@ This feature list is synchronized with the current repository implementation. It
 
 ## Not Production-Complete
 
-- Platform/FFI production wiring that installs authenticated peer-session readiness into `PacketTunnelCore` and exposes peer-session/replay drop observability.
-- Hardened public rendezvous, STUN, TURN, and relay services.
-- RFC-complete public ICE nomination behavior against deployed public infrastructure.
+- Runtime wiring that installs live mesh session readiness into `PacketTunnelCore` during Network Extension operation.
+- Hardened public rendezvous, STUN, TURN, and relay service controls.
+- RFC-complete public ICE nomination behavior and TURN relay-candidate data-plane consumption against deployed public infrastructure.
 - Notarized Developer ID app and tunnel extension bundle.
 - Managed Device Attestation and SSO integration.
 - Full post-quantum update manifest and release-signing layer.
