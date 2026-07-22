@@ -302,6 +302,7 @@ impl PeerRecordSource {
 
 pub struct DirectLink {
     pub remote_addr: SocketAddr,
+    path_kind: PathKind,
     session: CarrierSession,
     frame_protector: PqcFrameProtector,
 }
@@ -354,7 +355,7 @@ impl MeshLink {
 
     pub fn path_kind(&self) -> PathKind {
         match &self.inner {
-            MeshLinkInner::Direct(_) => PathKind::Direct,
+            MeshLinkInner::Direct(link) => link.path_kind,
             MeshLinkInner::Relay(_) => PathKind::Relay,
         }
     }
@@ -813,6 +814,7 @@ impl MeshConnector {
         match probe_outcome {
             DirectProbeResult::Established {
                 address,
+                path_kind,
                 session,
                 session_keys,
                 attempts,
@@ -820,7 +822,7 @@ impl MeshConnector {
                 self.cache.record(remote_peer_id, address);
                 let outcome = ConnectionOutcome {
                     remote_peer_id: remote_peer_id.to_string(),
-                    path_kind: PathKind::Direct,
+                    path_kind,
                     remote_addr: Some(address),
                     attempts,
                     total_elapsed: started.elapsed(),
@@ -830,6 +832,7 @@ impl MeshConnector {
                 };
                 let link = MeshLink::direct(DirectLink {
                     remote_addr: address,
+                    path_kind,
                     session,
                     frame_protector: PqcFrameProtector::new(session_keys),
                 });
@@ -945,6 +948,7 @@ impl MeshConnector {
 
             match probe_result {
                 Ok(Ok((session, session_keys, identity_assertion_elapsed))) => {
+                    let path_kind = path_kind_for_candidate(&candidate_type);
                     attempts.push(ProbeAttempt {
                         candidate_type,
                         address,
@@ -957,6 +961,7 @@ impl MeshConnector {
                     });
                     return DirectProbeResult::Established {
                         address,
+                        path_kind,
                         session,
                         session_keys,
                         attempts,
@@ -1163,6 +1168,7 @@ impl MeshConnector {
         match probe_outcome {
             DirectProbeResult::Established {
                 address,
+                path_kind,
                 session,
                 session_keys,
                 attempts,
@@ -1170,7 +1176,7 @@ impl MeshConnector {
                 self.cache.record(remote_peer_id, address);
                 let outcome = ConnectionOutcome {
                     remote_peer_id: remote_peer_id.to_string(),
-                    path_kind: PathKind::Direct,
+                    path_kind,
                     remote_addr: Some(address),
                     attempts,
                     total_elapsed: started.elapsed(),
@@ -1180,6 +1186,7 @@ impl MeshConnector {
                 };
                 let link = MeshLink::direct(DirectLink {
                     remote_addr: address,
+                    path_kind,
                     session,
                     frame_protector: PqcFrameProtector::new(session_keys),
                 });
@@ -1816,6 +1823,7 @@ impl MeshConnector {
                 join_set.shutdown().await;
                 return DirectProbeResult::Established {
                     address: addr,
+                    path_kind: path_kind_for_candidate(&record.candidate_type),
                     session,
                     session_keys,
                     attempts,
@@ -1830,6 +1838,7 @@ impl MeshConnector {
 enum DirectProbeResult {
     Established {
         address: SocketAddr,
+        path_kind: PathKind,
         session: CarrierSession,
         session_keys: SessionKeys,
         attempts: Vec<ProbeAttempt>,
@@ -1896,7 +1905,7 @@ fn order_direct_candidates(
         .filter(|candidate| {
             matches!(
                 candidate.candidate_type,
-                CandidateType::Host | CandidateType::ServerReflexive
+                CandidateType::Host | CandidateType::ServerReflexive | CandidateType::Relay
             )
         })
         .cloned()
@@ -1925,7 +1934,15 @@ fn direct_candidate_rank(candidate_type: &CandidateType) -> u8 {
     match candidate_type {
         CandidateType::Host => 0,
         CandidateType::ServerReflexive => 1,
-        CandidateType::QuantumLinkRelay | CandidateType::Relay => 2,
+        CandidateType::Relay => 2,
+        CandidateType::QuantumLinkRelay => 3,
+    }
+}
+
+fn path_kind_for_candidate(candidate_type: &CandidateType) -> PathKind {
+    match candidate_type {
+        CandidateType::Host | CandidateType::ServerReflexive => PathKind::Direct,
+        CandidateType::Relay | CandidateType::QuantumLinkRelay => PathKind::Relay,
     }
 }
 
@@ -2033,7 +2050,7 @@ mod native_udp_live_mesh_tests {
         pqc_session_wire::run_pqc_session_responder,
         relay::{spawn_dev_relay, RelayResponderListener},
         rendezvous::spawn_dev_rendezvous,
-        traversal::quantum_link_relay_candidate,
+        traversal::{quantum_link_relay_candidate, relay_candidate},
     };
     use std::net::Ipv4Addr;
 
@@ -2114,6 +2131,89 @@ mod native_udp_live_mesh_tests {
         link.send_frame(b"native-udp-ping".to_vec()).await.unwrap();
         let opened = responder_task.await.unwrap();
         assert_eq!(opened, b"native-udp-ping");
+    }
+
+    #[tokio::test]
+    async fn native_udp_consumes_published_turn_relay_candidate_as_relay_path() {
+        let rendezvous = spawn_dev_rendezvous().await.unwrap();
+        let rendezvous_client = RendezvousClient::new(rendezvous.local_addr().to_string());
+
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let server_socket = UdpSocket::bind(bind).await.unwrap();
+        let server_addr = server_socket.local_addr().unwrap();
+
+        let local_key = Arc::new(DeviceKeypair::generate().unwrap());
+        let remote_key = Arc::new(DeviceKeypair::generate().unwrap());
+        let remote_peer_id = remote_key.public_key().peer_id();
+        let responder_peer_id = remote_peer_id.clone();
+        let responder_key = remote_key.clone();
+        let responder_task = tokio::spawn(async move {
+            let (session, _initiator_addr) =
+                NativeUdpSession::accept_on(server_socket).await.unwrap();
+            let session = CarrierSession::from(session);
+            let (decision, assertion) = receive_and_evaluate_inbound(
+                &session,
+                MESH_ID,
+                DEFAULT_INBOUND_ASSERTION_MAX_AGE_SECONDS,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(decision, InboundDecision::Accepted);
+
+            let context = PqcSessionContext::new(
+                MESH_ID,
+                assertion.peer_id,
+                responder_peer_id.clone(),
+                native_udp_carrier_binding(MESH_ID, &responder_peer_id, server_addr),
+            );
+            let session_keys = run_pqc_session_responder(&session, context, responder_key.as_ref())
+                .await
+                .unwrap();
+            let mut frame_protector = PqcFrameProtector::new(session_keys);
+            let protected = session.receive_frame().await.unwrap();
+            frame_protector.open(&protected).unwrap()
+        });
+
+        let remote_record = signed_record(
+            remote_key.as_ref(),
+            vec![
+                relay_candidate(server_addr),
+                quantum_link_relay_candidate("127.0.0.1:9".parse().unwrap()),
+            ],
+            2,
+        );
+        rendezvous_client
+            .publish(MESH_ID, remote_record)
+            .await
+            .unwrap();
+
+        let connector = MeshConnector::new(
+            MeshConnectorConfig::new(MESH_ID, local_key.public_key().peer_id())
+                .with_direct_probe_timeout(Duration::from_millis(750))
+                .with_overall_deadline(Duration::from_secs(3))
+                .with_local_device_keypair(local_key.clone()),
+            rendezvous_client,
+        );
+
+        let (mut link, outcome) = connector.connect(&remote_peer_id).await.unwrap();
+        assert_eq!(link.path_kind(), PathKind::Relay);
+        assert_eq!(outcome.path_kind, PathKind::Relay);
+        assert_eq!(outcome.remote_addr, Some(server_addr));
+        assert!(outcome.attempts.iter().any(|attempt| {
+            attempt.candidate_type == CandidateType::Relay
+                && attempt.outcome == ProbeOutcome::Established
+        }));
+        assert!(!outcome
+            .attempts
+            .iter()
+            .any(|attempt| attempt.candidate_type == CandidateType::QuantumLinkRelay));
+
+        link.send_frame(b"turn-relay-candidate-frame".to_vec())
+            .await
+            .unwrap();
+        let opened = responder_task.await.unwrap();
+        assert_eq!(opened, b"turn-relay-candidate-frame");
     }
 
     #[tokio::test]
@@ -2351,13 +2451,32 @@ mod native_udp_live_mesh_tests {
                     port: 40000,
                     priority: 100,
                 },
+                CandidateEndpoint {
+                    candidate_type: CandidateType::QuantumLinkRelay,
+                    address: "203.0.113.11".to_string(),
+                    port: 9472,
+                    priority: u32::MAX,
+                },
             ],
             None,
         );
 
-        assert_eq!(ordered.len(), 2);
+        assert_eq!(ordered.len(), 3);
         assert_eq!(ordered[0].candidate_type, CandidateType::Host);
         assert_eq!(ordered[1].candidate_type, CandidateType::ServerReflexive);
+        assert_eq!(ordered[2].candidate_type, CandidateType::Relay);
+    }
+
+    #[test]
+    fn relay_server_candidates_ignore_standard_turn_relay_candidates() {
+        let standard_turn = relay_candidate("203.0.113.10:49160".parse().unwrap());
+        let quantum_link = quantum_link_relay_candidate("203.0.113.11:9472".parse().unwrap());
+
+        assert!(relay_server_candidates(&[standard_turn.clone()], None).is_empty());
+        assert_eq!(
+            relay_server_candidates(&[standard_turn, quantum_link], None),
+            vec!["203.0.113.11:9472".to_string()]
+        );
     }
 
     fn signed_record(

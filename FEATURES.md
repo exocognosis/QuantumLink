@@ -33,7 +33,7 @@ This feature list is synchronized with the current repository implementation. It
 - Development relay server and client.
 - Native UDP carrier is the default mesh data-plane carrier; Quinn/rustls is feature-gated for legacy development.
 - Mesh connector state machine for rendezvous lookup, native direct candidate probes, PQC relay fallback, published QuantumLink relay-candidate fallback, last-good path caching, and reconnect handling.
-- Optional ICE/STUN helper paths for connectivity checks, plus feature-gated TURN relay-candidate gathering. TURN relay allocations are gathered and signed, but the TURN data-plane adapter remains separate from the QuantumLink app-relay carrier.
+- Optional ICE/STUN helper paths for connectivity checks, plus feature-gated TURN relay-candidate gathering. Published TURN relay candidates are consumed as UDP-relayed carrier targets when live, while the long-lived TURN allocation lifecycle remains separate from the QuantumLink app-relay carrier.
 - File-backed peer store with optional ChaCha20-Poly1305 envelope encryption.
 - OpenMetrics endpoint support when explicitly configured.
 
