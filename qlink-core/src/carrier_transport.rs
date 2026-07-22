@@ -1,6 +1,8 @@
 use crate::error::{QlinkError, Result};
 #[cfg(feature = "dev-quic-carrier")]
 use crate::quic_transport::QuicDatagramSession;
+#[cfg(feature = "turn-relay")]
+use crate::turn::TurnRelaySocket;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -105,13 +107,52 @@ impl From<crate::relay::RelayCarrierSession> for CarrierSession {
 
 #[derive(Debug, Clone)]
 pub struct NativeUdpSession {
-    socket: Arc<UdpSocket>,
+    transport: DatagramTransport,
     recv_lock: Arc<Mutex<()>>,
     pending_frames: Arc<Mutex<VecDeque<Vec<u8>>>>,
     pending_authenticated: Arc<Mutex<VecDeque<Vec<u8>>>>,
     reassembly: Arc<Mutex<HashMap<FragmentKey, FragmentBuffer>>>,
     completed_fragments: Arc<Mutex<CompletedFragmentKeys>>,
     next_message_id: Arc<AtomicU64>,
+}
+
+#[derive(Debug, Clone)]
+enum DatagramTransport {
+    Udp(Arc<UdpSocket>),
+    #[cfg(feature = "turn-relay")]
+    Turn(TurnRelaySocket),
+}
+
+impl DatagramTransport {
+    async fn send(&self, datagram: &[u8]) -> Result<usize> {
+        match self {
+            Self::Udp(socket) => socket.send(datagram).await.map_err(|err| {
+                QlinkError::Protocol(format!("failed to send native UDP datagram: {err}"))
+            }),
+            #[cfg(feature = "turn-relay")]
+            Self::Turn(socket) => socket.send(datagram).await,
+        }
+    }
+
+    async fn recv(&self, buffer: &mut [u8]) -> Result<usize> {
+        match self {
+            Self::Udp(socket) => socket.recv(buffer).await.map_err(|err| {
+                QlinkError::Protocol(format!("failed to receive native UDP datagram: {err}"))
+            }),
+            #[cfg(feature = "turn-relay")]
+            Self::Turn(socket) => socket.recv(buffer).await,
+        }
+    }
+
+    fn try_send(&self, datagram: &[u8]) -> Result<usize> {
+        match self {
+            Self::Udp(socket) => socket.try_send(datagram).map_err(|err| {
+                QlinkError::Protocol(format!("failed to send native UDP close datagram: {err}"))
+            }),
+            #[cfg(feature = "turn-relay")]
+            Self::Turn(socket) => socket.try_send(datagram),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -268,8 +309,17 @@ impl NativeUdpSession {
     }
 
     fn from_socket(socket: UdpSocket) -> Self {
+        Self::from_transport(DatagramTransport::Udp(Arc::new(socket)))
+    }
+
+    #[cfg(feature = "turn-relay")]
+    pub fn from_turn_relay(socket: TurnRelaySocket) -> Self {
+        Self::from_transport(DatagramTransport::Turn(socket))
+    }
+
+    fn from_transport(transport: DatagramTransport) -> Self {
         Self {
-            socket: Arc::new(socket),
+            transport,
             recv_lock: Arc::new(Mutex::new(())),
             pending_frames: Arc::new(Mutex::new(VecDeque::new())),
             pending_authenticated: Arc::new(Mutex::new(VecDeque::new())),
@@ -281,9 +331,7 @@ impl NativeUdpSession {
 
     async fn send_datagram(&self, kind: DatagramKind, payload: Vec<u8>) -> Result<()> {
         let datagram = encode_datagram(kind, &payload)?;
-        self.socket.send(&datagram).await.map_err(|err| {
-            QlinkError::Protocol(format!("failed to send native UDP datagram: {err}"))
-        })?;
+        self.transport.send(&datagram).await?;
         Ok(())
     }
 
@@ -309,7 +357,7 @@ impl NativeUdpSession {
         let Ok(datagram) = encode_datagram(DatagramKind::Close, reason) else {
             return;
         };
-        let _ = self.socket.try_send(&datagram);
+        let _ = self.transport.try_send(&datagram);
     }
 
     async fn send_message(&self, kind: MessageKind, payload: Vec<u8>) -> Result<()> {
@@ -384,9 +432,7 @@ impl NativeUdpSession {
 
     async fn receive_datagram(&self) -> Result<CarrierDatagram> {
         let mut buf = vec![0_u8; MAX_UDP_DATAGRAM_LEN + 1];
-        let len = self.socket.recv(&mut buf).await.map_err(|err| {
-            QlinkError::Protocol(format!("failed to receive native UDP datagram: {err}"))
-        })?;
+        let len = self.transport.recv(&mut buf).await?;
         if len > MAX_UDP_DATAGRAM_LEN {
             return Err(QlinkError::Protocol(format!(
                 "native UDP carrier datagram exceeds {MAX_UDP_DATAGRAM_LEN} bytes"
@@ -1165,7 +1211,13 @@ mod tests {
         let mut oversized =
             encode_datagram(DatagramKind::Frame, &vec![0x99; MAX_CARRIER_PAYLOAD_LEN]).unwrap();
         oversized.push(0xaa);
-        left.socket.send(&oversized).await.unwrap();
+        match &left.transport {
+            DatagramTransport::Udp(socket) => {
+                socket.send(&oversized).await.unwrap();
+            }
+            #[cfg(feature = "turn-relay")]
+            DatagramTransport::Turn(_) => panic!("loopback pair should use native UDP sockets"),
+        }
 
         let error = right.receive_frame().await.unwrap_err();
 

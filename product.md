@@ -178,6 +178,10 @@ Implemented or scaffolded behavior includes:
 - Published TURN relay candidates are consumed as UDP-relayed carrier targets
   when a live allocation is present, distinct from the QuantumLink app-relay
   fallback path.
+- The `turn-relay` proof path can keep a resident TURN allocation alive, install
+  a peer permission, wrap native carrier datagrams in TURN Send indications, and
+  receive peer traffic through TURN Data indications; the public-infra smoke can
+  require `selected_path=turn-relay` in local rehearsal.
 - Optional dev-only QUIC DATAGRAM carrier transport behind `dev-quic-carrier`,
   rendezvous lookup, direct probes, optional ICE, PQC relay fallback, peer-store
   persistence, per-peer state, and network-event reconnect behavior.
@@ -196,8 +200,8 @@ Production gaps include:
 - Developer ID signing, notarization, stapling, and Gatekeeper validation.
 - Real-hardware validation of signed/provisioned Network Extension builds,
   including peer-session readiness under live packet flow.
-- Long-lived TURN allocation lifecycle, deployed public TURN proof, and
-  RFC-complete ICE nomination behavior against deployed public infrastructure.
+- Deployed public TURN data-plane proof and RFC-complete ICE nomination behavior
+  against deployed public infrastructure.
 - Hardened public rendezvous and relay TLS/auth/rate-limit controls.
 - Signed Sparkle/platform update pipeline paired with a post-quantum release
   manifest layer.
