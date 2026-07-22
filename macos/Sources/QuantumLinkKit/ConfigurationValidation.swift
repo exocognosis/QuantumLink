@@ -86,6 +86,13 @@ public enum ConfigurationValidator {
     if configuration.discoveryModes.contains(.rendezvous), configuration.rendezvousServers.isEmpty {
       warnings.append("rendezvous discovery is enabled but rendezvousServers is empty")
     }
+    if configuration.requirePeerSession,
+      configuration.remotePeerID?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true
+    {
+      warnings.append(
+        "requirePeerSession is enabled but remotePeerID is empty; protected packet flow will stay fail-closed until a peer is selected"
+      )
+    }
     if configuration.mtu < 576 {
       warnings.append("mtu is below IPv4 minimum reassembly size")
     }

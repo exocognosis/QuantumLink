@@ -10,6 +10,7 @@ import Foundation
 ///   - `protectedRoutes`, `excludedRoutes`, `dnsServers`, `dnsSearchDomains`,
 ///     `rendezvousServers`, `relayServers`, `allowedRelayEndpoints`: arrays
 ///     of strings
+///   - `remotePeerID`: string
 ///   - `routeMode`: `splitTunnel` | `protectedPrefixesOnly` | `fullTunnel`
 ///   - `dnsMode`: `tunnelProvided` | `system` | `disabled`
 ///   - `killSwitch`: `failClosed` | `strict`
@@ -67,6 +68,7 @@ public enum ManagedConfigurationLoader {
     var dnsSearchDomains = base.dnsSearchDomains
     var rendezvousServers = base.rendezvousServers
     var relayServers = base.relayServers
+    var remotePeerID = base.remotePeerID
     var allowedRelayEndpoints = base.allowedRelayEndpoints
     var relayTLSPolicy = base.relayTLSPolicy
     var maximumCandidateAgeSeconds = base.maximumCandidateAgeSeconds
@@ -148,6 +150,13 @@ public enum ManagedConfigurationLoader {
       case "relayServers":
         if let arrayValue = value as? [String] {
           relayServers = arrayValue
+          applied.append(key)
+        } else {
+          rejected.append(key)
+        }
+      case "remotePeerID":
+        if let stringValue = value as? String, !stringValue.isEmpty {
+          remotePeerID = stringValue
           applied.append(key)
         } else {
           rejected.append(key)
@@ -309,6 +318,7 @@ public enum ManagedConfigurationLoader {
       discoveryModes: base.discoveryModes,
       rendezvousServers: rendezvousServers,
       relayServers: relayServers,
+      remotePeerID: remotePeerID,
       allowedRelayEndpoints: allowedRelayEndpoints,
       relayTLSPolicy: relayTLSPolicy,
       maximumCandidateAgeSeconds: maximumCandidateAgeSeconds,

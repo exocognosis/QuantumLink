@@ -10,8 +10,11 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var packetCount: UInt64 = 0
     private var lastBatchPacketCount: Int = 0
     private var currentConfiguration = TunnelConfiguration.defaultDevelopment
+    private var coreAdapter: TunnelCoreAdapting?
     private var packetPump = TunnelPacketPump(coreAdapter: nil)
     private var transport: TunnelTransporting = DevelopmentDropTransportSender(reason: "Tunnel transport is not started")
+    private var packetSessionCoordinator = PacketSessionReadinessCoordinator()
+    private var lastPacketSessionReport = PacketSessionReadinessReport(state: .notRequired)
     private var networkObserver: NetworkPathObserver?
     private var pendingReassertion = false
     private var lastNetworkEvent: NetworkLifecycleEvent?
@@ -57,8 +60,11 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
                 }
 
                 self.isRunning = true
+                self.packetSessionCoordinator = PacketSessionReadinessCoordinator()
+                let coreAdapter = self.makeCoreAdapter(configuration: configuration)
+                self.coreAdapter = coreAdapter
                 self.packetPump = TunnelPacketPump(
-                    coreAdapter: self.makeCoreAdapter(configuration: configuration),
+                    coreAdapter: coreAdapter,
                     killSwitch: configuration.killSwitch
                 )
                 self.transport = self.makeTransport(configuration: configuration)
@@ -76,6 +82,7 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
                     self.transport = DevelopmentDropTransportSender(reason: error.localizedDescription)
                     try? self.transport.start()
                 }
+                self.synchronizePacketSessionReadiness()
                 self.logger.info("QuantumLink packet tunnel started for mesh \(configuration.meshID, privacy: .public)")
                 self.startNetworkObserver()
                 self.startKillSwitchWatchdog(policy: configuration.killSwitch)
@@ -99,7 +106,9 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
         stopKillSwitchWatchdog()
         stopPublishSelfLoop()
         stopTracingForwarder()
+        clearPacketSessionReadiness()
         productionMeshBundle = nil
+        coreAdapter = nil
         packetPump = TunnelPacketPump(coreAdapter: nil)
         transport.stop()
         transport = DevelopmentDropTransportSender(reason: "Tunnel transport is stopped")
@@ -190,6 +199,7 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     private func handlePackets(_ packets: [Data], protocols: [NSNumber]) {
+        synchronizePacketSessionReadiness()
         let result = packetPump.handlePackets(
             packets,
             protocolFamilies: protocols.map(\.uint32Value),
@@ -209,6 +219,7 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     private func drainInboundTransportFrames() {
+        synchronizePacketSessionReadiness()
         var packets: [Data] = []
         var protocols: [NSNumber] = []
 
@@ -241,6 +252,41 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
 
         if !packets.isEmpty {
             packetFlow.writePackets(packets, withProtocols: protocols)
+        }
+    }
+
+    private func synchronizePacketSessionReadiness() {
+        let report = packetSessionCoordinator.synchronize(
+            coreAdapter: coreAdapter,
+            source: transport as? PacketSessionReadinessSource,
+            configuration: currentConfiguration
+        )
+        recordPacketSessionReport(report)
+    }
+
+    private func clearPacketSessionReadiness() {
+        let report = packetSessionCoordinator.clear(coreAdapter: coreAdapter)
+        recordPacketSessionReport(report)
+    }
+
+    private func recordPacketSessionReport(_ report: PacketSessionReadinessReport) {
+        guard report != lastPacketSessionReport else {
+            return
+        }
+        defer {
+            lastPacketSessionReport = report
+        }
+
+        if report.installed {
+            logger.info("packet session ready for peer \(PrivacyDefaults.redactForLog(report.peerID ?? ""), privacy: .public)")
+            return
+        }
+        if report.cleared {
+            logger.info("packet session cleared: \(report.state.rawValue, privacy: .public)")
+            return
+        }
+        if let error = report.errorDescription {
+            logger.error("packet session readiness failed: \(PrivacyDefaults.redactForLog(error), privacy: .public)")
         }
     }
 
@@ -457,6 +503,7 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
            let rustEvent = Self.mapNetworkEvent(event) {
             mesh.notifyNetworkEvent(rustEvent)
         }
+        synchronizePacketSessionReadiness()
 
         if decision.reprobeRecommended {
             beginReassertion()
@@ -519,7 +566,8 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
             "pump_failed_submissions=\(packetPump.counters.failedSubmissions)",
             "pump_frames_accepted=\(packetPump.counters.transportFramesAccepted)",
             "pump_tunnel_packets_emitted=\(packetPump.counters.tunnelPacketsEmitted)",
-            "pump_distinct_peers_seen=\(packetPump.counters.transportFramesAcceptedPerPeer.count)"
+            "pump_distinct_peers_seen=\(packetPump.counters.transportFramesAcceptedPerPeer.count)",
+            "packet_session_state=\(lastPacketSessionReport.state.rawValue)"
         ]
         // Per-peer breakdown surfaced with ephemeral labels. Raw peer IDs are
         // persistent identifiers and must not leave the tunnel in the default
@@ -545,6 +593,10 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
             fields.append("core_frames_in=\(metrics.transportFramesIn)")
             fields.append("core_dropped_unprotected=\(metrics.droppedUnprotected)")
             fields.append("core_dropped_malformed=\(metrics.droppedMalformed)")
+            fields.append("core_dropped_peer_session_unavailable=\(metrics.droppedPeerSessionUnavailable)")
+            fields.append("core_dropped_replay=\(metrics.droppedReplay)")
+            fields.append("core_peer_session_required=\(metrics.peerSessionRequired)")
+            fields.append("core_peer_session_ready=\(metrics.peerSessionReady)")
         }
 
         let trustSummary = currentStatus().peerTrust
@@ -604,7 +656,7 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
 
         let bytesIn = transportMetrics.bytesReceived
         let bytesOut = transportMetrics.bytesSent
-        let replayDrops = (try? packetPump.coreMetrics()?.droppedMalformed) ?? 0
+        let replayDrops = (try? packetPump.coreMetrics()?.droppedReplay) ?? 0
         let rustTransport = transport as? RustMeshTransport
         let managedPeerIDs = rustTransport?.managedPeerIDs ?? []
         let blockedPeerHistory = rustTransport?.blockedPeerHistory ?? []

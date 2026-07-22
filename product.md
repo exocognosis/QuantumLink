@@ -32,8 +32,7 @@ endpoints, or session keys on-chain.
 QuantumLink is source-ready for local protocol, client, packaging, and platform
 development. It is not yet a production VPN bundle. Production release still
 requires platform signing, Apple Network Extension entitlement approval for
-macOS, hardened public rendezvous/relay infrastructure, platform/FFI wiring for
-authenticated packet-session readiness and observability, release update signing,
+macOS, hardened public rendezvous/relay infrastructure, release update signing,
 and real-hardware validation across supported platforms.
 
 ## Product goals
@@ -165,7 +164,8 @@ Implemented or scaffolded behavior includes:
   classical encryption boundary.
 - Packet-core FFI exposes authenticated peer-session install/clear/readiness
   hooks plus peer-session-unavailable and replay-drop counters for macOS
-  observability.
+  observability; the macOS development runtime wires live default-peer mesh
+  readiness into those install/clear/rotation gates.
 - Native UDP carrier session-wire test coverage; default live mesh direct
   dialing and inbound response use the native UDP carrier with app-layer PQC
   session establishment.
@@ -188,8 +188,8 @@ Production gaps include:
 
 - Apple-granted Network Extension entitlements and production provisioning.
 - Developer ID signing, notarization, stapling, and Gatekeeper validation.
-- Runtime handoff from live mesh session establishment into packet-core
-  peer-session install/rotation for the Network Extension packet pump.
+- Real-hardware validation of signed/provisioned Network Extension builds,
+  including peer-session readiness under live packet flow.
 - TURN relay-candidate data-plane consumption and RFC-complete ICE nomination
   behavior against deployed public infrastructure.
 - Hardened public rendezvous and relay TLS/auth/rate-limit controls.
@@ -485,6 +485,8 @@ data. The local UI and support bundle should expose:
 - Candidate pair and relay status in redacted form.
 - RTT, loss estimate, bytes in/out, and route state.
 - Last rekey time.
+- Peer-session required/ready state plus peer-session-unavailable and replay-drop
+  counters.
 - DNS mode and protected route mode.
 - Identity mode and registry status.
 - Last peer rejection reason.
