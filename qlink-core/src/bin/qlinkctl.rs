@@ -13,7 +13,9 @@ use qlink_core::{
     discovery::{CandidateEndpoint, CandidateType, PeerRecord, UnsignedPeerRecord},
     dytallix_identity::MeshTrustPolicy,
     ice::{perform_ice_check, spawn_dev_ice_responder, IceCheckRequest, IceCredentials},
-    mesh_connection::{ConnectionOutcome, MeshConnector, MeshConnectorConfig, PathKind},
+    mesh_connection::{
+        ConnectionOutcome, MeshConnector, MeshConnectorConfig, PathKind, ProbeOutcome,
+    },
     mesh_transport::{MeshTransportConfig, MeshTransportHandle},
     relay::run_relay,
     rendezvous::{run_rendezvous, RendezvousClient},
@@ -480,13 +482,7 @@ async fn main() -> qlink_core::Result<()> {
             println!("rendezvous={rendezvous}");
             println!("mesh_id={mesh_id}");
             println!("remote_peer_id={remote_peer_id}");
-            println!(
-                "selected_path={}",
-                match outcome.path_kind {
-                    PathKind::Direct => "native-udp-direct",
-                    PathKind::Relay => "relay",
-                }
-            );
+            println!("selected_path={}", selected_path_label(outcome));
             if let Some(addr) = outcome.remote_addr {
                 println!("selected_remote_addr={addr}");
             }
@@ -584,6 +580,21 @@ impl DirectSendTimingReport {
             datagram_delivery_ms: run.datagram_delivery_elapsed.as_millis(),
             total_elapsed_ms: run.outcome.total_elapsed.as_millis(),
         }
+    }
+}
+
+fn selected_path_label(outcome: &ConnectionOutcome) -> &'static str {
+    let established_candidate = outcome
+        .attempts
+        .iter()
+        .rev()
+        .find(|attempt| matches!(attempt.outcome, ProbeOutcome::Established))
+        .map(|attempt| &attempt.candidate_type);
+
+    match (outcome.path_kind, established_candidate) {
+        (PathKind::Direct, _) => "native-udp-direct",
+        (PathKind::Relay, Some(CandidateType::Relay)) => "turn-relay",
+        (PathKind::Relay, _) => "relay",
     }
 }
 
@@ -1211,13 +1222,7 @@ async fn run_mesh_connect_demo(scenario: &str) -> qlink_core::Result<()> {
     println!("relay_addr={relay_addr}");
     println!("local_peer_id={local_peer_id}");
     println!("remote_peer_id={remote_peer_id}");
-    println!(
-        "selected_path={}",
-        match outcome.path_kind {
-            PathKind::Direct => "native-udp-direct",
-            PathKind::Relay => "relay",
-        }
-    );
+    println!("selected_path={}", selected_path_label(&outcome));
     if let Some(addr) = outcome.remote_addr {
         println!("selected_remote_addr={addr}");
     }

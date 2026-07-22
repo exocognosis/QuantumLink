@@ -175,6 +175,9 @@ Implemented or scaffolded behavior includes:
 - Configured QuantumLink relay URLs are signed into peer records as
   `quantum_link_relay` candidates, and connectors consume those published
   relay candidates after host/server-reflexive direct probes fail.
+- Published TURN relay candidates are consumed as UDP-relayed carrier targets
+  when a live allocation is present, distinct from the QuantumLink app-relay
+  fallback path.
 - Optional dev-only QUIC DATAGRAM carrier transport behind `dev-quic-carrier`,
   rendezvous lookup, direct probes, optional ICE, PQC relay fallback, peer-store
   persistence, per-peer state, and network-event reconnect behavior.
@@ -193,8 +196,8 @@ Production gaps include:
 - Developer ID signing, notarization, stapling, and Gatekeeper validation.
 - Real-hardware validation of signed/provisioned Network Extension builds,
   including peer-session readiness under live packet flow.
-- TURN relay-candidate data-plane consumption and RFC-complete ICE nomination
-  behavior against deployed public infrastructure.
+- Long-lived TURN allocation lifecycle, deployed public TURN proof, and
+  RFC-complete ICE nomination behavior against deployed public infrastructure.
 - Hardened public rendezvous and relay TLS/auth/rate-limit controls.
 - Signed Sparkle/platform update pipeline paired with a post-quantum release
   manifest layer.
