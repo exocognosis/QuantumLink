@@ -484,6 +484,7 @@ public struct TunnelConfiguration: Codable, Equatable, Sendable {
   public let discoveryModes: [DiscoveryMode]
   public let rendezvousServers: [String]
   public let relayServers: [String]
+  public let remotePeerID: String?
   public let allowedRelayEndpoints: [String]
   public let relayTLSPolicy: RelayTLSPolicy
   public let maximumCandidateAgeSeconds: UInt64
@@ -510,6 +511,7 @@ public struct TunnelConfiguration: Codable, Equatable, Sendable {
     discoveryModes: [DiscoveryMode] = [.rendezvous],
     rendezvousServers: [String] = [],
     relayServers: [String] = [],
+    remotePeerID: String? = nil,
     allowedRelayEndpoints: [String] = [],
     relayTLSPolicy: RelayTLSPolicy = .required,
     maximumCandidateAgeSeconds: UInt64 = 120,
@@ -535,6 +537,7 @@ public struct TunnelConfiguration: Codable, Equatable, Sendable {
     self.discoveryModes = discoveryModes
     self.rendezvousServers = rendezvousServers
     self.relayServers = relayServers
+    self.remotePeerID = remotePeerID
     self.allowedRelayEndpoints = allowedRelayEndpoints
     self.relayTLSPolicy = relayTLSPolicy
     self.maximumCandidateAgeSeconds = maximumCandidateAgeSeconds
@@ -568,6 +571,7 @@ public struct TunnelConfiguration: Codable, Equatable, Sendable {
     self.rendezvousServers =
       try container.decodeIfPresent([String].self, forKey: .rendezvousServers) ?? []
     self.relayServers = try container.decodeIfPresent([String].self, forKey: .relayServers) ?? []
+    self.remotePeerID = try container.decodeIfPresent(String.self, forKey: .remotePeerID)
     self.allowedRelayEndpoints =
       try container.decodeIfPresent([String].self, forKey: .allowedRelayEndpoints) ?? []
     self.relayTLSPolicy =

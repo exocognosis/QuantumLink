@@ -25,7 +25,7 @@ This feature list is synchronized with the current repository implementation. It
 - Inbound identity assertions and optional peer ACL evaluation.
 - App-layer PQC frame protection using ML-KEM session keys, SHAKE256 masking/authentication, and replay rejection.
 - Packet-core route enforcement, packet metadata normalization, peer-session readiness gates, and monotonic packet-number replay window.
-- macOS FFI hooks for packet-core peer-session install/clear/readiness plus peer-session and replay-drop metrics.
+- macOS FFI hooks and development-runtime wiring for packet-core peer-session install/clear/readiness plus peer-session and replay-drop metrics.
 
 ## Mesh and Transport
 
@@ -41,15 +41,16 @@ This feature list is synchronized with the current repository implementation. It
 
 - Local development app can run without a signed Network Extension by using simulated mesh state or development loopback transport.
 - Unsigned XcodeGen project scaffolding can be generated without Apple credentials.
+- The macOS development runtime installs, clears, and rotates packet-core peer-session readiness from the live default-peer mesh session, so protected packet flow fails closed until an authenticated peer session is available.
 - Real packet tunnel execution requires Apple Network Extension entitlements, provisioning, signing, and notarization.
 - Enterprise rollout is designed around MDM, per-app VPN payloads, VPN On Demand rules, and extension preapproval.
 
 ## Not Production-Complete
 
-- Runtime wiring that installs live mesh session readiness into `PacketTunnelCore` during Network Extension operation.
 - Hardened public rendezvous, STUN, TURN, and relay service controls.
 - RFC-complete public ICE nomination behavior and TURN relay-candidate data-plane consumption against deployed public infrastructure.
 - Notarized Developer ID app and tunnel extension bundle.
+- Real-hardware validation of signed/provisioned Network Extension builds, including peer-session readiness under live packet flow.
 - Managed Device Attestation and SSO integration.
 - Full post-quantum update manifest and release-signing layer.
 - Anonymity guarantees beyond metadata minimization.

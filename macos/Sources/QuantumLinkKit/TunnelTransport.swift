@@ -283,6 +283,8 @@ public final class RustDevQuicLoopbackTransport: TunnelTransporting {
 ///   - `stop()` destroys the handle; the Rust runtime is torn down off the
 ///     calling thread.
 public final class RustMeshTransport: TunnelTransporting {
+    public static let unconfiguredRemotePeerID = "qlink_unconfigured"
+
     private let library: RustCoreLibrary
     private let configuration: MeshTransportConfiguration
     /// Local device keypair for the responder + cert publishing flow.
@@ -311,6 +313,18 @@ public final class RustMeshTransport: TunnelTransporting {
     /// no keypair was supplied at construction.
     public var localPeerID: String? {
         keypair?.peerID
+    }
+
+    /// Default outbound peer for the legacy single-peer packet pump path.
+    /// Multi-peer routing will eventually target peers per flow; until then,
+    /// the packet-session gate follows the same default peer the Rust FFI
+    /// `send_frame` path targets.
+    public var defaultRemotePeerID: String? {
+        let trimmed = configuration.remotePeerID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed != Self.unconfiguredRemotePeerID else {
+            return nil
+        }
+        return trimmed
     }
 
     deinit {
@@ -660,7 +674,7 @@ public enum TunnelTransportFactory {
             // Default peer for the legacy single-peer fallback
             // surface; production callers should `addPeer(_:)`
             // explicit peers post-start.
-            remotePeerID: "qlink_unconfigured",
+            remotePeerID: configuration.remotePeerID ?? RustMeshTransport.unconfiguredRemotePeerID,
             rendezvousURL: rendezvousURL ?? "127.0.0.1:9471",
             relayURL: relayURL,
             bindAddress: bindAddress,
@@ -712,5 +726,18 @@ public enum TunnelTransportFactory {
                 reason: "Rust mesh transport unavailable: \(error.localizedDescription)"
             )
         }
+    }
+}
+
+extension RustMeshTransport: PacketSessionReadinessSource {
+    public var packetSessionPeerID: String? {
+        defaultRemotePeerID
+    }
+
+    public var packetSessionTransportReady: Bool {
+        guard let peerID = defaultRemotePeerID else {
+            return false
+        }
+        return isReady && peerStateCode(peerID) == .ready
     }
 }
