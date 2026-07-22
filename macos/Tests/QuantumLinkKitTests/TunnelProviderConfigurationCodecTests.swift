@@ -10,6 +10,8 @@ final class TunnelProviderConfigurationCodecTests: XCTestCase {
       tunnelRemoteAddress: "203.0.113.10",
       protectedRoutes: ["100.64.0.0/10"],
       dnsServers: ["100.127.0.1"],
+      remotePeerID: "qlink_public-peer",
+      requirePeerSession: true,
       meshTrustPolicy: .publicRequired,
       discoveryIdentityMode: .publicWallet,
       dytallixIdentity: DytallixIdentityConfiguration(
@@ -27,6 +29,8 @@ final class TunnelProviderConfigurationCodecTests: XCTestCase {
     )
 
     XCTAssertEqual(decoded.meshID, "public-mesh")
+    XCTAssertEqual(decoded.remotePeerID, "qlink_public-peer")
+    XCTAssertTrue(decoded.requirePeerSession)
     XCTAssertEqual(decoded.dytallixIdentity?.endpoint, "https://dytallix.example")
     XCTAssertEqual(
       decoded.dytallixIdentity?.contractAddress,

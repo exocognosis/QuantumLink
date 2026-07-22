@@ -85,7 +85,8 @@ final class ConnectionProfileTests: XCTestCase {
         var profile = ConnectionProfile(
             sourceIPAddress: "100.127.0.2",
             destinationIPAddress: "",
-            connectionType: .custom
+            connectionType: .custom,
+            customSettings: CustomConnectionSettings(protocolName: "game")
         )
 
         XCTAssertTrue(profile.missingRequiredFields(for: .mesh).contains("Mesh peer"))
@@ -100,6 +101,31 @@ final class ConnectionProfileTests: XCTestCase {
         ]
 
         XCTAssertFalse(profile.missingRequiredFields(for: .mesh).contains("Mesh peer"))
+        XCTAssertTrue(profile.missingRequiredFields(for: .mesh).contains("Peer ID"))
+
+        profile.deploymentDetails.peerDevices[0].peerID = " qlink_helsinki "
+
+        XCTAssertEqual(profile.deploymentDetails.selectedRemotePeerID, "qlink_helsinki")
+        XCTAssertTrue(profile.missingRequiredFields(for: .mesh).isEmpty)
+    }
+
+    func testPeerDeviceProfileDecodesOlderProfilesWithoutPeerID() throws {
+        let data = """
+        {
+          "id": "00000000-0000-0000-0000-000000000001",
+          "alias": "old-peer",
+          "endpointAddress": "203.0.113.42",
+          "overlayIPAddress": "100.127.0.42",
+          "role": "peer",
+          "port": 9471
+        }
+        """.data(using: .utf8)!
+
+        let profile = try JSONDecoder().decode(PeerDeviceProfile.self, from: data)
+
+        XCTAssertEqual(profile.alias, "old-peer")
+        XCTAssertEqual(profile.peerID, "")
+        XCTAssertNil(profile.normalizedPeerID)
     }
 
     func testStableKeyIncludesConnectionSpecificSettings() {
@@ -112,6 +138,22 @@ final class ConnectionProfileTests: XCTestCase {
 
         var second = first
         second.sshSettings.username = "root"
+
+        XCTAssertNotEqual(first.stableKey, second.stableKey)
+    }
+
+    func testStableKeyIncludesPeerID() {
+        var first = ConnectionProfile(
+            sourceIPAddress: "100.127.0.2",
+            destinationIPAddress: "89.167.52.129",
+            connectionType: .custom
+        )
+        first.deploymentDetails.peerDevices = [
+            PeerDeviceProfile(peerID: "qlink_alpha", endpointAddress: "89.167.52.129")
+        ]
+
+        var second = first
+        second.deploymentDetails.peerDevices[0].peerID = "qlink_beta"
 
         XCTAssertNotEqual(first.stableKey, second.stableKey)
     }

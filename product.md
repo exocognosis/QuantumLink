@@ -166,6 +166,9 @@ Implemented or scaffolded behavior includes:
   hooks plus peer-session-unavailable and replay-drop counters for macOS
   observability; the macOS development runtime wires live default-peer mesh
   readiness into those install/clear/rotation gates.
+- macOS connection profiles, MDM/AppConfig overlays, and party-mesh invite
+  flows can carry a selected remote QuantumLink peer ID into tunnel
+  configuration so peer-session-gated packet flow is tied to the target peer.
 - Native UDP carrier session-wire test coverage; default live mesh direct
   dialing and inbound response use the native UDP carrier with app-layer PQC
   session establishment.

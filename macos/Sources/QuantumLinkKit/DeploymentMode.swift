@@ -16,6 +16,7 @@ public enum QuantumLinkDeploymentMode: String, Codable, CaseIterable, Hashable, 
             protectedRoutes: protectedRoutes(from: base, destinationIPAddress: nil),
             rendezvousServers: rendezvousServers(from: base, destinationIPAddress: nil),
             relayServers: relayServers(from: base, destinationIPAddress: nil),
+            remotePeerID: remotePeerID(from: base, profile: nil),
             crypto: base.crypto
         )
     }
@@ -34,6 +35,7 @@ public enum QuantumLinkDeploymentMode: String, Codable, CaseIterable, Hashable, 
             protectedRoutes: protectedRoutes(from: base, destinationIPAddress: destinationIPAddress, profile: profile),
             rendezvousServers: rendezvousServers(from: base, destinationIPAddress: destinationIPAddress, endpointPort: profile.deploymentDetails.directEndpointPort),
             relayServers: relayServers(from: base, destinationIPAddress: destinationIPAddress),
+            remotePeerID: remotePeerID(from: base, profile: profile),
             crypto: CryptoPolicy(pqcAlgorithm: profile.pqcAlgorithm)
         )
     }
@@ -45,9 +47,11 @@ public enum QuantumLinkDeploymentMode: String, Codable, CaseIterable, Hashable, 
         protectedRoutes: [String],
         rendezvousServers: [String],
         relayServers: [String],
+        remotePeerID: String?,
         crypto: CryptoPolicy
     ) -> TunnelConfiguration {
-        TunnelConfiguration(
+        let normalizedRemotePeerID = normalizedPeerID(remotePeerID)
+        return TunnelConfiguration(
             meshID: base.meshID,
             deviceAlias: base.deviceAlias,
             overlayIPv4Address: overlayIPv4Address,
@@ -61,9 +65,51 @@ public enum QuantumLinkDeploymentMode: String, Codable, CaseIterable, Hashable, 
             discoveryModes: discoveryModes,
             rendezvousServers: rendezvousServers,
             relayServers: relayServers,
+            remotePeerID: normalizedRemotePeerID,
+            allowedRelayEndpoints: base.allowedRelayEndpoints,
+            relayTLSPolicy: base.relayTLSPolicy,
+            maximumCandidateAgeSeconds: base.maximumCandidateAgeSeconds,
+            failClosedOnNoCandidate: base.failClosedOnNoCandidate,
             mtu: base.mtu,
-            crypto: crypto
+            crypto: crypto,
+            requirePeerSession: requirePeerSession(
+                from: base,
+                remotePeerID: normalizedRemotePeerID
+            ),
+            killSwitch: base.killSwitch,
+            meshTrustPolicy: base.meshTrustPolicy,
+            discoveryIdentityMode: base.discoveryIdentityMode,
+            dytallixIdentity: base.dytallixIdentity
         )
+    }
+
+    private func remotePeerID(
+        from base: TunnelConfiguration,
+        profile: ConnectionProfile?
+    ) -> String? {
+        switch self {
+        case .mesh, .partyMesh, .direct:
+            profile?.deploymentDetails.selectedRemotePeerID ?? base.remotePeerID
+        case .localVPN:
+            nil
+        }
+    }
+
+    private func normalizedPeerID(_ peerID: String?) -> String? {
+        let trimmed = peerID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private func requirePeerSession(
+        from base: TunnelConfiguration,
+        remotePeerID: String?
+    ) -> Bool {
+        switch self {
+        case .mesh, .partyMesh, .direct:
+            base.requirePeerSession || remotePeerID != nil
+        case .localVPN:
+            false
+        }
     }
 
     private func protectedRoutes(
