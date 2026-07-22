@@ -43,7 +43,7 @@ const DEFAULT_OVERALL_DEADLINE: Duration = Duration::from_secs(3);
 const DEFAULT_PROBE_PACING: Duration = Duration::from_millis(50);
 
 #[cfg(not(feature = "dev-quic-carrier"))]
-pub(crate) fn native_udp_carrier_binding(
+pub fn native_udp_carrier_binding(
     mesh_id: &str,
     remote_peer_id: &str,
     address: SocketAddr,

@@ -5,8 +5,21 @@ use clap::{Parser, Subcommand};
 use qlink_core::relay::RelayMessage;
 #[cfg(feature = "turn-relay")]
 use qlink_core::traversal::gather_ice_candidates;
+#[cfg(all(feature = "turn-relay", not(feature = "dev-quic-carrier")))]
+use qlink_core::turn::TurnClient;
 #[cfg(feature = "turn-relay")]
-use qlink_core::turn::{gather_relay_candidate, TurnCredentials, TurnServer};
+use qlink_core::turn::{gather_relay_candidate, run_dev_turn, TurnCredentials, TurnServer};
+#[cfg(all(feature = "turn-relay", not(feature = "dev-quic-carrier")))]
+use qlink_core::{
+    carrier_transport::{CarrierSession, NativeUdpSession},
+    inbound_identity::{
+        receive_and_evaluate_inbound, InboundDecision, DEFAULT_INBOUND_ASSERTION_MAX_AGE_SECONDS,
+    },
+    mesh_connection::native_udp_carrier_binding,
+    pqc_session_wire::run_pqc_session_responder,
+    session_crypto::PqcSessionContext,
+    traversal::relay_candidate,
+};
 use qlink_core::{crypto::SessionKeys, pqc_frame::PqcFrameProtector};
 use qlink_core::{
     crypto::{answer_handshake, start_handshake, DeviceKeypair},
@@ -100,6 +113,42 @@ enum Command {
         password: Option<String>,
         #[arg(long)]
         realm: Option<String>,
+    },
+    /// Run the local development TURN server used by proof harnesses. This is
+    /// unauthenticated and single-process only; use coturn on public edges.
+    #[cfg(feature = "turn-relay")]
+    TurnDev {
+        #[arg(long, default_value = "127.0.0.1:3478")]
+        listen: String,
+    },
+    /// Publish a resident TURN allocation and accept one native UDP/PQC session
+    /// through TURN Send/Data indications. Native-carrier proof only.
+    #[cfg(all(feature = "turn-relay", not(feature = "dev-quic-carrier")))]
+    TurnRelayResponder {
+        #[arg(long, default_value = "127.0.0.1:9471")]
+        rendezvous: String,
+        #[arg(long, default_value = "devmesh")]
+        mesh_id: String,
+        #[arg(long)]
+        turn: String,
+        #[arg(long, default_value = "0.0.0.0:0")]
+        bind_addr: String,
+        #[arg(long, default_value = "127.0.0.1")]
+        permit_peer_ip: String,
+        #[arg(long, default_value = "120")]
+        ttl_seconds: u64,
+        #[arg(long)]
+        keyfile: Option<String>,
+        #[arg(long)]
+        turn_username: Option<String>,
+        #[arg(long)]
+        turn_password: Option<String>,
+        #[arg(long)]
+        turn_realm: Option<String>,
+        /// Exit after this many protected frames. 0 means stay resident until
+        /// the carrier closes or the process is interrupted.
+        #[arg(long, default_value_t = 0)]
+        max_frames: u64,
     },
     QuicLoopback,
     MeshLoopback,
@@ -361,6 +410,40 @@ async fn main() -> qlink_core::Result<()> {
             println!("relayed_port={}", candidate.port);
             println!("candidate_type={:?}", candidate.candidate_type);
             println!("elapsed_ms={}", started.elapsed().as_millis());
+        }
+        #[cfg(feature = "turn-relay")]
+        Command::TurnDev { listen } => {
+            println!("turn_dev_listen={listen}");
+            run_dev_turn(&listen).await?;
+        }
+        #[cfg(all(feature = "turn-relay", not(feature = "dev-quic-carrier")))]
+        Command::TurnRelayResponder {
+            rendezvous,
+            mesh_id,
+            turn,
+            bind_addr,
+            permit_peer_ip,
+            ttl_seconds,
+            keyfile,
+            turn_username,
+            turn_password,
+            turn_realm,
+            max_frames,
+        } => {
+            run_turn_relay_responder(
+                &rendezvous,
+                &mesh_id,
+                &turn,
+                &bind_addr,
+                &permit_peer_ip,
+                ttl_seconds,
+                keyfile.as_deref(),
+                turn_username.as_deref(),
+                turn_password.as_deref(),
+                turn_realm.as_deref(),
+                max_frames,
+            )
+            .await?;
         }
         Command::QuicLoopback => {
             return Err(qlink_core::QlinkError::Protocol(
@@ -896,6 +979,138 @@ async fn run_publish_self(
         let sleep_secs = ttl_seconds.saturating_div(2).max(1);
         tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
     }
+}
+
+#[cfg(all(feature = "turn-relay", not(feature = "dev-quic-carrier")))]
+#[allow(clippy::too_many_arguments)]
+async fn run_turn_relay_responder(
+    rendezvous_url: &str,
+    mesh_id: &str,
+    turn_server: &str,
+    bind_addr: &str,
+    permit_peer_ip: &str,
+    ttl_seconds: u64,
+    keyfile: Option<&str>,
+    turn_username: Option<&str>,
+    turn_password: Option<&str>,
+    turn_realm: Option<&str>,
+    max_frames: u64,
+) -> qlink_core::Result<()> {
+    let keypair = Arc::new(load_or_generate_keypair(keyfile)?);
+    let local_peer_id = keypair.public_key().peer_id();
+    let turn_addr = parse_socket_addr_arg("--turn", turn_server)?;
+    let bind: SocketAddr = bind_addr
+        .parse()
+        .map_err(|err| qlink_core::QlinkError::Protocol(format!("invalid --bind-addr: {err}")))?;
+    let permitted_ip: IpAddr = permit_peer_ip.parse().map_err(|err| {
+        qlink_core::QlinkError::Protocol(format!("invalid --permit-peer-ip: {err}"))
+    })?;
+
+    let credentials = match (turn_username, turn_password) {
+        (Some(username), Some(password)) => {
+            let credentials = TurnCredentials::new(username, password);
+            Some(match turn_realm {
+                Some(realm) => credentials.with_realm(realm),
+                None => credentials,
+            })
+        }
+        (None, None) => None,
+        _ => {
+            return Err(qlink_core::QlinkError::Protocol(
+                "TURN credentials require both --turn-username and --turn-password".into(),
+            ))
+        }
+    };
+
+    let mut client = TurnClient::new(bind).with_timeout(Duration::from_secs(3));
+    if let Some(credentials) = credentials {
+        client = client.with_credentials(credentials);
+    }
+    let resident = client.allocate_resident(turn_addr, permitted_ip).await?;
+    let relayed_addr = resident.relayed_addr();
+    let endpoint = relay_candidate(relayed_addr);
+    let record = PeerRecord::signed(
+        UnsignedPeerRecord::new(
+            mesh_id,
+            "qlink-turn-relay",
+            keypair.public_key(),
+            vec![endpoint],
+            vec!["100.127.0.10/32".to_string()],
+            ttl_seconds,
+            1,
+        ),
+        keypair.as_ref(),
+    )?;
+    RendezvousClient::new(rendezvous_url.to_string())
+        .publish(mesh_id, record.clone())
+        .await?;
+
+    println!("local_peer_id={local_peer_id}");
+    println!("mesh_id={mesh_id}");
+    println!("rendezvous_url={rendezvous_url}");
+    println!("turn_server={turn_server}");
+    println!("turn_permission_peer_ip={permitted_ip}");
+    println!("turn_relayed_address={}", relayed_addr.ip());
+    println!("turn_relayed_port={}", relayed_addr.port());
+    println!(
+        "turn_allocation_lifetime_secs={}",
+        resident.allocation().lifetime_secs
+    );
+    println!("published_candidate_count={}", record.body.endpoints.len());
+    for (index, candidate) in record.body.endpoints.iter().enumerate() {
+        println!(
+            "published_candidate[{index}]_type={:?}",
+            candidate.candidate_type
+        );
+        println!("published_candidate[{index}]_address={}", candidate.address);
+        println!("published_candidate[{index}]_port={}", candidate.port);
+        println!(
+            "published_candidate[{index}]_priority={}",
+            candidate.priority
+        );
+    }
+    println!("turn_responder_ready=true");
+
+    let session = CarrierSession::from(NativeUdpSession::from_turn_relay(resident.relay_socket()));
+    let (decision, assertion) = receive_and_evaluate_inbound(
+        &session,
+        mesh_id,
+        DEFAULT_INBOUND_ASSERTION_MAX_AGE_SECONDS,
+        None,
+    )
+    .await?;
+    if decision != InboundDecision::Accepted {
+        session.close(b"");
+        return Err(qlink_core::QlinkError::Protocol(format!(
+            "TURN inbound identity rejected: {decision:?}"
+        )));
+    }
+
+    let peer_id = assertion.peer_id;
+    let pqc_context = PqcSessionContext::new(
+        mesh_id,
+        peer_id.clone(),
+        local_peer_id.clone(),
+        native_udp_carrier_binding(mesh_id, &local_peer_id, relayed_addr),
+    );
+    let session_keys = run_pqc_session_responder(&session, pqc_context, keypair.as_ref()).await?;
+    let mut frame_protector = PqcFrameProtector::new(session_keys);
+    let mut received_count = 0_u64;
+    while max_frames == 0 || received_count < max_frames {
+        let protected = match session.receive_frame().await {
+            Ok(frame) => frame,
+            Err(error) => {
+                println!("turn_responder_receive_closed={error}");
+                break;
+            }
+        };
+        let frame = frame_protector.open(&protected)?;
+        println!("received_frame[{received_count}]_peer_id={peer_id}");
+        println!("received_frame[{received_count}]_bytes={}", frame.len());
+        received_count += 1;
+    }
+    println!("received_frame_count={received_count}");
+    Ok(())
 }
 
 fn parse_socket_addr_arg(label: &str, value: &str) -> qlink_core::Result<SocketAddr> {

@@ -27,10 +27,11 @@ Implemented baseline:
 - Raw QUIC, raw relay, and legacy mesh loopback smoke paths fail closed unless an end-to-end app-layer PQC session exists.
 - Native UDP carrier with fragmented authenticated control-message support; default live mesh direct dialing and inbound response use this non-TLS carrier with the app-layer PQC session wire, and tests prove both sides establish matching ML-KEM/SHAKE keys.
 - Relay fallback is end-to-end PQC only: when direct native UDP probes fail, the connector can establish the same signed inbound assertion, ML-KEM session, and protected-frame path through a configured or signed `quantum_link_relay` carrier candidate. Raw unauthenticated relay fallback remains rejected.
-- Candidate gathering covers host and STUN server-reflexive candidates in default builds, plus TURN relay candidates when `turn-relay` is explicitly enabled. Gather failures are reported per server without suppressing lower-latency direct candidates. Published TURN relay candidates are consumed as UDP relay-assisted carrier targets when live; the QuantumLink app-relay carrier remains distinct.
+- Candidate gathering covers host and STUN server-reflexive candidates in default builds, plus TURN relay candidates when `turn-relay` is explicitly enabled. Gather failures are reported per server without suppressing lower-latency direct candidates. Published TURN relay candidates are consumed as UDP relay-assisted carrier targets when live; the resident proof path keeps a TURN allocation alive, refreshes it, installs a peer permission, and carries native carrier datagrams through Send/Data indications. The QuantumLink app-relay carrier remains distinct.
 - A public-edge deployment runbook and smoke harness cover allowlisted
-  rendezvous, STUN, TURN allocation, and end-to-end PQC relay-fallback proof
-  while open-internet rendezvous/relay TLS/auth remains unfinished.
+  rendezvous, STUN, TURN allocation, end-to-end PQC app-relay fallback, and
+  local resident TURN data-plane proof while open-internet rendezvous/relay
+  TLS/auth remains unfinished.
 - Default `qlink-core` builds keep the legacy Quinn/rustls/rcgen carrier dependencies out of the compiled dependency graph; the dev QUIC carrier remains available only with `--features dev-quic-carrier`.
 
 Dytallix wallet and registry boundary:
@@ -75,7 +76,7 @@ regenerate `peers.json` after rolling the new build.
 Not yet production-complete:
 
 - Open-internet rendezvous/QuantumLink-relay TLS, authentication policy, rate limits, abuse monitoring, revocation, and retention controls beyond the current allowlisted/tunneled public-edge runbook.
-- Long-lived TURN allocation lifecycle and RFC-complete ICE nomination against deployed public infrastructure beyond the current deterministic candidate ordering and connectivity-check paths.
+- Deployed public TURN data-plane proof and RFC-complete ICE nomination against deployed public infrastructure beyond the current deterministic candidate ordering, connectivity-check paths, and local resident TURN proof.
 - Notarized Developer ID app and extension bundles.
 - Managed Device Attestation and SSO integration.
 - Full update signing pipeline with a post-quantum manifest layer.

@@ -6,8 +6,9 @@ validation while Apple credentials are still pending.
 ## Current Boundary
 
 The repo can now prove live rendezvous, STUN, optional TURN allocation, signed
-peer-record publication of gathered ICE candidates, and end-to-end PQC relay
-fallback with `scripts/public-infra-smoke.sh`.
+peer-record publication of gathered ICE candidates, end-to-end PQC app-relay
+fallback, and resident TURN data-plane behavior with
+`scripts/public-infra-smoke.sh`.
 
 Do not treat the in-repo rendezvous and QuantumLink relay binaries as open
 internet production services yet. Their client protocol is still raw TCP. Until
@@ -21,9 +22,11 @@ STUN and coturn TURN may be internet-facing. Published TURN relay candidates
 are consumed by the mesh connector when the responder keeps a live allocation.
 The QuantumLink data-plane relay is the app relay path and is published as a
 signed `quantum_link_relay` candidate when a responder is configured with
-`--relay`; the current public smoke uses coturn to prove allocation and
+`--relay`. The default public smoke uses coturn to prove allocation and
 candidate gathering, then proves end-to-end PQC fallback through the
-QuantumLink app relay.
+QuantumLink app relay. The `--prove-turn-relay` mode instead publishes a
+resident TURN allocation and requires the connector to report
+`selected_path=turn-relay`.
 
 ## Edge Layout
 
@@ -103,10 +106,29 @@ scripts/public-infra-smoke.sh \
   --build
 ```
 
+To prove the TURN data plane instead of the QuantumLink app-relay path, run the
+same command with `--prove-turn-relay` and set the permitted peer IP to the
+tester machine's public egress address:
+
+```sh
+scripts/public-infra-smoke.sh \
+  --rendezvous EDGE_HOST:9471 \
+  --relay EDGE_HOST:9472 \
+  --stun EDGE_HOST:3478 \
+  --turn EDGE_HOST:3478 \
+  --turn-username "$QLINK_TURN_USERNAME" \
+  --turn-password "$QLINK_TURN_PASSWORD" \
+  --turn-realm "$QLINK_TURN_REALM" \
+  --turn-permit-peer-ip "$TESTER_PUBLIC_IP" \
+  --prove-turn-relay \
+  --build
+```
+
 For an offline local rehearsal:
 
 ```sh
 scripts/public-infra-smoke.sh --local --build
+scripts/public-infra-smoke.sh --local --prove-turn-relay --build
 ```
 
 The smoke run writes `build/public-infra-smoke/<timestamp>/evidence.json`. A
@@ -120,13 +142,21 @@ passing evidence file must show:
 - `selected_path` is `relay`;
 - `frames_sent` matches the requested count.
 
+For `--prove-turn-relay`, the passing evidence changes to:
+
+- `prove_turn_relay` is `true`;
+- `turn_responder_relayed` is non-empty;
+- `published_candidate_types` is `Relay`;
+- `selected_path` is `turn-relay`;
+- `frames_sent` matches the requested count.
+
 The responder deliberately publishes `127.0.0.1:1` by default as its host
-candidate. STUN/TURN candidates are still gathered and signed into the record,
-but the smoke does not yet keep a long-lived TURN allocation resident for the
-responder. The unreachable host candidate forces direct probing to fail quickly
-so the result proves the configured rendezvous plus published QuantumLink PQC
-relay candidate rather than a local direct path. A future resident TURN
-allocation proof should expect `selected_path=turn-relay`.
+candidate in default app-relay mode. STUN/TURN candidates are gathered and
+signed into the record, but the unreachable host candidate forces direct
+probing to fail quickly so the result proves the configured rendezvous plus
+published QuantumLink PQC relay candidate rather than a local direct path. In
+`--prove-turn-relay` mode, the resident responder publishes only its TURN relay
+candidate and accepts the native carrier through TURN Send/Data indications.
 
 ## Hardening Checks
 
