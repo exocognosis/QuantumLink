@@ -25,7 +25,7 @@
 - MDM profile install and per-app VPN policy apply
 - Dytallix identity enrollment and public-mesh verification
 - Native UDP direct peer path
-- Relay fallback path
+- Relay fallback path through configured and signed `quantum_link_relay` candidates
 - Host, STUN server-reflexive, and TURN relay candidate gathering
 - Sleep, wake, network roam, captive portal, tethering, and offline recovery
 - Update from previous signed build to current signed build

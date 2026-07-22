@@ -5,7 +5,7 @@ use crate::{
     mesh_transport::{
         MeshTransportConfig, MeshTransportHandle, MeshTransportState, PeerTrustStatusRaw,
     },
-    packet_core::{PacketDisposition, PacketTunnelCore},
+    packet_core::{InstalledPeerSession, PacketDisposition, PacketTunnelCore},
     tracing_bridge,
 };
 use std::{
@@ -58,6 +58,10 @@ pub struct QlinkTunnelMetrics {
     pub transport_frames_in: u64,
     pub dropped_unprotected: u64,
     pub dropped_malformed: u64,
+    pub dropped_peer_session_unavailable: u64,
+    pub dropped_replay: u64,
+    pub peer_session_required: u32,
+    pub peer_session_ready: u32,
 }
 
 #[repr(C)]
@@ -145,10 +149,8 @@ pub unsafe extern "C" fn qlink_tunnel_core_submit_packet(
 
     match core.submit_tunnel_packet(protocol_family, packet) {
         Ok(PacketDisposition::QueuedForTransport) => 1,
-        Ok(
-            PacketDisposition::DroppedUnprotected
-            | PacketDisposition::DroppedPeerSessionUnavailable,
-        ) => 0,
+        Ok(PacketDisposition::DroppedUnprotected) => 0,
+        Ok(PacketDisposition::DroppedPeerSessionUnavailable) => 2,
         Err(_) => -1,
     }
 }
@@ -249,8 +251,67 @@ pub unsafe extern "C" fn qlink_tunnel_core_metrics(
         transport_frames_in: metrics.transport_frames_in,
         dropped_unprotected: metrics.dropped_unprotected,
         dropped_malformed: metrics.dropped_malformed,
+        dropped_peer_session_unavailable: metrics.dropped_peer_session_unavailable,
+        dropped_replay: metrics.dropped_replay,
+        peer_session_required: u32::from(core.peer_session_required()),
+        peer_session_ready: u32::from(core.peer_session_ready()),
     };
     true
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn qlink_tunnel_core_install_peer_session(
+    handle: *mut QlinkTunnelCoreHandle,
+    peer_id: *const u8,
+    peer_id_len: usize,
+    expires_at_unix: u64,
+    rekey_after_packets: u64,
+) -> bool {
+    let Some(handle) = handle.as_ref() else {
+        return false;
+    };
+    let Some(peer_id) = borrowed_utf8(peer_id, peer_id_len) else {
+        return false;
+    };
+    let Ok(mut core) = handle.core.lock() else {
+        return false;
+    };
+
+    core.install_peer_session(InstalledPeerSession {
+        peer_id: peer_id.to_string(),
+        expires_at_unix,
+        rekey_after_packets,
+    });
+    true
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn qlink_tunnel_core_clear_peer_session(
+    handle: *mut QlinkTunnelCoreHandle,
+) -> bool {
+    let Some(handle) = handle.as_ref() else {
+        return false;
+    };
+    let Ok(mut core) = handle.core.lock() else {
+        return false;
+    };
+
+    core.clear_peer_session();
+    true
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn qlink_tunnel_core_peer_session_ready(
+    handle: *mut QlinkTunnelCoreHandle,
+) -> bool {
+    let Some(handle) = handle.as_ref() else {
+        return false;
+    };
+    let Ok(core) = handle.core.lock() else {
+        return false;
+    };
+
+    core.peer_session_ready()
 }
 
 #[no_mangle]
@@ -345,6 +406,11 @@ unsafe fn borrowed_slice<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
         return None;
     }
     Some(slice::from_raw_parts(ptr, len))
+}
+
+unsafe fn borrowed_utf8<'a>(ptr: *const u8, len: usize) -> Option<&'a str> {
+    let bytes = borrowed_slice(ptr, len)?;
+    str::from_utf8(bytes).ok()
 }
 
 fn owned_buffer_from_vec(mut bytes: Vec<u8>) -> QlinkOwnedBuffer {
@@ -1162,6 +1228,58 @@ mod tests {
         assert_eq!(restored_bytes[16..20], packet[16..20]);
         assert_eq!(ipv4_header_checksum(&restored_bytes), 0);
         unsafe { qlink_owned_buffer_free(restored.buffer) };
+        unsafe { qlink_tunnel_core_destroy(handle) };
+    }
+
+    #[test]
+    fn ffi_peer_session_controls_gate_protected_packets() {
+        let config = br#"{
+            "protectedRoutes": ["100.127.0.0/16"],
+            "excludedRoutes": [],
+            "routeMode": "splitTunnel",
+            "mtu": 1280,
+            "requirePeerSession": true
+        }"#;
+
+        let handle = unsafe { qlink_tunnel_core_create(config.as_ptr(), config.len()) };
+        assert!(!handle.is_null());
+
+        let packet = test_ipv4_packet([100, 127, 0, 9]);
+        let blocked =
+            unsafe { qlink_tunnel_core_submit_packet(handle, 2, packet.as_ptr(), packet.len()) };
+        assert_eq!(blocked, 2);
+        assert!(!unsafe { qlink_tunnel_core_peer_session_ready(handle) });
+
+        let mut metrics = QlinkTunnelMetrics::default();
+        assert!(unsafe { qlink_tunnel_core_metrics(handle, &mut metrics) });
+        assert_eq!(metrics.dropped_peer_session_unavailable, 1);
+        assert_eq!(metrics.peer_session_required, 1);
+        assert_eq!(metrics.peer_session_ready, 0);
+
+        let peer_id = b"qlink_peer-session-test";
+        let expires_at_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 60;
+        assert!(unsafe {
+            qlink_tunnel_core_install_peer_session(
+                handle,
+                peer_id.as_ptr(),
+                peer_id.len(),
+                expires_at_unix,
+                0,
+            )
+        });
+        assert!(unsafe { qlink_tunnel_core_peer_session_ready(handle) });
+
+        let queued =
+            unsafe { qlink_tunnel_core_submit_packet(handle, 2, packet.as_ptr(), packet.len()) };
+        assert_eq!(queued, 1);
+
+        assert!(unsafe { qlink_tunnel_core_clear_peer_session(handle) });
+        assert!(!unsafe { qlink_tunnel_core_peer_session_ready(handle) });
+
         unsafe { qlink_tunnel_core_destroy(handle) };
     }
 

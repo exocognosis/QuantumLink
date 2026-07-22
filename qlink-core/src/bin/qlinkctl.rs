@@ -164,9 +164,9 @@ enum Command {
         /// bind to a local port, advertise the public proxy endpoint.
         #[arg(long)]
         advertise_addr: Option<String>,
-        /// Also register with this relay (TCP url) so the node accepts
-        /// relay-fallback connections — makes it a full mesh node that can
-        /// be reached over both the direct and relay paths.
+        /// Also register with this relay (TCP url) and publish it as a signed
+        /// QuantumLink relay candidate so the node can be reached over both
+        /// direct and app-relay paths.
         #[arg(long)]
         relay: Option<String>,
         /// STUN server used to gather server-reflexive candidates before each
@@ -217,8 +217,9 @@ enum Command {
         /// Delay between streamed frames in milliseconds (0 = back-to-back).
         #[arg(long, default_value_t = 0)]
         interval_ms: u64,
-        /// Relay (TCP url) the connector may fall back to when the direct
-        /// probe fails. Required to exercise the mesh / relay-fallback path.
+        /// Relay (TCP url) the connector may fall back to when direct probes
+        /// fail. If omitted, signed QuantumLink relay candidates from the
+        /// peer record are used when present.
         #[arg(long)]
         relay: Option<String>,
     },

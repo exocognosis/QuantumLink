@@ -27,6 +27,7 @@ public enum RustCoreBridgeError: Error, LocalizedError {
 public enum TunnelPacketDisposition: Equatable, Sendable {
     case queuedForTransport
     case droppedUnprotected
+    case droppedPeerSessionUnavailable
 }
 
 public enum RustMeshPeerTrustDecision: UInt32, Sendable {
@@ -156,6 +157,34 @@ public struct TunnelCoreMetrics: Equatable, Sendable {
     public let transportFramesIn: UInt64
     public let droppedUnprotected: UInt64
     public let droppedMalformed: UInt64
+    public let droppedPeerSessionUnavailable: UInt64
+    public let droppedReplay: UInt64
+    public let peerSessionRequired: Bool
+    public let peerSessionReady: Bool
+
+    public init(
+        packetsFromTunnel: UInt64,
+        packetsToTunnel: UInt64,
+        transportFramesOut: UInt64,
+        transportFramesIn: UInt64,
+        droppedUnprotected: UInt64,
+        droppedMalformed: UInt64,
+        droppedPeerSessionUnavailable: UInt64 = 0,
+        droppedReplay: UInt64 = 0,
+        peerSessionRequired: Bool = false,
+        peerSessionReady: Bool = true
+    ) {
+        self.packetsFromTunnel = packetsFromTunnel
+        self.packetsToTunnel = packetsToTunnel
+        self.transportFramesOut = transportFramesOut
+        self.transportFramesIn = transportFramesIn
+        self.droppedUnprotected = droppedUnprotected
+        self.droppedMalformed = droppedMalformed
+        self.droppedPeerSessionUnavailable = droppedPeerSessionUnavailable
+        self.droppedReplay = droppedReplay
+        self.peerSessionRequired = peerSessionRequired
+        self.peerSessionReady = peerSessionReady
+    }
 }
 
 public struct RustDevQuicTransportMetrics: Equatable, Sendable {
@@ -280,6 +309,23 @@ public protocol TunnelCoreAdapting: AnyObject {
     func acceptTransportFrame(_ frame: Data) throws
     func popTunnelPacket() throws -> TunnelCorePacket?
     func metrics() throws -> TunnelCoreMetrics
+    func installPeerSession(peerID: String, expiresAt: Date, rekeyAfterPackets: UInt64) throws
+    func clearPeerSession() throws
+    func peerSessionReady() throws -> Bool
+}
+
+public extension TunnelCoreAdapting {
+    func installPeerSession(peerID: String, expiresAt: Date, rekeyAfterPackets: UInt64) throws {
+        throw RustCoreBridgeError.operationFailed("Tunnel core adapter does not support peer-session installation")
+    }
+
+    func clearPeerSession() throws {
+        throw RustCoreBridgeError.operationFailed("Tunnel core adapter does not support peer-session clearing")
+    }
+
+    func peerSessionReady() throws -> Bool {
+        false
+    }
 }
 
 public final class RustCoreLibrary {
@@ -365,6 +411,8 @@ public final class RustCoreLibrary {
             return .queuedForTransport
         case 0:
             return .droppedUnprotected
+        case 2:
+            return .droppedPeerSessionUnavailable
         default:
             throw RustCoreBridgeError.operationFailed("Rust tunnel core rejected packet")
         }
@@ -420,8 +468,53 @@ public final class RustCoreLibrary {
             transportFramesOut: metrics.transportFramesOut,
             transportFramesIn: metrics.transportFramesIn,
             droppedUnprotected: metrics.droppedUnprotected,
-            droppedMalformed: metrics.droppedMalformed
+            droppedMalformed: metrics.droppedMalformed,
+            droppedPeerSessionUnavailable: metrics.droppedPeerSessionUnavailable,
+            droppedReplay: metrics.droppedReplay,
+            peerSessionRequired: metrics.peerSessionRequired != 0,
+            peerSessionReady: metrics.peerSessionReady != 0
         )
+    }
+
+    fileprivate func installPeerSession(
+        handle: UnsafeMutableRawPointer,
+        peerID: String,
+        expiresAt: Date,
+        rekeyAfterPackets: UInt64
+    ) throws {
+        guard let install = symbols.tunnelCoreInstallPeerSession else {
+            throw RustCoreBridgeError.missingSymbol("qlink_tunnel_core_install_peer_session")
+        }
+        let peerIDData = Data(peerID.utf8)
+        let expiresAtUnix = UInt64(max(0, expiresAt.timeIntervalSince1970))
+        let ok = peerIDData.withUnsafeBytes { rawBuffer in
+            install(
+                handle,
+                rawBuffer.bindMemory(to: UInt8.self).baseAddress,
+                rawBuffer.count,
+                expiresAtUnix,
+                rekeyAfterPackets
+            )
+        }
+        guard ok else {
+            throw RustCoreBridgeError.operationFailed("Rust tunnel core rejected peer-session installation")
+        }
+    }
+
+    fileprivate func clearPeerSession(handle: UnsafeMutableRawPointer) throws {
+        guard let clear = symbols.tunnelCoreClearPeerSession else {
+            throw RustCoreBridgeError.missingSymbol("qlink_tunnel_core_clear_peer_session")
+        }
+        guard clear(handle) else {
+            throw RustCoreBridgeError.operationFailed("Rust tunnel core rejected peer-session clear")
+        }
+    }
+
+    fileprivate func peerSessionReady(handle: UnsafeMutableRawPointer) throws -> Bool {
+        guard let ready = symbols.tunnelCorePeerSessionReady else {
+            throw RustCoreBridgeError.missingSymbol("qlink_tunnel_core_peer_session_ready")
+        }
+        return ready(handle)
     }
 
     func createDevQuicTransport() throws -> UnsafeMutableRawPointer {
@@ -888,6 +981,23 @@ public final class RustTunnelCoreAdapter: TunnelCoreAdapting {
     public func metrics() throws -> TunnelCoreMetrics {
         try library.metrics(handle: handle)
     }
+
+    public func installPeerSession(peerID: String, expiresAt: Date, rekeyAfterPackets: UInt64) throws {
+        try library.installPeerSession(
+            handle: handle,
+            peerID: peerID,
+            expiresAt: expiresAt,
+            rekeyAfterPackets: rekeyAfterPackets
+        )
+    }
+
+    public func clearPeerSession() throws {
+        try library.clearPeerSession(handle: handle)
+    }
+
+    public func peerSessionReady() throws -> Bool {
+        try library.peerSessionReady(handle: handle)
+    }
 }
 
 private struct QlinkOwnedBuffer {
@@ -938,6 +1048,10 @@ private struct QlinkTunnelMetrics {
     var transportFramesIn: UInt64 = 0
     var droppedUnprotected: UInt64 = 0
     var droppedMalformed: UInt64 = 0
+    var droppedPeerSessionUnavailable: UInt64 = 0
+    var droppedReplay: UInt64 = 0
+    var peerSessionRequired: UInt32 = 0
+    var peerSessionReady: UInt32 = 0
 }
 
 private struct QlinkTransportMetrics {
@@ -971,6 +1085,9 @@ private struct Symbols {
     typealias AcceptTransportFrameFn = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<UInt8>?, Int) -> Int32
     typealias PopTunnelPacketFn = @convention(c) (UnsafeMutableRawPointer?, UnsafeMutableRawPointer?) -> Bool
     typealias MetricsFn = @convention(c) (UnsafeMutableRawPointer?, UnsafeMutableRawPointer?) -> Bool
+    typealias InstallPeerSessionFn = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<UInt8>?, Int, UInt64, UInt64) -> Bool
+    typealias ClearPeerSessionFn = @convention(c) (UnsafeMutableRawPointer?) -> Bool
+    typealias PeerSessionReadyFn = @convention(c) (UnsafeMutableRawPointer?) -> Bool
     typealias DevQuicCreateFn = @convention(c) () -> UnsafeMutableRawPointer?
     typealias DevQuicDestroyFn = @convention(c) (UnsafeMutableRawPointer?) -> Void
     typealias DevQuicSendFrameFn = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<UInt8>?, Int) -> Int32
@@ -1017,6 +1134,9 @@ private struct Symbols {
     let acceptTransportFrame: AcceptTransportFrameFn
     let popTunnelPacket: PopTunnelPacketFn
     let metrics: MetricsFn
+    let tunnelCoreInstallPeerSession: InstallPeerSessionFn?
+    let tunnelCoreClearPeerSession: ClearPeerSessionFn?
+    let tunnelCorePeerSessionReady: PeerSessionReadyFn?
     let devQuicTransportCreate: DevQuicCreateFn
     let devQuicTransportDestroy: DevQuicDestroyFn
     let devQuicTransportSendFrame: DevQuicSendFrameFn
@@ -1060,6 +1180,9 @@ private struct Symbols {
         self.acceptTransportFrame = try load("qlink_tunnel_core_accept_transport_frame", from: handle)
         self.popTunnelPacket = try load("qlink_tunnel_core_pop_tunnel_packet", from: handle)
         self.metrics = try load("qlink_tunnel_core_metrics", from: handle)
+        self.tunnelCoreInstallPeerSession = optionalLoad("qlink_tunnel_core_install_peer_session", from: handle)
+        self.tunnelCoreClearPeerSession = optionalLoad("qlink_tunnel_core_clear_peer_session", from: handle)
+        self.tunnelCorePeerSessionReady = optionalLoad("qlink_tunnel_core_peer_session_ready", from: handle)
         self.devQuicTransportCreate = try load("qlink_dev_quic_transport_create", from: handle)
         self.devQuicTransportDestroy = try load("qlink_dev_quic_transport_destroy", from: handle)
         self.devQuicTransportSendFrame = try load("qlink_dev_quic_transport_send_frame", from: handle)

@@ -490,6 +490,7 @@ public struct TunnelConfiguration: Codable, Equatable, Sendable {
   public let failClosedOnNoCandidate: Bool
   public let mtu: Int
   public let crypto: CryptoPolicy
+  public let requirePeerSession: Bool
   public let killSwitch: KillSwitchPolicy
   public let meshTrustPolicy: MeshTrustPolicy
   public let discoveryIdentityMode: DiscoveryIdentityMode
@@ -515,6 +516,7 @@ public struct TunnelConfiguration: Codable, Equatable, Sendable {
     failClosedOnNoCandidate: Bool = true,
     mtu: Int = 1280,
     crypto: CryptoPolicy = CryptoPolicy(),
+    requirePeerSession: Bool = false,
     killSwitch: KillSwitchPolicy = .failClosed,
     meshTrustPolicy: MeshTrustPolicy = .developmentOptional,
     discoveryIdentityMode: DiscoveryIdentityMode = .off,
@@ -539,6 +541,7 @@ public struct TunnelConfiguration: Codable, Equatable, Sendable {
     self.failClosedOnNoCandidate = failClosedOnNoCandidate
     self.mtu = mtu
     self.crypto = crypto
+    self.requirePeerSession = requirePeerSession
     self.killSwitch = killSwitch
     self.meshTrustPolicy = meshTrustPolicy
     self.discoveryIdentityMode = discoveryIdentityMode
@@ -576,6 +579,8 @@ public struct TunnelConfiguration: Codable, Equatable, Sendable {
     self.mtu = try container.decodeIfPresent(Int.self, forKey: .mtu) ?? 1280
     self.crypto =
       try container.decodeIfPresent(CryptoPolicy.self, forKey: .crypto) ?? CryptoPolicy()
+    self.requirePeerSession =
+      try container.decodeIfPresent(Bool.self, forKey: .requirePeerSession) ?? false
     self.killSwitch =
       try container.decodeIfPresent(KillSwitchPolicy.self, forKey: .killSwitch) ?? .failClosed
     self.meshTrustPolicy =

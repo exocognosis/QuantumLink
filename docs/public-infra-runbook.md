@@ -18,8 +18,9 @@ client-side TLS/auth lands, expose those two ports only through one of:
 - an SSH tunnel for one-off validation.
 
 STUN and coturn TURN may be internet-facing. The QuantumLink data-plane relay is
-still the app relay path; coturn is currently used to prove TURN allocation and
-ICE relay-candidate gathering.
+the app relay path and is published as a signed `quantum_link_relay` candidate
+when a responder is configured with `--relay`; coturn is currently used to prove
+TURN allocation and ICE relay-candidate gathering.
 
 ## Edge Layout
 
@@ -111,6 +112,7 @@ passing evidence file must show:
 - `stun_reflexive` is non-empty;
 - `turn_relayed` is non-empty when `--turn` was supplied;
 - `published_candidate_types` includes `ServerReflexive`;
+- `published_candidate_types` includes `QuantumLinkRelay`;
 - `published_candidate_types` includes `Relay` when `--turn` was supplied;
 - `selected_path` is `relay`;
 - `frames_sent` matches the requested count.
@@ -118,8 +120,8 @@ passing evidence file must show:
 The responder deliberately publishes `127.0.0.1:1` by default as its host
 candidate. STUN/TURN candidates are still gathered and signed into the record,
 but that unreachable host candidate forces direct probing to fail quickly so the
-result proves the configured rendezvous plus QuantumLink PQC relay path rather
-than a local direct path.
+result proves the configured rendezvous plus published QuantumLink PQC relay
+candidate rather than a local direct path.
 
 ## Hardening Checks
 

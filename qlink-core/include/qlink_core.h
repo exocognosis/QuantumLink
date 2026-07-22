@@ -35,6 +35,10 @@ typedef struct QlinkTunnelMetrics {
     uint64_t transport_frames_in;
     uint64_t dropped_unprotected;
     uint64_t dropped_malformed;
+    uint64_t dropped_peer_session_unavailable;
+    uint64_t dropped_replay;
+    uint32_t peer_session_required;
+    uint32_t peer_session_ready;
 } QlinkTunnelMetrics;
 
 typedef struct QlinkTransportMetrics {
@@ -90,6 +94,18 @@ bool qlink_tunnel_core_metrics(
     QlinkTunnelCoreHandle *handle,
     QlinkTunnelMetrics *out
 );
+
+bool qlink_tunnel_core_install_peer_session(
+    QlinkTunnelCoreHandle *handle,
+    const uint8_t *peer_id,
+    uintptr_t peer_id_len,
+    uint64_t expires_at_unix,
+    uint64_t rekey_after_packets
+);
+
+bool qlink_tunnel_core_clear_peer_session(QlinkTunnelCoreHandle *handle);
+
+bool qlink_tunnel_core_peer_session_ready(QlinkTunnelCoreHandle *handle);
 
 // Disabled in the strict PQC profile because raw Quinn DATAGRAM bypasses the
 // app-layer ML-KEM/SHAKE frame session. Always returns NULL.
