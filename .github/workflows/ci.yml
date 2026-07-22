@@ -6,53 +6,122 @@ on:
   pull_request:
 
 jobs:
-  test:
-    name: Swift and Rust tests
+  rust:
+    name: Rust workspace (shared core + cross-platform silo code)
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Show toolchain
         run: |
-          swift --version
           rustc --version
           cargo --version
-          xcodebuild -version
+      # Workspace covers qlink-core plus the Windows silo's cross-platform
+      # crates (quantumlink-proto, the non-Windows parts of
+      # quantumlink-service). Windows-only modules are cfg-gated and built
+      # in windows-ci.yml.
       - name: Rust tests
         run: cargo test --workspace
       - name: Rust formatting
         run: cargo fmt --all -- --check
-      - name: Rust QUIC smoke
-        run: cargo run -p qlink-core --bin qlinkctl -- quic-loopback
-      - name: Rust mesh and relay smokes
+      - name: Rust strict PQC carrier checks
         run: |
-          cargo run -p qlink-core --bin qlinkctl -- mesh-loopback
-          cargo run -p qlink-core --bin qlinkctl -- relay-loopback
+          cargo test -p qlink-core --lib pqc_policy_tests --no-default-features --features native-udp-carrier -- --nocapture
+          cargo tree --manifest-path qlink-core/Cargo.toml --locked --no-default-features --features native-udp-carrier --target all -e normal --prefix none > native-carrier-deps.txt
+          forbidden_native_deps="$(grep -E '^(quinn|quinn-proto|rustls|rcgen|aws-lc-rs|ring) v' native-carrier-deps.txt || true)"
+          if [[ -n "$forbidden_native_deps" ]]; then
+            printf 'forbidden native-UDP dependency resolved:\n%s\n' "$forbidden_native_deps"
+            exit 1
+          fi
+          cargo test -p qlink-core --lib native_udp_session --no-default-features --features native-udp-carrier -- --nocapture
+          cargo test -p qlink-core --lib pqc_session_wire_establishes_keys_over_native_udp_carrier --no-default-features --features native-udp-carrier -- --nocapture
+          cargo check -p qlink-core --bin qlinkctl --no-default-features --features native-udp-carrier
+      - name: Rust dev QUIC carrier tests
+        run: cargo test -p qlink-core --lib --no-default-features --features dev-quic-carrier -- --nocapture
+      - name: Rust TURN relay client (off-by-default feature)
+        # turn.rs is excluded from every other job (default and dev-quic-carrier
+        # builds don't compile it); this exercises it under its own feature.
+        # Direct-dependency purity of the default build is enforced separately by
+        # the pqc_policy_tests manifest check above.
+        run: |
+          cargo test -p qlink-core --lib turn:: --features turn-relay -- --nocapture
+
+  macos:
+    name: macOS silo (Swift + XCFramework)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Show toolchain
+        run: |
+          swift --version
+          xcodebuild -version
+      # Build the shared core dylib once at the workspace root.
+      - name: Build shared core
+        run: cargo build -p qlink-core --release
+      # The XCFramework step builds a universal (arm64 + x86_64) static
+      # library, so both Apple targets must be installed.
+      - name: Install Apple Rust targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - name: macOS release readiness
+        working-directory: macos
+        run: ./scripts/macos-release-readiness.sh
       - name: Swift tests
+        working-directory: macos
         run: swift test
       - name: Swift transport smoke
+        working-directory: macos
         run: |
-          cargo build --workspace --release
-          swift run QuantumLinkSmoke validate-config --config config/mesh.example.json
+          swift run QuantumLinkSmoke validate-config --config ../config/mesh.example.json
+          preflight_log="$(mktemp)"
+          set +e
           swift run QuantumLinkSmoke preflight \
-            --config config/mesh.example.json \
+            --config ../config/mesh.example.json \
             --transport \
             --mode dev-quic-loopback \
-            --dylib "$PWD/target/release/libqlink_core.dylib"
+            --dylib "$PWD/../target/release/libqlink_core.dylib" > "$preflight_log" 2>&1
+          preflight_status=$?
+          set -e
+          cat "$preflight_log"
+          if [[ "$preflight_status" -eq 0 ]]; then
+            echo "Expected dev QUIC loopback preflight to fail closed while transport is unavailable"
+            exit 1
+          fi
+          if ! grep -q "preflight_smoke_outcome=fail-closed" "$preflight_log"; then
+            echo "Expected preflight_smoke_outcome=fail-closed"
+            exit 1
+          fi
       - name: Rust XCFramework
+        working-directory: macos
         run: ./scripts/build-rust-xcframework.sh
       - name: Development artifact package
+        working-directory: macos
         run: ./scripts/package-dev-artifacts.sh
+      - name: Upload development artifact package
+        uses: actions/upload-artifact@v7
+        with:
+          name: QuantumLink-dev-${{ github.sha }}
+          path: |
+            macos/build/dist/QuantumLink-dev.tar.gz
+            macos/build/dist/QuantumLink-dev.tar.gz.sha256
+          if-no-files-found: error
 
   xcodegen-smoke:
     name: Unsigned Xcode project smoke
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install XcodeGen
         run: brew install xcodegen
+      - name: Build Rust XCFramework
+        working-directory: macos
+        run: QLINK_RUST_TARGETS="$(rustc -vV | awk '/^host:/ { print $2 }')" ./scripts/build-rust-xcframework.sh
       - name: Generate unsigned project
-        run: ./scripts/generate-xcode-project.sh
+        working-directory: macos
+        # generate-xcode-project.sh re-runs build-rust-xcframework.sh; keep it
+        # host-only (matching the step above) so it does not require the
+        # x86_64 cross-target, which this smoke job does not install.
+        run: QLINK_RUST_TARGETS="$(rustc -vV | awk '/^host:/ { print $2 }')" ./scripts/generate-xcode-project.sh
       - name: Build unsigned app target
+        working-directory: macos
         run: |
           xcodebuild \
             -project QuantumLink.xcodeproj \

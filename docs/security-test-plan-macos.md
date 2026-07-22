@@ -43,7 +43,7 @@
 | `target/release/qlinkctl mesh-loopback` | Pass | `packet_round_trip=true`; selected path was `Relay`, so this run is relay-path evidence, not direct-path evidence. |
 | `target/release/qlinkctl relay-loopback` | Pass | `packet_round_trip=true`. |
 | `plutil -lint macos/mdm/*.mobileconfig.template macos/entitlements/*.entitlements` | Pass | All MDM templates and entitlement plists lint cleanly. |
-| `swift run QuantumLinkMDM --help` | Pass | CLI builds and prints `build-perapp` and `build-ondemand` usage. SwiftPM emits a non-security warning that `Sources/QuantumLinkApp/Assets.xcassets` is unhandled. |
+| `swift run QuantumLinkMDM --help` | Pass | CLI builds and prints `build-perapp` and `build-ondemand` usage. SwiftPM emits a non-security warning that `macos/Sources/QuantumLinkApp/Assets.xcassets` is unhandled. |
 | `./scripts/package-dev-artifacts.sh` | Pass | Created `build/dist/QuantumLink-dev.tar.gz`; the prior `SupportBundleExporter.swift` sendability warning is fixed. |
 | `./scripts/build-rust-xcframework.sh` | Blocked after Rust builds | Both Apple Darwin Rust targets compiled, then `xcodebuild -create-xcframework` failed because active developer directory is CommandLineTools, not full Xcode. |
 | `./scripts/package-macos.sh --skip-sign --pkg` | Blocked | Reached the same `xcodebuild -create-xcframework` full-Xcode boundary after Rust Darwin target builds. |
@@ -86,7 +86,7 @@
 ### 2.1 PQC Implementation Verification
 
 - [ ] **ML-KEM-768**
-  - [ ] Verify `rust/qlink-core` suite identifiers match the FIPS 203 path documented in `README.md`.
+  - [ ] Verify `qlink-core` suite identifiers match the FIPS 203 path documented in `README.md`.
   - [ ] Check encapsulation/decapsulation error handling and transcript binding.
   - [ ] Run unit tests covering handshake success, tampered transcripts, and rejected legacy suite identifiers.
   - [ ] Compare against available vendor or NIST KATs when crate support exposes stable vectors.
@@ -415,7 +415,7 @@ Expected: Developer ID signature, production App Group, packet-tunnel Network Ex
 - [ ] Rust unit/integration tests.
 - [ ] `cargo fmt --all -- --check`.
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings` when dependency and target state allow it.
-- [ ] Manual review of `Sources/QuantumLinkKit`, `Sources/QuantumLinkTunnel`, `rust/qlink-core/src`, `macos/entitlements`, `macos/mdm`, and release scripts.
+- [ ] Manual review of `macos/Sources/QuantumLinkKit`, `macos/Sources/QuantumLinkTunnel`, `qlink-core/src`, `macos/entitlements`, `macos/mdm`, and release scripts.
 
 ### Cryptography
 

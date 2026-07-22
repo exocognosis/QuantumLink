@@ -17,22 +17,22 @@ This feature list is synchronized with the current repository implementation. It
 ## Cryptography and Identity
 
 - ML-KEM-768 session establishment without a classical key-exchange fallback.
-- SHAKE256-KDF suite identifiers (`QLINK-FIPS203-MLKEM768-SHAKE256-v1`, ML-DSA-65, SLH-DSA-SHAKE128S) with anti-downgrade suite binding; legacy HKDF/X25519 identifiers are explicitly rejected.
+- FIPS 203, FIPS 204, and FIPS 205 suite identifiers with anti-downgrade suite binding.
 - ML-DSA-65 default device credential generation, persistence, signing, and verification.
-- SLH-DSA (SHAKE) signing and verification for the FIPS 205 suite path.
+- SLH-DSA-SHA2-128S signing and verification for the FIPS 205 suite path.
 - Peer IDs derived from device public-key material.
 - Signed, expiring peer records for rendezvous publication.
 - Inbound identity assertions and optional peer ACL evaluation.
-- **On-chain Dytallix identity:** node-registry contract deployed to the Dytallix testnet; `MeshTrustPolicy` (public-required / private-preferred / development-optional) enforced on both the outbound connector and inbound responder — public meshes fail closed on peers without an active registry record (live-verified against the deployed contract).
-- Production peer-session key installation into ChaCha20-Poly1305 packet-frame encryption.
-- Monotonic packet-number replay window.
+- App-layer PQC frame protection using ML-KEM session keys, SHAKE256 masking/authentication, and replay rejection.
+- Packet-core route enforcement, packet metadata normalization, peer-session readiness gates, and monotonic packet-number replay window.
 
 ## Mesh and Transport
 
-- Native UDP carrier + PQC session handshake driving the live data plane (the dev-quic loopback is retained behind a feature flag for tests only).
-- Rendezvous + relay server/client; QuantumLink native relay plus a standard TURN (RFC 5766/8656) client for relay-candidate gathering from coturn-style infrastructure.
-- Mesh connector state machine for rendezvous lookup, direct candidate probes, relay fallback, last-good path caching, and reconnect handling.
-- RFC 8445 candidate model — host / server-reflexive (STUN) / relay (native + TURN) with priority-ordered nomination.
+- Development rendezvous server and client.
+- Development relay server and client.
+- Native UDP carrier is the default mesh data-plane carrier; Quinn/rustls is feature-gated for legacy development.
+- Mesh connector state machine for rendezvous lookup, native direct candidate probes, PQC relay fallback, last-good path caching, and reconnect handling.
+- Optional ICE/STUN helper paths for connectivity checks, plus feature-gated TURN relay-candidate gathering.
 - File-backed peer store with optional ChaCha20-Poly1305 envelope encryption.
 - OpenMetrics endpoint support when explicitly configured.
 
@@ -45,9 +45,9 @@ This feature list is synchronized with the current repository implementation. It
 
 ## Not Production-Complete
 
-- Hardened public rendezvous and relay services (production abuse controls, TLS, revocation, retention limits).
-- Wiring the STUN/TURN candidate gatherers into the mesh's self-candidate publishing (the TURN client + RFC 8445 candidate model exist; the mesh does not gather them by default yet).
-- Swift app-UI surfacing of the identity module and a full-Xcode rebuild of the signed `.app` (see `docs/xcode-rebuild-onchain-identity-runbook.md`).
+- Platform/FFI production wiring that installs authenticated peer-session readiness into `PacketTunnelCore` and exposes peer-session/replay drop observability.
+- Hardened public rendezvous, STUN, TURN, and relay services.
+- RFC-complete public ICE nomination behavior against deployed public infrastructure.
 - Notarized Developer ID app and tunnel extension bundle.
 - Managed Device Attestation and SSO integration.
 - Full post-quantum update manifest and release-signing layer.

@@ -1,0 +1,17 @@
+id = "minecraft"
+display_name = "Minecraft"
+executables = ["java", "minecraft-launcher"]
+udp_ports = [19132, 25565]
+lan_discovery = true
+voice_chat_safe = true
+low_latency = true
+
+# Validation role:
+# - peer-hosted world traffic
+# - LAN discovery heavy title
+# - voice-chat-safe profile coverage
+#
+# Routing boundary:
+# - split-tunnel game traffic only
+# - do not protect Steam account, store, wallet, checkout, inventory,
+#   marketplace, launcher, or embedded browser categories

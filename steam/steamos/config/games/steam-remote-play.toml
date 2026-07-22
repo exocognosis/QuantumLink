@@ -1,0 +1,17 @@
+id = "steam-remote-play"
+display_name = "Steam Remote Play"
+executables = ["steam", "steamwebhelper"]
+udp_ports = [27031, 27036]
+lan_discovery = true
+voice_chat_safe = true
+low_latency = true
+
+# Validation role:
+# - Steam Remote Play style streaming traffic
+# - voice-chat-safe profile coverage
+# - low-latency direct-path preference
+#
+# Routing boundary:
+# - split-tunnel streaming/game traffic only
+# - do not protect Steam account, store, wallet, checkout, inventory,
+#   marketplace, launcher, or embedded browser categories

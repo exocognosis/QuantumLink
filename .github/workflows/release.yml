@@ -14,14 +14,16 @@ jobs:
     name: Build and (optionally) sign QuantumLink.app
     runs-on: macos-15
     env:
-      QLINK_APP_BUNDLE_ID: com.quantumlink.macos
-      QLINK_TUNNEL_BUNDLE_ID: com.quantumlink.macos.PacketTunnel
-      QLINK_DEVELOPMENT_TEAM: ${{ vars.APPLE_TEAM_ID }}
-      QLINK_PROVISIONING_PROFILE: ${{ vars.QLINK_PROVISIONING_PROFILE }}
+      QLINK_APP_BUNDLE_ID: ${{ vars.QLINK_APP_BUNDLE_ID }}
+      QLINK_TUNNEL_BUNDLE_ID: ${{ vars.QLINK_TUNNEL_BUNDLE_ID }}
+      QLINK_APP_GROUP: ${{ vars.QLINK_APP_GROUP }}
+      QLINK_DEVELOPMENT_TEAM: ${{ vars.QLINK_DEVELOPMENT_TEAM }}
+      QLINK_APP_PROVISIONING_PROFILE_SPECIFIER: ${{ vars.QLINK_APP_PROVISIONING_PROFILE_SPECIFIER }}
+      QLINK_TUNNEL_PROVISIONING_PROFILE_SPECIFIER: ${{ vars.QLINK_TUNNEL_PROVISIONING_PROFILE_SPECIFIER }}
       QLINK_SPARKLE_FEED_URL: ${{ vars.QLINK_SPARKLE_FEED_URL }}
       QLINK_SPARKLE_PUBLIC_ED_KEY: ${{ vars.QLINK_SPARKLE_PUBLIC_ED_KEY }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Show toolchain
         run: |
@@ -29,11 +31,14 @@ jobs:
           rustc --version
           xcodebuild -version
 
+      - name: Install Apple Rust targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
       - name: Install XcodeGen
         run: brew install xcodegen
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -48,11 +53,28 @@ jobs:
              && -n "${{ secrets.APPLE_DEVELOPER_ID_CERT_PASSWORD }}" \
              && -n "${{ secrets.APPLE_NOTARY_API_KEY_BASE64 }}" \
              && -n "${{ secrets.APPLE_NOTARY_API_KEY_ID }}" \
-             && -n "${{ secrets.APPLE_NOTARY_API_KEY_ISSUER_ID }}" ]]; then
+             && -n "${{ secrets.APPLE_NOTARY_API_KEY_ISSUER_ID }}" \
+             && -n "${{ secrets.QLINK_APP_PROVISIONING_PROFILE_BASE64 }}" \
+             && -n "${{ secrets.QLINK_TUNNEL_PROVISIONING_PROFILE_BASE64 }}" \
+             && -n "${{ secrets.SPARKLE_EDDSA_PRIVATE_KEY }}" \
+             && -n "${QLINK_APP_BUNDLE_ID:-}" \
+             && -n "${QLINK_TUNNEL_BUNDLE_ID:-}" \
+             && -n "${QLINK_APP_GROUP:-}" \
+             && -n "${QLINK_DEVELOPMENT_TEAM:-}" \
+             && -n "${QLINK_APP_PROVISIONING_PROFILE_SPECIFIER:-}" \
+             && -n "${QLINK_TUNNEL_PROVISIONING_PROFILE_SPECIFIER:-}" \
+             && -n "${QLINK_SPARKLE_FEED_URL:-}" \
+             && -n "${QLINK_SPARKLE_PUBLIC_ED_KEY:-}" ]]; then
             echo "available=true" >> "$GITHUB_OUTPUT"
           else
             echo "available=false" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Refuse unsigned tag release
+        if: startsWith(github.ref, 'refs/tags/v') && steps.signing.outputs.available != 'true'
+        run: |
+          echo "Signed release credentials, provisioning profiles, and variables are required for v* tags." >&2
+          exit 1
 
       - name: Import Developer ID certificate
         if: steps.signing.outputs.available == 'true'
@@ -88,6 +110,19 @@ jobs:
             echo "APPLE_DEVELOPER_ID_INSTALLER=$installer_name" >> "$GITHUB_ENV"
           fi
 
+      - name: Install provisioning profiles
+        if: steps.signing.outputs.available == 'true'
+        env:
+          APP_PROFILE_BASE64: ${{ secrets.QLINK_APP_PROVISIONING_PROFILE_BASE64 }}
+          TUNNEL_PROFILE_BASE64: ${{ secrets.QLINK_TUNNEL_PROVISIONING_PROFILE_BASE64 }}
+        run: |
+          set -euo pipefail
+          profile_dir="$HOME/Library/MobileDevice/Provisioning Profiles"
+          mkdir -p "$profile_dir"
+          echo -n "$APP_PROFILE_BASE64" | base64 -d -o "$profile_dir/QuantumLinkApp.provisionprofile"
+          echo -n "$TUNNEL_PROFILE_BASE64" | base64 -d -o "$profile_dir/QuantumLinkTunnel.provisionprofile"
+          ls -lh "$profile_dir"
+
       - name: Configure notary credentials
         if: steps.signing.outputs.available == 'true'
         env:
@@ -105,57 +140,72 @@ jobs:
           rm -f "$KEY_PATH"
           echo "APPLE_NOTARY_PROFILE=QLINK_RELEASE_NOTARY" >> "$GITHUB_ENV"
 
+      - name: Validate signed release settings
+        if: steps.signing.outputs.available == 'true'
+        working-directory: macos
+        run: ./scripts/macos-release-readiness.sh --require-pkg-signing-env
+
       - name: Build and (sign + notarize) macOS app
+        working-directory: macos
         run: |
           if [[ "${{ steps.signing.outputs.available }}" == "true" ]]; then
-            if [[ -n "${APPLE_DEVELOPER_ID_INSTALLER:-}" ]]; then
-              ./scripts/package-macos.sh --pkg
-            else
-              ./scripts/package-macos.sh
-            fi
+            ./scripts/package-macos.sh --pkg
           else
             ./scripts/package-macos.sh --skip-sign --pkg
           fi
 
+      - name: Generate release checksums
+        working-directory: macos
+        run: |
+          set -euo pipefail
+          shasum -a 256 build/release/*.dmg build/release/*.pkg > build/release/SHA256SUMS.txt
+
       - name: Generate appcast (signing required)
         if: steps.signing.outputs.available == 'true' && env.QLINK_SPARKLE_FEED_URL != ''
+        working-directory: macos
         run: |
+          set -euo pipefail
+          mkdir -p build/sparkle
           # Sparkle's sign_update tool needs the EdDSA private key in the
           # keychain. CI imports it from secrets just like the Developer ID cert.
-          if [[ -n "${{ secrets.SPARKLE_EDDSA_PRIVATE_KEY }}" ]]; then
-            echo "${{ secrets.SPARKLE_EDDSA_PRIVATE_KEY }}" | base64 -d > "$RUNNER_TEMP/sparkle.priv"
-            # Sparkle's generate_keys --account flag inserts an entry under that name.
-            # We import the secret key directly via security import for the same account.
-            security import "$RUNNER_TEMP/sparkle.priv" -k "$RUNNER_TEMP/quantumlink-release.keychain-db"
-            rm -f "$RUNNER_TEMP/sparkle.priv"
+          echo "${{ secrets.SPARKLE_EDDSA_PRIVATE_KEY }}" | base64 -d > "$RUNNER_TEMP/sparkle.priv"
+          # Sparkle's generate_keys --account flag inserts an entry under that name.
+          # We import the secret key directly via security import for the same account.
+          security import "$RUNNER_TEMP/sparkle.priv" -k "$RUNNER_TEMP/quantumlink-release.keychain-db"
+          rm -f "$RUNNER_TEMP/sparkle.priv"
 
-            ref="${GITHUB_REF_NAME:-dev}"
-            ./scripts/sparkle-build-appcast.sh \
-              --artifact build/release/QuantumLink.dmg \
-              --version "${ref#v}" \
-              --build "${{ github.run_number }}" \
-              --feed-url "${{ vars.QLINK_SPARKLE_FEED_URL }}/QuantumLink-${ref#v}.dmg"
-          else
-            echo "SPARKLE_EDDSA_PRIVATE_KEY secret not set; skipping appcast generation"
-          fi
+          ref="${GITHUB_REF_NAME:-dev}"
+          ./scripts/sparkle-build-appcast.sh \
+            --artifact build/release/QuantumLink.dmg \
+            --version "${ref#v}" \
+            --build "${{ github.run_number }}" \
+            --feed-url "${{ vars.QLINK_SPARKLE_FEED_URL }}/QuantumLink-${ref#v}.dmg" \
+            | tee build/sparkle/appcast-evidence.txt
+          grep -q 'sparkle:edSignature' build/sparkle/appcast.xml
 
       - name: Upload release artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: QuantumLink-macos-${{ github.ref_name }}
           path: |
-            build/release/*.app
-            build/release/*.dmg
-            build/release/*.pkg
-            build/sparkle/appcast.xml
+            macos/build/release/export/QuantumLink.app
+            macos/build/release/*.dmg
+            macos/build/release/*.pkg
+            macos/build/release/SHA256SUMS.txt
+            macos/build/release/notary-*.json
+            macos/build/sparkle/appcast.xml
+            macos/build/sparkle/appcast-evidence.txt
           if-no-files-found: warn
 
       - name: Attach to GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
-            build/release/*.dmg
-            build/release/*.pkg
-            build/sparkle/appcast.xml
+            macos/build/release/*.dmg
+            macos/build/release/*.pkg
+            macos/build/release/SHA256SUMS.txt
+            macos/build/release/notary-*.json
+            macos/build/sparkle/appcast.xml
+            macos/build/sparkle/appcast-evidence.txt
           fail_on_unmatched_files: false

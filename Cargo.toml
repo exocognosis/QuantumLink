@@ -1,4 +1,18 @@
 [workspace]
-members = ["rust/qlink-core", "dytallix/quantumlink-node-registry"]
+members = [
+    "qlink-core",
+    "dytallix/quantumlink-node-registry",
+    "windows/rust/quantumlink-proto",
+    "windows/rust/quantumlink-service",
+    "steam/steamos/rust/qlink-game",
+    "steam/steamos/rust/qlink-proto",
+    "steam/steamos/rust/qlink-linux",
+    "steam/steamos/rust/qlinkd",
+    "steam/steamos/rust/qlinkctl",
+    "steam/mobile/rust/qlink-mobile-proto",
+]
 resolver = "2"
 
+[profile.release]
+lto = "thin"
+codegen-units = 1

@@ -41,13 +41,13 @@ strings macos/build/qlink-core-universal/libqlink_core.a \
 
 ## 2. Wire the identity UI into the app (two edits)
 
-The identity **module** is already in `Sources/QuantumLinkKit/` (DiscoveryIdentityMode,
+The identity **module** is already in `macos/Sources/QuantumLinkKit/` (DiscoveryIdentityMode,
 MeshTrustPolicy, DytallixIdentityConfiguration, DytallixEnrollmentSettings, …) and
-a starter view is in `Sources/QuantumLinkApp/DytallixEnrollmentView.swift`. Two
+a starter view is in `macos/Sources/QuantumLinkApp/DytallixEnrollmentView.swift`. Two
 edits connect them:
 
 **2a. Surface the enrollment view.** In the app's configuration/security
-navigation (`Sources/QuantumLinkApp/QuantumLinkApp.swift`, the `DashboardDetailView`
+navigation (`macos/Sources/QuantumLinkApp/QuantumLinkApp.swift`, the `DashboardDetailView`
 section list), add a destination backed by persisted state:
 
 ```swift
@@ -69,7 +69,7 @@ Use Xcode's SwiftUI **preview** (the view ships a `PreviewProvider`) to iterate 
 layout — that is exactly what this environment could not do.
 
 **2b. Apply enforcement to the live transport.** In
-`Sources/QuantumLinkKit/TunnelTransport.swift` where `meshConfig` is built
+`macos/Sources/QuantumLinkKit/TunnelTransport.swift` where `meshConfig` is built
 (~line 658), apply the composer so public meshes fail closed:
 
 ```swift
@@ -86,7 +86,7 @@ let meshConfig = MeshTransportConfiguration(
 
 The Rust core auto-builds a live `DytallixIdentityRegistry` from `dytallixIdentity`
 and gates the connector + responder — verified end-to-end against the deployed
-contract in `rust/qlink-core/tests/dytallix_live.rs`. Deployed testnet contract:
+contract in `qlink-core/tests/dytallix_live.rs`. Deployed testnet contract:
 `0xbcb5cf5abb50333ee4bfde91f21bbcc24828673d` (see `config/dytallix-testnet.json`
 and `config/mesh-transport.public.example.json`).
 

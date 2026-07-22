@@ -1,0 +1,17 @@
+[package]
+name = "quantumlink-proto"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "Shared QuantumLink models and UI<->service IPC schema (port of QuantumLinkKit Models.swift / TunnelMessages.swift)"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+getrandom = "0.4"
+thiserror = "1"
+
+[dev-dependencies]
+serde_json = "1"

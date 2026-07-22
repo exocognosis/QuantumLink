@@ -2,14 +2,14 @@
 
 QuantumLink is a macOS-first peer-to-peer mesh VPN scaffold. The implementation target is a server-minimized L3 overlay: peers exchange traffic directly when possible, use rendezvous for discovery, and fall back to relay paths when direct connectivity is unavailable. It does not require a centralized VPN concentrator in the steady-state data plane.
 
-This specification reflects the current repository implementation, especially `rust/qlink-core`.
+This specification reflects the current repository implementation, especially `qlink-core`.
 
 ## Runtime Surfaces
 
 - `QuantumLinkApp`: SwiftUI app for enrollment, mesh status, operator controls, diagnostics, and profile lifecycle.
 - `QuantumLinkTunnel`: `NEPacketTunnelProvider` scaffold that configures `utun`, routes, DNS, packet ingress/egress, and kill-switch behavior.
 - `QuantumLinkKit`: shared Swift models, configuration, Keychain storage, Rust FFI bridge, packet pump, profile management, MDM helpers, and support bundles.
-- `qlink-core`: Rust protocol core for crypto orchestration, signed peer records, routing, packet-frame protection, replay protection, QUIC transport scaffolding, rendezvous, relay, ICE/STUN helpers, metrics, and FFI.
+- `qlink-core`: Rust protocol core for crypto orchestration, signed peer records, routing, packet framing, app-layer PQC frame protection, replay protection, QUIC transport scaffolding, rendezvous, relay, ICE/STUN helpers, metrics, and FFI.
 
 ## Cryptographic Model
 
@@ -17,26 +17,26 @@ The current handshake is post-quantum only for session establishment. It does no
 
 Supported suite identifiers:
 
-- `QLINK-FIPS203-MLKEM768-HKDFSHA256-v1`
-- `QLINK-FIPS204-MLDSA65-HKDFSHA256-v1`
-- `QLINK-FIPS205-SLHDSA-SHA2-128S-HKDFSHA256-v1`
+- `QLINK-FIPS203-MLKEM768-SHAKE256-v1`
+- `QLINK-FIPS204-MLDSA65-SHAKE256-v1`
+- `QLINK-FIPS205-SLHDSA-SHAKE128S-SHAKE256-v1`
 
 Implemented crypto behavior:
 
 - ML-KEM-768 three-message session establishment.
-- SHA-256 transcript hashing.
-- HKDF-SHA-256 directional key derivation with suite binding.
+- SHAKE256 transcript binding.
+- SHAKE256 directional key derivation with suite binding.
 - ML-DSA-65 device credentials by default.
-- SLH-DSA-SHA2-128S signing and verification for the FIPS 205 suite path.
+- SLH-DSA-SHAKE-128S signing and verification for the FIPS 205 suite path.
 - Signed, expiring peer records containing peer identity, device public key, routes, endpoint candidates, ICE credentials, QUIC certificate material, expiration, and sequence number.
-- ChaCha20-Poly1305 packet-frame protection in `PacketTunnelCore` using suite-bound HKDF-derived frame keys.
+- Suite-validated packet framing in `PacketTunnelCore` plus app-layer PQC frame protection on negotiated session paths.
 - Monotonic packet-number replay protection.
 
-The legacy `QLINK-HYBRID-X25519-MLKEM768-HKDFSHA256-v1` suite is intentionally rejected. Production peer sessions still need to install negotiated session keys into packet-frame encryption; current packet-frame keys are development suite-bound keys.
+The legacy `QLINK-HYBRID-X25519-MLKEM768-HKDFSHA256-v1` suite is intentionally rejected. `PacketTunnelCore` does not install negotiated session keys into an inner packet-frame cipher; it emits suite-validated packet frames and requires an authenticated peer-session readiness marker when configured to do so. Confidentiality and integrity on negotiated peer paths come from app-layer `PqcFrameProtector` instances keyed by the ML-KEM session.
 
 ## Data Plane
 
-QuantumLink is an L3 overlay. The packet tunnel provider configures a `utun` interface with protected routes and DNS settings. Protected IPv4 packets pass through `TunnelPacketPump` and `PacketTunnelCore`, where route policy is enforced, selected IPv4 metadata is normalized, and transport frames are encrypted before they are sent to the transport.
+QuantumLink is an L3 overlay. The packet tunnel provider configures a `utun` interface with protected routes and DNS settings. Protected IPv4 packets pass through `TunnelPacketPump` and `PacketTunnelCore`, where route policy is enforced, selected IPv4 metadata is normalized, and packet-core transport frames are handed to the negotiated mesh session for app-layer PQC frame protection.
 
 Current transport modes:
 
@@ -66,7 +66,7 @@ Production release still requires:
 - Developer ID signing and notarization.
 - Provisioning profiles for the app and tunnel extension.
 - MDM pre-approval flows for managed deployments.
-- Production peer-session key installation into packet-frame encryption.
+- Platform/FFI production wiring that installs authenticated peer-session readiness into `PacketTunnelCore` and exposes peer-session/replay drop observability.
 - Hardened public rendezvous/relay infrastructure.
 - Release update signing and a post-quantum manifest layer.
 

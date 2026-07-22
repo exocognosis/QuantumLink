@@ -1,171 +1,557 @@
-# QuantumLink macOS Product Specification
+# QuantumLink Product Specification
+
+Updated: 2026-06-28
 
 ## Executive summary
 
-QuantumLink should be specified as a **peer-to-peer mesh VPN with a server-minimized control plane**, not as a literally server-free system. On the public internet, a practical mesh needs at least bootstrap and rendezvous assistance, and in a nontrivial share of cases it also needs a relay path when direct UDP connectivity fails. That follows directly from the way ICE, STUN, and TURN are standardized: STUN is only a tool, ICE is the coordination framework, and TURN exists precisely because many peers cannot connect directly through NATs and firewalls. A defensible product definition is therefore: **no mandatory centralized VPN concentrator for the steady-state data plane, but optional stateless helper services for discovery, hole punching, and relay fallback**. citeturn25search3turn12search0turn10search7turn34search2
+QuantumLink is a cross-platform, post-quantum mesh VPN product built around a
+shared Rust protocol core and native platform silos for macOS, Windows, and the
+Steam/SteamOS gamer track. The product is not a conventional hub-and-spoke VPN
+and should not be specified as a literal "serverless" network. The correct
+product boundary is:
 
-For macOS, the correct architectural center of gravity is the entity["company","Apple","cupertino tech company"] **Network Extension** stack in user space, specifically a packet tunnel provider attached to a `utun` interface. Apple’s current guidance is to move VPN products away from packet filter tricks and away from legacy kernel extension patterns; Apple explicitly says packet filter is not API, and its packet tunnel provider documentation describes a virtual network interface exposed through the provider. A QuantumLink v1 should therefore be an **L3 user-space overlay** implemented with `NEPacketTunnelProvider`, not a kernel module and not a pf-based kill-switch product. citeturn5search0turn38search0turn38search1turn38search4
+**No mandatory centralized VPN concentrator in the steady-state data plane, with
+server-minimized helper services for discovery, NAT traversal, relay fallback,
+updates, and future paid access.**
 
-On post-quantum security, the repository baseline is **ML-KEM-768 session establishment, crypto agility everywhere, and cautious use of PQ signatures**. The current `qlink-core` implementation supports FIPS 203, 204, and 205 suite identifiers, uses ML-KEM-768 for session establishment, defaults device credentials to ML-DSA-65, and implements SLH-DSA-SHA2-128S for the FIPS 205 suite path. The current handshake intentionally has no X25519 or other classical key-exchange fallback. For signatures, ML-DSA-65 is the practical default leaf/device credential choice; SLH-DSA remains heavier and is best reserved for high-assurance or specialized signing flows until product requirements justify routine use.
+The traffic path is peer-to-peer or relay-assisted, end-to-end encrypted, and
+off-chain. Identity and authorization are verified before peers are allowed to
+participate in a public mesh. The product promise is therefore:
 
-Operationally, the product should ship as a **Developer ID–signed, notarized direct-distribution Mac app plus extension**, with PKG support for enterprise rollout and Sparkle-based background updates for non-App-Store users. Enterprise features should rely on Apple deployment primitives rather than bespoke installers: Automated Device Enrollment, Device Enrollment, Managed Device Attestation, the Extensible SSO payload, and the per-app VPN mapping payload on managed Macs. citeturn37search7turn37search10turn9view0turn9view1turn41search0turn41search1turn41search6turn41search13turn3search12turn8view1
+**Identity on-chain. Traffic off-chain. Access accountless. Transport
+server-minimized.**
 
-## Product goals and target users
+The refreshed product direction adds a first-class **on-chain identity
+verification** feature backed by Dytallix. Public meshes require a live,
+matching Dytallix registry entry before dialing or accepting a peer. Private
+meshes can warn and continue when registry status is missing. Development
+meshes can disable registry enforcement entirely. This gives QuantumLink a
+decentralized trust layer without putting packet data, routes, DNS, peer
+endpoints, or session keys on-chain.
 
-QuantumLink’s product goal should be **secure overlay connectivity without a hub-and-spoke trust bottleneck**. The value proposition is not “VPN, but decentralized” in the abstract. It is: **direct device-to-device encrypted reachability, low operational overhead, strong endpoint identity, minimal persistent metadata, and acceptable behavior on hostile consumer networks**. If the specification pursues those goals, QuantumLink becomes useful both as a remote-access tool and as a private connectivity substrate for device fleets, developer machines, and small-site networking.
+QuantumLink is source-ready for local protocol, client, packaging, and platform
+development. It is not yet a production VPN bundle. Production release still
+requires platform signing, Apple Network Extension entitlement approval for
+macOS, hardened public rendezvous/relay infrastructure, platform/FFI wiring for
+authenticated packet-session readiness and observability, release update signing,
+and real-hardware validation across supported platforms.
 
-The highest-value target users are three groups. The first is **small teams and technical individuals** who want private access between laptops, home labs, NAS devices, and personal servers without operating a gateway concentrator. The second is **security-conscious SMB and mid-market IT** that want mesh connectivity, device-bound policy, and enterprise sign-in without deploying a full SD-WAN stack. The third is **managed enterprise environments** that want per-app VPN, SSO, enrollment, device attestation, and compliance controls on macOS endpoints. Enterprise use is especially important on this platform because macOS exposes first-party deployment primitives for automated enrollment, SSO payloads, per-app VPN mapping, and managed attestation. citeturn41search0turn41search6turn41search13turn41search1turn3search12
+## Product goals
 
-The right use cases follow from that target set. QuantumLink should handle remote development access to private RFC1918 space, service-to-service overlay paths between edge devices, private reachability across home and office networks, and point-to-point admin access where exposing inbound ports is undesirable. It should not try to be everything in v1. In particular, a first macOS release should **not** chase full Ethernet bridging semantics, consumer-grade anonymous browsing, or full-scale enterprise ZTNA policy orchestration. The first release should be an **IP-layer mesh overlay with strong identity, usable UX, and predictable recovery behavior**.
+QuantumLink should optimize for five durable product outcomes:
 
-A hard product boundary is also necessary: a “serverless mesh VPN” for the open internet is only credible if “serverless” means **no mandatory centralized traffic concentrator**. If marketing or internal design assumes discovery and relay can be eliminated entirely, the product will fail under symmetric NAT, UDP-blocking firewalls, captive networks, and sleeping/mobile peers. TURN exists because those conditions are normal, not edge cases. citeturn25search3turn12search0turn10search7
+- Secure device-to-device reachability without a mandatory traffic concentrator.
+- Strong peer identity that can survive device restarts, network changes, and
+  public mesh discovery.
+- Post-quantum session establishment and crypto-agile protocol boundaries.
+- Privacy-preserving defaults for discovery, diagnostics, relay use, and
+  support bundles.
+- Native OS integration instead of a lowest-common-denominator VPN wrapper.
 
-## Threat model and security requirements
+The product should be explained as a private connectivity substrate, not as an
+anonymous browsing product. QuantumLink is for remote access, small-team mesh
+networking, private development infrastructure, secure device fleets, and
+game-aware low-latency routing. It should not promise anonymity, region
+evasion, traffic laundering, or unrestricted export until those claims have
+legal and technical backing.
 
-QuantumLink should assume six attacker classes. First, a **passive network observer** such as an ISP, Wi‑Fi operator, relay operator, or compromised LAN element. Second, an **active on-path attacker** who can reorder, replay, drop, or inject packets during discovery or transport. Third, a **malicious or compromised bootstrap/rendezvous service** that can lie about peer locations or attempt correlation. Fourth, a **malicious relay** that can observe metadata and packet timing but should not learn payload contents. Fifth, a **stolen or malware-compromised endpoint**. Sixth, a **curious local network** where discovery traffic itself leaks hostnames or service presence. RFC 6762 and related privacy analysis make the local-LAN point explicit: mDNS materially exposes device presence and naming information and should not be a silent always-on discovery mode. citeturn36search0turn35search1
+## Product pillars
 
-The minimum cryptographic requirement for confidentiality in this repository is **post-quantum ML-KEM-768 session establishment** with transcript-bound HKDF key derivation and strict suite negotiation. The current suite identifiers are `QLINK-FIPS203-MLKEM768-HKDFSHA256-v1`, `QLINK-FIPS204-MLDSA65-HKDFSHA256-v1`, and `QLINK-FIPS205-SLHDSA-SHA2-128S-HKDFSHA256-v1`. The Rust core rejects the legacy `QLINK-HYBRID-X25519-MLKEM768-HKDFSHA256-v1` identifier so documentation and tests do not imply a classical fallback that is not implemented.
+### Post-quantum mesh data plane
 
-The minimum authentication requirement is **versioned device credentials plus explicit crypto agility**. For leaf credentials, **ML-DSA-65** is the practical post-quantum choice: it lands in NIST security category 3 and has a 1952-byte public key and a 3309-byte signature. **SLH-DSA** is too heavy for routine live peer authentication in a mesh: even its 128-bit security parameter sets have 7856-byte or 17088-byte signatures, and the larger sets become much bigger still. The specification should therefore use **ML-DSA-65 for leaf/device credentials**, and reserve **SLH-DSA** for offline roots, recovery packages, or rare high-assurance signing flows. Because mixed classical/post-quantum credential norms are still evolving, any migration envelope should remain optional rather than a protocol invariant. citeturn16view2turn22view0turn18view0turn20view0turn20view1turn14search12
+QuantumLink's shared core owns ML-KEM-768 session establishment, ML-DSA-65
+device credentials, SLH-DSA-SHAKE-128S support for the FIPS 205 path,
+SHAKE256 transcript binding, SHAKE256 directional derivation, app-layer PQC
+frame protection, and monotonic replay protection.
 
-The key-management requirement is **device-local secret protection with minimal trust in the UI app**. Apple’s security model gives two useful platform primitives: the Keychain, which stores small secrets in an encrypted database, and the Secure Enclave, which provides isolated hardware-backed security services. Apple’s platform security documentation also states that keychain metadata and secret values are separately protected, and that the secret key path always involves the Secure Enclave on supported systems. The right design pattern is therefore: store QuantumLink’s long-term secret seeds and session cache material in the **Data Protection keychain**, and optionally bind sensitive operations to a **Secure-Enclave-backed local platform key** for device trust, unlock gating, and enterprise attestation workflows. That is better than assuming arbitrary PQC private keys can live natively inside the enclave API surface. citeturn27search4turn27search0turn27search2
+The legacy hybrid X25519/ML-KEM suite identifier is intentionally rejected. The
+v1 direction is post-quantum session establishment without a classical
+key-exchange fallback. Any future hybrid or standards-track transition must be
+explicitly versioned and tested instead of implied by documentation.
 
-Forward secrecy, replay protection, and metadata protection should be specified explicitly rather than left to library defaults. Every production connection should install negotiated ML-KEM-derived session keys into packet-frame encryption, with mandatory rekeying on both a time threshold and a byte-count threshold. Data packets should carry **monotonic packet numbers**, a **sliding replay window**, and per-direction key separation. Handshake messages should be transcript-bound and include anti-downgrade markers. Metadata protection should include rotating peer aliases, encrypted control-plane messages, and a strict ban on shipping usernames, hostnames, or stable organizational identifiers in cleartext discovery paths. DNS should default to tunnel-provided resolvers, not ambient local resolvers, and local-LAN discovery should be opt-in because mDNS is link-visible by design. QUIC’s packet protection, path migration, and low-latency setup make it an especially strong substrate for this model.
+### Server-minimized control plane
 
-The table below summarizes the main post-quantum choices that matter for a mesh VPN, based on NIST FIPS 203, 204, and 205. citeturn21view0turn22view0turn20view0
+The control plane is layered:
 
-| Primitive | Recommended role in QuantumLink | Security category | Notable size facts | Main trade-off |
-|---|---|---:|---|---|
-| ML-KEM-768 | **Default session KEM** | 3 | 1184-byte encapsulation key, 1088-byte ciphertext | Strong default; current repo has no classical ECDH fallback |
-| ML-KEM-512 | Compatibility / lower-cost option | 1 | Smaller than 768 | Lower margin; not the best default |
-| ML-KEM-1024 | High-assurance policy tier | 5 | 1568-byte encapsulation key, 1568-byte ciphertext | Higher cost and larger messages |
-| ML-DSA-65 | **Default PQ leaf credential signature** | 3 | 1952-byte pubkey, 3309-byte signature | Practical for peer auth; still much larger than Ed25519 |
-| ML-DSA-87 | High-assurance admin/root policy | 5 | 2592-byte pubkey, 4627-byte signature | Larger signatures and CPU cost |
-| SLH-DSA-128s / 128f | Offline recovery / root-signing option | 1 | 7856-byte or 17088-byte signature | Conservative hash-based design, but too large for routine live handshakes |
+- Signed, expiring peer records carry peer identity, device public key, routes,
+  endpoint candidates, ICE credentials, QUIC certificate material, expiration,
+  and sequence number.
+- Rendezvous services publish and look up short-lived peer records.
+- ICE/STUN helpers support candidate validation and direct path selection.
+- Relay services provide fallback when direct paths fail.
+- Peer stores cache verified records for graceful degradation when rendezvous
+  is unavailable.
 
-## Privacy and compliance
+The development rendezvous and relay services in this repository are not
+hardened public infrastructure by themselves. A production deployment needs
+authentication policy, abuse controls, TLS, monitoring, durable revocation,
+retention controls, and operational runbooks.
 
-For privacy, QuantumLink should be designed as if **control-plane metadata is regulated data**. Under GDPR, the core design implications come from the principles in Article 5, the privacy-by-design/default requirement in Article 25, and the security-of-processing requirement in Article 32. Those provisions require lawful and transparent processing, minimization, purpose limitation, default restriction to only necessary personal data, and appropriate technical and organizational security measures including encryption and pseudonymization where appropriate. Because VPN control planes routinely process IP addresses, device identifiers, account identifiers, connection timestamps, and potentially DNS-derived metadata, the product should treat all of that as regulated personal data in the ordinary case. citeturn32search0turn33search0turn32search7
+### On-chain identity verification
 
-That translates into concrete product rules. Telemetry should be **off by default unless strictly needed for service delivery or admin policy**. Relay servers should store **only short-lived operational data** needed to route traffic, defend against abuse, or support billing if billing exists later. Discovery records should use pseudonymous node identifiers and short TTLs. Debug logs should remain local unless the user or enterprise admin explicitly exports them. Support bundles should redact peer IPs by default and require an elevated export action for raw packets or raw resolver failures. In GDPR terms, that is not optional polish; it is exactly what privacy by design and data minimization demand. citeturn33search0turn32search7
+Dytallix-backed identity is a first-class product feature. It binds a
+QuantumLink peer identity to an on-chain registry record so public mesh peers
+can reject unregistered, revoked, suspended, or mismatched identities before
+transport setup.
 
-The CCPA/CPRA implications are similar. The official California text requires notice at or before collection, collection/use/retention that is reasonably necessary and proportionate, contractual restrictions with service providers and contractors, and reasonable security procedures appropriate to the nature of the data. It also defines business purposes that include security/integrity and debugging, but those uses still have to remain proportionate. For QuantumLink, that means a public privacy notice must explain what identity, device, connection, and diagnostics data are collected; retention defaults must be short; and relay/update/analytics subprocessors must be under clear contractual controls if the product ever uses them. citeturn30search0turn29view1turn29view2
+The identity layer is discovery-adjacent, not packet-path infrastructure. It
+does not route traffic, decrypt traffic, inspect DNS, hold session keys, or
+store raw peer endpoints. The default public mode proves eligibility without
+publishing the wallet address in rendezvous records.
 
-Export controls cannot be ignored. The U.S. BIS guidance states that encryption items generally fall under Category 5 Part 2, with License Exception ENC in Section 740.17 providing broad authorizations subject to classification and reporting requirements. BIS also provides separate mass-market guidance for some products. A PQC mesh VPN will almost certainly implicate those rules because it is encryption software by design. The safe specification position is: **assume Category 5 Part 2 review is required, plan for ENC/mass-market analysis before broad international shipment, and do not promise unrestricted export until legal classification is complete**. citeturn29view3turn28search4turn28search1
+### Accountless commercial access
 
-## macOS architecture and UX integration
+QuantumLink should not require a QuantumLink username/password account to unlock
+future paid access. The paid-access model should be a signed cryptographic
+entitlement bound to an opaque subject, such as a Dytallix wallet hash or
+QuantumLink device public key hash.
 
-A macOS QuantumLink client should be split into three runtime surfaces: a **SwiftUI desktop app**, a **packet tunnel provider extension** that owns the tunnel, and a small **privileged lifecycle/install surface** only where direct distribution requires it. The packet tunnel provider is the core. Apple’s documentation describes it as a VPN client for a packet-oriented custom VPN protocol, and the modern macOS guidance centers Network Extension rather than kernel extensions or packet filter hacks. The system creates a `utun` interface for the provider. That is the correct abstraction for a mesh overlay carrying IP packets. citeturn38search1turn38search0turn38search4turn5search0
+Billing may issue or verify entitlement proofs, but billing must not enter the
+VPN transport path. It must not see peer IDs, routes, DNS queries, packet
+metadata, session keys, or mesh traffic. Product language should use
+"accountless access" and "billing outside the transport path," not stronger
+claims such as anonymous payment unless the implementation actually delivers
+that property.
 
-Kernel space should be avoided. Apple’s deployment documentation says kernel extensions are no longer recommended and that users should prefer solutions that do not extend the kernel. For QuantumLink, that means: **no kext**, **no TAP-style kernel dependency**, and **no pf-based core security model**. If a future version needs L2 semantics, macOS now exposes `NEEthernetTunnelProvider` on macOS 13+, but that should be treated as a later extension, not the initial product center. A first release should stay with `NEPacketTunnelProvider` because most mesh VPN functionality is L3, not Ethernet bridging. citeturn41search11turn38search6turn38search1
+### Native platform silos
 
-The installer and trust flow need the same discipline. For direct distribution, Apple’s own documentation is clear: outside the Mac App Store, the app should be signed with a **Developer ID** certificate and **notarized**. Apple’s platform security guide explains that notarization produces a ticket that can be stapled and verified offline, and Gatekeeper uses code signing plus notarization as part of its malware defense chain. The best user experience for unmanaged users is therefore a **notarized DMG or PKG**, with a PKG favored for enterprise deployments because it can handle extension setup more predictably. Managed deployments should use MDM to pre-approve relevant extensions and reduce user friction. citeturn37search7turn37search10turn9view0turn9view1turn41search5turn41search2
+All platform clients use the same protocol core:
 
-The architecture below reflects the recommended split. The control helpers are optional from a steady-state data-plane perspective, but they are not optional from a real-world product perspective.
+- macOS uses SwiftUI, Network Extension, Keychain, XcodeGen, MDM payloads, and
+  Apple signing/notarization flows.
+- Windows uses a privileged Rust service, Wintun, WFP kill switch, DPAPI,
+  named-pipe IPC, WinUI 3, and WiX packaging.
+- Steam/SteamOS is a gamer-focused product track with game-aware routing,
+  Steam-safe bypass policy, streamer/privacy modes, and low-latency goals.
 
-```mermaid
-flowchart LR
-    UI[QuantumLink macOS App\nSwiftUI + Local Controller]
-    EXT[Packet Tunnel Provider\nNEPacketTunnelProvider]
-    IPC[XPC / Shared State]
-    UTUN[utun Interface\nRoutes + DNS + Policy]
-    CORE[Mesh Core\nQUIC + PQC Handshake + Routing]
-    DISC[Discovery Layer\nRendezvous / Private DHT / mDNS]
-    NAT[NAT Traversal\nICE + STUN]
-    RELAY[Relay Fallback\nTURN-like or QUIC relay]
-    KEY[Local Secrets\nKeychain + Device-bound trust]
-    SSO[Enterprise\nSSO / Enrollment / Attestation]
+There should be no separate macOS protocol, Windows protocol, or Steam protocol.
+Each silo wraps the shared mesh engine with OS-specific UI, privilege, tunnel,
+packaging, and release mechanics.
 
-    UI --> IPC
-    IPC --> EXT
-    EXT --> UTUN
-    EXT --> CORE
-    CORE --> NAT
-    CORE --> DISC
-    CORE --> RELAY
-    EXT --> KEY
-    UI --> SSO
+## Target users and use cases
+
+The highest-value users are:
+
+- Technical individuals and small teams connecting laptops, home labs, NAS
+  devices, workstations, and private services without operating a gateway VPN.
+- Security-conscious SMB and mid-market IT teams that want mesh connectivity,
+  device-bound policy, and clear trust diagnostics without deploying a full
+  SD-WAN stack.
+- Managed enterprise environments that need per-app VPN, SSO, device
+  attestation, enrollment policy, and signed release artifacts.
+- Gamers and streamers who need Steam-safe, low-latency connectivity for
+  trusted peers without routing store, wallet, checkout, or account-security
+  traffic through the tunnel.
+
+V1 should focus on remote development access, private service reachability,
+point-to-point administration, small-site networking, and team/fleet mesh
+connectivity. V1 should not chase full Ethernet bridging, anonymous browsing,
+consumer geo-evasion, or full enterprise ZTNA orchestration.
+
+## Current implementation snapshot
+
+This specification reflects the active repository, especially `qlink-core`,
+`macos/`, `windows/`, and `steam/`.
+
+Implemented or scaffolded behavior includes:
+
+- ML-KEM-768 three-message session establishment.
+- ML-DSA-65 device credentials by default.
+- SLH-DSA-SHA2-128S signing and verification for the FIPS 205 suite path.
+- SHAKE256 transcript binding and SHAKE256 directional key derivation.
+- Signed, expiring peer records.
+- App-layer PQC frame protection with replay rejection for direct mesh links.
+- Packet core framing and metadata normalization; the packet core is not a
+  classical encryption boundary.
+- Native UDP carrier session-wire test coverage; default live mesh direct
+  dialing and inbound response use the native UDP carrier with app-layer PQC
+  session establishment.
+- Optional dev-only QUIC DATAGRAM carrier transport behind `dev-quic-carrier`,
+  rendezvous lookup, direct probes, optional ICE, PQC relay fallback, peer-store
+  persistence, per-peer state, and network-event reconnect behavior.
+- Host/STUN candidate gathering is available in default builds, and TURN relay
+  candidate gathering is available behind the explicit `turn-relay` feature.
+- macOS SwiftUI app, `NEPacketTunnelProvider` scaffold, `QuantumLinkKit`,
+  Keychain-backed identity paths, MDM payload templates, XcodeGen project, and
+  packaging/release scripts.
+- Windows service, Wintun/WFP direction, DPAPI secret storage, named-pipe IPC,
+  WinUI 3 surface, WiX packaging, and beta runbook.
+- Steam/SteamOS product and policy planning surfaces.
+
+Production gaps include:
+
+- Apple-granted Network Extension entitlements and production provisioning.
+- Developer ID signing, notarization, stapling, and Gatekeeper validation.
+- Hardened public STUN/TURN/rendezvous/relay deployment and RFC-complete
+  nomination behavior against that deployed infrastructure.
+- Hardened public rendezvous and relay infrastructure.
+- Signed Sparkle/platform update pipeline paired with a post-quantum release
+  manifest layer.
+- Production Dytallix mainnet or hardened registry trust root for public
+  identity enforcement.
+- Real-hardware, multi-platform release validation.
+
+## On-chain identity verification
+
+### Feature definition
+
+On-chain identity verification binds a QuantumLink peer record to a Dytallix
+registry entry. The registry proves that a Dytallix wallet owns or authorizes a
+QuantumLink device identity. QuantumLink peers use that registry state as a
+connection policy input before dialing, accepting, or publishing into public
+mesh infrastructure.
+
+The feature must preserve this split:
+
+- The Dytallix registry verifies persistent identity, status, and optional
+  reputation or staking policy.
+- QuantumLink signed peer records verify fresh discovery and transport
+  information.
+- QuantumLink inbound identity assertions verify that the connected endpoint is
+  the peer that was authorized.
+- Packet encryption remains local to the QuantumLink transport and never
+  depends on the chain for packet handling.
+
+### Identity modes
+
+| Mode | Meaning | Intended use |
+|---|---|---|
+| `Off` | Do not use Dytallix identity for discovery or peer policy. | Development meshes and fully private meshes. |
+| `Verified` | Verify active registry status without publishing the wallet address in rendezvous records. | Default for public meshes. |
+| `Public Wallet` | Publish the Dytallix wallet address in the discovery record for operator identity, reputation, or staking visibility. | Public operators who intentionally want visible identity. |
+
+Public meshes must not allow `Off`. The app should disable that option for
+public meshes or require the user to switch the mesh type to private or
+development before disabling registry verification.
+
+The term "ZK ID" is reserved for a later proof mode. The MVP `Verified` mode is
+registry-backed and privacy-preserving by minimization and redaction, but it is
+not zero-knowledge unless a real proof system is implemented.
+
+### Mesh trust policy
+
+| Mesh type | Registry behavior | Connection behavior |
+|---|---|---|
+| Public | Required | Reject peers without an active matching Dytallix registry entry. |
+| Private | Preferred | Accept valid QuantumLink peers, but warn when registry verification is missing, stale, or unavailable. |
+| Development | Optional | Do not require registry verification; if enabled, use the same real Dytallix path as other mesh types. |
+
+Public policy should fail closed for missing, revoked, suspended, mismatched, or
+unavailable registry state unless a narrowly configured cached-proof grace
+period is active.
+
+### Registry data model
+
+The Dytallix contract should store compact identity records keyed by
+QuantumLink `peer_id`:
+
+```text
+peer_id: string
+owner_daddr: string
+device_public_key_hash: bytes32
+latest_peer_record_hash: bytes32
+status: active | revoked | suspended
+reputation_score: u64
+stake_status: optional enum/string
+updated_at: u64
+expires_at: optional u64
+metadata_commitment: optional bytes32
 ```
 
-The UX flows should be correspondingly simple. First-run should do six things only: install components, create the VPN profile, sign in or accept an invite, enroll or mint device credentials, test direct connectivity, and join the mesh. Connection UI should show **direct vs relay path**, **current IP families**, **last rekey time**, **DNS mode**, and **route mode**. Admin UX should clearly separate **user identity**, **device identity**, and **peer authorization**, because conflating those is how mesh tools become impossible to debug.
+The contract must not store raw peer endpoints, hostnames, route lists, DNS
+activity, packet data, packet timing, relay paths, or session material.
+`latest_peer_record_hash` binds a short-lived rendezvous record to persistent
+registration without copying the whole peer record on-chain.
 
-Packaging options differ materially on macOS. The table below summarizes the practical choices using Apple’s distribution and notarization model and Sparkle’s update model. citeturn37search7turn9view0turn7search0turn8view1
+### Enrollment flow
 
-| Approach | Best use case | Advantages | Costs / limits | Recommendation |
-|---|---|---|---|---|
-| Mac App Store | Consumer discovery, simpler updates | Apple-hosted distribution and auto-updates | Approval constraints; less enterprise control | Secondary channel only |
-| Developer ID DMG | Individual direct download | Simple install, flexible release cadence | Weaker enterprise automation than PKG | Good for public direct distribution |
-| Developer ID PKG | Enterprise rollout | Better extension/setup handling, MDM-friendly | Heavier packaging pipeline | **Best primary enterprise path** |
-| MDM-delivered PKG | Managed fleets | Pre-approval of extensions, policy enforcement, per-app VPN mapping | Requires MDM | **Best managed deployment path** |
-| Sparkle-backed direct updates | Non-App-Store updates | Secure appcast flow, sandbox support, EdDSA + Apple signing checks | Classical update-signing model unless extended | **Recommended for direct channel** |
+1. QuantumLink loads or creates a persistent Dytallix wallet through the real
+   Dytallix wallet or SDK path.
+2. QuantumLink loads or creates the existing ML-DSA device identity through the
+   platform secret store.
+3. The Rust core derives the QuantumLink `peer_id` from the device public key.
+4. QuantumLink builds a registration payload containing `peer_id`,
+   `device_public_key_hash`, `latest_peer_record_hash`, selected identity mode,
+   and timestamps.
+5. The device key signs a binding statement so device ownership and wallet
+   ownership are both represented.
+6. The Dytallix wallet submits the registry contract call.
+7. QuantumLink caches registry status and proof freshness for diagnostics and
+   offline tolerance.
 
-## Features and functionality
+Wallet secrets stay in the Dytallix keystore or a future Keychain-backed wallet
+wrapper. QuantumLink device private keys stay in the platform secret store.
+The tunnel/runtime receives only validated policy and registry configuration; it
+must not own wallet secrets.
 
-Peer discovery should be explicitly layered. On the **local network**, QuantumLink can offer mDNS-based discovery because RFC 6762 makes zero-configuration local discovery easy. On the **public internet**, the default should be an authenticated rendezvous service carrying signed peer records, with an optional private Kademlia DHT for organizations or advanced users who want more decentralized lookup. libp2p’s rendezvous and Kad-DHT models are good conceptual fits here: rendezvous gives bounded, signed presence exchange; DHT gives decentralized peer lookup. The product should not force DHT usage because many enterprise networks and consumer routers will degrade or block it. citeturn36search0turn34search2turn34search1turn34search7
+### Verification flow
 
-NAT traversal should follow standards, not folklore. ICE is the coordination framework. STUN is a discovery and keepalive tool. TURN is the relay fallback when direct paths fail. In implementation terms, QuantumLink should gather host, reflexive, and relay candidates; prioritize direct UDP paths; run paced connectivity checks; and cache last-good paths by peer and network. It should also support **multi-homing**, because QUIC explicitly supports path migration and network path changes are normal on laptops moving between Wi‑Fi, Ethernet, tethering, and sleep/wake states. citeturn25search3turn12search0turn10search7turn10search0
+For every discovered peer:
 
-Routing and policy should be opinionated. The default should be **split tunnel**, because full-tunnel behavior is not always desirable in a mesh and creates more breakage on macOS. The product should support subnet routes, host routes, DNS-aware route selectors, and peer ACLs at the overlay layer. For enterprise use, per-app routing is viable on macOS through Apple’s **App-to-App-Layer VPN Mapping** payload; Apple’s published payload schema shows bundle identifier mapping to a VPN UUID and supported code-signature matching fields. That means QuantumLink can support true per-app VPN behavior, but it should present it as an **enterprise-managed feature**, not a casual consumer toggle. citeturn3search12
+1. Fetch the signed QuantumLink `PeerRecord` from rendezvous or peer-store
+   cache.
+2. Verify the peer record signature, expiry, mesh ID, sequence number, and
+   public-key binding.
+3. Compute `device_public_key_hash` and `latest_peer_record_hash`.
+4. Evaluate the mesh trust policy.
+5. Query the Dytallix registry or use a fresh cached registry proof.
+6. For public meshes, require an active record with matching `peer_id`, matching
+   device public key hash, matching or policy-fresh peer record hash, and any
+   configured reputation/staking threshold.
+7. Start the QuantumLink carrier and app-layer PQC session only after registry
+   policy passes.
+8. Complete the existing inbound identity assertion before accepting traffic.
 
-A kill switch is still necessary, but it should be defined precisely. On unmanaged Macs, the product should implement a **fail-closed route policy inside the packet tunnel lifecycle**: when the overlay is expected to be up, traffic for protected prefixes must not silently escape to the default interface. On managed Macs, the design can be strengthened with **VPN On Demand** rules and MDM policy so the system starts and maintains the tunnel under defined conditions. Apple exposes on-demand rule constructs for this, and the NEVPNManager API manages Personal VPN configuration on macOS. citeturn4search9turn4search1turn4search15
+Rejected peers should produce operator-readable reasons such as
+`rejected_missing_registry`, `rejected_revoked`, `rejected_suspended`,
+`rejected_key_mismatch`, `rejected_record_hash_mismatch`,
+`rejected_stake_or_reputation`, and `registry_unavailable`.
 
-Diagnostics and observability should be split into **local operator diagnostics** and **admin telemetry**. Locally, the product should expose path type, candidate pair, relay status, RTT, loss estimate, rekey time, peer count, bytes in/out, and route state. Structured logs should go through Apple’s unified logging system using `Logger`/OSLog. For exported telemetry, the best shape is vendor-neutral structured logs plus Prometheus/OpenMetrics-compatible counters and gauges, but only through explicit opt-in or enterprise policy. The client should never exfiltrate packet-level or DNS-level content by default. citeturn39search6turn39search9turn39search2turn39search8turn39search1turn39search25
+### UX requirements
 
-Enterprise controls should use platform facilities wherever possible. Apple’s deployment material shows support for Automated Device Enrollment, Device Enrollment, Managed Device Attestation, the Extensions payload, and the Extensible SSO payload. That gives QuantumLink a clean enterprise story: enroll the Mac, attest device properties, deliver identities and policy over MDM, pre-approve extensions, and attach SSO to the app’s user identity flow. That is materially better than inventing a private enterprise bootstrap protocol. citeturn41search0turn41search6turn41search1turn41search5turn41search13
+The app should expose identity state in operational terms:
 
-## Recommended tech stack
+- Wallet present or missing.
+- Registry endpoint and contract.
+- Mesh trust policy.
+- Identity mode: `Off`, `Verified`, or `Public Wallet`.
+- Current registry status.
+- Last successful verification time.
+- Last rejection reason.
+- Whether the wallet address is hidden or intentionally published.
 
-The best overall implementation strategy is a **Swift + Rust product**. Use SwiftUI for the macOS app and settings surface, and a Rust networking core for the transport, crypto orchestration, traversal, discovery, and metrics engine. That division matches the platform boundary: Swift is the best fit for app lifecycle, settings, and Apple framework integration; Rust is the best fit for protocol-heavy, concurrency-heavy, memory-sensitive networking code. The app and extension should communicate over a narrow IPC boundary, with the tunnel provider remaining small and delegating most protocol logic to the Rust core where feasible.
+The default public display should show "Verified" without exposing
+`owner_daddr`. Raw wallet addresses should appear only in `Public Wallet` mode,
+explicit detailed diagnostics, or operator-approved support export.
 
-For PQC libraries, the recommendation is **not** to hardwire QuantumLink to one experimental library forever. entity["organization","Open Quantum Safe","pqc open source project"] `liboqs` is the strongest near-term choice for a prototype-to-product path because OQS explicitly targets real-world prototyping and provides protocol integrations around TLS/X.509 experiments. `PQClean` is useful as a reference corpus and for portability studies, but PQClean’s maintainers have announced it is being retired and archived in 2026, so it should **not** be the long-term primary dependency for a shipping VPN. citeturn42search0turn42search4turn42search1turn42search13
+## Accountless entitlements and access gates
 
-For transport, the best default is **QUIC v1 plus QUIC DATAGRAM**. RFC 9000 gives path migration, low-latency setup, and congestion control; RFC 9001 binds QUIC to TLS 1.3; RFC 9221 adds unreliable datagrams that map well to packet-tunnel carriage. The alternative is a WireGuard-like custom UDP transport, which can shave overhead but increases protocol-design burden and standardization risk, especially once post-quantum behavior is added. DTLS 1.3 is standards-based and smaller conceptually than QUIC, but it lacks QUIC’s migration and ecosystem momentum for application-managed multiplexed transports. citeturn10search0turn10search1turn10search2turn11search1turn11search0
+Paid access is future-state architecture and should not be framed as active beta
+charging. The correct model is to charge for a cryptographic entitlement, not
+for a QuantumLink login.
 
-The transport comparison below reflects those trade-offs. citeturn10search0turn10search1turn10search2turn11search0turn11search1
+A signed entitlement should contain only the minimum required fields:
 
-| Transport | Strengths | Weaknesses | Fit for QuantumLink |
-|---|---|---|---|
-| **QUIC + DATAGRAM** | Path migration, modern congestion control, low-latency setup, mature user-space libraries | More protocol surface and implementation complexity | **Best default** |
-| WireGuard-like custom UDP | Minimal framing overhead, very efficient data plane | More custom cryptographic design work for post-quantum adaptation and observability | Good future optimization path, not best v1 |
-| DTLS 1.3 | Standards-based datagram security | Less ergonomic migration/rebinding behavior than QUIC | Reasonable fallback thought experiment, not preferred |
+```text
+entitlement_id
+subject
+plan
+features
+issued_at
+expires_at
+max_devices
+signing_key_id
+signature
+```
 
-For QUIC implementations, **Quinn** and **quiche** are the two best sourced options in the current ecosystem. Quinn is a pure-Rust, async-friendly QUIC implementation and fits a Rust-first core. quiche is lower-level and gives tighter packet-loop control, which may matter if you want a very custom tunnel scheduler or a C ABI boundary. For QuantumLink on macOS, **Quinn is the better first choice** if the core is Rust; **quiche** is better if you expect to expose the transport through a lower-level FFI boundary or you want finer send-path control early. citeturn23search0turn23search1
+The `subject` should be opaque, such as a hash of a Dytallix wallet or a
+QuantumLink device public key. It should not contain email, peer routes, DNS
+activity, endpoint candidates, packet metadata, or session keys.
 
-For NAT traversal, the best choices are **libnice**, **libjuice**, and **Pion ICE**, but they fit different implementation styles. libnice implements ICE/STUN/TURN-related functionality with a mature GLib-centric ecosystem and broad standards coverage. libjuice is leaner and better if you want a small C ICE layer without the GLib footprint. Pion ICE is excellent if the control plane is in Go, but that points the product toward a different language center. For a Swift+Rust QuantumLink, **libjuice is the best lightweight traversal choice** and **libnice is the best standards-heavy alternative**. TURN relay service should default to **coturn** unless and until QuantumLink implements its own QUIC relay. citeturn25search0turn25search1turn24search2turn24search1turn23search3
+Access gates should be product-layer gates:
 
-For identity and secret storage, the product should use the **Keychain as the canonical secret store**, with optional **Secure Enclave** linkage for device-bound unlock and enterprise attestation. For enterprise device identity, Apple’s Managed Device Attestation should be used where available on managed Macs because it can cryptographically attest properties such as UDID, OS version, Secure Enclave firmware version, SIP status, and secure boot status on supported systems. citeturn27search0turn27search2turn41search1
+- App gate: unlock paid UI and profile creation only when an entitlement is
+  active.
+- Rendezvous gate: require active entitlement before public paid mesh
+  publication.
+- Relay gate: require active entitlement before hosted relay allocation or paid
+  bandwidth tiers.
+- Peer-policy gate: let public/paid meshes require an entitlement-bound subject
+  before dialing or accepting peers.
 
-For packaging and updates, the default stack should be **Developer ID + notarization + PKG/DMG + Sparkle 2**. Sparkle 2’s documented features matter directly: it supports sandboxed apps, background updates, external bundle updates, and verifies updates using EdDSA signatures and Apple code signing. That said, Sparkle’s update-signing model is still classical. If QuantumLink wants a post-quantum story for the supply chain, it should add a second signed manifest layer or plan for future PQ signature adoption in the update path. Apple notarization and Gatekeeper remain mandatory regardless. citeturn8view1turn8view0turn9view0turn9view1
+Free/private mode can remain usable for beta, development, and private meshes
+without paid entitlement. Paid public infrastructure should fail closed when an
+entitlement is missing, expired, or invalid.
 
-For telemetry and CI/CD, use **OSLog locally**, optional **OpenTelemetry-compatible structured export**, and a **Prometheus/OpenMetrics-compatible metrics endpoint only in debug/admin mode**. For build and release automation, use **Xcode Cloud** for Apple-native build/sign/notarization smoke tests and either **GitHub-hosted macOS runners** or self-hosted Apple Silicon runners for protocol interop, crypto tests, fuzzing, and multi-peer simulation. entity["company","GitHub","code hosting company"] and Apple both support those workflows today. citeturn39search6turn39search2turn39search1turn40search3turn40search1turn40search0turn40search14turn40search6
+## Architecture and runtime surfaces
 
-The table below consolidates the recommended stack with macOS-specific implementation notes.
+The runtime architecture is intentionally split:
 
-| Component | Recommended choice | Alternatives | Trade-offs | macOS-specific implementation notes |
-|---|---|---|---|---|
-| UI | SwiftUI | AppKit | SwiftUI is faster for settings/status UI; AppKit still helps for advanced admin tooling | Keep UI mostly separate from tunnel logic |
-| Reactive state | Combine | AsyncStream / custom event bus | Combine integrates cleanly with SwiftUI; async-only model may simplify future refactors | Use for live status, metrics, and enrollment state |
-| Tunnel | `NEPacketTunnelProvider` | `NEEthernetTunnelProvider` later | Packet tunnel is the correct v1 abstraction; Ethernet tunnel is L2-heavy | User-space `utun`; avoid kext/pf design |
-| Core language | Rust | C++ or Go | Rust gives safety and a strong QUIC ecosystem | Keep extension boundary narrow; use IPC/XPC to isolate UI |
-| PQC library | `liboqs` behind internal crypto API | `PQClean` reference code | `liboqs` is practical for prototyping; PQClean is being retired | Keep crypto agile so implementations can be swapped later |
-| Session KEM | ML-KEM-768 | ML-KEM-512 / 1024 tiers | 768 is the current repo default; no X25519 fallback is implemented | Use transcript-bound HKDF and strict suite negotiation |
-| Device signatures | ML-DSA-65 leaf creds | SLH-DSA for roots/recovery | ML-DSA is practical; SLH-DSA is much larger | Store secret seeds in Keychain; bind device policy to enclave-backed local trust if desired |
-| Transport | QUIC + DATAGRAM | WireGuard-like UDP, DTLS 1.3 | QUIC gives migration and mature semantics | Prefer Quinn for Rust-first core; quiche if lower-level control is needed |
-| Peer discovery | Signed rendezvous + optional private DHT + opt-in mDNS | Central directory only | Layered approach works across hostile networks and local LANs | Keep mDNS off by default on untrusted LANs |
-| NAT traversal | libjuice + coturn | libnice, Pion ICE | libjuice is lean; libnice is heavier but broader | Cache last-good candidate pair by peer/network |
-| Secret storage | Keychain + Secure-Enclave-linked local trust | Filesystem secrets | Keychain is the correct platform secret store | Protect admin/support exports separately from long-term keys |
-| Distribution | Developer ID PKG/DMG + notarization | Mac App Store | Direct distribution is more flexible for VPN products | Plan for MDM pre-approval in enterprise deployments |
-| Updates | Sparkle 2 | App Store channel | Best for direct channel, but update signatures stay classical | Build appcast pipeline into release process |
-| Logging | OSLog | custom flat files | Better platform integration and privacy controls | Keep sensitive fields redacted by default |
-| Metrics/export | OpenTelemetry-compatible logs + Prometheus/OpenMetrics debug endpoint | Proprietary telemetry | Vendor-neutral and enterprise-friendly | Export only with user/admin opt-in |
-| CI/CD | Xcode Cloud + macOS runners | single-system local CI | Better signing/notarization and platform coverage | Include notarization, upgrade, sleep/wake, and network-change tests |
+- `QuantumLinkApp`: platform UI for enrollment, status, controls, diagnostics,
+  identity state, profile lifecycle, and future entitlement state.
+- `QuantumLinkTunnel`: packet tunnel or platform tunnel runtime that owns the
+  OS packet interface and protected route lifecycle.
+- `QuantumLinkKit`: shared macOS models, Keychain storage, Rust FFI bridge,
+  packet pump, profile management, MDM helpers, and support bundles.
+- `quantumlink-service`: Windows privileged tunnel service and platform runtime.
+- `qlink-core`: Rust protocol core for crypto orchestration, signed peer
+  records, routing, app-layer PQC frame protection, replay protection, native
+  UDP carrier work, optional dev QUIC carrier support, rendezvous, relay,
+  ICE/STUN helpers, metrics, tracing, and FFI.
+
+Control-plane services help peers find and reach each other. They are not the
+steady-state trust center for packet confidentiality. Relay fallback can see
+metadata and timing, but it must not learn payload contents or session keys.
+
+## Security requirements
+
+QuantumLink should assume:
+
+- Passive observers on Wi-Fi, LAN, ISP, relay, and organizational networks.
+- Active on-path attackers that reorder, replay, drop, or inject traffic.
+- Malicious or compromised rendezvous services.
+- Malicious or compromised relay services.
+- Stolen or malware-compromised endpoints.
+- Curious local networks where discovery itself leaks presence.
+- Misconfigured public meshes admitting peers that should have been rejected.
+
+Minimum security requirements:
+
+- ML-KEM-768 session establishment with strict suite negotiation.
+- ML-DSA-65 device credentials as the practical default.
+- SLH-DSA reserved for specialized FIPS 205 or high-assurance paths.
+- Signed, expiring peer records with replay and sequence handling.
+- Transcript-bound key derivation and anti-downgrade markers.
+- Per-direction packet keys and monotonic packet numbers.
+- Rekeying by time and byte threshold.
+- Public mesh identity verification before dialing.
+- Fail-closed route policy for protected prefixes.
+- Revocation and quarantine flows for compromised devices.
+
+Device compromise remains catastrophic for that device until revocation takes
+effect. The product should make revocation visible, fast, and testable.
+
+## Privacy and data handling
+
+QuantumLink should treat control-plane metadata as sensitive data. The product
+must minimize, pseudonymize, redact, and expire data by default.
+
+Privacy defaults:
+
+- Mesh and device labels are pseudonymous by default.
+- Discovery records use short TTLs.
+- Public peer-record minimization can prefer relay-only publication where
+  appropriate.
+- mDNS/local discovery is opt-in outside trusted local contexts.
+- DNS search domains default to empty.
+- Diagnostics redact raw peer IDs, wallet addresses, and network addresses by
+  default.
+- Raw support-bundle export requires explicit opt-in.
+- Telemetry export is disabled unless required by enterprise policy or explicit
+  user/admin consent.
+
+The Dytallix identity feature must preserve these privacy rules. On-chain
+records are for identity verification, status, and policy. They are not a place
+for traffic, endpoint, DNS, route, or packet metadata.
+
+## Platform requirements
+
+### macOS
+
+The macOS client should remain a SwiftUI app plus
+`NEPacketTunnelProvider`-based packet tunnel. It should use Keychain-backed
+local secrets, MDM payloads for managed deployments, Developer ID signing,
+notarization, and Sparkle-style direct updates where appropriate.
+
+The v1 macOS product should not depend on kernel extensions, custom kernel
+drivers, or a pf-based core security model. Protected-route fail-closed behavior
+belongs in the packet tunnel lifecycle and managed policy where available.
+
+### Windows
+
+The Windows client should use the privileged Rust service, Wintun adapter path,
+WFP kill switch, DPAPI secret storage, named-pipe IPC, WinUI 3 dashboard, WiX
+MSI packaging, and Windows-specific beta validation gates.
+
+Windows should share the same `qlink-core` protocol and identity semantics as
+macOS. Platform differences should be limited to tunnel mechanics, privilege
+boundaries, UI, packaging, and OS policy enforcement.
+
+### Steam and SteamOS
+
+The Steam/SteamOS product track should preserve Steam-safe boundaries. Steam
+account, store, wallet, checkout, inventory, marketplace, launcher, and embedded
+browser traffic should bypass QuantumLink by default.
+
+The gamer edition should focus on trusted-peer game traffic, latency-sensitive
+mode, streamer/privacy controls, and clear disclosure about what traffic is and
+is not protected.
+
+## Diagnostics and support
+
+Diagnostics should make mesh behavior explainable without leaking sensitive
+data. The local UI and support bundle should expose:
+
+- Direct versus relay path.
+- Current peer count and selected path kind.
+- Candidate pair and relay status in redacted form.
+- RTT, loss estimate, bytes in/out, and route state.
+- Last rekey time.
+- DNS mode and protected route mode.
+- Identity mode and registry status.
+- Last peer rejection reason.
+- Entitlement status when paid gates are enabled.
+
+Support exports should default to redacted identifiers. Raw peer IDs, wallet
+addresses, endpoint candidates, routes, DNS data, and packet captures require an
+explicit elevated export action.
+
+## Release and production boundaries
+
+Official production binaries are signed release artifacts. Local source builds,
+unsigned packages, CI uploads, and generated Xcode projects are development or
+validation artifacts only.
+
+The public repository may contain:
+
+- Source code for `qlink-core`, macOS, Windows, and Steam/SteamOS planning.
+- Build and validation scripts.
+- Public documentation, examples, tests, and CI definitions.
+- macOS and Windows packaging source.
+
+The public repository must not contain:
+
+- Production signing keys or certificates.
+- App-store or notarization credentials.
+- Hosted rendezvous or relay secrets.
+- Telemetry infrastructure secrets.
+- Support data, customer data, or private release infrastructure.
+- Billing processor secrets or entitlement signing private keys.
+- Dytallix wallet private keys.
 
 ## Performance, failure modes, and open questions
 
-The first performance targets should be treated as **engineering SLOs**, not marketing copy. A reasonable v1 target set is: median direct connection establishment under 300 ms on same-region WAN when discovery data is warm, post-sleep or post-network-change recovery under 1 second, relay fallback activation within 2 seconds when direct checks fail, direct-LAN throughput that can sustain at least several hundred Mbps on modern Apple silicon, and stable operation with dozens of concurrently reachable peers and hundreds of cached peer records per device. Those targets are realistic for a user-space QUIC overlay with packet tunneling, but they must be validated against actual Network Extension overhead, rekey cadence, and PQ handshake cost.
+The first performance targets are engineering SLOs, not marketing claims:
 
-The most important failure modes are predictable. **Symmetric NAT or blocked UDP** means direct paths fail; recovery is relay/TURN. **Bootstrap outage** means no new internet peers can be found, but cached peers and local-LAN discovery may still work. **Relay compromise** should expose at most metadata, not payload, if the protocol is end-to-end encrypted correctly. **Local device compromise** remains catastrophic for local traffic and credentials until the device is revoked; the product therefore needs revocation lists, device quarantining, short-lived credentials, and admin-visible compromise state. **Sleep/wake, captive portals, Wi‑Fi roaming, and tethering** should be treated as normal events and tested aggressively because QUIC migration is only useful if the product’s state machine re-probes and re-selects paths correctly. citeturn10search0turn25search3turn10search7
+| SLO | Target |
+|---|---|
+| Median direct connect with warm discovery | < 300 ms |
+| Median post-event recovery from `PathChanged` to ready | < 1 s |
+| Median relay-fallback activation | < 2 s |
 
-The macOS-specific recovery logic should be explicit. On wake or interface change, QuantumLink should immediately mark existing candidate pairs as suspect, probe the last-good path, then race a limited set of fresh candidates. If the device is managed, policy can strengthen startup semantics using on-demand rules and extension pre-approval. If the device is unmanaged, the tunnel should still fail closed for protected routes while discovery and traversal retry in the background. This is the difference between a mesh VPN that feels reliable and one that quietly leaks traffic during churn. citeturn4search9turn4search1turn41search5
+These targets are intentionally anchored to warm discovery and reasonable WAN
+conditions. Degraded mobile networks, high packet loss, captive portals, and
+blocked UDP can exceed them. The repository's loopback and synthetic-WAN
+benchmarks should continue to report both product SLO compliance and realistic
+degraded-network behavior.
 
-The main unresolved questions are straightforward and should be called out now. First, **leaf-credential format**: whether QuantumLink should keep ML-DSA-only device credentials in v1 or add a migration envelope for environments that require classical companion signatures. Second, **supply-chain cryptography**: Sparkle remains practical, but the update-signing story is not post-quantum by default. Third, **discovery privacy**: whether the optional DHT mode delivers enough operational benefit to justify its larger metadata surface compared with signed rendezvous. Fourth, **transport standardization timing**: how to keep the versioned application-level handshake compatible with maturing PQ transport standards without documenting an unimplemented X25519 fallback. Fifth, **enterprise packaging strategy**: whether the public channel should exist at all in v1, or whether the first macOS release should be enterprise-first with ADE, MDM, and attestation as the primary operating model.
+Expected failure modes:
+
+- Symmetric NAT or blocked UDP: direct paths fail and relay fallback activates.
+- Bootstrap outage: new internet peers may not be discoverable, but cached peers
+  and local discovery can continue where policy allows.
+- Relay compromise: payload confidentiality should hold, but metadata exposure
+  must be assumed.
+- Registry outage: public meshes fail closed unless a configured cached-proof
+  grace period applies; private meshes warn and continue by default.
+- Entitlement outage: paid public infrastructure should fail closed for paid
+  gates while free/private mode remains available where configured.
+- Local device compromise: local traffic and credentials are unsafe until the
+  device is revoked and quarantined.
+- Sleep, wake, roaming, captive portals, and tethering: normal events that must
+  trigger path re-probing and route-policy preservation.
+
+Open questions:
+
+- Whether v1 public identity should require only active registry status or also
+  minimum staking/reputation policy.
+- How quickly to add a future proof-based identity mode that hides wallet
+  addresses from the verifier.
+- How to pair Sparkle or platform update signing with a post-quantum signed
+  release manifest.
+- Whether the first production channel should be enterprise-first or public
+  direct download plus enterprise packaging.
+- How strict the cached-proof grace policy should be for public meshes during
+  Dytallix or network outages.
+- Which paid entitlement gates should ship first after beta: app unlock,
+  rendezvous publication, hosted relay allocation, or public mesh membership.

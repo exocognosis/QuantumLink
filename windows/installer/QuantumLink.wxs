@@ -1,0 +1,95 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  QuantumLink Windows installer (WiX v4).
+
+  Replaces the macOS Sparkle/DMG/PKG pipeline. Responsibilities:
+  - install service binary + qlink_core.dll + wintun.dll + UI app
+  - register and start the QuantumLinkService Windows service
+  - create %ProgramData%\QuantumLink with a SYSTEM/Administrators ACL
+  - uninstall cleanup: stop+delete service (dynamic WFP filters and the
+    Wintun adapter disappear with the service process; routes are
+    removed by the service during disconnect)
+
+  Build (on Windows):
+    Install the pinned WiX 6.0.2 dotnet tool first.
+    wix build -arch x64 installer\QuantumLink.wxs -d BuildDir=..\target\x86_64-pc-windows-msvc\release -ext WixToolset.Util.wixext/6.0.2 -o QuantumLink.msi
+
+  Sign with an Authenticode certificate before distribution:
+    signtool sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 QuantumLink.msi
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+
+  <Package Name="QuantumLink"
+           Manufacturer="QuantumLink"
+           Version="0.1.0"
+           UpgradeCode="9f3d2b7e-6c41-4a8d-b2f0-7e54a9c13d88"
+           Scope="perMachine"
+           Compressed="yes">
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of QuantumLink is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+    <Property Id="QL_STATE_FOLDER_PATH" Value="%ProgramData%\QuantumLink" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="QuantumLink">
+        <Component Id="ServiceBinary" Guid="2a64f0c1-8b3d-4e55-9d27-c1b6a07e44f9">
+          <File Id="ServiceExe" Source="$(BuildDir)\quantumlink-service.exe" KeyPath="yes" />
+          <ServiceInstall Id="QuantumLinkServiceInstall"
+                          Name="QuantumLinkService"
+                          DisplayName="QuantumLink Tunnel Service"
+                          Description="Owns the QuantumLink Wintun adapter, encrypted mesh transport, and kill switch."
+                          Type="ownProcess"
+                          Start="auto"
+                          Account="LocalSystem"
+                          ErrorControl="normal"
+                          Arguments="service" />
+          <ServiceControl Id="QuantumLinkServiceControl"
+                          Name="QuantumLinkService"
+                          Start="install"
+                          Stop="both"
+                          Remove="uninstall"
+                          Wait="yes" />
+        </Component>
+
+        <Component Id="CoreDll" Guid="6d18c4a2-0f5b-49ad-8c33-5e92b1d7a604">
+          <File Source="$(BuildDir)\qlink_core.dll" KeyPath="yes" />
+        </Component>
+
+        <!-- wintun.dll is distributed per its license; place the
+             matching-arch DLL into the build dir before building the
+             installer. See installer/README.md. -->
+        <Component Id="WintunDll" Guid="b7e09f64-23d1-4c8a-a6f5-90c4d2e81b37">
+          <File Source="$(BuildDir)\wintun.dll" KeyPath="yes" />
+        </Component>
+
+        <Component Id="UiBinary" Guid="48a3d9b0-f1c6-4e72-b85a-2d60c97f13e5">
+          <File Source="$(UiPublishDir)\QuantumLink.Windows.exe" KeyPath="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <!-- %ProgramData%\QuantumLink: service state, DPAPI blobs, logs.
+         ACL: SYSTEM + Administrators full control; no user read of
+         secrets. -->
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="StateFolder" Name="QuantumLink">
+        <Component Id="StateDir" Guid="0c5be1d8-7a92-4f04-9e61-d3b8a25c70f1" KeyPath="yes">
+          <CreateFolder>
+            <PermissionEx Id="StateFolderAcl" Sddl="D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)" />
+          </CreateFolder>
+          <util:RemoveFolderEx Id="RemoveStateFolderTree" On="uninstall" Property="QL_STATE_FOLDER_PATH" />
+          <RemoveFolder Id="RemoveStateFolder" On="uninstall" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="Main" Title="QuantumLink" Level="1">
+      <ComponentRef Id="ServiceBinary" />
+      <ComponentRef Id="CoreDll" />
+      <ComponentRef Id="WintunDll" />
+      <ComponentRef Id="UiBinary" />
+      <ComponentRef Id="StateDir" />
+    </Feature>
+  </Package>
+</Wix>

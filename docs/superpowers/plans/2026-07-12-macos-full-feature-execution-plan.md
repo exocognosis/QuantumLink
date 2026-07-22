@@ -6,13 +6,13 @@
 
 Grounded in code inspection, not doc claims:
 
-- **Crypto core ~88%** — ML-KEM-768, ML-DSA-65, SLH-DSA-128s, anti-downgrade suite binding, replay window, ChaCha20-Poly1305 frames all implemented in `rust/qlink-core/src/crypto.rs` + `packet_core.rs` + `replay.rs`.
-- **Mesh state machine ~60%** — elaborate connector in `rust/qlink-core/src/mesh_connection.rs` (2,588 ln) + `mesh_transport.rs` (2,578 ln): rendezvous lookup, direct probe, relay fallback, last-good caching. Dev-grade, not hardened.
+- **Crypto core ~88%** — ML-KEM-768, ML-DSA-65, SLH-DSA-128s, anti-downgrade suite binding, replay window, ChaCha20-Poly1305 frames all implemented in `qlink-core/src/crypto.rs` + `packet_core.rs` + `replay.rs`.
+- **Mesh state machine ~60%** — elaborate connector in `qlink-core/src/mesh_connection.rs` (2,588 ln) + `mesh_transport.rs` (2,578 ln): rendezvous lookup, direct probe, relay fallback, last-good caching. Dev-grade, not hardened.
 - **Live data plane ~35%** — `quic_transport.rs` binds real UDP sockets but the shipped FFI path is `qlink_dev_quic_transport_*` (loopback, self-signed). Production session-key install into packet frames is listed *not complete* in `FEATURES.md`.
 - **Connection types ~55%** — mDNS (`mdns_discovery.rs`), ICE (`ice.rs`, 1,034 ln), STUN (`stun.rs`) exist; **full ICE/STUN/TURN nomination incomplete; no TURN client**.
-- **On-chain Dytallix identity ~18% (on this branch)** — NOT on `main`. Real 1,392-line `dytallix_identity.rs` + `dytallix/quantumlink-node-registry` crate + Swift UX exist in silo worktrees, reconciled against the `qlink-core/`+`macos/Sources/` **silo layout**, which differs from this repo's `rust/qlink-core/`+`Sources/` layout. On `main`, identity = app-layer ML-DSA assertions (`inbound_identity.rs`), not on-chain.
-- **App/UX shell ~80%** — `Sources/QuantumLinkApp/QuantumLinkApp.swift` (2,617 ln), all views present, bound to simulated/dev state.
-- **Packet tunnel ~55%** — `Sources/QuantumLinkTunnel/PacketTunnelProvider.swift` + kill-switch + fail-closed pump coded; cannot run without Apple entitlements/signing.
+- **On-chain Dytallix identity ~18% (on this branch)** — NOT on `main` at the time this plan was written. Real 1,392-line `dytallix_identity.rs` + `dytallix/quantumlink-node-registry` crate + Swift UX exist in silo worktrees, reconciled against the current `qlink-core/` + `macos/Sources/` layout. On `main` at the time, identity = app-layer ML-DSA assertions (`inbound_identity.rs`), not on-chain.
+- **App/UX shell ~80%** — `macos/Sources/QuantumLinkApp/QuantumLinkApp.swift` (2,617 ln), all views present, bound to simulated/dev state.
+- **Packet tunnel ~55%** — `macos/Sources/QuantumLinkTunnel/PacketTunnelProvider.swift` + kill-switch + fail-closed pump coded; cannot run without Apple entitlements/signing.
 - **Enterprise/MDM ~70%**, **Signing/notarization ~25%**, **Real-hardware validation ~10%**.
 
 Test culture is strong: **147 Rust tests**, **25 Swift test files** — plan is TDD-first to match.
@@ -25,12 +25,12 @@ Discovered while executing the Phase 3 spike: the cross-platform **silo** branch
 - **Phase 3 connection wiring exists in silo:** `mesh_connection.rs` already wires `IdentityRegistryLookup` + `verify_registry_binding` to gate dialing.
 - Silo `qlink-core` has **252 test fns vs main's 192**.
 
-**Revised strategy for Phases 1 & 3:** treat them as a **structured module-by-module reconcile-port from silo → this repo's `rust/qlink-core/` layout, gated by the test suite** (as done successfully for `dytallix_identity` + `quantumlink-node-registry` on 2026-07-12), NOT as net-new implementation. Risk to manage: silo uses the `qlink-core/`+`macos/Sources/` layout and other modules (`mesh_connection` +130, `mesh_transport` +295) have diverged — reconcile per-module with tests green, do not wholesale-copy.
+**Revised strategy for Phases 1 & 3:** treat them as a **structured module-by-module reconcile-port into this repo's `qlink-core/` + `macos/Sources/` layout, gated by the test suite** (as done successfully for `dytallix_identity` + `quantumlink-node-registry` on 2026-07-12), NOT as net-new implementation. Risk to manage: modules (`mesh_connection` +130, `mesh_transport` +295) have diverged — reconcile per-module with tests green, do not wholesale-copy.
 
 ### Landed on branch `feat/macos-full-feature` (2026-07-12, uncommitted)
-- Dytallix SDK deps (`dytallix-core`/`dytallix-sdk` @ `657d0db`) + `hex`/`reqwest` added to `rust/qlink-core/Cargo.toml`; builds clean.
+- Dytallix SDK deps (`dytallix-core`/`dytallix-sdk` @ `657d0db`) + `hex`/`reqwest` added to `qlink-core/Cargo.toml`; builds clean.
 - `quantumlink-node-registry` contract crate ported to `dytallix/quantumlink-node-registry/`, workspace member; **native 23 tests pass**, WASM deploy artifact built + validated (388 KB).
-- `dytallix_identity.rs` (2,122 ln) ported to `rust/qlink-core/src/`; **45 module tests pass**; full suite **203 pass, 0 fail** (no regressions). — commit `292fb19`
+- `dytallix_identity.rs` (2,122 ln) ported to `qlink-core/src/`; **45 module tests pass**; full suite **203 pass, 0 fail** (no regressions). — commit `292fb19`
 - **Phase 1 foundation ported** from silo: `carrier_transport` (12 tests), `session_crypto` (7), `pqc_frame` (3), `pqc_session_wire` (1); added `sha3` + declared `dev-quic-carrier` feature (off). qlink-core suite **226 pass, 0 fail**. — commit `7f23e5a`
 - **Registry contract deployed + live-verified** at `0xbcb5cf5abb50333ee4bfde91f21bbcc24828673d`; `config/dytallix-testnet.json` + `tests/dytallix_live.rs`. — commits `ce2729a`, `7257f73`
 - **SHAKE256 stack adopted** (decision over legacy HKDF): `crypto.rs` migrated (suites `…-SHAKE256-v1`); `packet_core.rs` gains production peer-session key installation (`install_peer_session` + `require_peer_session`); suite strings synced across ffi/config/Swift. **232 pass / 0 fail.** — commit `1ba142d`
@@ -65,9 +65,9 @@ P0 hygiene ─┬─ P1 live carrier ───┬─ P4 tunnel/privacy ─┐
 
 **Goal:** one canonical layout, a clean branch, and a recorded green baseline so every later phase measures against truth.
 
-**Files:** `Cargo.toml` (workspace), `Package.swift`, `docs/` status docs. Remove/needs-decision: `Package.swift.blocked-read-20260521`, `.build.codex-stale-*`.
+**Files:** `Cargo.toml` (workspace), `macos/Package.swift`, `docs/` status docs. Remove/needs-decision: `Package.swift.blocked-read-20260521`, `.build.codex-stale-*`.
 
-- [ ] Confirm canonical layout is this repo's `rust/qlink-core/` + `Sources/` (decision: do **not** adopt the silo `qlink-core/`+`macos/Sources/` layout; port into this one).
+- [ ] Confirm canonical layout is this repo's `qlink-core/` + `macos/Sources/` (decision: keep the silo layout; do **not** restore the legacy `rust/qlink-core/` + root `Sources/` layout).
 - [ ] Create branch `feat/macos-full-feature` off `main`.
 - [ ] Run and record baseline: `cargo test` (expect ~147 passing) and `swift test` (25 suites). Capture pass/fail list.
 - [ ] Triage stale artifacts (`.build.codex-stale-*`, `Package.swift.blocked-read-*`, extra `QuantumLink N.xcodeproj` copies) — archive or delete after confirming they are not referenced.
@@ -80,7 +80,7 @@ P0 hygiene ─┬─ P1 live carrier ───┬─ P4 tunnel/privacy ─┐
 
 **Goal:** two real peers carry encrypted traffic over the network (not loopback), with negotiated ML-KEM session keys installed into packet-frame encryption, no `dev-quic-carrier`.
 
-**Files:** `rust/qlink-core/src/mesh_connection.rs`, `mesh_transport.rs`, `quic_transport.rs`, `rendezvous.rs`, `packet_core.rs`, `ffi.rs`, `src/bin/qlinkctl.rs`; `Sources/QuantumLinkKit/RustCoreBridge.swift`, `TransportSmokeRunner.swift`, `TunnelTransport.swift`; tests `Tests/QuantumLinkKitTests/RustMeshTransportTests.swift`, `ProductionMeshTransportTests.swift`.
+**Files:** `qlink-core/src/mesh_connection.rs`, `mesh_transport.rs`, `quic_transport.rs`, `rendezvous.rs`, `packet_core.rs`, `ffi.rs`, `src/bin/qlinkctl.rs`; `macos/Sources/QuantumLinkKit/RustCoreBridge.swift`, `TransportSmokeRunner.swift`, `TunnelTransport.swift`; tests `macos/Tests/QuantumLinkKitTests/RustMeshTransportTests.swift`, `ProductionMeshTransportTests.swift`.
 
 - [ ] **Failing test first:** two peer records with real UDP endpoint candidates; assert direct probe returns an established production session, not the dev-loopback path.
 - [ ] Promote `quic_transport` production path: real bind addresses from rendezvous candidates, production certificate/trust handling (not the loopback self-signed test cert), behind a `production-carrier` feature; keep dev-quic loopback for tests only.
@@ -99,7 +99,7 @@ P0 hygiene ─┬─ P1 live carrier ───┬─ P4 tunnel/privacy ─┐
 
 **Goal:** LAN, server-reflexive, and relay candidates gathered, prioritized, and nominated deterministically; TURN relay client real; mDNS opt-in.
 
-**Files:** `rust/qlink-core/src/ice.rs`, `stun.rs`, `traversal.rs`, `relay.rs`, `mdns_discovery.rs`, `mesh_transport.rs`; `Sources/QuantumLinkKit/TunnelTransport.swift`, `ConnectionProfile.swift`, `ManagedConfiguration.swift`; tests `DirectConnectionRoutingTests.swift`, `TunnelTransportTests.swift`, `rust/qlink-core` synthetic_wan.
+**Files:** `qlink-core/src/ice.rs`, `stun.rs`, `traversal.rs`, `relay.rs`, `mdns_discovery.rs`, `mesh_transport.rs`; `macos/Sources/QuantumLinkKit/TunnelTransport.swift`, `ConnectionProfile.swift`, `ManagedConfiguration.swift`; tests `DirectConnectionRoutingTests.swift`, `TunnelTransportTests.swift`, `qlink-core` synthetic_wan.
 
 - [ ] Deterministic candidate priority: (1) local/private LAN, (2) server-reflexive STUN, (3) TURN/relay, (4) fail-closed for protected routes.
 - [ ] Complete ICE connectivity-check pacing + nomination (currently "optional helper paths").
@@ -120,9 +120,9 @@ P0 hygiene ─┬─ P1 live carrier ───┬─ P4 tunnel/privacy ─┐
 
 **Source to port (silo layout → this layout):** `.worktrees/*/qlink-core/src/dytallix_identity.rs` (reconciled 1,392-ln version), `.worktrees/*/dytallix/quantumlink-node-registry/` crate, Swift enrollment/UX deltas.
 
-**Files (target):** new `rust/qlink-core/src/dytallix_identity.rs`; new workspace member `dytallix/quantumlink-node-registry/`; `Cargo.toml` (add members + `dytallix-core`/`dytallix-sdk` pinned git deps); `rust/qlink-core/src/mesh_connection.rs`, `inbound_identity.rs`, `discovery.rs`, `lib.rs`, `src/bin/qlinkctl.rs`; `Sources/QuantumLinkKit/` new `DytallixEnrollmentSettings.swift`, plus `Models.swift`, `ConfigurationValidation.swift`, `ManagedConfiguration.swift`, `TunnelTransport.swift`; `Sources/QuantumLinkApp/QuantumLinkApp.swift` (enrollment + discovery-identity UX); `scripts/dytallix-live-validation.sh`, `scripts/dytallix-identity-e2e.sh`; tests.
+**Files (target):** new `qlink-core/src/dytallix_identity.rs`; new workspace member `dytallix/quantumlink-node-registry/`; `Cargo.toml` (add members + `dytallix-core`/`dytallix-sdk` pinned git deps); `qlink-core/src/mesh_connection.rs`, `inbound_identity.rs`, `discovery.rs`, `lib.rs`, `src/bin/qlinkctl.rs`; `macos/Sources/QuantumLinkKit/` new `DytallixEnrollmentSettings.swift`, plus `Models.swift`, `ConfigurationValidation.swift`, `ManagedConfiguration.swift`, `TunnelTransport.swift`; `macos/Sources/QuantumLinkApp/QuantumLinkApp.swift` (enrollment + discovery-identity UX); `macos/scripts/dytallix-live-validation.sh`, `macos/scripts/dytallix-identity-e2e.sh`; tests.
 
-- [x] **Day-one spike (longest lead) — DONE 2026-07-12:** pinned `dytallix-core`/`dytallix-sdk` deps added to `rust/qlink-core/Cargo.toml`; SDK builds standalone and coexists with qlink-core's graph (no conflicts); testnet gateway live with `/contracts/call` + `/contracts/deploy`. Still needed for live enforcement: deployed registry contract address + funded testnet wallet.
+- [x] **Day-one spike (longest lead) — DONE 2026-07-12:** pinned `dytallix-core`/`dytallix-sdk` deps added to `qlink-core/Cargo.toml`; SDK builds standalone and coexists with qlink-core's graph (no conflicts); testnet gateway live with `/contracts/call` + `/contracts/deploy`. Still needed for live enforcement: deployed registry contract address + funded testnet wallet.
 - [ ] Port `IdentityRegistry` trait + `DytallixIdentityRegistry` (lookup / register / verify_binding) near discovery, **not** in packet crypto.
 - [ ] Registry data model + decision states per spec (`accepted`, `rejected_missing_registry`, `rejected_revoked`, `rejected_key_mismatch`, `rejected_record_hash_mismatch`, `registry_unavailable`, …).
 - [ ] Enforce mesh trust policy in connection decisions: **public = required/fail-closed**, private = preferred/warn, dev = optional. Wire into outbound (`PeerRecord`) and inbound (`InboundIdentityAssertion`) verification.
@@ -130,7 +130,7 @@ P0 hygiene ─┬─ P1 live carrier ───┬─ P4 tunnel/privacy ─┐
 - [ ] Swift UX: wallet present/missing, registry status, discovery-identity mode **Off / Verified / Public Wallet** (public meshes may not select Off), last verification result, **wallet-address redaction** outside Public Wallet mode. Tunnel receives validated policy only — never wallet secrets.
 - [ ] Rust tests per spec (public rejects missing/revoked/mismatch; private warns+accepts; dev bypass; register/update/revoke/lookup against real contract state machine). Swift tests (policy mapping, redaction, config encoding).
 
-**Verify:** `cargo test -p qlink-core dytallix`; `scripts/dytallix-live-validation.sh`; `scripts/dytallix-identity-e2e.sh`; `swift test --filter DytallixEnrollmentSettingsTests --filter DytallixPeerTrustModelTests`.
+**Verify:** `cargo test -p qlink-core dytallix`; `macos/scripts/dytallix-live-validation.sh`; `macos/scripts/dytallix-identity-e2e.sh`; `swift test --filter DytallixEnrollmentSettingsTests --filter DytallixPeerTrustModelTests`.
 
 **Done when:** public meshes enforce pinned Dytallix production trust and fail closed on registry errors; enrollment + discovery-identity UX ships; no mocks/stubs in the identity path.
 
@@ -140,7 +140,7 @@ P0 hygiene ─┬─ P1 live carrier ───┬─ P4 tunnel/privacy ─┐
 
 **Goal:** the running tunnel preserves fail-closed protected routes across the real data plane and leaks nothing in default diagnostics. Depends on Phase 1.
 
-**Files:** `Sources/QuantumLinkTunnel/PacketTunnelProvider.swift`, `Sources/QuantumLinkKit/TunnelPacketPump.swift`, `KillSwitchWatchdog.swift`, `SupportBundleExporter.swift`, `PrivacyDefaults.swift`, `PerAppVPNPayload.swift`; tests for each.
+**Files:** `macos/Sources/QuantumLinkTunnel/PacketTunnelProvider.swift`, `macos/Sources/QuantumLinkKit/TunnelPacketPump.swift`, `KillSwitchWatchdog.swift`, `SupportBundleExporter.swift`, `PrivacyDefaults.swift`, `PerAppVPNPayload.swift`; tests for each.
 
 - [ ] Prove protected routes stay blocked when the data plane is unavailable, the provider stops unexpectedly, or route re-application fails after sleep/wake.
 - [ ] Support bundles redact raw peer IDs, **wallet addresses**, endpoint candidates, routes, DNS, and packet captures unless an elevated raw-export action is taken.
@@ -157,7 +157,7 @@ P0 hygiene ─┬─ P1 live carrier ───┬─ P4 tunnel/privacy ─┐
 
 **Status:** Apple-dependent. Prep scripts/CI now; execute when credentials land.
 
-**Files:** `macos/project.yml`, `macos/config/*.xcconfig`, `macos/entitlements/*`, `macos/scripts/macos-release-readiness.sh`, `package-macos.sh`, `sparkle-build-appcast.sh`, `.github/workflows/release.yml`, `Sources/QuantumLinkApp/UpdateController.swift`.
+**Files:** `macos/project.yml`, `macos/config/*.xcconfig`, `macos/entitlements/*`, `macos/scripts/macos-release-readiness.sh`, `package-macos.sh`, `sparkle-build-appcast.sh`, `.github/workflows/release.yml`, `macos/Sources/QuantumLinkApp/UpdateController.swift`.
 
 - [ ] Configure Apple inputs (Developer ID cert, NE entitlement, provisioning profiles, notary API key, Sparkle EdDSA key, bundle IDs, app group, team) as CI secrets/vars.
 - [ ] Produce signed `QuantumLink.app` + `.pkg` + `.dmg`, notarize, staple, `SHA256SUMS.txt`.

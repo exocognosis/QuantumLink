@@ -1,0 +1,20 @@
+[package]
+name = "qlinkd"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+qlink-core = { path = "../../../../qlink-core" }
+qlink-game = { path = "../qlink-game" }
+qlink-linux = { path = "../qlink-linux" }
+qlink-proto = { path = "../qlink-proto" }
+base64 = "0.22"
+getrandom = "0.4"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"

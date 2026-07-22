@@ -13,6 +13,8 @@ target/
 
 # Xcode local state
 DerivedData/
+macos/*.xcodeproj/
+macos/*.xcodeproj/**
 *.xcuserstate
 *.xcuserdata/
 xcuserdata/
@@ -41,4 +43,5 @@ macos/config/QuantumLink.developer-id.local.xcconfig
 
 # Tooling scratch files
 *.moved-aside
+*.blocked-read-*
 .worktrees/

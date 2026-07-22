@@ -1,5 +1,7 @@
-// Copy this file to QuantumLink.developer-id.local.xcconfig and fill in team/profile values.
-// Do not commit the local file if it includes private team or profile names.
+// Reference template for Developer ID release settings.
+// The generated Xcode project uses QuantumLink.unsigned.xcconfig by default;
+// scripts/package-macos.sh supplies signed release values through environment
+// variables so private team/profile names do not need to be committed.
 
 #include "QuantumLink.common.xcconfig"
 
@@ -8,4 +10,8 @@ CODE_SIGNING_REQUIRED = YES
 CODE_SIGN_STYLE = Manual
 DEVELOPMENT_TEAM = YOURTEAMID
 CODE_SIGN_IDENTITY = Developer ID Application
-PROVISIONING_PROFILE_SPECIFIER = QuantumLink Developer ID Profile
+QLINK_APP_BUNDLE_ID = com.example.QuantumLink
+QLINK_TUNNEL_BUNDLE_ID = com.example.QuantumLink.PacketTunnel
+QLINK_APP_GROUP = group.com.example.QuantumLink
+QLINK_APP_PROVISIONING_PROFILE_SPECIFIER = QuantumLink Developer ID App Profile
+QLINK_TUNNEL_PROVISIONING_PROFILE_SPECIFIER = QuantumLink Developer ID Tunnel Profile
