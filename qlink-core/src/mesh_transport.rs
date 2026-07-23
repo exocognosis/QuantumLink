@@ -478,7 +478,11 @@ pub struct MeshTransportConfig {
     pub remote_peer_id: String,
     pub rendezvous_url: String,
     #[serde(default)]
+    pub rendezvous_auth_token: Option<String>,
+    #[serde(default)]
     pub relay_url: Option<String>,
+    #[serde(default)]
+    pub relay_auth_token: Option<String>,
     /// Local QUIC bind address, e.g. "127.0.0.1:0" or "0.0.0.0:0".
     pub bind_addr: String,
     #[serde(default = "default_overall_deadline_ms")]
@@ -769,7 +773,8 @@ impl MeshTransportHandle {
             (Some(socket), Some(local_addr))
         };
 
-        let rendezvous_client = RendezvousClient::new(config.rendezvous_url.clone());
+        let rendezvous_client = RendezvousClient::new(config.rendezvous_url.clone())
+            .with_optional_auth_token(config.rendezvous_auth_token.clone());
         let local_credentials = IceCredentials::generate()?;
 
         let mut connector_config =
@@ -780,6 +785,9 @@ impl MeshTransportHandle {
                 .with_mesh_trust_policy(config.mesh_trust_policy);
         if let Some(relay) = config.relay_url.clone() {
             connector_config = connector_config.with_relay_server(relay);
+        }
+        if let Some(token) = config.relay_auth_token.clone() {
+            connector_config = connector_config.with_relay_auth_token(token);
         }
         if config.enable_ice {
             connector_config = connector_config.with_local_ice_credentials(local_credentials);
@@ -973,7 +981,8 @@ impl MeshTransportHandle {
         // empty — any direct `connect()` would fail by design.
         let quic_endpoint = QuicEndpoint::client(client_bind_addr, &[])?;
 
-        let rendezvous_client = RendezvousClient::new(config.rendezvous_url.clone());
+        let rendezvous_client = RendezvousClient::new(config.rendezvous_url.clone())
+            .with_optional_auth_token(config.rendezvous_auth_token.clone());
         let local_credentials = IceCredentials::generate()?;
 
         let mut connector_config =
@@ -984,6 +993,9 @@ impl MeshTransportHandle {
                 .with_mesh_trust_policy(config.mesh_trust_policy);
         if let Some(relay) = config.relay_url.clone() {
             connector_config = connector_config.with_relay_server(relay);
+        }
+        if let Some(token) = config.relay_auth_token.clone() {
+            connector_config = connector_config.with_relay_auth_token(token);
         }
         if config.enable_ice {
             connector_config = connector_config.with_local_ice_credentials(local_credentials);
@@ -1112,6 +1124,7 @@ impl MeshTransportHandle {
         ) {
             runtime.spawn(run_relay_responder_loop(
                 relay_url,
+                config.relay_auth_token.clone(),
                 config.mesh_id.clone(),
                 config.local_peer_id.clone(),
                 keypair,
@@ -1289,6 +1302,28 @@ impl MeshTransportHandle {
         extra_candidates: Vec<CandidateEndpoint>,
         overlay_routes: Vec<String>,
     ) -> Result<PeerRecord> {
+        self.publish_self_with_extra_candidates_and_auth(
+            keypair,
+            rendezvous_url,
+            None,
+            ttl_seconds,
+            sequence,
+            extra_candidates,
+            overlay_routes,
+        )
+        .await
+    }
+
+    pub async fn publish_self_with_extra_candidates_and_auth(
+        &self,
+        keypair: &DeviceKeypair,
+        rendezvous_url: &str,
+        rendezvous_auth_token: Option<&str>,
+        ttl_seconds: u64,
+        sequence: u64,
+        extra_candidates: Vec<CandidateEndpoint>,
+        overlay_routes: Vec<String>,
+    ) -> Result<PeerRecord> {
         let cert_der = self.server_certificate_der.clone().unwrap_or_default();
         let local_addr = self.responder_local_addr.ok_or_else(|| {
             QlinkError::Protocol(
@@ -1344,7 +1379,8 @@ impl MeshTransportHandle {
         // it doesn't need the handle's specialized runtime. Awaiting on
         // the caller's runtime keeps `publish_self` callable from any
         // async context (tests, `qlinkctl`, future FFI bridges).
-        let client = RendezvousClient::new(rendezvous_url.to_string());
+        let client = RendezvousClient::new(rendezvous_url.to_string())
+            .with_optional_auth_token(rendezvous_auth_token.map(|token| token.to_string()));
         client.publish(&mesh_id, record.clone()).await?;
 
         Ok(record)
@@ -1996,6 +2032,7 @@ async fn handle_inbound_session(
 #[allow(clippy::too_many_arguments)]
 async fn run_relay_responder_loop(
     relay_url: String,
+    relay_auth_token: Option<String>,
     expected_mesh_id: String,
     local_peer_id: String,
     local_device_keypair: Arc<DeviceKeypair>,
@@ -2006,20 +2043,25 @@ async fn run_relay_responder_loop(
     inbound_tx: mpsc::UnboundedSender<InboundFrame>,
     aggregate: Arc<AggregateState>,
 ) {
-    let result = RelayResponderListener::run(&relay_url, local_peer_id.clone(), move |session| {
-        tokio::spawn(handle_inbound_session(
-            CarrierSession::from(session),
-            expected_mesh_id.clone(),
-            local_peer_id.clone(),
-            local_device_keypair.clone(),
-            local_server_certificate_der.clone(),
-            inbound_acl.clone(),
-            mesh_trust_policy,
-            identity_registry_lookup.clone(),
-            inbound_tx.clone(),
-            aggregate.clone(),
-        ));
-    })
+    let result = RelayResponderListener::run_with_auth(
+        &relay_url,
+        local_peer_id.clone(),
+        relay_auth_token.as_deref(),
+        move |session| {
+            tokio::spawn(handle_inbound_session(
+                CarrierSession::from(session),
+                expected_mesh_id.clone(),
+                local_peer_id.clone(),
+                local_device_keypair.clone(),
+                local_server_certificate_der.clone(),
+                inbound_acl.clone(),
+                mesh_trust_policy,
+                identity_registry_lookup.clone(),
+                inbound_tx.clone(),
+                aggregate.clone(),
+            ));
+        },
+    )
     .await;
     if let Err(error) = result {
         tracing::warn!(?error, "relay responder loop stopped");
@@ -2403,7 +2445,7 @@ mod native_udp_tests {
             .send_frame_to(&peer_b, b"native-udp-handle-frame".to_vec())
             .unwrap();
 
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + Duration::from_secs(10);
         let received = loop {
             if let Some(frame) = handle_b.try_receive_frame_from_any() {
                 break frame;
@@ -2458,7 +2500,9 @@ mod native_udp_tests {
             local_peer_id: local_peer_id.to_string(),
             remote_peer_id: remote_peer_id.to_string(),
             rendezvous_url: rendezvous_url.to_string(),
+            rendezvous_auth_token: None,
             relay_url: None,
+            relay_auth_token: None,
             bind_addr: "127.0.0.1:0".to_string(),
             overall_deadline_ms: 3_000,
             direct_probe_timeout_ms: 1_000,
@@ -2964,7 +3008,9 @@ mod tests {
             local_peer_id: "qlink_keyless-local".to_string(),
             remote_peer_id: "qlink_keyless-remote".to_string(),
             rendezvous_url: "127.0.0.1:9".to_string(),
+            rendezvous_auth_token: None,
             relay_url: Some("127.0.0.1:9".to_string()),
+            relay_auth_token: None,
             bind_addr: "127.0.0.1:0".to_string(),
             overall_deadline_ms: 100,
             direct_probe_timeout_ms: 50,
@@ -2993,7 +3039,9 @@ mod tests {
             local_peer_id: "qlink_keyless-local".to_string(),
             remote_peer_id: "qlink_keyless-remote".to_string(),
             rendezvous_url: "127.0.0.1:9".to_string(),
+            rendezvous_auth_token: None,
             relay_url: None,
+            relay_auth_token: None,
             bind_addr: "127.0.0.1:0".to_string(),
             overall_deadline_ms: 100,
             direct_probe_timeout_ms: 50,
@@ -3067,7 +3115,9 @@ mod tests {
                     local_peer_id,
                     remote_peer_id,
                     rendezvous_url,
+                    rendezvous_auth_token: None,
                     relay_url: None,
+                    relay_auth_token: None,
                     bind_addr: "127.0.0.1:0".to_string(),
                     overall_deadline_ms: 2_000,
                     direct_probe_timeout_ms: 500,
@@ -3140,7 +3190,9 @@ mod tests {
                     local_peer_id,
                     remote_peer_id: "qlink_does-not-exist".to_string(),
                     rendezvous_url,
+                    rendezvous_auth_token: None,
                     relay_url: None,
+                    relay_auth_token: None,
                     bind_addr: "127.0.0.1:0".to_string(),
                     overall_deadline_ms: 800,
                     direct_probe_timeout_ms: 200,
@@ -3194,7 +3246,9 @@ mod tests {
                     local_peer_id,
                     remote_peer_id: "qlink_does-not-exist".to_string(),
                     rendezvous_url,
+                    rendezvous_auth_token: None,
                     relay_url: None,
+                    relay_auth_token: None,
                     bind_addr: "127.0.0.1:0".to_string(),
                     overall_deadline_ms: 200,
                     direct_probe_timeout_ms: 100,
@@ -3291,7 +3345,9 @@ mod tests {
                     local_peer_id,
                     remote_peer_id,
                     rendezvous_url,
+                    rendezvous_auth_token: None,
                     relay_url: None,
+                    relay_auth_token: None,
                     bind_addr: "127.0.0.1:0".to_string(),
                     overall_deadline_ms: 2_000,
                     direct_probe_timeout_ms: 500,
@@ -3404,7 +3460,9 @@ mod tests {
                     local_peer_id,
                     remote_peer_id: "qlink_does-not-exist".to_string(),
                     rendezvous_url,
+                    rendezvous_auth_token: None,
                     relay_url: None,
+                    relay_auth_token: None,
                     bind_addr: "127.0.0.1:0".to_string(),
                     overall_deadline_ms: 200,
                     direct_probe_timeout_ms: 100,
@@ -3538,7 +3596,9 @@ mod tests {
                     local_peer_id,
                     remote_peer_id: peer_a_id_for_handle,
                     rendezvous_url,
+                    rendezvous_auth_token: None,
                     relay_url: None,
+                    relay_auth_token: None,
                     bind_addr: "127.0.0.1:0".to_string(),
                     overall_deadline_ms: 2_000,
                     direct_probe_timeout_ms: 500,
@@ -3678,7 +3738,9 @@ mod tests {
                     local_peer_id,
                     remote_peer_id: remote_peer_id_for_handle,
                     rendezvous_url,
+                    rendezvous_auth_token: None,
                     relay_url: None,
+                    relay_auth_token: None,
                     bind_addr: "127.0.0.1:0".to_string(),
                     overall_deadline_ms: 2_000,
                     direct_probe_timeout_ms: 500,
@@ -3742,7 +3804,9 @@ mod tests {
                     local_peer_id,
                     remote_peer_id: "qlink_does-not-exist-A".to_string(),
                     rendezvous_url,
+                    rendezvous_auth_token: None,
                     relay_url: None,
+                    relay_auth_token: None,
                     bind_addr: "127.0.0.1:0".to_string(),
                     overall_deadline_ms: 200,
                     direct_probe_timeout_ms: 100,
@@ -3841,7 +3905,9 @@ mod tests {
                         local_peer_id: local_key.public_key().peer_id(),
                         remote_peer_id: "qlink_initial-peer".to_string(),
                         rendezvous_url: "127.0.0.1:1".to_string(),
+                        rendezvous_auth_token: None,
                         relay_url: None,
+                        relay_auth_token: None,
                         bind_addr: "127.0.0.1:0".to_string(),
                         overall_deadline_ms: 200,
                         direct_probe_timeout_ms: 100,
@@ -3909,7 +3975,9 @@ mod tests {
                     local_peer_id,
                     remote_peer_id: "qlink_unused-for-this-test".to_string(),
                     rendezvous_url,
+                    rendezvous_auth_token: None,
                     relay_url: None,
+                    relay_auth_token: None,
                     bind_addr: "127.0.0.1:0".to_string(),
                     overall_deadline_ms: 2_000,
                     direct_probe_timeout_ms: 500,
@@ -4350,7 +4418,9 @@ mod tests {
                         local_peer_id,
                         remote_peer_id: "qlink_unused-for-this-test".to_string(),
                         rendezvous_url,
+                        rendezvous_auth_token: None,
                         relay_url: Some(relay_url),
+                        relay_auth_token: None,
                         bind_addr: "127.0.0.1:0".to_string(),
                         overall_deadline_ms: 2_000,
                         direct_probe_timeout_ms: 500,

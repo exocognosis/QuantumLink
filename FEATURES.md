@@ -29,8 +29,11 @@ This feature list is synchronized with the current repository implementation. It
 
 ## Mesh and Transport
 
-- Development rendezvous server and client.
-- Development relay server and client.
+- Development rendezvous server and client, with optional bearer-token admission
+  and per-client IP rate limiting for public-edge rehearsal.
+- Development relay server and client, with optional bearer-token registration,
+  per-client IP rate limiting, and registered-source validation for relayed
+  datagrams.
 - Native UDP carrier is the default mesh data-plane carrier; Quinn/rustls is feature-gated for legacy development.
 - Mesh connector state machine for rendezvous lookup, native direct candidate probes, PQC relay fallback, published QuantumLink relay-candidate fallback, last-good path caching, and reconnect handling.
 - Optional ICE/STUN helper paths for connectivity checks, plus feature-gated TURN relay-candidate gathering. Published TURN relay candidates are consumed as UDP-relayed carrier targets when live, and the `turn-relay` proof path keeps a resident allocation with CreatePermission plus Send/Data indication handling distinct from the QuantumLink app-relay carrier.
@@ -48,7 +51,9 @@ This feature list is synchronized with the current repository implementation. It
 
 ## Not Production-Complete
 
-- Hardened public rendezvous, STUN, TURN, and relay service controls.
+- Public rendezvous/relay TLS, durable revocation, abuse monitoring, retention
+  controls, and deployed hardening evidence beyond the implemented admission
+  token/rate-limit baseline.
 - RFC-complete public ICE nomination behavior and TURN relay-candidate data-plane proof against deployed public infrastructure.
 - Notarized Developer ID app and tunnel extension bundle.
 - Real-hardware validation of signed/provisioned Network Extension builds, including peer-session readiness under live packet flow.

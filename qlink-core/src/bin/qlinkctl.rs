@@ -9,6 +9,21 @@ use qlink_core::traversal::gather_ice_candidates;
 use qlink_core::turn::TurnClient;
 #[cfg(feature = "turn-relay")]
 use qlink_core::turn::{gather_relay_candidate, run_dev_turn, TurnCredentials, TurnServer};
+use qlink_core::{
+    admission::ServiceAdmissionConfig,
+    crypto::{answer_handshake, start_handshake, DeviceKeypair},
+    discovery::{CandidateEndpoint, CandidateType, PeerRecord, UnsignedPeerRecord},
+    dytallix_identity::MeshTrustPolicy,
+    ice::{perform_ice_check, spawn_dev_ice_responder, IceCheckRequest, IceCredentials},
+    mesh_connection::{
+        ConnectionOutcome, MeshConnector, MeshConnectorConfig, PathKind, ProbeOutcome,
+    },
+    mesh_transport::{MeshTransportConfig, MeshTransportHandle},
+    relay::run_relay_with_config,
+    rendezvous::{run_rendezvous_with_config, RendezvousClient},
+    stun::{gather_server_reflexive_candidate, run_stun, spawn_dev_stun},
+    traversal::gather_local_candidates,
+};
 #[cfg(all(feature = "turn-relay", not(feature = "dev-quic-carrier")))]
 use qlink_core::{
     carrier_transport::{CarrierSession, NativeUdpSession},
@@ -21,20 +36,6 @@ use qlink_core::{
     traversal::relay_candidate,
 };
 use qlink_core::{crypto::SessionKeys, pqc_frame::PqcFrameProtector};
-use qlink_core::{
-    crypto::{answer_handshake, start_handshake, DeviceKeypair},
-    discovery::{CandidateEndpoint, CandidateType, PeerRecord, UnsignedPeerRecord},
-    dytallix_identity::MeshTrustPolicy,
-    ice::{perform_ice_check, spawn_dev_ice_responder, IceCheckRequest, IceCredentials},
-    mesh_connection::{
-        ConnectionOutcome, MeshConnector, MeshConnectorConfig, PathKind, ProbeOutcome,
-    },
-    mesh_transport::{MeshTransportConfig, MeshTransportHandle},
-    relay::run_relay,
-    rendezvous::{run_rendezvous, RendezvousClient},
-    stun::{gather_server_reflexive_candidate, run_stun, spawn_dev_stun},
-    traversal::gather_local_candidates,
-};
 #[cfg(feature = "dev-quic-carrier")]
 use qlink_core::{
     quic_transport::QuicEndpoint, relay::spawn_dev_relay, rendezvous::spawn_dev_rendezvous,
@@ -77,10 +78,22 @@ enum Command {
     Rendezvous {
         #[arg(long, default_value = "127.0.0.1:9471")]
         listen: String,
+        #[arg(long)]
+        auth_token: Option<String>,
+        #[arg(long, default_value_t = 0)]
+        rate_limit_per_window: u32,
+        #[arg(long, default_value_t = 60)]
+        rate_limit_window_seconds: u64,
     },
     Relay {
         #[arg(long, default_value = "127.0.0.1:9472")]
         listen: String,
+        #[arg(long)]
+        auth_token: Option<String>,
+        #[arg(long, default_value_t = 0)]
+        rate_limit_per_window: u32,
+        #[arg(long, default_value_t = 60)]
+        rate_limit_window_seconds: u64,
     },
     /// Run a STUN binding server (reflects the client's public-facing
     /// address as XOR-MAPPED-ADDRESS). Stand this up on a public host so
@@ -127,6 +140,8 @@ enum Command {
     TurnRelayResponder {
         #[arg(long, default_value = "127.0.0.1:9471")]
         rendezvous: String,
+        #[arg(long)]
+        rendezvous_auth_token: Option<String>,
         #[arg(long, default_value = "devmesh")]
         mesh_id: String,
         #[arg(long)]
@@ -160,6 +175,8 @@ enum Command {
     RendezvousSmoke {
         #[arg(long, default_value = "127.0.0.1:9471")]
         server: String,
+        #[arg(long)]
+        auth_token: Option<String>,
     },
     /// Drive the rendezvous → direct-probe → relay-fallback state machine end-to-end.
     /// `--scenario direct` advertises a working host candidate; `--scenario relay-fallback`
@@ -220,6 +237,10 @@ enum Command {
         /// direct and app-relay paths.
         #[arg(long)]
         relay: Option<String>,
+        #[arg(long)]
+        rendezvous_auth_token: Option<String>,
+        #[arg(long)]
+        relay_auth_token: Option<String>,
         /// STUN server used to gather server-reflexive candidates before each
         /// signed record publish. Repeat to probe multiple public edges.
         #[arg(long = "stun")]
@@ -273,6 +294,10 @@ enum Command {
         /// peer record are used when present.
         #[arg(long)]
         relay: Option<String>,
+        #[arg(long)]
+        rendezvous_auth_token: Option<String>,
+        #[arg(long)]
+        relay_auth_token: Option<String>,
     },
     /// Attack the real PQC channel and assert every attack fails closed.
     /// Runs an app-layer battery (tamper / replay / downgrade / key-isolation
@@ -347,13 +372,52 @@ async fn main() -> qlink_core::Result<()> {
                 println!("record_json={}", serde_json::to_string_pretty(&record)?);
             }
         }
-        Command::Rendezvous { listen } => {
+        Command::Rendezvous {
+            listen,
+            auth_token,
+            rate_limit_per_window,
+            rate_limit_window_seconds,
+        } => {
+            let admission = service_admission_config(
+                auth_token.as_deref(),
+                rate_limit_per_window,
+                rate_limit_window_seconds,
+            )?;
             println!("rendezvous_listen={listen}");
-            run_rendezvous(&listen).await?;
+            println!(
+                "rendezvous_auth_required={}",
+                admission.auth_token_configured()
+            );
+            if let Some(rate_limit) = admission.rate_limit() {
+                println!("rendezvous_rate_limit_per_window={}", rate_limit.max_events);
+                println!(
+                    "rendezvous_rate_limit_window_seconds={}",
+                    rate_limit.window.as_secs()
+                );
+            }
+            run_rendezvous_with_config(&listen, admission).await?;
         }
-        Command::Relay { listen } => {
+        Command::Relay {
+            listen,
+            auth_token,
+            rate_limit_per_window,
+            rate_limit_window_seconds,
+        } => {
+            let admission = service_admission_config(
+                auth_token.as_deref(),
+                rate_limit_per_window,
+                rate_limit_window_seconds,
+            )?;
             println!("relay_listen={listen}");
-            run_relay(&listen).await?;
+            println!("relay_auth_required={}", admission.auth_token_configured());
+            if let Some(rate_limit) = admission.rate_limit() {
+                println!("relay_rate_limit_per_window={}", rate_limit.max_events);
+                println!(
+                    "relay_rate_limit_window_seconds={}",
+                    rate_limit.window.as_secs()
+                );
+            }
+            run_relay_with_config(&listen, admission).await?;
         }
         Command::Stun { listen } => {
             println!("stun_listen={listen}");
@@ -419,6 +483,7 @@ async fn main() -> qlink_core::Result<()> {
         #[cfg(all(feature = "turn-relay", not(feature = "dev-quic-carrier")))]
         Command::TurnRelayResponder {
             rendezvous,
+            rendezvous_auth_token,
             mesh_id,
             turn,
             bind_addr,
@@ -432,6 +497,7 @@ async fn main() -> qlink_core::Result<()> {
         } => {
             run_turn_relay_responder(
                 &rendezvous,
+                rendezvous_auth_token.as_deref(),
                 &mesh_id,
                 &turn,
                 &bind_addr,
@@ -465,7 +531,7 @@ async fn main() -> qlink_core::Result<()> {
                 "relay-smoke is disabled until relay has an end-to-end PQC session".into(),
             ));
         }
-        Command::RendezvousSmoke { server } => {
+        Command::RendezvousSmoke { server, auth_token } => {
             let keypair = DeviceKeypair::generate()?;
             let public = keypair.public_key();
             let body = UnsignedPeerRecord::new(
@@ -484,7 +550,8 @@ async fn main() -> qlink_core::Result<()> {
             );
             let record = PeerRecord::signed(body, &keypair)?;
             let peer_id = record.body.peer_id.clone();
-            let client = RendezvousClient::new(&server);
+            let client =
+                RendezvousClient::new(&server).with_optional_auth_token(auth_token.clone());
             client.publish("devmesh", record).await?;
             let found = client.lookup("devmesh", &peer_id).await?.ok_or_else(|| {
                 qlink_core::QlinkError::Protocol("published peer was not found".into())
@@ -509,6 +576,8 @@ async fn main() -> qlink_core::Result<()> {
             metrics_addr,
             advertise_addr,
             relay,
+            rendezvous_auth_token,
+            relay_auth_token,
             stun_servers,
             turn_servers,
             turn_username,
@@ -526,6 +595,8 @@ async fn main() -> qlink_core::Result<()> {
                 metrics_addr.as_deref(),
                 advertise_addr.as_deref(),
                 relay.as_deref(),
+                rendezvous_auth_token.as_deref(),
+                relay_auth_token.as_deref(),
                 &stun_servers,
                 &turn_servers,
                 turn_username.as_deref(),
@@ -546,6 +617,8 @@ async fn main() -> qlink_core::Result<()> {
             count,
             interval_ms,
             relay,
+            rendezvous_auth_token,
+            relay_auth_token,
         } => {
             let run = run_direct_send_detailed(
                 &rendezvous,
@@ -559,6 +632,8 @@ async fn main() -> qlink_core::Result<()> {
                 count,
                 interval_ms,
                 relay.as_deref(),
+                rendezvous_auth_token.as_deref(),
+                relay_auth_token.as_deref(),
             )
             .await?;
             let outcome = &run.outcome;
@@ -621,6 +696,8 @@ async fn run_direct_send(
         1,
         0,
         None,
+        None,
+        None,
     )
     .await
     .map(|run| run.outcome)
@@ -681,6 +758,34 @@ fn selected_path_label(outcome: &ConnectionOutcome) -> &'static str {
     }
 }
 
+fn service_admission_config(
+    auth_token: Option<&str>,
+    rate_limit_per_window: u32,
+    rate_limit_window_seconds: u64,
+) -> qlink_core::Result<ServiceAdmissionConfig> {
+    let mut admission = ServiceAdmissionConfig::open();
+    if let Some(token) = auth_token {
+        if token.trim().is_empty() {
+            return Err(qlink_core::QlinkError::Protocol(
+                "service auth token must not be empty".into(),
+            ));
+        }
+        admission = admission.with_auth_token(token.to_string());
+    }
+    if rate_limit_per_window > 0 {
+        if rate_limit_window_seconds == 0 {
+            return Err(qlink_core::QlinkError::Protocol(
+                "rate limit window must be at least 1 second".into(),
+            ));
+        }
+        admission = admission.with_rate_limit(
+            rate_limit_per_window,
+            Duration::from_secs(rate_limit_window_seconds),
+        );
+    }
+    Ok(admission)
+}
+
 #[cfg(not(feature = "dev-quic-carrier"))]
 async fn run_direct_send_detailed(
     rendezvous_url: &str,
@@ -694,13 +799,16 @@ async fn run_direct_send_detailed(
     count: u64,
     interval_ms: u64,
     relay: Option<&str>,
+    rendezvous_auth_token: Option<&str>,
+    relay_auth_token: Option<&str>,
 ) -> qlink_core::Result<DirectSendRun> {
     let keypair = Arc::new(load_or_generate_keypair(keyfile)?);
     let local_peer_id = keypair.public_key().peer_id();
     let _bind_addr: SocketAddr = bind_addr
         .parse()
         .map_err(|err| qlink_core::QlinkError::Protocol(format!("invalid bind_addr: {err}")))?;
-    let rendezvous_client = RendezvousClient::new(rendezvous_url.to_string());
+    let rendezvous_client = RendezvousClient::new(rendezvous_url.to_string())
+        .with_optional_auth_token(rendezvous_auth_token.map(|token| token.to_string()));
     let timeout = Duration::from_millis(timeout_ms);
     let direct_probe_timeout = Duration::from_millis(direct_probe_timeout_ms.unwrap_or(timeout_ms));
     let mut connector_config = MeshConnectorConfig::new(mesh_id.to_string(), local_peer_id)
@@ -710,6 +818,9 @@ async fn run_direct_send_detailed(
         .with_probe_pacing(Duration::from_millis(50));
     if let Some(relay_url) = relay {
         connector_config = connector_config.with_relay_server(relay_url.to_string());
+    }
+    if let Some(token) = relay_auth_token {
+        connector_config = connector_config.with_relay_auth_token(token.to_string());
     }
     let connector = MeshConnector::new(connector_config, rendezvous_client);
 
@@ -755,6 +866,8 @@ async fn run_direct_send_detailed(
     count: u64,
     interval_ms: u64,
     relay: Option<&str>,
+    rendezvous_auth_token: Option<&str>,
+    relay_auth_token: Option<&str>,
 ) -> qlink_core::Result<DirectSendRun> {
     let keypair = Arc::new(load_or_generate_keypair(keyfile)?);
     let local_peer_id = keypair.public_key().peer_id();
@@ -762,7 +875,8 @@ async fn run_direct_send_detailed(
         .parse()
         .map_err(|err| qlink_core::QlinkError::Protocol(format!("invalid bind_addr: {err}")))?;
     let client_endpoint = QuicEndpoint::client(bind_addr, &[])?;
-    let rendezvous_client = RendezvousClient::new(rendezvous_url.to_string());
+    let rendezvous_client = RendezvousClient::new(rendezvous_url.to_string())
+        .with_optional_auth_token(rendezvous_auth_token.map(|token| token.to_string()));
     let timeout = Duration::from_millis(timeout_ms);
     let direct_probe_timeout = Duration::from_millis(direct_probe_timeout_ms.unwrap_or(timeout_ms));
     let mut connector_config = MeshConnectorConfig::new(mesh_id.to_string(), local_peer_id)
@@ -774,6 +888,9 @@ async fn run_direct_send_detailed(
     // the relay path (mesh mode). Without it, direct is the only path.
     if let Some(relay_url) = relay {
         connector_config = connector_config.with_relay_server(relay_url.to_string());
+    }
+    if let Some(token) = relay_auth_token {
+        connector_config = connector_config.with_relay_auth_token(token.to_string());
     }
     let connector = MeshConnector::new(connector_config, rendezvous_client, client_endpoint);
 
@@ -821,6 +938,8 @@ async fn run_publish_self(
     metrics_addr: Option<&str>,
     advertise_addr: Option<&str>,
     relay: Option<&str>,
+    rendezvous_auth_token: Option<&str>,
+    relay_auth_token: Option<&str>,
     stun_server_args: &[String],
     turn_server_args: &[String],
     turn_username: Option<&str>,
@@ -854,6 +973,8 @@ async fn run_publish_self(
     let peer_store_for_handle = peer_store_path.map(|p| p.to_string());
     let metrics_addr_for_handle = metrics_addr.map(|m| m.to_string());
     let relay_for_handle = relay.map(|r| r.to_string());
+    let rendezvous_auth_token_for_handle = rendezvous_auth_token.map(|token| token.to_string());
+    let relay_auth_token_for_handle = relay_auth_token.map(|token| token.to_string());
     let local_peer_id_for_handle = local_peer_id.clone();
     let keypair_for_handle = keypair.clone();
     let handle = tokio::task::spawn_blocking(move || {
@@ -867,7 +988,9 @@ async fn run_publish_self(
                 // API still requires.
                 remote_peer_id: "qlink_unconfigured".to_string(),
                 rendezvous_url: rendezvous_owned,
+                rendezvous_auth_token: rendezvous_auth_token_for_handle,
                 relay_url: relay_for_handle,
+                relay_auth_token: relay_auth_token_for_handle,
                 bind_addr: bind_addr_owned,
                 overall_deadline_ms: 3_000,
                 direct_probe_timeout_ms: 750,
@@ -935,9 +1058,10 @@ async fn run_publish_self(
         let (gathered_candidates, gather_report) =
             gather_local_candidates(advertised_addr, &stun_servers).await;
         let record = handle
-            .publish_self_with_extra_candidates(
+            .publish_self_with_extra_candidates_and_auth(
                 keypair.as_ref(),
                 rendezvous_url,
+                rendezvous_auth_token,
                 ttl_seconds,
                 sequence,
                 gathered_candidates,
@@ -985,6 +1109,7 @@ async fn run_publish_self(
 #[allow(clippy::too_many_arguments)]
 async fn run_turn_relay_responder(
     rendezvous_url: &str,
+    rendezvous_auth_token: Option<&str>,
     mesh_id: &str,
     turn_server: &str,
     bind_addr: &str,
@@ -1042,6 +1167,7 @@ async fn run_turn_relay_responder(
         keypair.as_ref(),
     )?;
     RendezvousClient::new(rendezvous_url.to_string())
+        .with_optional_auth_token(rendezvous_auth_token.map(|token| token.to_string()))
         .publish(mesh_id, record.clone())
         .await?;
 
@@ -1247,7 +1373,9 @@ async fn spawn_relay_responder_handle(
                 local_peer_id,
                 remote_peer_id: "qlink_unconfigured".to_string(),
                 rendezvous_url,
+                rendezvous_auth_token: None,
                 relay_url: Some(relay_url),
+                relay_auth_token: None,
                 bind_addr: "127.0.0.1:0".to_string(),
                 overall_deadline_ms: 3_000,
                 direct_probe_timeout_ms: 750,
@@ -1691,7 +1819,7 @@ async fn handle_tampering_conn(
 
     while reader.read_line(&mut line).await? != 0 {
         match serde_json::from_str::<RelayMessage>(line.trim_end()) {
-            Ok(RelayMessage::Register { peer_id }) => {
+            Ok(RelayMessage::Register { peer_id, .. }) => {
                 if let Some(mut writer) = pending_writer.take() {
                     let registered_msg = RelayMessage::Registered {
                         peer_id: peer_id.clone(),
@@ -2089,7 +2217,9 @@ mod tests {
                         local_peer_id: remote_peer_id,
                         remote_peer_id: "qlink_unused".to_string(),
                         rendezvous_url,
+                        rendezvous_auth_token: None,
                         relay_url: None,
+                        relay_auth_token: None,
                         bind_addr: "127.0.0.1:0".to_string(),
                         overall_deadline_ms: 3_000,
                         direct_probe_timeout_ms: 750,
@@ -2174,7 +2304,9 @@ mod native_udp_tests {
                         local_peer_id: remote_peer_id,
                         remote_peer_id: "qlink_unused".to_string(),
                         rendezvous_url,
+                        rendezvous_auth_token: None,
                         relay_url: None,
+                        relay_auth_token: None,
                         bind_addr: "127.0.0.1:0".to_string(),
                         overall_deadline_ms: 3_000,
                         direct_probe_timeout_ms: 750,

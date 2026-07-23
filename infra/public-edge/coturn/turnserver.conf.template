@@ -1,9 +1,10 @@
 # coturn production-candidate template for QuantumLink TURN allocation probes.
 # Render placeholders from /etc/quantumlink/public-edge.env before installing.
 #
-# QuantumLink's in-repo TURN code currently gathers relay candidates only; data
-# relay still uses the QuantumLink PQC relay. Keep coturn enabled for public ICE
-# and NAT classification proof, not as the app data-plane carrier.
+# QuantumLink can gather TURN relay candidates and the local proof path can keep
+# a resident allocation alive for native carrier traffic through Send/Data
+# indications. The default app-relay smoke remains separate from coturn so
+# operators can prove both fallback paths independently.
 
 listening-port=3478
 tls-listening-port=5349

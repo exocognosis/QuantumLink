@@ -81,10 +81,11 @@ The control plane is layered:
 - Peer stores cache verified records for graceful degradation when rendezvous
   is unavailable.
 
-The development rendezvous and relay services in this repository are not
-hardened public infrastructure by themselves. A production deployment needs
-authentication policy, abuse controls, TLS, monitoring, durable revocation,
-retention controls, and operational runbooks.
+The development rendezvous and relay services in this repository include
+bearer-token admission and per-client IP rate limits for public-edge rehearsal,
+but they are not hardened public infrastructure by themselves. A production
+deployment still needs TLS, abuse monitoring, durable revocation, retention
+controls, and operational runbooks.
 
 ### On-chain identity verification
 
@@ -202,7 +203,9 @@ Production gaps include:
   including peer-session readiness under live packet flow.
 - Deployed public TURN data-plane proof and RFC-complete ICE nomination behavior
   against deployed public infrastructure.
-- Hardened public rendezvous and relay TLS/auth/rate-limit controls.
+- Public rendezvous and relay TLS, durable credential revocation, abuse
+  monitoring, retention controls, and deployed hardening evidence beyond the
+  current token-auth/rate-limit baseline.
 - Signed Sparkle/platform update pipeline paired with a post-quantum release
   manifest layer.
 - Production Dytallix mainnet or hardened registry trust root for public

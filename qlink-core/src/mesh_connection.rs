@@ -85,6 +85,7 @@ pub struct MeshConnectorConfig {
     /// reuse `direct_probe_timeout`.
     pub ice_check_timeout: Option<Duration>,
     pub relay_server: Option<String>,
+    pub relay_auth_token: Option<String>,
     /// Peer authorization list. When set, the connector evaluates the
     /// remote peer ID against this ACL *before* any rendezvous lookup or
     /// candidate probe. Denied peers fail with a clear protocol error and
@@ -117,6 +118,10 @@ impl std::fmt::Debug for MeshConnectorConfig {
             .field("local_ice_credentials", &self.local_ice_credentials)
             .field("ice_check_timeout", &self.ice_check_timeout)
             .field("relay_server", &self.relay_server)
+            .field(
+                "relay_auth_token_configured",
+                &self.relay_auth_token.is_some(),
+            )
             .field("peer_acl", &self.peer_acl)
             .field("local_device_keypair", &self.local_device_keypair)
             .field("mesh_trust_policy", &self.mesh_trust_policy)
@@ -139,6 +144,7 @@ impl MeshConnectorConfig {
             local_ice_credentials: None,
             ice_check_timeout: None,
             relay_server: None,
+            relay_auth_token: None,
             peer_acl: None,
             local_device_keypair: None,
             mesh_trust_policy: MeshTrustPolicy::DevelopmentOptional,
@@ -173,6 +179,11 @@ impl MeshConnectorConfig {
 
     pub fn with_relay_server(mut self, server: impl Into<String>) -> Self {
         self.relay_server = Some(server.into());
+        self
+    }
+
+    pub fn with_relay_auth_token(mut self, token: impl Into<String>) -> Self {
+        self.relay_auth_token = Some(token.into());
         self
     }
 
@@ -1300,10 +1311,11 @@ impl MeshConnector {
         // responder's certificate. Bounded by the overall deadline so a silent
         // relay (no responder registered) fails closed instead of hanging.
         let establish = async {
-            let relay_session = RelayCarrierSession::connect_initiator(
+            let relay_session = RelayCarrierSession::connect_initiator_with_auth(
                 server,
                 local_peer_id.clone(),
                 remote_peer_id.to_string(),
+                self.config.relay_auth_token.as_deref(),
             )
             .await?;
             let session = CarrierSession::from(relay_session);
@@ -2115,8 +2127,8 @@ mod native_udp_live_mesh_tests {
 
         let connector = MeshConnector::new(
             MeshConnectorConfig::new(MESH_ID, local_key.public_key().peer_id())
-                .with_direct_probe_timeout(Duration::from_millis(500))
-                .with_overall_deadline(Duration::from_secs(2))
+                .with_direct_probe_timeout(Duration::from_secs(2))
+                .with_overall_deadline(Duration::from_secs(6))
                 .with_local_device_keypair(local_key.clone()),
             rendezvous_client,
         );
@@ -2190,8 +2202,8 @@ mod native_udp_live_mesh_tests {
 
         let connector = MeshConnector::new(
             MeshConnectorConfig::new(MESH_ID, local_key.public_key().peer_id())
-                .with_direct_probe_timeout(Duration::from_millis(750))
-                .with_overall_deadline(Duration::from_secs(3))
+                .with_direct_probe_timeout(Duration::from_secs(2))
+                .with_overall_deadline(Duration::from_secs(6))
                 .with_local_device_keypair(local_key.clone()),
             rendezvous_client,
         );

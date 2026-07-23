@@ -13,7 +13,8 @@
 #   scripts/public-infra-smoke.sh --rendezvous qlink.example.com:9471 \
 #     --relay qlink.example.com:9472 --stun qlink.example.com:3478 \
 #     --turn qlink.example.com:3478 --turn-username qlink --turn-password "$TURN_PASSWORD" --build
-#   scripts/public-infra-smoke.sh --local --prove-turn-relay --build
+#   scripts/public-infra-smoke.sh --local --admission-token local-edge-secret --build
+#   scripts/public-infra-smoke.sh --local --prove-turn-relay --admission-token local-edge-secret --build
 
 set -euo pipefail
 
@@ -30,6 +31,11 @@ TURN_USERNAME="${QLINK_TURN_USERNAME:-}"
 TURN_PASSWORD="${QLINK_TURN_PASSWORD:-}"
 TURN_REALM="${QLINK_TURN_REALM:-}"
 TURN_PERMIT_PEER_IP="${QLINK_TURN_PERMIT_PEER_IP:-}"
+RENDEZVOUS_AUTH_TOKEN="${QLINK_RENDEZVOUS_AUTH_TOKEN:-}"
+RELAY_AUTH_TOKEN="${QLINK_RELAY_AUTH_TOKEN:-}"
+RENDEZVOUS_RATE_LIMIT_PER_WINDOW="${QLINK_RENDEZVOUS_RATE_LIMIT_PER_WINDOW:-0}"
+RELAY_RATE_LIMIT_PER_WINDOW="${QLINK_RELAY_RATE_LIMIT_PER_WINDOW:-0}"
+ADMISSION_RATE_LIMIT_WINDOW_SECONDS="${QLINK_ADMISSION_RATE_LIMIT_WINDOW_SECONDS:-60}"
 BIN="${QLINK_BIN:-$ROOT/target/release/qlinkctl}"
 BUILD=0
 PROVE_TURN_RELAY=0
@@ -59,6 +65,16 @@ while [[ $# -gt 0 ]]; do
     --turn-password) TURN_PASSWORD="$2"; shift 2 ;;
     --turn-realm) TURN_REALM="$2"; shift 2 ;;
     --turn-permit-peer-ip) TURN_PERMIT_PEER_IP="$2"; shift 2 ;;
+    --rendezvous-auth-token) RENDEZVOUS_AUTH_TOKEN="$2"; shift 2 ;;
+    --relay-auth-token) RELAY_AUTH_TOKEN="$2"; shift 2 ;;
+    --admission-token)
+      RENDEZVOUS_AUTH_TOKEN="$2"
+      RELAY_AUTH_TOKEN="$2"
+      shift 2
+      ;;
+    --rendezvous-rate-limit-per-window) RENDEZVOUS_RATE_LIMIT_PER_WINDOW="$2"; shift 2 ;;
+    --relay-rate-limit-per-window) RELAY_RATE_LIMIT_PER_WINDOW="$2"; shift 2 ;;
+    --admission-rate-limit-window-seconds) ADMISSION_RATE_LIMIT_WINDOW_SECONDS="$2"; shift 2 ;;
     --base-port) BASE_PORT="$2"; shift 2 ;;
     --responder-bind) RESPONDER_BIND="$2"; shift 2 ;;
     --advertise-addr) ADVERTISE_ADDR="$2"; shift 2 ;;
@@ -137,6 +153,14 @@ require_endpoint() {
   [[ "$value" == *:* ]] || die "$name must be host:port"
 }
 
+bool_for_nonempty() {
+  if [[ -n "$1" ]]; then
+    echo true
+  else
+    echo false
+  fi
+}
+
 if [[ "$BUILD" -eq 1 ]]; then
   features="dev-quic-carrier"
   if [[ "$PROVE_TURN_RELAY" -eq 1 ]]; then
@@ -161,10 +185,30 @@ if [[ "$MODE" == "local" ]]; then
   fi
 
   log "starting local rendezvous at $RENDEZVOUS"
-  "$BIN" rendezvous --listen "$RENDEZVOUS" > "$RUN_DIR/rendezvous.log" 2>&1 &
+  rendezvous_args=(rendezvous --listen "$RENDEZVOUS")
+  if [[ -n "$RENDEZVOUS_AUTH_TOKEN" ]]; then
+    rendezvous_args+=(--auth-token "$RENDEZVOUS_AUTH_TOKEN")
+  fi
+  if [[ "$RENDEZVOUS_RATE_LIMIT_PER_WINDOW" -gt 0 ]]; then
+    rendezvous_args+=(
+      --rate-limit-per-window "$RENDEZVOUS_RATE_LIMIT_PER_WINDOW"
+      --rate-limit-window-seconds "$ADMISSION_RATE_LIMIT_WINDOW_SECONDS"
+    )
+  fi
+  "$BIN" "${rendezvous_args[@]}" > "$RUN_DIR/rendezvous.log" 2>&1 &
   PIDS+=("$!")
   log "starting local relay at $RELAY"
-  "$BIN" relay --listen "$RELAY" > "$RUN_DIR/relay.log" 2>&1 &
+  relay_args=(relay --listen "$RELAY")
+  if [[ -n "$RELAY_AUTH_TOKEN" ]]; then
+    relay_args+=(--auth-token "$RELAY_AUTH_TOKEN")
+  fi
+  if [[ "$RELAY_RATE_LIMIT_PER_WINDOW" -gt 0 ]]; then
+    relay_args+=(
+      --rate-limit-per-window "$RELAY_RATE_LIMIT_PER_WINDOW"
+      --rate-limit-window-seconds "$ADMISSION_RATE_LIMIT_WINDOW_SECONDS"
+    )
+  fi
+  "$BIN" "${relay_args[@]}" > "$RUN_DIR/relay.log" 2>&1 &
   PIDS+=("$!")
   log "starting local STUN at $STUN"
   "$BIN" stun --listen "$STUN" > "$RUN_DIR/stun.log" 2>&1 &
@@ -192,7 +236,11 @@ wait_tcp "$RENDEZVOUS" || die "rendezvous did not accept TCP connections"
 wait_tcp "$RELAY" || die "relay did not accept TCP connections"
 
 log "proving rendezvous publish/lookup"
-"$BIN" rendezvous-smoke --server "$RENDEZVOUS" > "$RUN_DIR/rendezvous-smoke.log" 2>&1
+rendezvous_smoke_args=(rendezvous-smoke --server "$RENDEZVOUS")
+if [[ -n "$RENDEZVOUS_AUTH_TOKEN" ]]; then
+  rendezvous_smoke_args+=(--auth-token "$RENDEZVOUS_AUTH_TOKEN")
+fi
+"$BIN" "${rendezvous_smoke_args[@]}" > "$RUN_DIR/rendezvous-smoke.log" 2>&1
 grep -q '^record_verified=true$' "$RUN_DIR/rendezvous-smoke.log" \
   || die "rendezvous smoke did not verify the published record"
 
@@ -235,6 +283,9 @@ if [[ "$PROVE_TURN_RELAY" -eq 1 ]]; then
     --ttl-seconds 60
     --keyfile "$RESPONDER_KEY"
     --max-frames "$COUNT")
+  if [[ -n "$RENDEZVOUS_AUTH_TOKEN" ]]; then
+    publish_args+=(--rendezvous-auth-token "$RENDEZVOUS_AUTH_TOKEN")
+  fi
   if [[ -n "$TURN_USERNAME" || -n "$TURN_PASSWORD" ]]; then
     publish_args+=(--turn-username "$TURN_USERNAME" --turn-password "$TURN_PASSWORD")
   fi
@@ -243,14 +294,20 @@ if [[ "$PROVE_TURN_RELAY" -eq 1 ]]; then
   fi
 else
   publish_args=(publish-self
-    --rendezvous "$RENDEZVOUS" \
-    --mesh-id "$MESH_ID" \
-    --bind-addr "$RESPONDER_BIND" \
-    --advertise-addr "$ADVERTISE_ADDR" \
-    --relay "$RELAY" \
-    --ttl-seconds 60 \
-    --keyfile "$RESPONDER_KEY" \
+    --rendezvous "$RENDEZVOUS"
+    --mesh-id "$MESH_ID"
+    --bind-addr "$RESPONDER_BIND"
+    --advertise-addr "$ADVERTISE_ADDR"
+    --relay "$RELAY"
+    --ttl-seconds 60
+    --keyfile "$RESPONDER_KEY"
     --stun "$STUN")
+  if [[ -n "$RENDEZVOUS_AUTH_TOKEN" ]]; then
+    publish_args+=(--rendezvous-auth-token "$RENDEZVOUS_AUTH_TOKEN")
+  fi
+  if [[ -n "$RELAY_AUTH_TOKEN" ]]; then
+    publish_args+=(--relay-auth-token "$RELAY_AUTH_TOKEN")
+  fi
   if [[ -n "$TURN" ]]; then
     publish_args+=(--turn "$TURN")
     if [[ -n "$TURN_USERNAME" || -n "$TURN_PASSWORD" ]]; then
@@ -287,17 +344,23 @@ if [[ "$PROVE_TURN_RELAY" -eq 1 ]]; then
 fi
 
 log "forcing published $expected_path fallback to peer $REMOTE_PEER"
-"$BIN" direct-send \
-  --rendezvous "$RENDEZVOUS" \
-  --mesh-id "$MESH_ID" \
-  --remote-peer-id "$REMOTE_PEER" \
-  --bind-addr 0.0.0.0:0 \
-  --payload public-infra-smoke \
-  --count "$COUNT" \
-  --interval-ms "$INTERVAL_MS" \
-  --timeout-ms "$TIMEOUT_MS" \
-  --direct-probe-timeout-ms "$DIRECT_PROBE_TIMEOUT_MS" \
-  > "$RUN_DIR/direct-send.log" 2>&1
+direct_send_args=(direct-send
+  --rendezvous "$RENDEZVOUS"
+  --mesh-id "$MESH_ID"
+  --remote-peer-id "$REMOTE_PEER"
+  --bind-addr 0.0.0.0:0
+  --payload public-infra-smoke
+  --count "$COUNT"
+  --interval-ms "$INTERVAL_MS"
+  --timeout-ms "$TIMEOUT_MS"
+  --direct-probe-timeout-ms "$DIRECT_PROBE_TIMEOUT_MS")
+if [[ -n "$RENDEZVOUS_AUTH_TOKEN" ]]; then
+  direct_send_args+=(--rendezvous-auth-token "$RENDEZVOUS_AUTH_TOKEN")
+fi
+if [[ -n "$RELAY_AUTH_TOKEN" ]]; then
+  direct_send_args+=(--relay-auth-token "$RELAY_AUTH_TOKEN")
+fi
+"$BIN" "${direct_send_args[@]}" > "$RUN_DIR/direct-send.log" 2>&1
 
 selected_path="$(sed -n 's/^selected_path=//p' "$RUN_DIR/direct-send.log" | tail -1)"
 frames_sent="$(sed -n 's/^frames_sent=//p' "$RUN_DIR/direct-send.log" | tail -1)"
@@ -337,6 +400,11 @@ cat > "$EVIDENCE" <<EOF
   "relay": "$RELAY",
   "stun": "$STUN",
   "turn": "$TURN",
+  "rendezvous_auth_required": $(bool_for_nonempty "$RENDEZVOUS_AUTH_TOKEN"),
+  "relay_auth_required": $(bool_for_nonempty "$RELAY_AUTH_TOKEN"),
+  "rendezvous_rate_limit_per_window": $RENDEZVOUS_RATE_LIMIT_PER_WINDOW,
+  "relay_rate_limit_per_window": $RELAY_RATE_LIMIT_PER_WINDOW,
+  "admission_rate_limit_window_seconds": $ADMISSION_RATE_LIMIT_WINDOW_SECONDS,
   "prove_turn_relay": $([[ "$PROVE_TURN_RELAY" -eq 1 ]] && echo true || echo false),
   "remote_peer_id": "$REMOTE_PEER",
   "advertise_addr": "$ADVERTISE_ADDR",

@@ -7,12 +7,14 @@ validation while Apple credentials are still pending.
 
 The repo can now prove live rendezvous, STUN, optional TURN allocation, signed
 peer-record publication of gathered ICE candidates, end-to-end PQC app-relay
-fallback, and resident TURN data-plane behavior with
-`scripts/public-infra-smoke.sh`.
+fallback, resident TURN data-plane behavior, and app-layer rendezvous/relay
+admission with `scripts/public-infra-smoke.sh`.
 
-Do not treat the in-repo rendezvous and QuantumLink relay binaries as open
-internet production services yet. Their client protocol is still raw TCP. Until
-client-side TLS/auth lands, expose those two ports only through one of:
+Do not treat the in-repo rendezvous and QuantumLink relay binaries as broadly
+open internet production services yet. They now support bearer-token admission
+and per-client IP rate limits, but their client protocol is still raw TCP
+without TLS. Until client-side TLS lands, expose those two ports only through
+one of:
 
 - a source-allowlisted firewall for named testers;
 - a private overlay such as WireGuard;
@@ -44,8 +46,8 @@ Expected default ports:
 
 | Service | Port | Exposure |
 |---|---:|---|
-| Rendezvous | TCP 9471 | allowlisted/tunneled only |
-| QuantumLink relay | TCP 9472 | allowlisted/tunneled only |
+| Rendezvous | TCP 9471 | token-authenticated plus allowlisted/tunneled until TLS |
+| QuantumLink relay | TCP 9472 | token-authenticated plus allowlisted/tunneled until TLS |
 | coturn STUN/TURN | UDP 3478 | public |
 | QuantumLink STUN auxiliary | UDP 3479-3480 | public |
 | TURN TLS | TCP 5349 | public |
@@ -70,10 +72,12 @@ sudo systemctl daemon-reload
 ```
 
 Edit `/etc/quantumlink/public-edge.env` before starting services. Set the real
-public IP, realm, and high-entropy TURN password. Then apply equivalent firewall
-rules from `infra/public-edge/ufw.rules.example`.
+public IP, realm, high-entropy rendezvous and relay admission tokens, rate-limit
+windows, and high-entropy TURN password. Then apply equivalent firewall rules
+from `infra/public-edge/ufw.rules.example`.
 
-Start the raw QuantumLink services only after firewall allowlisting is in place:
+Start the raw QuantumLink services only after admission tokens are set and
+firewall allowlisting is in place:
 
 ```sh
 sudo systemctl enable --now quantumlink-rendezvous quantumlink-relay
@@ -99,6 +103,8 @@ scripts/public-infra-smoke.sh \
   --rendezvous EDGE_HOST:9471 \
   --relay EDGE_HOST:9472 \
   --stun EDGE_HOST:3478 \
+  --rendezvous-auth-token "$QLINK_RENDEZVOUS_AUTH_TOKEN" \
+  --relay-auth-token "$QLINK_RELAY_AUTH_TOKEN" \
   --turn EDGE_HOST:3478 \
   --turn-username "$QLINK_TURN_USERNAME" \
   --turn-password "$QLINK_TURN_PASSWORD" \
@@ -115,6 +121,8 @@ scripts/public-infra-smoke.sh \
   --rendezvous EDGE_HOST:9471 \
   --relay EDGE_HOST:9472 \
   --stun EDGE_HOST:3478 \
+  --rendezvous-auth-token "$QLINK_RENDEZVOUS_AUTH_TOKEN" \
+  --relay-auth-token "$QLINK_RELAY_AUTH_TOKEN" \
   --turn EDGE_HOST:3478 \
   --turn-username "$QLINK_TURN_USERNAME" \
   --turn-password "$QLINK_TURN_PASSWORD" \
@@ -127,14 +135,16 @@ scripts/public-infra-smoke.sh \
 For an offline local rehearsal:
 
 ```sh
-scripts/public-infra-smoke.sh --local --build
-scripts/public-infra-smoke.sh --local --prove-turn-relay --build
+scripts/public-infra-smoke.sh --local --admission-token local-edge-secret --build
+scripts/public-infra-smoke.sh --local --prove-turn-relay --admission-token local-edge-secret --build
 ```
 
 The smoke run writes `build/public-infra-smoke/<timestamp>/evidence.json`. A
 passing evidence file must show:
 
 - `stun_reflexive` is non-empty;
+- `rendezvous_auth_required` and `relay_auth_required` match the intended edge
+  admission mode;
 - `turn_relayed` is non-empty when `--turn` was supplied;
 - `published_candidate_types` includes `ServerReflexive`;
 - `published_candidate_types` includes `QuantumLinkRelay`;
@@ -163,11 +173,13 @@ candidate and accepts the native carrier through TURN Send/Data indications.
 Before widening tester access:
 
 - Confirm cloud firewall and host firewall expose only the listed ports.
-- Confirm rendezvous and QuantumLink relay are not globally reachable unless a
-  TLS/auth client path has shipped.
+- Confirm rendezvous and QuantumLink relay require non-placeholder admission
+  tokens, enforce appropriate rate limits, and remain source-limited or tunneled
+  until TLS lands.
 - Confirm coturn uses long-term credentials and a constrained relay port range.
 - Confirm coturn has readable TLS cert/key paths before exposing TCP/UDP 5349.
 - Confirm `journalctl -u quantumlink-*` contains control-plane metadata only.
-- Rotate the TURN password and redeploy if it appears in any shared transcript.
+- Rotate the rendezvous, relay, and TURN credentials and redeploy if any appear
+  in a shared transcript.
 - Re-run `scripts/public-infra-smoke.sh` from an off-host network after every
   firewall, DNS, binary, or unit-file change.
