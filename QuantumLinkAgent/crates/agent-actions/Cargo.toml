@@ -1,0 +1,11 @@
+[package]
+name = "qlink-agent-actions"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+qlink-agent-contracts = { path = "../agent-contracts" }
+
+[dev-dependencies]
+uuid = { version = "1", features = ["v4"] }
