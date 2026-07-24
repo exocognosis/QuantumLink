@@ -44,6 +44,11 @@ jobs:
         # the pqc_policy_tests manifest check above.
         run: |
           cargo test -p qlink-core --lib turn:: --features turn-relay -- --nocapture
+      - name: Public edge evidence contracts
+        run: |
+          bash -n scripts/public-edge-live-evidence.sh
+          ruby -c scripts/verify-public-infra-evidence.rb
+          ruby scripts/public_infra_evidence_test.rb
 
   macos:
     name: macOS silo (Swift + XCFramework)
