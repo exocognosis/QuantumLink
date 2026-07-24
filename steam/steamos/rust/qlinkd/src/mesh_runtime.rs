@@ -31,7 +31,7 @@ use crate::identity::DeviceIdentity;
 use base64::Engine as _;
 use qlink_core::crypto::DeviceKeypair;
 use qlink_core::mesh_transport::{MeshTransportConfig, MeshTransportHandle};
-use qlink_core::packet_core::InstalledPeerSession;
+use qlink_core::packet_core::{InstalledPeerSession, PeerSessionDirection};
 use qlink_proto::{peer_store_path_from_state_dir, DaemonConfig, PathKind};
 use std::collections::VecDeque;
 use std::path::Path;
@@ -137,8 +137,11 @@ impl MeshFrameTransport for DaemonMeshTransport {
             Self::Mesh(_) => None,
             Self::LocalEcho(_) => Some(InstalledPeerSession {
                 peer_id: LOCAL_ECHO_PEER_ID.to_string(),
+                direction: PeerSessionDirection::Outbound,
+                generation: 1,
+                transcript_binding: [0; 32],
                 expires_at_unix: u64::MAX,
-                rekey_after_packets: 0,
+                rekey_after_bytes: 0,
             }),
         }
     }
