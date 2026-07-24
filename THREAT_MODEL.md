@@ -10,7 +10,7 @@ This document is repository-scoped. It covers the current implementation baselin
 - Device identity and peer records use ML-DSA-65 by default, with SLH-DSA-SHA2-128S support for the FIPS 205 suite path.
 - Signed peer records bind peer IDs, device public keys, endpoint candidates, ICE credentials, QUIC certificate material, routes, expiration, and sequence numbers.
 - The packet core encrypts packet frames with ChaCha20-Poly1305 using suite-bound development keys today. Production peer sessions still need to install negotiated session keys into packet-frame encryption before production confidentiality or HNDL resistance should be claimed for carried user traffic.
-- The included rendezvous and relay services are development services. They are not hardened public infrastructure without TLS, authentication policy, rate limits, revocation, monitoring, and retention controls.
+- The included rendezvous and relay services are development services with bearer-token admission and per-client IP rate limits. They are not hardened public infrastructure without TLS, durable revocation, monitoring, resource quotas, and retention controls.
 
 For quantum-era risks in more detail, see `QUANTUM_THREATS.md`.
 
@@ -132,8 +132,8 @@ Capabilities:
 Security expectation:
 
 - Several control paths bound message size or reject malformed input, for example inbound identity assertions are capped at 32 KiB.
-- Development rendezvous and relay services are simple unauthenticated TCP JSON services and should not be exposed publicly.
-- Production deployments still need explicit rate limits, connection quotas, abuse monitoring, authenticated service access, and resource accounting.
+- Development rendezvous and relay services are raw TCP JSON services with optional bearer-token admission and per-client IP rate limits; keep them source-limited or tunneled until TLS lands.
+- Production deployments still need connection quotas, abuse monitoring, durable authenticated service access, token revocation, and resource accounting.
 
 7. Key compromise adversary
 
@@ -322,7 +322,8 @@ Mitigations:
 Reviewer focus:
 
 - Treat rendezvous and relay as malicious. Verify they cannot forge identity, route policy, or packet contents.
-- Add production rate limits and authentication before any public service exposure.
+- Require non-placeholder admission tokens and rate limits before public-edge
+  testing, and add TLS plus durable revocation before broad service exposure.
 - Confirm stale peer-store fallback cannot revive revoked peers in public-required deployments.
 - Ensure relay metadata visibility is documented and acceptable for the deployment.
 
@@ -423,7 +424,7 @@ Active MITM:
 Malicious peer:
 
 - Sends validly signed but harmful traffic, advertises bad routes, probes ACLs, or floods resources.
-- Mitigated by route policy, ACLs, registry policy, message caps, and fail-closed packet handling. Residual DoS and abuse risk remains until rate limits and quotas are added.
+- Mitigated by route policy, ACLs, registry policy, message caps, fail-closed packet handling, and service-level admission/rate limits. Residual DoS and abuse risk remains until connection quotas, telemetry, and operator abuse workflows are added.
 
 Malicious rendezvous or relay:
 

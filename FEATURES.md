@@ -23,16 +23,20 @@ This feature list is synchronized with the current repository implementation. It
 - Peer IDs derived from device public-key material.
 - Signed, expiring peer records for rendezvous publication.
 - Inbound identity assertions and optional peer ACL evaluation.
-- ChaCha20-Poly1305 packet-frame protection in the Rust packet core.
-- Monotonic packet-number replay window.
+- App-layer PQC frame protection using ML-KEM session keys, SHAKE256 masking/authentication, and replay rejection.
+- Packet-core route enforcement, packet metadata normalization, peer-session readiness gates, and monotonic packet-number replay window.
+- macOS FFI hooks and development-runtime wiring for packet-core peer-session install/clear/readiness plus peer-session and replay-drop metrics.
 
 ## Mesh and Transport
 
-- Development rendezvous server and client.
-- Development relay server and client.
-- Quinn QUIC DATAGRAM loopback smoke path.
-- Mesh connector state machine for rendezvous lookup, direct candidate probes, relay fallback, last-good path caching, and reconnect handling.
-- Optional ICE/STUN helper paths for connectivity checks.
+- Development rendezvous server and client, with optional bearer-token admission
+  and per-client IP rate limiting for public-edge rehearsal.
+- Development relay server and client, with optional bearer-token registration,
+  per-client IP rate limiting, and registered-source validation for relayed
+  datagrams.
+- Native UDP carrier is the default mesh data-plane carrier; Quinn/rustls is feature-gated for legacy development.
+- Mesh connector state machine for rendezvous lookup, native direct candidate probes, PQC relay fallback, published QuantumLink relay-candidate fallback, last-good path caching, and reconnect handling.
+- Optional ICE/STUN helper paths for connectivity checks, plus feature-gated TURN relay-candidate gathering. Published TURN relay candidates are consumed as UDP-relayed carrier targets when live, and the `turn-relay` proof path keeps a resident allocation with CreatePermission plus Send/Data indication handling distinct from the QuantumLink app-relay carrier.
 - File-backed peer store with optional ChaCha20-Poly1305 envelope encryption.
 - OpenMetrics endpoint support when explicitly configured.
 
@@ -40,15 +44,19 @@ This feature list is synchronized with the current repository implementation. It
 
 - Local development app can run without a signed Network Extension by using simulated mesh state or development loopback transport.
 - Unsigned XcodeGen project scaffolding can be generated without Apple credentials.
+- The macOS development runtime installs, clears, and rotates packet-core peer-session readiness from the live default-peer mesh session, so protected packet flow fails closed until an authenticated peer session is available.
+- macOS connection profiles, managed configuration, and party-mesh invite flows can select a remote QuantumLink peer ID and carry it into the packet-session readiness gate.
 - Real packet tunnel execution requires Apple Network Extension entitlements, provisioning, signing, and notarization.
 - Enterprise rollout is designed around MDM, per-app VPN payloads, VPN On Demand rules, and extension preapproval.
 
 ## Not Production-Complete
 
-- Production peer-session key installation into packet-frame encryption.
-- Hardened public rendezvous and relay services.
-- Full public ICE/STUN/TURN deployment and nomination behavior.
+- Public rendezvous/relay TLS, durable revocation, abuse monitoring, retention
+  controls, and deployed hardening evidence beyond the implemented admission
+  token/rate-limit baseline.
+- RFC-complete public ICE nomination behavior and TURN relay-candidate data-plane proof against deployed public infrastructure.
 - Notarized Developer ID app and tunnel extension bundle.
+- Real-hardware validation of signed/provisioned Network Extension builds, including peer-session readiness under live packet flow.
 - Managed Device Attestation and SSO integration.
 - Full post-quantum update manifest and release-signing layer.
 - Anonymity guarantees beyond metadata minimization.

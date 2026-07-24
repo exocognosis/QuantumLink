@@ -29,12 +29,17 @@ final class PartyMeshInviteTests: XCTestCase {
       )
     )
 
-    let invite = PartyMeshInvite(configuration: configuration, gamePort: 27015)
+    let invite = PartyMeshInvite(
+      configuration: configuration,
+      gamePort: 27015,
+      hostPeerID: " qlink_host-peer "
+    )
     let code = try invite.joinCode()
     let decoded = try PartyMeshInvite(joinCode: code)
 
     XCTAssertEqual(decoded.meshID, "ranked-squad-night")
     XCTAssertEqual(decoded.hostAlias, "Host Mac")
+    XCTAssertEqual(decoded.hostPeerID, "qlink_host-peer")
     XCTAssertEqual(decoded.hostOverlayAddress, "100.88.10.4")
     XCTAssertEqual(decoded.rendezvousServers, ["rendezvous.quantumlink.example:9471"])
     XCTAssertEqual(decoded.relayServers, ["relay.quantumlink.example:9472"])
@@ -48,6 +53,26 @@ final class PartyMeshInviteTests: XCTestCase {
 
   func testInviteRejectsMalformedJoinCode() {
     XCTAssertThrowsError(try PartyMeshInvite(joinCode: "not-a-valid-party-code"))
+  }
+
+  func testInviteDecodesOlderPayloadWithoutHostPeerID() throws {
+    let data = """
+    {
+      "meshID": "duo-night",
+      "hostAlias": "Host Mac",
+      "hostOverlayAddress": "100.88.10.4",
+      "rendezvousServers": ["rendezvous.quantumlink.example:9471"],
+      "relayServers": [],
+      "gamePort": 27015,
+      "identityMode": "off",
+      "meshTrustPolicy": "development_optional"
+    }
+    """.data(using: .utf8)!
+
+    let invite = try JSONDecoder().decode(PartyMeshInvite.self, from: data)
+
+    XCTAssertNil(invite.hostPeerID)
+    XCTAssertEqual(invite.hostOverlayAddress, "100.88.10.4")
   }
 
   func testInviteSummaryExplainsPublicMeshTrustRequirement() {

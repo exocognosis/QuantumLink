@@ -53,9 +53,10 @@ use crate::{
     },
     pqc_frame::PqcFrameProtector,
     pqc_session_wire::run_pqc_session_responder,
+    relay::RelayResponderListener,
     rendezvous::RendezvousClient,
     session_crypto::{derive_packet_session_binding, PqcSessionContext, PqcSessionRole},
-    traversal::HOST_PRIORITY,
+    traversal::{order_remote_candidates, quantum_link_relay_candidate, HOST_PRIORITY},
 };
 #[cfg(not(feature = "dev-quic-carrier"))]
 use crate::{carrier_transport::NativeUdpListener, mesh_connection::native_udp_carrier_binding};
@@ -592,12 +593,20 @@ struct PerPeerMetricsRaw {
 #[derive(Debug)]
 struct AggregateState {
     network_event_count: AtomicU64,
+    // Inbound-responder frames don't flow through a `self.peers` session
+    // (see `handle_inbound_session`), so their receive counts are tracked
+    // here and folded into the metrics snapshot alongside the per-peer
+    // totals. Without this, a pure responder always reports 0 received.
+    inbound_frames_received: AtomicU64,
+    inbound_bytes_received: AtomicU64,
 }
 
 impl AggregateState {
     fn new() -> Self {
         Self {
             network_event_count: AtomicU64::new(0),
+            inbound_frames_received: AtomicU64::new(0),
+            inbound_bytes_received: AtomicU64::new(0),
         }
     }
 }
@@ -610,7 +619,11 @@ pub struct MeshTransportConfig {
     pub remote_peer_id: String,
     pub rendezvous_url: String,
     #[serde(default)]
+    pub rendezvous_auth_token: Option<String>,
+    #[serde(default)]
     pub relay_url: Option<String>,
+    #[serde(default)]
+    pub relay_auth_token: Option<String>,
     /// Local QUIC bind address, e.g. "127.0.0.1:0" or "0.0.0.0:0".
     pub bind_addr: String,
     #[serde(default = "default_overall_deadline_ms")]
@@ -865,6 +878,12 @@ pub struct MeshTransportHandle {
     /// Responder accept-loop task. Aborted on `Drop`. `None` when the
     /// responder is disabled via `disable_inbound_responder`.
     responder_task: StdMutex<Option<JoinHandle<()>>>,
+    /// Address to advertise in published peer records INSTEAD of
+    /// `responder_local_addr`. Lets a node behind a proxy/NAT (or a test
+    /// harness inserting an on-path element) publish a routable candidate
+    /// that differs from its actual bind address. `None` = advertise the
+    /// real bound address.
+    advertise_addr: StdMutex<Option<SocketAddr>>,
 }
 
 impl MeshTransportHandle {
@@ -949,7 +968,8 @@ impl MeshTransportHandle {
             (Some(socket), Some(local_addr))
         };
 
-        let rendezvous_client = RendezvousClient::new(config.rendezvous_url.clone());
+        let rendezvous_client = RendezvousClient::new(config.rendezvous_url.clone())
+            .with_optional_auth_token(config.rendezvous_auth_token.clone());
         let local_credentials = IceCredentials::generate()?;
 
         let mut connector_config =
@@ -960,6 +980,9 @@ impl MeshTransportHandle {
                 .with_mesh_trust_policy(config.mesh_trust_policy);
         if let Some(relay) = config.relay_url.clone() {
             connector_config = connector_config.with_relay_server(relay);
+        }
+        if let Some(token) = config.relay_auth_token.clone() {
+            connector_config = connector_config.with_relay_auth_token(token);
         }
         if config.enable_ice {
             connector_config = connector_config.with_local_ice_credentials(local_credentials);
@@ -1083,6 +1106,7 @@ impl MeshTransportHandle {
             server_certificate_der: None,
             responder_local_addr,
             responder_task: StdMutex::new(responder_task),
+            advertise_addr: StdMutex::new(None),
         };
 
         handle.add_peer(&config.remote_peer_id)?;
@@ -1167,7 +1191,8 @@ impl MeshTransportHandle {
         // empty — any direct `connect()` would fail by design.
         let quic_endpoint = QuicEndpoint::client(client_bind_addr, &[])?;
 
-        let rendezvous_client = RendezvousClient::new(config.rendezvous_url.clone());
+        let rendezvous_client = RendezvousClient::new(config.rendezvous_url.clone())
+            .with_optional_auth_token(config.rendezvous_auth_token.clone());
         let local_credentials = IceCredentials::generate()?;
 
         let mut connector_config =
@@ -1178,6 +1203,9 @@ impl MeshTransportHandle {
                 .with_mesh_trust_policy(config.mesh_trust_policy);
         if let Some(relay) = config.relay_url.clone() {
             connector_config = connector_config.with_relay_server(relay);
+        }
+        if let Some(token) = config.relay_auth_token.clone() {
+            connector_config = connector_config.with_relay_auth_token(token);
         }
         if config.enable_ice {
             connector_config = connector_config.with_local_ice_credentials(local_credentials);
@@ -1265,6 +1293,7 @@ impl MeshTransportHandle {
         // identity + ACL evaluation, and routes accepted frames into
         // `inbound_tx` tagged with the verified peer_id. Disabled paths
         // simply skip the spawn.
+        let relay_registry_lookup = inbound_identity_registry_lookup.clone();
         let responder_task = match server_endpoint {
             Some(endpoint) => {
                 let inbound_acl = config.inbound_acl.clone().map(Arc::new);
@@ -1295,11 +1324,41 @@ impl MeshTransportHandle {
                     blocked_peer_history_responder,
                     config.packet_session_lifetime_seconds,
                     config.packet_session_rekey_after_bytes,
+                    aggregate.clone(),
                 ));
                 Some(task)
             }
             None => None,
         };
+
+        // Also accept relay-fallback connections when a relay is configured and
+        // the responder is enabled (cert + keypair present): register with the
+        // relay under our peer id and run the same inbound handler per source
+        // peer. Lets peers that cannot reach us directly still connect. The task
+        // is aborted with the runtime on handle drop.
+        if let (Some(relay_url), Some(cert_der), Some(keypair)) = (
+            config.relay_url.clone(),
+            server_certificate_der.clone(),
+            local_device_keypair.clone(),
+        ) {
+            runtime.spawn(run_relay_responder_loop(
+                relay_url,
+                config.relay_auth_token.clone(),
+                config.mesh_id.clone(),
+                config.local_peer_id.clone(),
+                keypair,
+                cert_der,
+                config.inbound_acl.clone().map(Arc::new),
+                inbound_mesh_trust_policy,
+                relay_registry_lookup,
+                inbound_tx.clone(),
+                packet_session_generation.clone(),
+                packet_session_event_tx.clone(),
+                config.packet_session_lifetime_seconds,
+                config.packet_session_rekey_after_bytes,
+                aggregate.clone(),
+            ));
+        }
 
         let handle = Self {
             runtime: Some(runtime),
@@ -1320,6 +1379,7 @@ impl MeshTransportHandle {
             server_certificate_der,
             responder_local_addr,
             responder_task: StdMutex::new(responder_task),
+            advertise_addr: StdMutex::new(None),
         };
 
         // Auto-add the configured peer for back-compat with the
@@ -1330,6 +1390,32 @@ impl MeshTransportHandle {
     }
 
     // (continued below — public API)
+}
+
+fn published_candidate_endpoints(
+    advertised: SocketAddr,
+    extra_candidates: Vec<CandidateEndpoint>,
+) -> Vec<CandidateEndpoint> {
+    let mut candidates = vec![CandidateEndpoint {
+        candidate_type: CandidateType::Host,
+        address: advertised.ip().to_string(),
+        port: advertised.port(),
+        priority: HOST_PRIORITY,
+    }];
+    candidates.extend(extra_candidates);
+
+    let mut unique: Vec<CandidateEndpoint> = Vec::new();
+    for candidate in candidates {
+        if unique.iter().any(|existing| {
+            existing.candidate_type == candidate.candidate_type
+                && existing.address == candidate.address
+                && existing.port == candidate.port
+        }) {
+            continue;
+        }
+        unique.push(candidate);
+    }
+    order_remote_candidates(&unique)
 }
 
 impl MeshTransportHandle {
@@ -1354,6 +1440,15 @@ impl MeshTransportHandle {
     /// responder is disabled. Stable for the lifetime of the handle.
     pub fn responder_local_addr(&self) -> Option<SocketAddr> {
         self.responder_local_addr
+    }
+
+    /// Override the candidate address advertised by `publish_self`. Use when
+    /// the node is reached through a proxy/NAT whose public endpoint differs
+    /// from the local bind address.
+    pub fn set_advertise_addr(&self, addr: SocketAddr) {
+        if let Ok(mut guard) = self.advertise_addr.lock() {
+            *guard = Some(addr);
+        }
     }
 
     /// Synchronous wrapper for `publish_self` that drives the async
@@ -1411,6 +1506,52 @@ impl MeshTransportHandle {
         sequence: u64,
         overlay_routes: Vec<String>,
     ) -> Result<PeerRecord> {
+        self.publish_self_with_extra_candidates(
+            keypair,
+            rendezvous_url,
+            ttl_seconds,
+            sequence,
+            Vec::new(),
+            overlay_routes,
+        )
+        .await
+    }
+
+    /// Same as [`Self::publish_self`], but appends already-gathered
+    /// server-reflexive or relay candidates to the signed record. This is used
+    /// by operator tooling after STUN/TURN gathering while keeping the FFI
+    /// wrapper's stable publish signature intact.
+    pub async fn publish_self_with_extra_candidates(
+        &self,
+        keypair: &DeviceKeypair,
+        rendezvous_url: &str,
+        ttl_seconds: u64,
+        sequence: u64,
+        extra_candidates: Vec<CandidateEndpoint>,
+        overlay_routes: Vec<String>,
+    ) -> Result<PeerRecord> {
+        self.publish_self_with_extra_candidates_and_auth(
+            keypair,
+            rendezvous_url,
+            None,
+            ttl_seconds,
+            sequence,
+            extra_candidates,
+            overlay_routes,
+        )
+        .await
+    }
+
+    pub async fn publish_self_with_extra_candidates_and_auth(
+        &self,
+        keypair: &DeviceKeypair,
+        rendezvous_url: &str,
+        rendezvous_auth_token: Option<&str>,
+        ttl_seconds: u64,
+        sequence: u64,
+        extra_candidates: Vec<CandidateEndpoint>,
+        overlay_routes: Vec<String>,
+    ) -> Result<PeerRecord> {
         let cert_der = self.server_certificate_der.clone().unwrap_or_default();
         let local_addr = self.responder_local_addr.ok_or_else(|| {
             QlinkError::Protocol(
@@ -1432,12 +1573,20 @@ impl MeshTransportHandle {
         }
         let mesh_id = connector_config.mesh_id.clone();
 
-        let endpoints = vec![CandidateEndpoint {
-            candidate_type: CandidateType::Host,
-            address: local_addr.ip().to_string(),
-            port: local_addr.port(),
-            priority: HOST_PRIORITY,
-        }];
+        let advertised = self
+            .advertise_addr
+            .lock()
+            .ok()
+            .and_then(|guard| *guard)
+            .unwrap_or(local_addr);
+        let mut candidates = extra_candidates;
+        if let Some(relay_server) = connector_config.relay_server.as_deref() {
+            let relay_addr: SocketAddr = relay_server.parse().map_err(|err| {
+                QlinkError::Protocol(format!("invalid configured relay_url: {err}"))
+            })?;
+            candidates.push(quantum_link_relay_candidate(relay_addr));
+        }
+        let endpoints = published_candidate_endpoints(advertised, candidates);
         let body = UnsignedPeerRecord::new(
             mesh_id.clone(),
             // The alias gets replaced inside `UnsignedPeerRecord::new`
@@ -1458,7 +1607,8 @@ impl MeshTransportHandle {
         // it doesn't need the handle's specialized runtime. Awaiting on
         // the caller's runtime keeps `publish_self` callable from any
         // async context (tests, `qlinkctl`, future FFI bridges).
-        let client = RendezvousClient::new(rendezvous_url.to_string());
+        let client = RendezvousClient::new(rendezvous_url.to_string())
+            .with_optional_auth_token(rendezvous_auth_token.map(|token| token.to_string()));
         client.publish(&mesh_id, record.clone()).await?;
 
         Ok(record)
@@ -2054,182 +2204,259 @@ async fn run_responder_loop(
     _blocked_peer_history: Arc<BlockedPeerHistory>,
     packet_session_lifetime_seconds: u64,
     packet_session_rekey_after_bytes: u64,
+    aggregate: Arc<AggregateState>,
 ) {
     loop {
         let session = match server.accept_one().await {
             Ok(session) => session,
             Err(_) => break,
         };
-        let session = CarrierSession::from(session);
-        let mesh_id = expected_mesh_id.clone();
-        let local_peer_id = local_peer_id.clone();
-        let local_device_keypair = local_device_keypair.clone();
-        let carrier_binding = local_server_certificate_der.clone();
-        let acl = inbound_acl.clone();
-        let identity_registry_lookup = identity_registry_lookup.clone();
-        let inbound_tx = inbound_tx.clone();
-        let packet_session_generation = packet_session_generation.clone();
-        let packet_session_event_tx = packet_session_event_tx.clone();
-        tokio::spawn(async move {
-            let acl_ref = acl.as_deref();
-            let evaluation = receive_and_evaluate_inbound(
-                &session,
-                &mesh_id,
-                DEFAULT_INBOUND_ASSERTION_MAX_AGE_SECONDS,
-                acl_ref,
-            )
-            .await;
-            match evaluation {
-                Ok((InboundDecision::Accepted, assertion)) => {
-                    let registry_record = match identity_registry_lookup.as_ref() {
-                        Some(registry) => match registry.lookup(&assertion.peer_id).await {
-                            Ok(record) => record,
-                            Err(error) => match mesh_trust_policy {
-                                MeshTrustPolicy::PublicRequired => {
-                                    tracing::warn!(
-                                        peer_id = %assertion.peer_id,
-                                        error = %error,
-                                        "inbound identity registry lookup failed"
-                                    );
-                                    session.close(b"");
-                                    return;
-                                }
-                                MeshTrustPolicy::PrivatePreferred
-                                | MeshTrustPolicy::DevelopmentOptional => {
-                                    tracing::warn!(
-                                        peer_id = %assertion.peer_id,
-                                        error = %error,
-                                        policy = ?mesh_trust_policy,
-                                        "inbound identity registry lookup failed; continuing without registry verification"
-                                    );
-                                    None
-                                }
-                            },
-                        },
-                        None => None,
-                    };
-                    if let Err(error) = verify_inbound_registry_assertion(
-                        &assertion,
-                        registry_record.as_ref(),
-                        mesh_trust_policy,
-                    ) {
-                        tracing::warn!(
-                            peer_id = %assertion.peer_id,
-                            error = %error,
-                            "inbound identity registry policy rejected assertion"
-                        );
-                        session.close(b"");
-                        return;
-                    }
+        tokio::spawn(handle_inbound_session(
+            CarrierSession::from(session),
+            expected_mesh_id.clone(),
+            local_peer_id.clone(),
+            local_device_keypair.clone(),
+            local_server_certificate_der.clone(),
+            inbound_acl.clone(),
+            mesh_trust_policy,
+            identity_registry_lookup.clone(),
+            inbound_tx.clone(),
+            packet_session_generation.clone(),
+            packet_session_event_tx.clone(),
+            packet_session_lifetime_seconds,
+            packet_session_rekey_after_bytes,
+            aggregate.clone(),
+        ));
+    }
+}
 
-                    let peer_id = assertion.peer_id;
-                    let pqc_context = PqcSessionContext::new(
-                        mesh_id.clone(),
-                        peer_id.clone(),
-                        local_peer_id.clone(),
-                        carrier_binding,
-                    );
-                    let handshake_timeout = pqc_responder_handshake_timeout();
-                    let session_keys = match tokio::time::timeout(
-                        handshake_timeout,
-                        run_pqc_session_responder(
-                            &session,
-                            pqc_context,
-                            local_device_keypair.as_ref(),
-                        ),
-                    )
-                    .await
-                    {
-                        Ok(Ok(session_keys)) => session_keys,
-                        Ok(Err(error)) => {
+/// Per-session inbound handler shared by the QUIC and relay responder loops.
+/// Verifies the peer's signed assertion + ACL, applies registry trust policy,
+/// runs the PQC responder handshake, then pumps decrypted frames into
+/// `inbound_tx` tagged with the verified peer_id. Carrier-agnostic: `session`
+/// may be a QUIC, native-UDP, or relay-tunneled `CarrierSession`.
+#[cfg(feature = "dev-quic-carrier")]
+#[allow(clippy::too_many_arguments)]
+async fn handle_inbound_session(
+    session: CarrierSession,
+    mesh_id: String,
+    local_peer_id: String,
+    local_device_keypair: Arc<DeviceKeypair>,
+    carrier_binding: Vec<u8>,
+    acl: Option<Arc<PeerAcl>>,
+    mesh_trust_policy: MeshTrustPolicy,
+    identity_registry_lookup: Option<Arc<dyn IdentityRegistryLookup>>,
+    inbound_tx: mpsc::Sender<InboundFrame>,
+    packet_session_generation: Arc<AtomicU64>,
+    packet_session_event_tx: mpsc::UnboundedSender<PacketSessionEvent>,
+    packet_session_lifetime_seconds: u64,
+    packet_session_rekey_after_bytes: u64,
+    aggregate: Arc<AggregateState>,
+) {
+    let acl_ref = acl.as_deref();
+    let evaluation = receive_and_evaluate_inbound(
+        &session,
+        &mesh_id,
+        DEFAULT_INBOUND_ASSERTION_MAX_AGE_SECONDS,
+        acl_ref,
+    )
+    .await;
+    match evaluation {
+        Ok((InboundDecision::Accepted, assertion)) => {
+            let registry_record = match identity_registry_lookup.as_ref() {
+                Some(registry) => match registry.lookup(&assertion.peer_id).await {
+                    Ok(record) => record,
+                    Err(error) => match mesh_trust_policy {
+                        MeshTrustPolicy::PublicRequired => {
                             tracing::warn!(
-                                ?error,
-                                peer_id = %peer_id,
-                                "inbound PQC session failed"
+                                peer_id = %assertion.peer_id,
+                                error = %error,
+                                "inbound identity registry lookup failed"
                             );
                             session.close(b"");
                             return;
                         }
-                        Err(_) => {
+                        MeshTrustPolicy::PrivatePreferred
+                        | MeshTrustPolicy::DevelopmentOptional => {
                             tracing::warn!(
-                                timeout_ms = handshake_timeout.as_millis() as u64,
-                                peer_id = %peer_id,
-                                "inbound PQC session timed out"
+                                peer_id = %assertion.peer_id,
+                                error = %error,
+                                policy = ?mesh_trust_policy,
+                                "inbound identity registry lookup failed; continuing without registry verification"
                             );
-                            session.close(b"");
-                            return;
+                            None
                         }
-                    };
-                    let authenticated_binding = derive_packet_session_binding(
-                        &session_keys.suite,
-                        &session_keys.handshake_hash,
-                        &mesh_id,
-                        &peer_id,
-                        &local_peer_id,
-                        PqcSessionRole::Responder,
-                    );
-                    let Some(generation) =
-                        next_packet_session_generation(&packet_session_generation)
-                    else {
-                        session.close(b"");
-                        return;
-                    };
-                    let packet_session = packet_session_lease(
-                        peer_id.clone(),
-                        PacketSessionDirection::Inbound,
-                        generation,
-                        authenticated_binding,
-                        packet_session_lifetime_seconds,
-                        packet_session_rekey_after_bytes,
-                    );
-                    let _ = packet_session_event_tx
-                        .send(PacketSessionEvent::Ready(packet_session.clone()));
-                    let mut frame_protector = PqcFrameProtector::new(session_keys);
-                    let deadline = tokio::time::Instant::now()
-                        + Duration::from_secs(packet_session_lifetime_seconds);
-                    let mut protected_bytes = 0_u64;
-                    loop {
-                        let protected_frame = tokio::select! {
-                            received = session.receive_frame() => match received {
-                                Ok(frame) => frame,
-                                Err(_) => break,
-                            },
-                            _ = tokio::time::sleep_until(deadline) => break,
-                        };
-                        protected_bytes =
-                            protected_bytes.saturating_add(protected_frame.len() as u64);
-                        let frame = match frame_protector.open(&protected_frame) {
-                            Ok(frame) => frame,
-                            Err(_) => break,
-                        };
-                        let inbound_frame = InboundFrame {
-                            peer_id: peer_id.clone(),
-                            frame,
-                            packet_session: packet_session.clone(),
-                        };
-                        if inbound_tx.send(inbound_frame).await.is_err() {
-                            break;
-                        }
-                        if protected_bytes >= packet_session.rekey_after_bytes {
-                            break;
-                        }
-                    }
-                    let _ = packet_session_event_tx.send(PacketSessionEvent::Cleared {
-                        peer_id,
-                        direction: PacketSessionDirection::Inbound,
-                        generation,
-                    });
+                    },
+                },
+                None => None,
+            };
+            if let Err(error) = verify_inbound_registry_assertion(
+                &assertion,
+                registry_record.as_ref(),
+                mesh_trust_policy,
+            ) {
+                tracing::warn!(
+                    peer_id = %assertion.peer_id,
+                    error = %error,
+                    "inbound identity registry policy rejected assertion"
+                );
+                session.close(b"");
+                return;
+            }
+
+            let peer_id = assertion.peer_id;
+            let pqc_context = PqcSessionContext::new(
+                mesh_id.clone(),
+                peer_id.clone(),
+                local_peer_id.clone(),
+                carrier_binding,
+            );
+            let handshake_timeout = pqc_responder_handshake_timeout();
+            let session_keys = match tokio::time::timeout(
+                handshake_timeout,
+                run_pqc_session_responder(&session, pqc_context, local_device_keypair.as_ref()),
+            )
+            .await
+            {
+                Ok(Ok(session_keys)) => session_keys,
+                Ok(Err(error)) => {
+                    tracing::warn!(?error, peer_id = %peer_id, "inbound PQC session failed");
                     session.close(b"");
+                    return;
                 }
-                _ => {
-                    // Closing without a reason is intentional: echoing
-                    // the rejection (`acl: peer is on the deny list`)
-                    // would let an attacker probe the ACL contents. The
-                    // peer just sees a generic close.
+                Err(_) => {
+                    tracing::warn!(
+                        timeout_ms = handshake_timeout.as_millis() as u64,
+                        peer_id = %peer_id,
+                        "inbound PQC session timed out"
+                    );
                     session.close(b"");
+                    return;
+                }
+            };
+            let authenticated_binding = derive_packet_session_binding(
+                &session_keys.suite,
+                &session_keys.handshake_hash,
+                &mesh_id,
+                &peer_id,
+                &local_peer_id,
+                PqcSessionRole::Responder,
+            );
+            let Some(generation) = next_packet_session_generation(&packet_session_generation)
+            else {
+                session.close(b"");
+                return;
+            };
+            let packet_session = packet_session_lease(
+                peer_id.clone(),
+                PacketSessionDirection::Inbound,
+                generation,
+                authenticated_binding,
+                packet_session_lifetime_seconds,
+                packet_session_rekey_after_bytes,
+            );
+            let _ = packet_session_event_tx.send(PacketSessionEvent::Ready(packet_session.clone()));
+            let mut frame_protector = PqcFrameProtector::new(session_keys);
+            let deadline =
+                tokio::time::Instant::now() + Duration::from_secs(packet_session_lifetime_seconds);
+            let mut protected_bytes = 0_u64;
+            loop {
+                let protected_frame = tokio::select! {
+                    received = session.receive_frame() => match received {
+                        Ok(frame) => frame,
+                        Err(_) => break,
+                    },
+                    _ = tokio::time::sleep_until(deadline) => break,
+                };
+                protected_bytes = protected_bytes.saturating_add(protected_frame.len() as u64);
+                let frame = match frame_protector.open(&protected_frame) {
+                    Ok(frame) => frame,
+                    Err(_) => break,
+                };
+                aggregate
+                    .inbound_frames_received
+                    .fetch_add(1, Ordering::Relaxed);
+                aggregate
+                    .inbound_bytes_received
+                    .fetch_add(frame.len() as u64, Ordering::Relaxed);
+                let inbound_frame = InboundFrame {
+                    peer_id: peer_id.clone(),
+                    frame,
+                    packet_session: packet_session.clone(),
+                };
+                if inbound_tx.send(inbound_frame).await.is_err() {
+                    break;
+                }
+                if protected_bytes >= packet_session.rekey_after_bytes {
+                    break;
                 }
             }
-        });
+            let _ = packet_session_event_tx.send(PacketSessionEvent::Cleared {
+                peer_id,
+                direction: PacketSessionDirection::Inbound,
+                generation,
+            });
+            session.close(b"");
+        }
+        _ => {
+            // Closing without a reason is intentional: echoing the rejection
+            // (`acl: peer is on the deny list`) would let an attacker probe the
+            // ACL contents. The peer just sees a generic close.
+            session.close(b"");
+        }
+    }
+}
+
+/// Relay analogue of `run_responder_loop`: registers with the relay under the
+/// local peer id and, for each inbound source peer, runs `handle_inbound_session`
+/// over a relay-tunneled carrier. Lets a node accept relay-fallback connections
+/// from peers that cannot reach it directly. Runs until the relay connection
+/// drops (or the runtime shuts down).
+#[cfg(feature = "dev-quic-carrier")]
+#[allow(clippy::too_many_arguments)]
+async fn run_relay_responder_loop(
+    relay_url: String,
+    relay_auth_token: Option<String>,
+    expected_mesh_id: String,
+    local_peer_id: String,
+    local_device_keypair: Arc<DeviceKeypair>,
+    local_server_certificate_der: Vec<u8>,
+    inbound_acl: Option<Arc<PeerAcl>>,
+    mesh_trust_policy: MeshTrustPolicy,
+    identity_registry_lookup: Option<Arc<dyn IdentityRegistryLookup>>,
+    inbound_tx: mpsc::Sender<InboundFrame>,
+    packet_session_generation: Arc<AtomicU64>,
+    packet_session_event_tx: mpsc::UnboundedSender<PacketSessionEvent>,
+    packet_session_lifetime_seconds: u64,
+    packet_session_rekey_after_bytes: u64,
+    aggregate: Arc<AggregateState>,
+) {
+    let result = RelayResponderListener::run_with_auth(
+        &relay_url,
+        local_peer_id.clone(),
+        relay_auth_token.as_deref(),
+        move |session| {
+            tokio::spawn(handle_inbound_session(
+                CarrierSession::from(session),
+                expected_mesh_id.clone(),
+                local_peer_id.clone(),
+                local_device_keypair.clone(),
+                local_server_certificate_der.clone(),
+                inbound_acl.clone(),
+                mesh_trust_policy,
+                identity_registry_lookup.clone(),
+                inbound_tx.clone(),
+                packet_session_generation.clone(),
+                packet_session_event_tx.clone(),
+                packet_session_lifetime_seconds,
+                packet_session_rekey_after_bytes,
+                aggregate.clone(),
+            ));
+        },
+    )
+    .await;
+    if let Err(error) = result {
+        tracing::warn!(?error, "relay responder loop stopped");
     }
 }
 
@@ -2283,6 +2510,13 @@ fn mesh_transport_snapshot(
             path_kind_code = better_path_kind(path_kind_code, session_path);
         }
     }
+
+    // Fold in frames absorbed by the inbound responder path, which never
+    // registers a `self.peers` session and so is invisible to the per-peer
+    // loop above. Lets a pure responder (e.g. `publish-self`) report the
+    // real received counts a monitor scrapes.
+    totals.frames_received += aggregate.inbound_frames_received.load(Ordering::Relaxed);
+    totals.bytes_received += aggregate.inbound_bytes_received.load(Ordering::Relaxed);
 
     snapshot.push_gauge(
         "qlink_mesh_transport_peers",
@@ -2682,7 +2916,7 @@ mod native_udp_tests {
         let frame_a = vec![0x41; 96];
         handle_a.send_frame_to(&peer_b, frame_a.clone()).unwrap();
 
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + Duration::from_secs(10);
         let received = loop {
             if let Some(frame) = handle_b.try_receive_frame_from_any() {
                 break frame;
@@ -2792,7 +3026,9 @@ mod native_udp_tests {
             local_peer_id: local_peer_id.to_string(),
             remote_peer_id: remote_peer_id.to_string(),
             rendezvous_url: rendezvous_url.to_string(),
+            rendezvous_auth_token: None,
             relay_url: None,
+            relay_auth_token: None,
             bind_addr: "127.0.0.1:0".to_string(),
             overall_deadline_ms: 3_000,
             direct_probe_timeout_ms: 1_000,
@@ -2822,6 +3058,7 @@ mod tests {
         inbound_identity::send_inbound_assertion,
         pqc_session_wire::run_pqc_session_initiator,
         quic_transport::QuicCertificate,
+        relay::spawn_dev_relay,
         rendezvous::spawn_dev_rendezvous,
     };
     use std::{
@@ -3299,7 +3536,9 @@ mod tests {
             local_peer_id: "qlink_keyless-local".to_string(),
             remote_peer_id: "qlink_keyless-remote".to_string(),
             rendezvous_url: "127.0.0.1:9".to_string(),
+            rendezvous_auth_token: None,
             relay_url: Some("127.0.0.1:9".to_string()),
+            relay_auth_token: None,
             bind_addr: "127.0.0.1:0".to_string(),
             overall_deadline_ms: 100,
             direct_probe_timeout_ms: 50,
@@ -3330,7 +3569,9 @@ mod tests {
             local_peer_id: "qlink_keyless-local".to_string(),
             remote_peer_id: "qlink_keyless-remote".to_string(),
             rendezvous_url: "127.0.0.1:9".to_string(),
+            rendezvous_auth_token: None,
             relay_url: None,
+            relay_auth_token: None,
             bind_addr: "127.0.0.1:0".to_string(),
             overall_deadline_ms: 100,
             direct_probe_timeout_ms: 50,
@@ -3406,7 +3647,9 @@ mod tests {
                     local_peer_id,
                     remote_peer_id,
                     rendezvous_url,
+                    rendezvous_auth_token: None,
                     relay_url: None,
+                    relay_auth_token: None,
                     bind_addr: "127.0.0.1:0".to_string(),
                     overall_deadline_ms: 2_000,
                     direct_probe_timeout_ms: 500,
@@ -3481,7 +3724,9 @@ mod tests {
                     local_peer_id,
                     remote_peer_id: "qlink_does-not-exist".to_string(),
                     rendezvous_url,
+                    rendezvous_auth_token: None,
                     relay_url: None,
+                    relay_auth_token: None,
                     bind_addr: "127.0.0.1:0".to_string(),
                     overall_deadline_ms: 800,
                     direct_probe_timeout_ms: 200,
@@ -3537,7 +3782,9 @@ mod tests {
                     local_peer_id,
                     remote_peer_id: "qlink_does-not-exist".to_string(),
                     rendezvous_url,
+                    rendezvous_auth_token: None,
                     relay_url: None,
+                    relay_auth_token: None,
                     bind_addr: "127.0.0.1:0".to_string(),
                     overall_deadline_ms: 200,
                     direct_probe_timeout_ms: 100,
@@ -3636,7 +3883,9 @@ mod tests {
                     local_peer_id,
                     remote_peer_id,
                     rendezvous_url,
+                    rendezvous_auth_token: None,
                     relay_url: None,
+                    relay_auth_token: None,
                     bind_addr: "127.0.0.1:0".to_string(),
                     overall_deadline_ms: 2_000,
                     direct_probe_timeout_ms: 500,
@@ -3751,7 +4000,9 @@ mod tests {
                     local_peer_id,
                     remote_peer_id: "qlink_does-not-exist".to_string(),
                     rendezvous_url,
+                    rendezvous_auth_token: None,
                     relay_url: None,
+                    relay_auth_token: None,
                     bind_addr: "127.0.0.1:0".to_string(),
                     overall_deadline_ms: 200,
                     direct_probe_timeout_ms: 100,
@@ -3887,7 +4138,9 @@ mod tests {
                     local_peer_id,
                     remote_peer_id: peer_a_id_for_handle,
                     rendezvous_url,
+                    rendezvous_auth_token: None,
                     relay_url: None,
+                    relay_auth_token: None,
                     bind_addr: "127.0.0.1:0".to_string(),
                     overall_deadline_ms: 2_000,
                     direct_probe_timeout_ms: 500,
@@ -4029,7 +4282,9 @@ mod tests {
                     local_peer_id,
                     remote_peer_id: remote_peer_id_for_handle,
                     rendezvous_url,
+                    rendezvous_auth_token: None,
                     relay_url: None,
+                    relay_auth_token: None,
                     bind_addr: "127.0.0.1:0".to_string(),
                     overall_deadline_ms: 2_000,
                     direct_probe_timeout_ms: 500,
@@ -4095,7 +4350,9 @@ mod tests {
                     local_peer_id,
                     remote_peer_id: "qlink_does-not-exist-A".to_string(),
                     rendezvous_url,
+                    rendezvous_auth_token: None,
                     relay_url: None,
+                    relay_auth_token: None,
                     bind_addr: "127.0.0.1:0".to_string(),
                     overall_deadline_ms: 200,
                     direct_probe_timeout_ms: 100,
@@ -4196,7 +4453,9 @@ mod tests {
                         local_peer_id: local_key.public_key().peer_id(),
                         remote_peer_id: "qlink_initial-peer".to_string(),
                         rendezvous_url: "127.0.0.1:1".to_string(),
+                        rendezvous_auth_token: None,
                         relay_url: None,
+                        relay_auth_token: None,
                         bind_addr: "127.0.0.1:0".to_string(),
                         overall_deadline_ms: 200,
                         direct_probe_timeout_ms: 100,
@@ -4266,7 +4525,9 @@ mod tests {
                     local_peer_id,
                     remote_peer_id: "qlink_unused-for-this-test".to_string(),
                     rendezvous_url,
+                    rendezvous_auth_token: None,
                     relay_url: None,
+                    relay_auth_token: None,
                     bind_addr: "127.0.0.1:0".to_string(),
                     overall_deadline_ms: 2_000,
                     direct_probe_timeout_ms: 500,
@@ -4613,6 +4874,143 @@ mod tests {
             err.to_string().contains("does not match"),
             "error should explain the mismatch, got: {err}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn publish_self_includes_extra_ice_candidates_in_signed_record() {
+        let rendezvous = spawn_dev_rendezvous().await.unwrap();
+        let rendezvous_url = rendezvous.local_addr().to_string();
+        let local_key = Arc::new(DeviceKeypair::generate().unwrap());
+        let local_peer_id = local_key.public_key().peer_id();
+        let handle = build_handle_with_responder(
+            rendezvous_url.clone(),
+            local_peer_id.clone(),
+            "devmesh",
+            None,
+            Some(local_key.clone()),
+        )
+        .await;
+        handle.set_advertise_addr("127.0.0.1:44000".parse().unwrap());
+
+        let record = handle
+            .publish_self_with_extra_candidates(
+                local_key.as_ref(),
+                &rendezvous_url,
+                120,
+                1,
+                vec![
+                    CandidateEndpoint {
+                        candidate_type: CandidateType::ServerReflexive,
+                        address: "203.0.113.10".to_string(),
+                        port: 52000,
+                        priority: 1,
+                    },
+                    CandidateEndpoint {
+                        candidate_type: CandidateType::Relay,
+                        address: "198.51.100.20".to_string(),
+                        port: 3478,
+                        priority: u32::MAX,
+                    },
+                    CandidateEndpoint {
+                        candidate_type: CandidateType::ServerReflexive,
+                        address: "203.0.113.10".to_string(),
+                        port: 52000,
+                        priority: 1,
+                    },
+                ],
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        record.verify("devmesh").unwrap();
+        let types: Vec<CandidateType> = record
+            .body
+            .endpoints
+            .iter()
+            .map(|candidate| candidate.candidate_type.clone())
+            .collect();
+        assert_eq!(
+            types,
+            vec![
+                CandidateType::Host,
+                CandidateType::ServerReflexive,
+                CandidateType::Relay
+            ]
+        );
+        assert_eq!(record.body.endpoints.len(), 3);
+
+        let found = RendezvousClient::new(rendezvous_url)
+            .lookup("devmesh", &local_peer_id)
+            .await
+            .unwrap()
+            .expect("published record must be available");
+        assert_eq!(found.body.endpoints, record.body.endpoints);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn publish_self_includes_configured_quantumlink_relay_candidate() {
+        let rendezvous = spawn_dev_rendezvous().await.unwrap();
+        let rendezvous_url = rendezvous.local_addr().to_string();
+        let relay = spawn_dev_relay().await.unwrap();
+        let relay_addr = relay.local_addr();
+        let relay_url = relay_addr.to_string();
+        let local_key = Arc::new(DeviceKeypair::generate().unwrap());
+        let local_peer_id = local_key.public_key().peer_id();
+
+        let handle = tokio::task::spawn_blocking({
+            let rendezvous_url = rendezvous_url.clone();
+            let relay_url = relay_url.clone();
+            let local_peer_id = local_peer_id.clone();
+            let local_key = local_key.clone();
+            move || {
+                MeshTransportHandle::new_with_keypair(
+                    MeshTransportConfig {
+                        mesh_id: "devmesh".to_string(),
+                        local_peer_id,
+                        remote_peer_id: "qlink_unused-for-this-test".to_string(),
+                        rendezvous_url,
+                        rendezvous_auth_token: None,
+                        relay_url: Some(relay_url),
+                        relay_auth_token: None,
+                        bind_addr: "127.0.0.1:0".to_string(),
+                        overall_deadline_ms: 2_000,
+                        direct_probe_timeout_ms: 500,
+                        probe_pacing_ms: 50,
+                        enable_ice: false,
+                        reconnect_initial_backoff_ms: 60_000,
+                        reconnect_max_backoff_ms: 60_000,
+                        packet_session_lifetime_seconds: DEFAULT_PACKET_SESSION_LIFETIME_SECONDS,
+                        packet_session_rekey_after_bytes: DEFAULT_PACKET_SESSION_REKEY_AFTER_BYTES,
+                        metrics_endpoint_bind_addr: None,
+                        inbound_acl: None,
+                        disable_inbound_responder: false,
+                        peer_store_path: None,
+                        peer_store_key_b64: None,
+                        mesh_trust_policy: MeshTrustPolicy::DevelopmentOptional,
+                        dytallix_identity: None,
+                    },
+                    Some(local_key),
+                )
+            }
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        let record = handle
+            .publish_self(local_key.as_ref(), &rendezvous_url, 120, 1, vec![])
+            .await
+            .unwrap();
+
+        let relay_candidate = record
+            .body
+            .endpoints
+            .iter()
+            .find(|candidate| candidate.candidate_type == CandidateType::QuantumLinkRelay)
+            .expect("configured relay_url must be published as a QuantumLink relay candidate");
+        assert_eq!(relay_candidate.address, relay_addr.ip().to_string());
+        assert_eq!(relay_candidate.port, relay_addr.port());
     }
 
     #[tokio::test(flavor = "multi_thread")]

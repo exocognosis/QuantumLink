@@ -22,9 +22,18 @@ Implemented baseline:
 - Fail-closed tunnel scaffold for protected routes when the data plane is unavailable.
 - Privacy-preserving defaults without a user-facing mode: overlay addresses in `100.64.0.0/10` allocated through a cryptographically seeded recursive permutation, pseudonymous mesh/device labels, no DNS search-domain default, redacted app/diagnostic network identifiers, and simulated peers that avoid hostnames or LAN endpoints.
 - Packet metadata normalization before packet-frame emission: DSCP/ECN is cleared, TTL is normalized, non-fragment IPv4 IDs are cleared, and IPv4 header checksums are recomputed.
+- Packet-session gating is observable through FFI metrics: peer-session-unavailable drops and replay drops are exposed to macOS, and the packet pump counts missing-session drops as fail-closed.
 - Public peer-record minimization: clear aliases are replaced with sequence-rotating pseudonyms and rendezvous publication keeps relay candidates only by default.
 - Raw QUIC, raw relay, and legacy mesh loopback smoke paths fail closed unless an end-to-end app-layer PQC session exists.
 - Native UDP carrier with fragmented authenticated control-message support; default live mesh direct dialing and inbound response use this non-TLS carrier with the app-layer PQC session wire, and tests prove both sides establish matching ML-KEM/SHAKE keys.
+- Relay fallback is end-to-end PQC only: when direct native UDP probes fail, the connector can establish the same signed inbound assertion, ML-KEM session, and protected-frame path through a configured or signed `quantum_link_relay` carrier candidate. Raw unauthenticated relay fallback remains rejected.
+- Candidate gathering covers host and STUN server-reflexive candidates in default builds, plus TURN relay candidates when `turn-relay` is explicitly enabled. Gather failures are reported per server without suppressing lower-latency direct candidates. Published TURN relay candidates are consumed as UDP relay-assisted carrier targets when live; the resident proof path keeps a TURN allocation alive, refreshes it, installs a peer permission, and carries native carrier datagrams through Send/Data indications. The QuantumLink app-relay carrier remains distinct.
+- A public-edge deployment runbook and smoke harness cover allowlisted
+  rendezvous, STUN, TURN allocation, end-to-end PQC app-relay fallback, and
+  local resident TURN data-plane proof.
+- Rendezvous and QuantumLink relay services support app-layer bearer-token
+  admission and per-client IP rate limits; the public smoke harness can prove
+  both client and service paths with redacted evidence.
 - Default `qlink-core` builds keep the legacy Quinn/rustls/rcgen carrier dependencies out of the compiled dependency graph; the dev QUIC carrier remains available only with `--features dev-quic-carrier`.
 
 Dytallix wallet and registry boundary:
@@ -68,16 +77,25 @@ regenerate `peers.json` after rolling the new build.
 
 Not yet production-complete:
 
-- Full ICE/STUN/TURN candidate gathering and nomination beyond local host/STUN parser scaffolding.
+- Open-internet rendezvous/QuantumLink-relay TLS, durable token revocation,
+  abuse monitoring, operational retention controls, and deployed hardening
+  evidence beyond the current allowlisted/tunneled public-edge runbook.
+- Deployed public TURN data-plane proof and RFC-complete ICE nomination against deployed public infrastructure beyond the current deterministic candidate ordering, connectivity-check paths, and local resident TURN proof.
 - Notarized Developer ID app and extension bundles.
 - Managed Device Attestation and SSO integration.
 - Full update signing pipeline with a post-quantum manifest layer.
 - Production Dytallix mainnet or hardened production registry trust root.
-- Hardened public relay abuse controls.
+- Hardened public relay abuse controls beyond bearer admission, rate limiting,
+  and registered-source validation.
 - Removal of non-transport platform classical primitives: macOS/Windows privacy redaction still uses SHA-256-derived aliases; macOS CMS/profile signing still uses platform SHA-256 and interacts with platform AES behavior.
 - Removal of every classical primitive from every build/tooling path. Default `qlink-core` builds should exclude the dev Quinn/rustls/aws-lc/ring carrier graph, but optional dev-carrier builds, platform signing/redaction helpers, and lockfile contents remain outside a full zero-classical claim.
 - Full anonymity guarantees. QuantumLink minimizes app/control-plane metadata by default, but outer transport IPs, relay timing, account context, and endpoint behavior can still identify users unless a future relay/egress architecture is built specifically for that threat model.
 
-The development rendezvous and relay binaries are local protocol tools. Do not expose them on the public internet without adding TLS, authentication policy, rate limits, abuse monitoring, durable revocation, retention controls, and production Dytallix registry pinning for public meshes.
+The development rendezvous and relay binaries now include bearer-token admission
+and per-client IP rate limits, but their client protocol remains raw TCP. Do not
+expose them broadly to the open internet without adding TLS, abuse monitoring,
+durable revocation, retention controls, and production Dytallix registry pinning
+for public meshes. For public validation before those controls land, use the
+allowlisted/tunneled edge runbook in `public-infra-runbook.md`.
 
 For repository-scoped reviewer guides, see `../THREAT_MODEL.md` and `../QUANTUM_THREATS.md`.

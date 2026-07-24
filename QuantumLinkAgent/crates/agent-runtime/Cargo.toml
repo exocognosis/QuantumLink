@@ -1,0 +1,17 @@
+[package]
+name = "qlink-agent-runtime"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+qlink-agent-actions = { path = "../agent-actions" }
+qlink-agent-audit = { path = "../agent-audit" }
+qlink-agent-contracts = { path = "../agent-contracts" }
+qlink-agent-evidence = { path = "../agent-evidence" }
+qlink-agent-policy = { path = "../agent-policy" }
+qlink-agent-reasoning = { path = "../agent-reasoning" }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"

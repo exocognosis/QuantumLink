@@ -1,0 +1,9 @@
+[package]
+name = "qlink-agent-reasoning"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+qlink-agent-contracts = { path = "../agent-contracts" }
+qlink-agent-evidence = { path = "../agent-evidence" }

@@ -37,6 +37,13 @@ jobs:
           cargo check -p qlink-core --bin qlinkctl --no-default-features --features native-udp-carrier
       - name: Rust dev QUIC carrier tests
         run: cargo test -p qlink-core --lib --no-default-features --features dev-quic-carrier -- --nocapture
+      - name: Rust TURN relay client (off-by-default feature)
+        # turn.rs is excluded from every other job (default and dev-quic-carrier
+        # builds don't compile it); this exercises it under its own feature.
+        # Direct-dependency purity of the default build is enforced separately by
+        # the pqc_policy_tests manifest check above.
+        run: |
+          cargo test -p qlink-core --lib turn:: --features turn-relay -- --nocapture
 
   macos:
     name: macOS silo (Swift + XCFramework)
@@ -64,11 +71,24 @@ jobs:
         working-directory: macos
         run: |
           swift run QuantumLinkSmoke validate-config --config ../config/mesh.example.json
+          preflight_log="$(mktemp)"
+          set +e
           swift run QuantumLinkSmoke preflight \
             --config ../config/mesh.example.json \
             --transport \
             --mode dev-quic-loopback \
-            --dylib "$PWD/../target/release/libqlink_core.dylib"
+            --dylib "$PWD/../target/release/libqlink_core.dylib" > "$preflight_log" 2>&1
+          preflight_status=$?
+          set -e
+          cat "$preflight_log"
+          if [[ "$preflight_status" -eq 0 ]]; then
+            echo "Expected dev QUIC loopback preflight to fail closed while transport is unavailable"
+            exit 1
+          fi
+          if ! grep -q "preflight_smoke_outcome=fail-closed" "$preflight_log"; then
+            echo "Expected preflight_smoke_outcome=fail-closed"
+            exit 1
+          fi
       - name: Rust XCFramework
         working-directory: macos
         run: ./scripts/build-rust-xcframework.sh

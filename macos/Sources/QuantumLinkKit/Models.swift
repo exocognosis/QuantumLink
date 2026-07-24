@@ -484,12 +484,14 @@ public struct TunnelConfiguration: Codable, Equatable, Sendable {
   public let discoveryModes: [DiscoveryMode]
   public let rendezvousServers: [String]
   public let relayServers: [String]
+  public let remotePeerID: String?
   public let allowedRelayEndpoints: [String]
   public let relayTLSPolicy: RelayTLSPolicy
   public let maximumCandidateAgeSeconds: UInt64
   public let failClosedOnNoCandidate: Bool
   public let mtu: Int
   public let crypto: CryptoPolicy
+  public let requirePeerSession: Bool
   public let killSwitch: KillSwitchPolicy
   public let meshTrustPolicy: MeshTrustPolicy
   public let discoveryIdentityMode: DiscoveryIdentityMode
@@ -509,12 +511,14 @@ public struct TunnelConfiguration: Codable, Equatable, Sendable {
     discoveryModes: [DiscoveryMode] = [.rendezvous],
     rendezvousServers: [String] = [],
     relayServers: [String] = [],
+    remotePeerID: String? = nil,
     allowedRelayEndpoints: [String] = [],
     relayTLSPolicy: RelayTLSPolicy = .required,
     maximumCandidateAgeSeconds: UInt64 = 120,
     failClosedOnNoCandidate: Bool = true,
     mtu: Int = 1280,
     crypto: CryptoPolicy = CryptoPolicy(),
+    requirePeerSession: Bool = false,
     killSwitch: KillSwitchPolicy = .failClosed,
     meshTrustPolicy: MeshTrustPolicy = .developmentOptional,
     discoveryIdentityMode: DiscoveryIdentityMode = .off,
@@ -533,12 +537,14 @@ public struct TunnelConfiguration: Codable, Equatable, Sendable {
     self.discoveryModes = discoveryModes
     self.rendezvousServers = rendezvousServers
     self.relayServers = relayServers
+    self.remotePeerID = remotePeerID
     self.allowedRelayEndpoints = allowedRelayEndpoints
     self.relayTLSPolicy = relayTLSPolicy
     self.maximumCandidateAgeSeconds = maximumCandidateAgeSeconds
     self.failClosedOnNoCandidate = failClosedOnNoCandidate
     self.mtu = mtu
     self.crypto = crypto
+    self.requirePeerSession = requirePeerSession
     self.killSwitch = killSwitch
     self.meshTrustPolicy = meshTrustPolicy
     self.discoveryIdentityMode = discoveryIdentityMode
@@ -565,6 +571,7 @@ public struct TunnelConfiguration: Codable, Equatable, Sendable {
     self.rendezvousServers =
       try container.decodeIfPresent([String].self, forKey: .rendezvousServers) ?? []
     self.relayServers = try container.decodeIfPresent([String].self, forKey: .relayServers) ?? []
+    self.remotePeerID = try container.decodeIfPresent(String.self, forKey: .remotePeerID)
     self.allowedRelayEndpoints =
       try container.decodeIfPresent([String].self, forKey: .allowedRelayEndpoints) ?? []
     self.relayTLSPolicy =
@@ -576,6 +583,8 @@ public struct TunnelConfiguration: Codable, Equatable, Sendable {
     self.mtu = try container.decodeIfPresent(Int.self, forKey: .mtu) ?? 1280
     self.crypto =
       try container.decodeIfPresent(CryptoPolicy.self, forKey: .crypto) ?? CryptoPolicy()
+    self.requirePeerSession =
+      try container.decodeIfPresent(Bool.self, forKey: .requirePeerSession) ?? false
     self.killSwitch =
       try container.decodeIfPresent(KillSwitchPolicy.self, forKey: .killSwitch) ?? .failClosed
     self.meshTrustPolicy =

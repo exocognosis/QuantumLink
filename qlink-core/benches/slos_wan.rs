@@ -32,11 +32,14 @@ const SAMPLE_COUNT: usize = 15;
 fn run_direct_warm_through_wan(profile: WanProfile) {
     let runtime = Runtime::new().unwrap();
     runtime.block_on(async {
-        // Probe and overall budgets sized to absorb the profile's
-        // round-trip time plus QUIC handshake (~3 RTTs) plus headroom.
+        // Probe and overall budgets sized to absorb the profile's RTT plus
+        // QUIC, signed inbound identity, and app-layer PQC session setup.
+        // The WAN bench is measurement-only; keeping the probe budget wide
+        // enough for the direct path avoids turning the direct rows into
+        // accidental relay-fallback rows.
         let rtt_ms = (profile.one_way_delay.as_millis() as u64) * 2;
-        let probe_ms = 750 + rtt_ms * 4;
-        let deadline_ms = 3_000 + rtt_ms * 6;
+        let probe_ms = 1_500 + rtt_ms * 6;
+        let deadline_ms = 4_000 + rtt_ms * 8;
         let env = common::build_direct_env_via_wan(probe_ms, deadline_ms, profile).await;
 
         // Warm-up: prime the cache so subsequent connects are "warm".
@@ -74,8 +77,8 @@ fn run_post_event_recovery_through_wan(profile: WanProfile) {
     let runtime = Runtime::new().unwrap();
     runtime.block_on(async {
         let rtt_ms = (profile.one_way_delay.as_millis() as u64) * 2;
-        let probe_ms = 750 + rtt_ms * 4;
-        let deadline_ms = 3_000 + rtt_ms * 6;
+        let probe_ms = 1_500 + rtt_ms * 6;
+        let deadline_ms = 4_000 + rtt_ms * 8;
         let env = common::build_direct_env_via_wan(probe_ms, deadline_ms, profile).await;
 
         let (warmup, _) = env.connector.connect(&env.remote_peer_id).await.unwrap();

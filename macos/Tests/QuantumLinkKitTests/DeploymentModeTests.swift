@@ -61,7 +61,19 @@ final class DeploymentModeTests: XCTestCase {
             sourceIPAddress: "100.127.200.245",
             destinationIPAddress: "89.167.52.129",
             connectionType: .ssh,
-            port: 22
+            port: 22,
+            deploymentDetails: DeploymentProfileDetails(
+                peerDevices: [
+                    PeerDeviceProfile(
+                        alias: "helsinki",
+                        peerID: " qlink_helsinki ",
+                        endpointAddress: "89.167.52.129",
+                        overlayIPAddress: "100.127.0.10",
+                        role: .peer,
+                        port: 22
+                    )
+                ]
+            )
         )
 
         let configuration = QuantumLinkDeploymentMode.mesh.configuration(
@@ -75,6 +87,47 @@ final class DeploymentModeTests: XCTestCase {
         XCTAssertEqual(configuration.rendezvousServers, ["89.167.52.129:9471"])
         XCTAssertEqual(configuration.relayServers, ["89.167.52.129:9472"])
         XCTAssertEqual(configuration.routeMode, .splitTunnel)
+        XCTAssertEqual(configuration.remotePeerID, "qlink_helsinki")
+        XCTAssertTrue(configuration.requirePeerSession)
+    }
+
+    func testDeploymentConfigurationPreservesRelayPolicyAndIdentitySettings() {
+        let dytallixIdentity = DytallixIdentityConfiguration(
+            endpoint: "https://dytallix.example",
+            contractAddress: "0x9a9671441249ee2c364f9b4bc8049e61b082449a",
+            publishWalletAddress: true
+        )
+        let base = TunnelConfiguration(
+            meshID: "prod-mesh",
+            deviceAlias: "mac",
+            overlayIPv4Address: "100.127.0.2",
+            tunnelRemoteAddress: "203.0.113.10",
+            protectedRoutes: ["100.64.0.0/10"],
+            dnsServers: ["100.127.0.1"],
+            remotePeerID: "qlink_base-peer",
+            allowedRelayEndpoints: ["relay.quantumlink.example:9472"],
+            relayTLSPolicy: .required,
+            maximumCandidateAgeSeconds: 90,
+            failClosedOnNoCandidate: true,
+            requirePeerSession: true,
+            killSwitch: .strict,
+            meshTrustPolicy: .publicRequired,
+            discoveryIdentityMode: .publicWallet,
+            dytallixIdentity: dytallixIdentity
+        )
+
+        let configuration = QuantumLinkDeploymentMode.mesh.configuration(from: base)
+
+        XCTAssertEqual(configuration.remotePeerID, "qlink_base-peer")
+        XCTAssertEqual(configuration.allowedRelayEndpoints, ["relay.quantumlink.example:9472"])
+        XCTAssertEqual(configuration.relayTLSPolicy, .required)
+        XCTAssertEqual(configuration.maximumCandidateAgeSeconds, 90)
+        XCTAssertTrue(configuration.failClosedOnNoCandidate)
+        XCTAssertTrue(configuration.requirePeerSession)
+        XCTAssertEqual(configuration.killSwitch, .strict)
+        XCTAssertEqual(configuration.meshTrustPolicy, .publicRequired)
+        XCTAssertEqual(configuration.discoveryIdentityMode, .publicWallet)
+        XCTAssertEqual(configuration.dytallixIdentity, dytallixIdentity)
     }
 
     func testLocalProfileConfigurationUsesFullTunnelAndLocalDiscoveryOnly() {
@@ -98,6 +151,8 @@ final class DeploymentModeTests: XCTestCase {
         XCTAssertTrue(configuration.rendezvousServers.isEmpty)
         XCTAssertTrue(configuration.relayServers.isEmpty)
         XCTAssertEqual(configuration.routeMode, .fullTunnel)
+        XCTAssertNil(configuration.remotePeerID)
+        XCTAssertFalse(configuration.requirePeerSession)
     }
 
     @MainActor

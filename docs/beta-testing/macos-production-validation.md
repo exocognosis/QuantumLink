@@ -25,10 +25,31 @@
 - MDM profile install and per-app VPN policy apply
 - Dytallix identity enrollment and public-mesh verification
 - Native UDP direct peer path
-- Relay fallback path
+- Relay fallback path through configured and signed `quantum_link_relay` candidates
+- Host, STUN server-reflexive, and TURN relay candidate gathering
 - Sleep, wake, network roam, captive portal, tethering, and offline recovery
 - Update from previous signed build to current signed build
 - Uninstall, reinstall, and stale credential recovery
+
+## Current Non-Apple Evidence
+
+As of the 2026-07-18 non-Apple closeout batch, these checks can run before
+Developer ID signing, notarization, and Apple Network Extension entitlement
+approval:
+
+- Native UDP live mesh direct path establishes a signed inbound assertion,
+  app-layer ML-KEM/SHAKE session, and protected frame.
+- Native UDP direct-probe exhaustion falls back to a relay carrier only after
+  establishing the same end-to-end PQC session; raw relay fallback remains
+  rejected when responder binding material is missing.
+- Default builds gather host and STUN server-reflexive candidates; `turn-relay`
+  builds additionally gather TURN relay candidates and report per-server
+  failures.
+- Public Dytallix mesh configuration fails closed without network ID, chain ID,
+  and trusted RPC endpoint pins in both Swift configuration validation and Rust
+  transport startup.
+- Packet-pump defaults remain fail-closed and default support bundles redact
+  mesh IDs, peer IDs, registry IDs, wallet/contract addresses, and IP endpoints.
 
 ## Release Decision
 

@@ -32,9 +32,8 @@ endpoints, or session keys on-chain.
 QuantumLink is source-ready for local protocol, client, packaging, and platform
 development. It is not yet a production VPN bundle. Production release still
 requires platform signing, Apple Network Extension entitlement approval for
-macOS, hardened public rendezvous/relay infrastructure, production peer-session
-key installation into packet-frame encryption, release update signing, and
-real-hardware validation across supported platforms.
+macOS, hardened public rendezvous/relay infrastructure, release update signing,
+and real-hardware validation across supported platforms.
 
 ## Product goals
 
@@ -82,10 +81,11 @@ The control plane is layered:
 - Peer stores cache verified records for graceful degradation when rendezvous
   is unavailable.
 
-The development rendezvous and relay services in this repository are not
-hardened public infrastructure by themselves. A production deployment needs
-authentication policy, abuse controls, TLS, monitoring, durable revocation,
-retention controls, and operational runbooks.
+The development rendezvous and relay services in this repository include
+bearer-token admission and per-client IP rate limits for public-edge rehearsal,
+but they are not hardened public infrastructure by themselves. A production
+deployment still needs TLS, abuse monitoring, durable revocation, retention
+controls, and operational runbooks.
 
 ### On-chain identity verification
 
@@ -163,12 +163,31 @@ Implemented or scaffolded behavior includes:
 - App-layer PQC frame protection with replay rejection for direct mesh links.
 - Packet core framing and metadata normalization; the packet core is not a
   classical encryption boundary.
+- Packet-core FFI exposes authenticated peer-session install/clear/readiness
+  hooks plus peer-session-unavailable and replay-drop counters for macOS
+  observability; the macOS development runtime wires live default-peer mesh
+  readiness into those install/clear/rotation gates.
+- macOS connection profiles, MDM/AppConfig overlays, and party-mesh invite
+  flows can carry a selected remote QuantumLink peer ID into tunnel
+  configuration so peer-session-gated packet flow is tied to the target peer.
 - Native UDP carrier session-wire test coverage; default live mesh direct
   dialing and inbound response use the native UDP carrier with app-layer PQC
   session establishment.
+- Configured QuantumLink relay URLs are signed into peer records as
+  `quantum_link_relay` candidates, and connectors consume those published
+  relay candidates after host/server-reflexive direct probes fail.
+- Published TURN relay candidates are consumed as UDP-relayed carrier targets
+  when a live allocation is present, distinct from the QuantumLink app-relay
+  fallback path.
+- The `turn-relay` proof path can keep a resident TURN allocation alive, install
+  a peer permission, wrap native carrier datagrams in TURN Send indications, and
+  receive peer traffic through TURN Data indications; the public-infra smoke can
+  require `selected_path=turn-relay` in local rehearsal.
 - Optional dev-only QUIC DATAGRAM carrier transport behind `dev-quic-carrier`,
-  rendezvous lookup, direct probes, optional ICE, relay fallback, peer-store
+  rendezvous lookup, direct probes, optional ICE, PQC relay fallback, peer-store
   persistence, per-peer state, and network-event reconnect behavior.
+- Host/STUN candidate gathering is available in default builds, and TURN relay
+  candidate gathering is available behind the explicit `turn-relay` feature.
 - macOS SwiftUI app, `NEPacketTunnelProvider` scaffold, `QuantumLinkKit`,
   Keychain-backed identity paths, MDM payload templates, XcodeGen project, and
   packaging/release scripts.
@@ -180,9 +199,13 @@ Production gaps include:
 
 - Apple-granted Network Extension entitlements and production provisioning.
 - Developer ID signing, notarization, stapling, and Gatekeeper validation.
-- Full ICE/STUN/TURN candidate gathering and nomination for direct and relay
-  path selection.
-- Hardened public rendezvous and relay infrastructure.
+- Real-hardware validation of signed/provisioned Network Extension builds,
+  including peer-session readiness under live packet flow.
+- Deployed public TURN data-plane proof and RFC-complete ICE nomination behavior
+  against deployed public infrastructure.
+- Public rendezvous and relay TLS, durable credential revocation, abuse
+  monitoring, retention controls, and deployed hardening evidence beyond the
+  current token-auth/rate-limit baseline.
 - Signed Sparkle/platform update pipeline paired with a post-quantum release
   manifest layer.
 - Production Dytallix mainnet or hardened registry trust root for public
@@ -475,6 +498,8 @@ data. The local UI and support bundle should expose:
 - Candidate pair and relay status in redacted form.
 - RTT, loss estimate, bytes in/out, and route state.
 - Last rekey time.
+- Peer-session required/ready state plus peer-session-unavailable and replay-drop
+  counters.
 - DNS mode and protected route mode.
 - Identity mode and registry status.
 - Last peer rejection reason.

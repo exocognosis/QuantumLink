@@ -442,8 +442,14 @@ private struct DashboardView: View {
       discoveryModes: baseConfiguration.discoveryModes,
       rendezvousServers: baseConfiguration.rendezvousServers,
       relayServers: baseConfiguration.relayServers,
+      remotePeerID: baseConfiguration.remotePeerID,
+      allowedRelayEndpoints: baseConfiguration.allowedRelayEndpoints,
+      relayTLSPolicy: baseConfiguration.relayTLSPolicy,
+      maximumCandidateAgeSeconds: baseConfiguration.maximumCandidateAgeSeconds,
+      failClosedOnNoCandidate: baseConfiguration.failClosedOnNoCandidate,
       mtu: baseConfiguration.mtu,
       crypto: CryptoPolicy(pqcAlgorithm: pqcAlgorithm),
+      requirePeerSession: baseConfiguration.requirePeerSession,
       killSwitch: baseConfiguration.killSwitch,
       meshTrustPolicy: baseConfiguration.meshTrustPolicy,
       discoveryIdentityMode: effectiveDiscoveryIdentityMode,
@@ -974,6 +980,7 @@ private struct DashboardDetailView: View {
           recentConnectionProfiles: recentConnectionProfiles,
           favoriteConnectionProfiles: favoriteConnectionProfiles,
           recentSessions: recentSessions,
+          localPeerID: dytallixEnrollmentSettingsBinding.wrappedValue.registeredPeerID,
           onConnect: onConnect,
           onDisconnect: onDisconnect,
           onRefresh: onRefresh,
@@ -989,6 +996,7 @@ private struct DashboardDetailView: View {
           favoriteConnectionProfiles: favoriteConnectionProfiles,
           configuration: configuration,
           overlayAddress: status.overlayIPv4Address,
+          localPeerID: dytallixEnrollmentSettingsBinding.wrappedValue.registeredPeerID,
           onStartConnection: onStartConnection,
           onToggleFavoriteConnection: onToggleFavoriteConnection
         )
@@ -1461,6 +1469,7 @@ private struct HomePanel: View {
   let recentConnectionProfiles: [ConnectionProfile]
   let favoriteConnectionProfiles: [ConnectionProfile]
   let recentSessions: [RecentSession]
+  let localPeerID: String?
   let onConnect: () -> Void
   let onDisconnect: () -> Void
   let onRefresh: () -> Void
@@ -1496,6 +1505,7 @@ private struct HomePanel: View {
         favoriteProfiles: favoriteConnectionProfiles,
         configuration: configuration,
         overlayAddress: status.overlayIPv4Address,
+        localPeerID: localPeerID,
         onStart: onStartConnection,
         onToggleFavorite: onToggleFavoriteConnection
       )
@@ -1526,6 +1536,7 @@ private struct ConnectionsPanel: View {
   let favoriteConnectionProfiles: [ConnectionProfile]
   let configuration: TunnelConfiguration
   let overlayAddress: String
+  let localPeerID: String?
   let onStartConnection: (ConnectionProfile) -> Void
   let onToggleFavoriteConnection: (ConnectionProfile) -> Void
 
@@ -1544,6 +1555,7 @@ private struct ConnectionsPanel: View {
         favoriteProfiles: favoriteConnectionProfiles,
         configuration: configuration,
         overlayAddress: overlayAddress,
+        localPeerID: localPeerID,
         onStart: onStartConnection,
         onToggleFavorite: onToggleFavoriteConnection
       )
@@ -1662,6 +1674,7 @@ private struct ConnectionLauncherPanel: View {
   let favoriteProfiles: [ConnectionProfile]
   let configuration: TunnelConfiguration
   let overlayAddress: String
+  let localPeerID: String?
   let onStart: (ConnectionProfile) -> Void
   let onToggleFavorite: (ConnectionProfile) -> Void
 
@@ -1670,8 +1683,18 @@ private struct ConnectionLauncherPanel: View {
   }
 
   private var canStart: Bool {
-    !draft.sourceIPAddress.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    let hasRouteEndpoints =
+      !draft.sourceIPAddress.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
       && !draft.destinationIPAddress.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    guard hasRouteEndpoints else { return false }
+    return deploymentMode.requiresPeerTarget
+      ? draft.deploymentDetails.selectedRemotePeerID != nil
+      : true
+  }
+
+  private var peerTargetStatus: String {
+    guard deploymentMode.requiresPeerTarget else { return "Optional" }
+    return draft.deploymentDetails.selectedRemotePeerID == nil ? "Required" : "Selected"
   }
 
   var body: some View {
@@ -1758,6 +1781,23 @@ private struct ConnectionLauncherPanel: View {
             TextField("Port", text: portBinding)
               .textFieldStyle(.roundedBorder)
               .frame(width: 96)
+          }
+        }
+
+        GridRow {
+          LabeledContent("Peer ID") {
+            TextField("qlink_...", text: primaryPeerIDBinding)
+              .textFieldStyle(.roundedBorder)
+              .font(.system(.caption, design: .monospaced))
+          }
+          LabeledContent("Session Gate") {
+            Text(peerTargetStatus)
+              .foregroundStyle(
+                deploymentMode.requiresPeerTarget && draft.deploymentDetails.selectedRemotePeerID == nil
+                  ? .orange
+                  : .secondary
+              )
+              .lineLimit(1)
           }
         }
 
@@ -1878,10 +1918,45 @@ private struct ConnectionLauncherPanel: View {
     )
   }
 
+  private var primaryPeerIDBinding: Binding<String> {
+    Binding(
+      get: { draft.deploymentDetails.selectedRemotePeerID ?? "" },
+      set: { setPrimaryPeerID($0) }
+    )
+  }
+
+  private func setPrimaryPeerID(_ peerID: String?) {
+    let normalizedPeerID = peerID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    if draft.deploymentDetails.peerDevices.isEmpty {
+      draft.deploymentDetails.peerDevices.append(
+        PeerDeviceProfile(
+          alias: draft.name,
+          peerID: normalizedPeerID,
+          endpointAddress: draft.destinationIPAddress,
+          overlayIPAddress: draft.destinationIPAddress,
+          role: .peer,
+          port: draft.port
+        )
+      )
+      return
+    }
+    draft.deploymentDetails.peerDevices[0].peerID = normalizedPeerID
+    if draft.deploymentDetails.peerDevices[0].endpointAddress.isEmpty {
+      draft.deploymentDetails.peerDevices[0].endpointAddress = draft.destinationIPAddress
+    }
+    if draft.deploymentDetails.peerDevices[0].overlayIPAddress.isEmpty {
+      draft.deploymentDetails.peerDevices[0].overlayIPAddress = draft.destinationIPAddress
+    }
+    if draft.deploymentDetails.peerDevices[0].port <= 0 {
+      draft.deploymentDetails.peerDevices[0].port = draft.port
+    }
+  }
+
   private func createPartyInvite() {
     let invite = PartyMeshInvite(
       configuration: deploymentMode.configuration(from: configuration),
-      gamePort: draft.port > 0 ? draft.port : 27015
+      gamePort: draft.port > 0 ? draft.port : 27015,
+      hostPeerID: localPeerID
     )
     partyInviteCode = (try? invite.joinCode()) ?? ""
     partyJoinMessage =
@@ -1905,6 +1980,7 @@ private struct ConnectionLauncherPanel: View {
       draft.destinationIPAddress = invite.hostOverlayAddress
       draft.connectionType = .custom
       draft.port = invite.gamePort
+      setPrimaryPeerID(invite.hostPeerID)
       partyJoinMessage = "\(invite.hostAlias) · \(invite.trustSummary). \(invite.pathSummary)."
     } catch {
       partyJoinMessage = "Party code is not valid."
@@ -4007,6 +4083,15 @@ extension QuantumLinkDeploymentMode {
     case .partyMesh: "gamecontroller"
     case .direct: "link"
     case .localVPN: "network"
+    }
+  }
+
+  fileprivate var requiresPeerTarget: Bool {
+    switch self {
+    case .mesh, .partyMesh:
+      true
+    case .direct, .localVPN:
+      false
     }
   }
 

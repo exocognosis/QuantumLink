@@ -1,3 +1,5 @@
+#[cfg(feature = "turn-relay")]
+use crate::turn::{gather_relay_candidates, TurnServer};
 use crate::{
     discovery::{CandidateEndpoint, CandidateType},
     error::{QlinkError, Result},
@@ -53,6 +55,9 @@ pub const SERVER_REFLEXIVE_PRIORITY: u32 =
 pub const PEER_REFLEXIVE_PRIORITY: u32 =
     ice_priority(TYPE_PREF_PEER_REFLEXIVE, DEFAULT_LOCAL_PREF, COMPONENT_ID);
 pub const RELAY_PRIORITY: u32 = ice_priority(TYPE_PREF_RELAY, DEFAULT_LOCAL_PREF, COMPONENT_ID);
+/// Slightly prefer the QuantumLink app relay over generic TURN relay
+/// allocations when both are published in one signed record.
+pub const QUANTUM_LINK_RELAY_PRIORITY: u32 = RELAY_PRIORITY.saturating_add(1);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CandidatePair {
@@ -126,6 +131,15 @@ pub fn relay_candidate(address: SocketAddr) -> CandidateEndpoint {
     }
 }
 
+pub fn quantum_link_relay_candidate(address: SocketAddr) -> CandidateEndpoint {
+    CandidateEndpoint {
+        candidate_type: CandidateType::QuantumLinkRelay,
+        address: address.ip().to_string(),
+        port: address.port(),
+        priority: QUANTUM_LINK_RELAY_PRIORITY,
+    }
+}
+
 pub fn server_reflexive_candidate(address: SocketAddr) -> CandidateEndpoint {
     CandidateEndpoint {
         candidate_type: CandidateType::ServerReflexive,
@@ -153,6 +167,7 @@ pub fn server_reflexive_candidate(address: SocketAddr) -> CandidateEndpoint {
 #[derive(Debug, Default)]
 pub struct GatherReport {
     pub stun_failures: Vec<(SocketAddr, String)>,
+    pub turn_failures: Vec<(SocketAddr, String)>,
 }
 
 pub async fn gather_local_candidates(
@@ -190,6 +205,37 @@ pub async fn gather_local_candidates(
     (candidates, report)
 }
 
+/// Gathers a complete local candidate set for production rendezvous records:
+/// host, server-reflexive, and TURN relay candidates. TURN support is feature
+/// gated because standard TURN authentication requires classical RFC framing
+/// primitives that are deliberately excluded from default PQC-only builds.
+#[cfg(feature = "turn-relay")]
+pub async fn gather_ice_candidates(
+    quic_local_addr: SocketAddr,
+    stun_servers: &[SocketAddr],
+    turn_servers: &[TurnServer],
+) -> (Vec<CandidateEndpoint>, GatherReport) {
+    let (mut candidates, mut report) = gather_local_candidates(quic_local_addr, stun_servers).await;
+
+    let turn_bind: SocketAddr = match quic_local_addr.ip() {
+        IpAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
+        IpAddr::V6(_) => "[::]:0".parse().unwrap(),
+    };
+    let (relay_candidates, failures) = gather_relay_candidates(turn_servers, turn_bind).await;
+    report.turn_failures = failures;
+
+    for mut candidate in relay_candidates {
+        candidate.priority = RELAY_PRIORITY;
+        if !candidates.iter().any(|existing| {
+            existing.address == candidate.address && existing.port == candidate.port
+        }) {
+            candidates.push(candidate);
+        }
+    }
+
+    (order_remote_candidates(&candidates), report)
+}
+
 fn host_candidate(addr: SocketAddr) -> CandidateEndpoint {
     CandidateEndpoint {
         candidate_type: CandidateType::Host,
@@ -205,8 +251,8 @@ fn host_candidate(addr: SocketAddr) -> CandidateEndpoint {
 pub fn order_remote_candidates(candidates: &[CandidateEndpoint]) -> Vec<CandidateEndpoint> {
     let mut sorted: Vec<CandidateEndpoint> = candidates.to_vec();
     sorted.sort_by(|a, b| {
-        let a_relay = matches!(a.candidate_type, CandidateType::Relay);
-        let b_relay = matches!(b.candidate_type, CandidateType::Relay);
+        let a_relay = is_relay_family_candidate(&a.candidate_type);
+        let b_relay = is_relay_family_candidate(&b.candidate_type);
         match (a_relay, b_relay) {
             (true, false) => std::cmp::Ordering::Greater,
             (false, true) => std::cmp::Ordering::Less,
@@ -214,6 +260,13 @@ pub fn order_remote_candidates(candidates: &[CandidateEndpoint]) -> Vec<Candidat
         }
     });
     sorted
+}
+
+fn is_relay_family_candidate(candidate_type: &CandidateType) -> bool {
+    matches!(
+        candidate_type,
+        CandidateType::Relay | CandidateType::QuantumLinkRelay
+    )
 }
 
 /// Validates a CandidateEndpoint enough to extract a `SocketAddr`.
@@ -252,6 +305,8 @@ mod tests {
         );
         assert_eq!(HOST_PRIORITY, expected);
         assert!(HOST_PRIORITY > SERVER_REFLEXIVE_PRIORITY);
+        assert!(SERVER_REFLEXIVE_PRIORITY > QUANTUM_LINK_RELAY_PRIORITY);
+        assert!(QUANTUM_LINK_RELAY_PRIORITY > RELAY_PRIORITY);
         assert!(SERVER_REFLEXIVE_PRIORITY > RELAY_PRIORITY);
     }
 
@@ -272,6 +327,7 @@ mod tests {
     fn order_remote_candidates_puts_relays_last() {
         let candidates = vec![
             relay_candidate("1.2.3.4:5".parse().unwrap()),
+            quantum_link_relay_candidate("1.2.3.5:9472".parse().unwrap()),
             CandidateEndpoint {
                 candidate_type: CandidateType::Host,
                 address: "1.2.3.4".to_string(),
@@ -288,7 +344,8 @@ mod tests {
         let ordered = order_remote_candidates(&candidates);
         assert_eq!(ordered[0].candidate_type, CandidateType::Host);
         assert_eq!(ordered[1].candidate_type, CandidateType::ServerReflexive);
-        assert_eq!(ordered[2].candidate_type, CandidateType::Relay);
+        assert_eq!(ordered[2].candidate_type, CandidateType::QuantumLinkRelay);
+        assert_eq!(ordered[3].candidate_type, CandidateType::Relay);
     }
 
     #[tokio::test]
@@ -318,6 +375,35 @@ mod tests {
         // Failure recorded.
         assert_eq!(report.stun_failures.len(), 1);
         assert_eq!(report.stun_failures[0].0, unreachable);
+        assert!(report.turn_failures.is_empty());
+    }
+
+    #[cfg(feature = "turn-relay")]
+    #[tokio::test]
+    async fn gather_ice_candidates_includes_host_srflx_and_turn_relay() {
+        use crate::{stun::spawn_dev_stun, turn::spawn_dev_turn};
+
+        let stun_server = spawn_dev_stun().await.unwrap();
+        let turn_server = spawn_dev_turn().await.unwrap();
+        let quic_addr: SocketAddr = "127.0.0.1:14435".parse().unwrap();
+        let turn_servers = vec![TurnServer::open(turn_server.local_addr())];
+
+        let (candidates, report) =
+            gather_ice_candidates(quic_addr, &[stun_server.local_addr()], &turn_servers).await;
+
+        assert!(report.stun_failures.is_empty());
+        assert!(report.turn_failures.is_empty());
+        assert_eq!(candidates[0].candidate_type, CandidateType::Host);
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.candidate_type == CandidateType::ServerReflexive));
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.candidate_type == CandidateType::Relay));
+        assert_eq!(
+            candidates.last().map(|candidate| &candidate.candidate_type),
+            Some(&CandidateType::Relay)
+        );
     }
 
     #[test]

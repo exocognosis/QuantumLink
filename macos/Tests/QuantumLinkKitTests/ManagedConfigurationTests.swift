@@ -20,6 +20,8 @@ final class ManagedConfigurationTests: XCTestCase {
             "protectedRoutes": ["10.0.0.0/8", "100.64.0.0/10"],
             "routeMode": "fullTunnel",
             "killSwitch": "strict",
+            "remotePeerID": "qlink_managed-peer",
+            "requirePeerSession": true,
             "mtu": 1400
         ]
 
@@ -31,10 +33,21 @@ final class ManagedConfigurationTests: XCTestCase {
         XCTAssertEqual(result.configuration.protectedRoutes, ["10.0.0.0/8", "100.64.0.0/10"])
         XCTAssertEqual(result.configuration.routeMode, .fullTunnel)
         XCTAssertEqual(result.configuration.killSwitch, .strict)
+        XCTAssertEqual(result.configuration.remotePeerID, "qlink_managed-peer")
+        XCTAssertTrue(result.configuration.requirePeerSession)
         XCTAssertEqual(result.configuration.mtu, 1400)
         XCTAssertEqual(
             result.appliedKeys,
-            ["deviceAlias", "killSwitch", "meshID", "mtu", "protectedRoutes", "routeMode"]
+            [
+                "deviceAlias",
+                "killSwitch",
+                "meshID",
+                "mtu",
+                "protectedRoutes",
+                "remotePeerID",
+                "requirePeerSession",
+                "routeMode"
+            ]
         )
         XCTAssertTrue(result.rejectedKeys.isEmpty)
     }

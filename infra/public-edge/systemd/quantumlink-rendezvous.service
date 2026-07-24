@@ -1,0 +1,29 @@
+[Unit]
+Description=QuantumLink rendezvous service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/quantumlink/public-edge.env
+ExecStart=/opt/quantumlink/bin/qlinkctl rendezvous --listen ${QLINK_RENDEZVOUS_LISTEN} --auth-token ${QLINK_RENDEZVOUS_AUTH_TOKEN} --rate-limit-per-window ${QLINK_RENDEZVOUS_RATE_LIMIT_PER_WINDOW} --rate-limit-window-seconds ${QLINK_ADMISSION_RATE_LIMIT_WINDOW_SECONDS}
+Restart=always
+RestartSec=3
+User=quantumlink
+Group=quantumlink
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/quantumlink /var/log/quantumlink
+CapabilityBoundingSet=
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target

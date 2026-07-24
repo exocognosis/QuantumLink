@@ -1,0 +1,17 @@
+{
+  "_comment": "Canonical MeshTransportConfig for a PUBLIC mesh — the exact JSON the macOS bridge/qlinkctl should hand to qlink-core's from_json_config (FFI qlink_mesh_transport_start). meshTrustPolicy=public_required makes the connector AND responder fail closed on any peer without an active, matching Dytallix registry record; dytallixIdentity binds enforcement to the deployed quantumlink-node-registry contract on the Dytallix testnet. Replace the peer ids and rendezvousUrl with real values. See config/dytallix-testnet.json and rust/qlink-core/tests/dytallix_live.rs.",
+  "meshId": "quantumlink-public",
+  "localPeerId": "qlink_REPLACE_WITH_LOCAL_PEER_ID",
+  "remotePeerId": "qlink_REPLACE_WITH_REMOTE_PEER_ID",
+  "rendezvousUrl": "REPLACE_WITH_PUBLIC_RENDEZVOUS_HOST:PORT",
+  "bindAddr": "0.0.0.0:0",
+  "enableIce": true,
+  "meshTrustPolicy": "public_required",
+  "dytallixIdentity": {
+    "endpoint": "https://dytallix.com",
+    "contractAddress": "0xbcb5cf5abb50333ee4bfde91f21bbcc24828673d",
+    "networkId": null,
+    "chainId": null,
+    "allowedRpcEndpoints": ["https://dytallix.com"]
+  }
+}

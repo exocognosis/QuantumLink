@@ -11,10 +11,10 @@ use tokio::{net::UdpSocket, task::JoinHandle};
 
 const BINDING_REQUEST: u16 = 0x0001;
 const BINDING_SUCCESS_RESPONSE: u16 = 0x0101;
-const XOR_MAPPED_ADDRESS: u16 = 0x0020;
-const MAGIC_COOKIE: u32 = 0x2112_A442;
-const HEADER_LEN: usize = 20;
-const TRANSACTION_ID_LEN: usize = 12;
+pub(crate) const XOR_MAPPED_ADDRESS: u16 = 0x0020;
+pub(crate) const MAGIC_COOKIE: u32 = 0x2112_A442;
+pub(crate) const HEADER_LEN: usize = 20;
+pub(crate) const TRANSACTION_ID_LEN: usize = 12;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -184,6 +184,16 @@ pub async fn spawn_dev_stun() -> Result<DevStunServer> {
     Ok(DevStunServer { local_addr, task })
 }
 
+/// Binds a STUN binding server to `listen` (e.g. `0.0.0.0:3478`) and serves
+/// reflexive-address requests until the socket errors. Carries the same
+/// non-production caveats as [`DevStunServer`]; intended for testbeds that
+/// need a real public-facing STUN endpoint for NAT-traversal testing.
+pub async fn run_stun(listen: &str) -> Result<()> {
+    let socket = Arc::new(UdpSocket::bind(listen).await?);
+    serve_dev_stun(socket).await;
+    Ok(())
+}
+
 async fn serve_dev_stun(socket: Arc<UdpSocket>) {
     let mut buffer = vec![0_u8; 1500];
     loop {
@@ -234,7 +244,7 @@ fn build_binding_response(
     response
 }
 
-fn encode_xor_mapped_address(
+pub(crate) fn encode_xor_mapped_address(
     transaction_id: [u8; TRANSACTION_ID_LEN],
     mapped_addr: SocketAddr,
 ) -> Vec<u8> {
@@ -264,7 +274,7 @@ fn encode_xor_mapped_address(
     attribute
 }
 
-fn parse_xor_mapped_address(
+pub(crate) fn parse_xor_mapped_address(
     value: &[u8],
     transaction_id: [u8; TRANSACTION_ID_LEN],
 ) -> Result<SocketAddr> {
@@ -310,7 +320,7 @@ fn parse_xor_mapped_address(
     }
 }
 
-fn padding_len(attribute_len: usize) -> usize {
+pub(crate) fn padding_len(attribute_len: usize) -> usize {
     (4 - (attribute_len % 4)) % 4
 }
 

@@ -119,6 +119,25 @@ final class ConfigurationValidationTests: XCTestCase {
     XCTAssertEqual(configuration.killSwitch, .strict)
   }
 
+  func testRequirePeerSessionWithoutRemotePeerWarnsFailClosed() throws {
+    let configuration = TunnelConfiguration(
+      meshID: "devmesh",
+      deviceAlias: "mac",
+      overlayIPv4Address: "100.127.0.2",
+      tunnelRemoteAddress: "100.127.0.1",
+      protectedRoutes: ["100.127.0.0/16"],
+      dnsServers: ["100.127.0.1"],
+      rendezvousServers: ["127.0.0.1:9471"],
+      requirePeerSession: true
+    )
+
+    let report = try ConfigurationValidator.validate(configuration: configuration)
+
+    XCTAssertTrue(report.warnings.contains {
+      $0.contains("requirePeerSession is enabled but remotePeerID is empty")
+    })
+  }
+
   func testPublicMeshCannotUseOffDiscoveryIdentityMode() throws {
     let configuration = makeConfiguration(discoveryIdentityMode: .off)
 

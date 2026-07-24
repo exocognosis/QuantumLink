@@ -1,0 +1,32 @@
+# coturn production-candidate template for QuantumLink TURN allocation probes.
+# Render placeholders from /etc/quantumlink/public-edge.env before installing.
+#
+# QuantumLink can gather TURN relay candidates and the local proof path can keep
+# a resident allocation alive for native carrier traffic through Send/Data
+# indications. The default app-relay smoke remains separate from coturn so
+# operators can prove both fallback paths independently.
+
+listening-port=3478
+tls-listening-port=5349
+listening-ip=${QLINK_TURN_LISTENING_IP}
+external-ip=${QLINK_TURN_EXTERNAL_IP}
+realm=${QLINK_TURN_REALM}
+server-name=${QLINK_TURN_REALM}
+
+fingerprint
+lt-cred-mech
+user=${QLINK_TURN_USER}:${QLINK_TURN_PASSWORD}
+stale-nonce=600
+
+min-port=${QLINK_TURN_MIN_PORT}
+max-port=${QLINK_TURN_MAX_PORT}
+
+no-loopback-peers
+no-multicast-peers
+no-cli
+no-tlsv1
+no-tlsv1_1
+cert=${QLINK_TURN_CERT}
+pkey=${QLINK_TURN_PKEY}
+log-file=/var/log/turnserver/turnserver.log
+simple-log

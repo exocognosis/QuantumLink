@@ -6,10 +6,12 @@
 
 QuantumLink is a cross-platform, post-quantum mesh VPN product built
 around a shared Rust protocol core and native platform silos for macOS,
-Windows, and the Steam/SteamOS gamer track. It is designed to minimize
-central infrastructure: peers discover each other through short-lived
-signed records, connect directly when possible, fall back to relay when
-necessary, and preserve a fail-closed L3 overlay on each supported OS.
+Windows, and the Steam/SteamOS gamer track, plus a separate
+QuantumLink Agent silo for agent-assisted mesh operations. It is
+designed to minimize central infrastructure: peers discover each other
+through short-lived signed records, connect directly when possible,
+fall back to relay when necessary, and preserve a fail-closed L3
+overlay on each supported OS.
 
 The product promise is: **identity on-chain, traffic off-chain, access
 accountless, transport server-minimized.** Peer identity is verified
@@ -44,6 +46,11 @@ release mechanics.
   IPC, WinUI 3, and WiX packaging; Steam/SteamOS is tracked as a gamer
   edition with Steam-safe routing policy and low-latency game traffic
   goals.
+- **QuantumLink Agent** - a product silo for agent runtime
+  orchestration, policy guardrails, mesh diagnostics interpretation,
+  Dytallix identity explanation, route and relay recommendations,
+  typed remediation plans, approval gates, audit records, and UI/CLI
+  adapter contracts.
 - **Fail-closed posture** - protected-route filtering, kill-switch
   watchdogs, packet-pump drop accounting, route/DNS policy, diagnostics
   redaction, and explicit production gates for signing, notarization,
@@ -58,6 +65,7 @@ release mechanics.
 | **macOS** | [`macos/`](macos) | Implemented baseline | SwiftUI app, `NEPacketTunnelProvider`, `QuantumLinkKit`, Rust FFI bridge, transport smoke runner, Dytallix enrollment UI/models, MDM payload templates, XcodeGen project, entitlements, Sparkle/appcast scripts, and unsigned/package build flows. |
 | **Windows** | [`windows/`](windows) | Alpha implementation | Privileged Rust tunnel service, Wintun adapter path, WFP kill switch, DPAPI secret storage, named-pipe IPC schema, WinUI 3 dashboard, WiX MSI packaging, beta runbook, and Windows CI smoke coverage. |
 | **Steam / SteamOS** | [`steam/`](steam) | Product track / planning baseline | Steam-safe gamer edition notes for desktop and companion surfaces: game-aware routing, SDR awareness, account/store traffic bypass policy, latency-sensitive mode, streamer/privacy modes, and future SteamOS packaging direction. |
+| **QuantumLink Agent** | [`QuantumLinkAgent/`](QuantumLinkAgent) | Build-neutral scaffold | Agentic VPN product silo for runtime orchestration, policy guardrails, approval-gated remediation, redacted diagnostics, Dytallix identity explanation, mesh adapter contracts, prompt templates, and Agent-specific test fixtures. |
 
 All platform work is built around the same `qlink-core` crate. There is
 no separate macOS protocol, Windows protocol, or Steam protocol. The
@@ -65,6 +73,12 @@ root Cargo workspace ties together the shared core and Windows Rust
 crates; the macOS silo consumes the same core through a generated
 XCFramework; the Steam track is expected to depend on the same service
 and policy layers rather than fork the mesh engine.
+
+QuantumLink Agent is separate from the platform clients. It depends on
+shared `qlink-core` mesh, cryptography, identity, and transport
+primitives, but it does not own macOS Network Extension packaging,
+Windows service packaging, SteamOS daemon packaging, or the shared
+cryptographic protocol.
 
 ## Repository Layout
 
@@ -99,6 +113,20 @@ steam/
   README.md, version.md             Steam gamer edition product direction
   steamos/                          SteamOS/Linux daemon runtime (qlinkd, qlinkctl)
   mobile/                           Steam Mobile companion silo (planning scaffold)
+
+QuantumLinkAgent/
+  README.md                         Agent silo overview and ownership boundary
+  feature.md                        Agent product feature specification
+  docs/                             Runtime architecture, development plan, permissions
+  src/runtime/                      Agent orchestration boundary
+  src/identity/                     Dytallix identity adapter boundary
+  src/mesh/                         qlink-core mesh adapter boundary
+  src/policy/                       Policy engine and patch model
+  src/diagnostics/                  Redacted evidence model
+  src/ui/                           Agent-facing UI contract
+  config/                           Example policy and prompt templates
+  scripts/                          Future Agent development scripts
+  tests/                            Agent test strategy and safe fixtures
 
 config/                             Shared example mesh configuration
 docs/                               Architecture, security, beta, perf notes

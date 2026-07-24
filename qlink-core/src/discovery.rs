@@ -19,6 +19,12 @@ pub struct CandidateEndpoint {
 pub enum CandidateType {
     Host,
     ServerReflexive,
+    /// QuantumLink's TCP app relay. This is distinct from a TURN relayed
+    /// transport address; connectors may dial this with `RelayCarrierSession`.
+    QuantumLinkRelay,
+    /// Standard TURN relayed transport address gathered from coturn or another
+    /// RFC 5766/8656 server. This remains a traversal candidate, not the
+    /// QuantumLink app-relay protocol endpoint.
     Relay,
 }
 
@@ -135,7 +141,12 @@ impl UnsignedPeerRecord {
     ) -> Self {
         let endpoints = endpoints
             .into_iter()
-            .filter(|endpoint| endpoint.candidate_type == CandidateType::Relay)
+            .filter(|endpoint| {
+                matches!(
+                    endpoint.candidate_type,
+                    CandidateType::Relay | CandidateType::QuantumLinkRelay
+                )
+            })
             .collect();
         Self::new(
             mesh_id,
@@ -264,6 +275,12 @@ mod tests {
                     port: 4433,
                     priority: 10,
                 },
+                CandidateEndpoint {
+                    candidate_type: CandidateType::QuantumLinkRelay,
+                    address: "qlink-relay.quantumlink.invalid".to_string(),
+                    port: 9472,
+                    priority: 11,
+                },
             ],
             vec!["100.64.0.10/32".to_string()],
             60,
@@ -283,6 +300,7 @@ mod tests {
                 CandidateType::Host,
                 CandidateType::ServerReflexive,
                 CandidateType::Relay,
+                CandidateType::QuantumLinkRelay,
             ]
         );
     }
@@ -330,6 +348,12 @@ mod tests {
                     port: 4433,
                     priority: 10,
                 },
+                CandidateEndpoint {
+                    candidate_type: CandidateType::QuantumLinkRelay,
+                    address: "qlink-relay.quantumlink.invalid".to_string(),
+                    port: 9472,
+                    priority: 11,
+                },
             ],
             vec!["100.64.0.10/32".to_string()],
             60,
@@ -337,8 +361,12 @@ mod tests {
         );
 
         assert!(body.alias.starts_with("peer-"));
-        assert_eq!(body.endpoints.len(), 1);
+        assert_eq!(body.endpoints.len(), 2);
         assert_eq!(body.endpoints[0].candidate_type, CandidateType::Relay);
+        assert_eq!(
+            body.endpoints[1].candidate_type,
+            CandidateType::QuantumLinkRelay
+        );
     }
 
     #[test]

@@ -25,9 +25,14 @@ clap = { version = "4", features = ["derive"] }
 crc32fast = "1.4"
 dytallix-core = { git = "https://github.com/DytallixHQ/dytallix-sdk", rev = "657d0db4794904f7c25192c9d0c1039c5b9fe5f0", package = "dytallix-core" }
 dytallix-sdk = { git = "https://github.com/DytallixHQ/dytallix-sdk", rev = "657d0db4794904f7c25192c9d0c1039c5b9fe5f0", package = "dytallix-sdk", features = ["network"] }
-flume = { version = "0.11", default-features = false }
+flume = { version = "0.12", default-features = false }
 getrandom = "0.4"
 hex = "0.4"
+# Optional TURN (`turn-relay` feature) auth primitives. Standard TURN long-term
+# credentials require HMAC-SHA1 + MD5 (RFC 5389/5766); these are excluded from
+# the default PQC-only build and only linked when `turn-relay` is enabled.
+hmac = { version = "0.12", optional = true }
+md-5 = { version = "0.10", optional = true }
 mdns-sd = { version = "0.20", default-features = false, features = ["async"] }
 # Keep the PQC signature crates on the same release-candidate dependency line
 # until slh-dsa supports the stable pkcs8 0.11 API.
@@ -40,7 +45,8 @@ reqwest = { version = "0.12", features = ["json"] }
 rustls = { version = "0.23", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
+sha1 = { version = "0.10", optional = true }
+sha2 = "0.11"
 sha3 = "0.12"
 shake = "0.1"
 slh-dsa = { version = "=0.2.0-rc.4", features = ["zeroize"] }
@@ -53,6 +59,9 @@ zeroize = { version = "1", features = ["derive"] }
 default = ["native-udp-carrier"]
 native-udp-carrier = []
 dev-quic-carrier = ["dep:quinn", "dep:rustls", "dep:rcgen"]
+# Standard TURN relay-candidate client. Off by default; pulls in the classical
+# HMAC-SHA1 + MD5 primitives that RFC 5389/5766 TURN auth mandates.
+turn-relay = ["dep:hmac", "dep:md-5", "dep:sha1"]
 
 [dev-dependencies]
 criterion = { version = "0.8", default-features = false, features = ["async_tokio", "html_reports"] }

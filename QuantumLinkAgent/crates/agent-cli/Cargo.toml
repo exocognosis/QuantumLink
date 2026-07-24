@@ -1,0 +1,22 @@
+[package]
+name = "qlink-agent-cli"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[[bin]]
+name = "qlink-agent"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+qlink-agent-actions = { path = "../agent-actions" }
+qlink-agent-audit = { path = "../agent-audit" }
+qlink-agent-contracts = { path = "../agent-contracts" }
+qlink-agent-identity = { path = "../agent-identity" }
+qlink-agent-policy = { path = "../agent-policy" }
+qlink-agent-reasoning = { path = "../agent-reasoning" }
+qlink-agent-runtime = { path = "../agent-runtime" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }

@@ -1,10 +1,13 @@
 use crate::{
     crypto::DeviceKeypair,
+    dytallix_identity::{ensure_dytallix_enrollment_wallet, DytallixRegistryConfig},
     mesh_connection::NetworkEvent,
     mesh_transport::{
         MeshTransportConfig, MeshTransportHandle, MeshTransportState, PeerTrustStatusRaw,
     },
-    packet_core::{PacketDisposition, PacketTunnelCore},
+    packet_core::{
+        InstalledPeerSession, PacketDisposition, PacketTunnelCore, PeerSessionDirection,
+    },
     tracing_bridge,
 };
 use std::{
@@ -57,6 +60,10 @@ pub struct QlinkTunnelMetrics {
     pub transport_frames_in: u64,
     pub dropped_unprotected: u64,
     pub dropped_malformed: u64,
+    pub dropped_peer_session_unavailable: u64,
+    pub dropped_replay: u64,
+    pub peer_session_required: u32,
+    pub peer_session_ready: u32,
 }
 
 #[repr(C)]
@@ -144,10 +151,8 @@ pub unsafe extern "C" fn qlink_tunnel_core_submit_packet(
 
     match core.submit_tunnel_packet(protocol_family, packet) {
         Ok(PacketDisposition::QueuedForTransport) => 1,
-        Ok(
-            PacketDisposition::DroppedUnprotected
-            | PacketDisposition::DroppedPeerSessionUnavailable,
-        ) => 0,
+        Ok(PacketDisposition::DroppedUnprotected) => 0,
+        Ok(PacketDisposition::DroppedPeerSessionUnavailable) => 2,
         Err(_) => -1,
     }
 }
@@ -248,8 +253,70 @@ pub unsafe extern "C" fn qlink_tunnel_core_metrics(
         transport_frames_in: metrics.transport_frames_in,
         dropped_unprotected: metrics.dropped_unprotected,
         dropped_malformed: metrics.dropped_malformed,
+        dropped_peer_session_unavailable: metrics.dropped_peer_session_unavailable,
+        dropped_replay: metrics.dropped_replay,
+        peer_session_required: u32::from(core.peer_session_required()),
+        peer_session_ready: u32::from(core.peer_session_ready()),
     };
     true
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn qlink_tunnel_core_install_peer_session(
+    handle: *mut QlinkTunnelCoreHandle,
+    peer_id: *const u8,
+    peer_id_len: usize,
+    expires_at_unix: u64,
+    rekey_after_bytes: u64,
+) -> bool {
+    let Some(handle) = handle.as_ref() else {
+        return false;
+    };
+    let Some(peer_id) = borrowed_utf8(peer_id, peer_id_len) else {
+        return false;
+    };
+    let Ok(mut core) = handle.core.lock() else {
+        return false;
+    };
+
+    core.install_peer_session(InstalledPeerSession {
+        peer_id: peer_id.to_string(),
+        direction: PeerSessionDirection::Outbound,
+        generation: 1,
+        transcript_binding: [0; 32],
+        expires_at_unix,
+        rekey_after_bytes,
+    });
+    true
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn qlink_tunnel_core_clear_peer_session(
+    handle: *mut QlinkTunnelCoreHandle,
+) -> bool {
+    let Some(handle) = handle.as_ref() else {
+        return false;
+    };
+    let Ok(mut core) = handle.core.lock() else {
+        return false;
+    };
+
+    core.clear_peer_sessions();
+    true
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn qlink_tunnel_core_peer_session_ready(
+    handle: *mut QlinkTunnelCoreHandle,
+) -> bool {
+    let Some(handle) = handle.as_ref() else {
+        return false;
+    };
+    let Ok(core) = handle.core.lock() else {
+        return false;
+    };
+
+    core.peer_session_ready()
 }
 
 #[no_mangle]
@@ -344,6 +411,11 @@ unsafe fn borrowed_slice<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
         return None;
     }
     Some(slice::from_raw_parts(ptr, len))
+}
+
+unsafe fn borrowed_utf8<'a>(ptr: *const u8, len: usize) -> Option<&'a str> {
+    let bytes = borrowed_slice(ptr, len)?;
+    str::from_utf8(bytes).ok()
 }
 
 fn owned_buffer_from_vec(mut bytes: Vec<u8>) -> QlinkOwnedBuffer {
@@ -601,6 +673,65 @@ pub unsafe extern "C" fn qlink_device_keypair_peer_id(
         return false;
     };
     *out = owned_buffer_from_vec(handle.public_key().peer_id().into_bytes());
+    true
+}
+
+// ===================================================================
+// Dytallix enrollment wallet
+// ===================================================================
+
+/// Ensures a Dytallix enrollment wallet exists in the keystore at
+/// `keystore_path`, generating + activating one if absent. On success writes a
+/// newline-delimited `key=value` summary (`wallet_name`, `wallet_address`,
+/// `created_wallet`) to `out` and returns true; the buffer is caller-owned and
+/// must be freed with `qlink_owned_buffer_free`. An empty `wallet_name_len`
+/// means "use the active/default wallet". `endpoint` + `contract` are validated
+/// into the registry config but only the keystore is touched here — no network.
+#[no_mangle]
+pub unsafe extern "C" fn qlink_dytallix_ensure_wallet(
+    endpoint_ptr: *const u8,
+    endpoint_len: usize,
+    contract_ptr: *const u8,
+    contract_len: usize,
+    keystore_path_ptr: *const u8,
+    keystore_path_len: usize,
+    wallet_name_ptr: *const u8,
+    wallet_name_len: usize,
+    out: *mut QlinkOwnedBuffer,
+) -> bool {
+    let Some(out) = out.as_mut() else {
+        return false;
+    };
+    let (Some(endpoint), Some(contract), Some(keystore_path)) = (
+        borrowed_slice(endpoint_ptr, endpoint_len).and_then(|b| str::from_utf8(b).ok()),
+        borrowed_slice(contract_ptr, contract_len).and_then(|b| str::from_utf8(b).ok()),
+        borrowed_slice(keystore_path_ptr, keystore_path_len).and_then(|b| str::from_utf8(b).ok()),
+    ) else {
+        return false;
+    };
+    let wallet_name = if wallet_name_len == 0 {
+        None
+    } else {
+        match borrowed_slice(wallet_name_ptr, wallet_name_len).and_then(|b| str::from_utf8(b).ok())
+        {
+            Some(name) => Some(name.to_string()),
+            None => return false,
+        }
+    };
+
+    let config = match DytallixRegistryConfig::new(endpoint, contract, keystore_path, wallet_name) {
+        Ok(config) => config,
+        Err(_) => return false,
+    };
+    let wallet = match ensure_dytallix_enrollment_wallet(&config) {
+        Ok(wallet) => wallet,
+        Err(_) => return false,
+    };
+    let summary = format!(
+        "wallet_name={}\nwallet_address={}\ncreated_wallet={}\n",
+        wallet.wallet_name, wallet.wallet_address, wallet.created_wallet
+    );
+    *out = owned_buffer_from_vec(summary.into_bytes());
     true
 }
 
@@ -1013,6 +1144,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ensure_wallet_ffi_generates_dytallix_address() {
+        let dir = std::env::temp_dir().join(format!(
+            "qlink-wallet-ffi-test-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let keystore = dir.join("keystore.json");
+        let keystore_str = keystore.to_str().unwrap();
+        let endpoint = "https://dytallix.com";
+        let contract = "0xbcb5cf5abb50333ee4bfde91f21bbcc24828673d";
+        let mut out = QlinkOwnedBuffer {
+            ptr: std::ptr::null_mut(),
+            len: 0,
+            cap: 0,
+        };
+        let ok = unsafe {
+            qlink_dytallix_ensure_wallet(
+                endpoint.as_ptr(),
+                endpoint.len(),
+                contract.as_ptr(),
+                contract.len(),
+                keystore_str.as_ptr(),
+                keystore_str.len(),
+                std::ptr::null(),
+                0,
+                &mut out,
+            )
+        };
+        assert!(ok, "ensure_wallet returned false");
+        let summary =
+            unsafe { String::from_utf8(slice::from_raw_parts(out.ptr, out.len).to_vec()).unwrap() };
+        unsafe { qlink_owned_buffer_free(out) };
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            summary.contains("wallet_address=dytallix1"),
+            "expected a dytallix1 address, got: {summary}"
+        );
+        assert!(
+            summary.contains("created_wallet=true"),
+            "expected created_wallet=true, got: {summary}"
+        );
+    }
+
+    #[test]
     fn ffi_core_round_trips_transport_frame() {
         let config = br#"{
             "protectedRoutes": ["100.127.0.0/16"],
@@ -1057,6 +1233,58 @@ mod tests {
         assert_eq!(restored_bytes[16..20], packet[16..20]);
         assert_eq!(ipv4_header_checksum(&restored_bytes), 0);
         unsafe { qlink_owned_buffer_free(restored.buffer) };
+        unsafe { qlink_tunnel_core_destroy(handle) };
+    }
+
+    #[test]
+    fn ffi_peer_session_controls_gate_protected_packets() {
+        let config = br#"{
+            "protectedRoutes": ["100.127.0.0/16"],
+            "excludedRoutes": [],
+            "routeMode": "splitTunnel",
+            "mtu": 1280,
+            "requirePeerSession": true
+        }"#;
+
+        let handle = unsafe { qlink_tunnel_core_create(config.as_ptr(), config.len()) };
+        assert!(!handle.is_null());
+
+        let packet = test_ipv4_packet([100, 127, 0, 9]);
+        let blocked =
+            unsafe { qlink_tunnel_core_submit_packet(handle, 2, packet.as_ptr(), packet.len()) };
+        assert_eq!(blocked, 2);
+        assert!(!unsafe { qlink_tunnel_core_peer_session_ready(handle) });
+
+        let mut metrics = QlinkTunnelMetrics::default();
+        assert!(unsafe { qlink_tunnel_core_metrics(handle, &mut metrics) });
+        assert_eq!(metrics.dropped_peer_session_unavailable, 1);
+        assert_eq!(metrics.peer_session_required, 1);
+        assert_eq!(metrics.peer_session_ready, 0);
+
+        let peer_id = b"qlink_peer-session-test";
+        let expires_at_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 60;
+        assert!(unsafe {
+            qlink_tunnel_core_install_peer_session(
+                handle,
+                peer_id.as_ptr(),
+                peer_id.len(),
+                expires_at_unix,
+                0,
+            )
+        });
+        assert!(unsafe { qlink_tunnel_core_peer_session_ready(handle) });
+
+        let queued =
+            unsafe { qlink_tunnel_core_submit_packet(handle, 2, packet.as_ptr(), packet.len()) };
+        assert_eq!(queued, 1);
+
+        assert!(unsafe { qlink_tunnel_core_clear_peer_session(handle) });
+        assert!(!unsafe { qlink_tunnel_core_peer_session_ready(handle) });
+
         unsafe { qlink_tunnel_core_destroy(handle) };
     }
 

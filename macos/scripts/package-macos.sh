@@ -28,6 +28,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "${ROOT}/.." && pwd)"
 cd "${ROOT}"
 
 skip_sign=false
@@ -94,28 +95,30 @@ cargo_target_root="${QLINK_CARGO_TARGET_DIR:-${TMPDIR:-/tmp}/quantumlink-cargo-t
 
 if [[ -z "${QLINK_PACKAGE_STAGED:-}" && "${QLINK_DISABLE_PACKAGE_STAGING:-false}" != "true" ]]; then
     stage_dir="$(mktemp -d "${TMPDIR:-/tmp}/quantumlink-package.XXXXXX")"
+    stage_root="${stage_dir}/QuantumLinkOS"
     cleanup_stage() {
         rm -rf "${stage_dir}"
     }
     trap cleanup_stage EXIT
 
-    echo "==> Staging release build under ${stage_dir}"
+    echo "==> Staging release build under ${stage_root}"
+    mkdir -p "${stage_root}"
     rsync -a --delete \
         --exclude '.git' \
         --exclude '.worktrees' \
-        --exclude '.build' \
-        --exclude 'QuantumLink.xcodeproj' \
-        --exclude 'build' \
+        --exclude 'macos/.build' \
+        --exclude 'macos/QuantumLink.xcodeproj' \
+        --exclude 'macos/build' \
         --exclude 'target' \
-        "${ROOT}/" "${stage_dir}/"
+        "${REPO_ROOT}/" "${stage_root}/"
 
     QLINK_PACKAGE_STAGED=1 \
     QLINK_CARGO_TARGET_DIR="${cargo_target_root}" \
-        "${stage_dir}/scripts/package-macos.sh" "${original_args[@]}"
+        "${stage_root}/macos/scripts/package-macos.sh" "${original_args[@]}"
 
     rm -rf "${out_dir}"
     mkdir -p "${out_dir}"
-    rsync -a "${stage_dir}/build/release/" "${out_dir}/"
+    rsync -a "${stage_root}/macos/build/release/" "${out_dir}/"
     echo "==> Copied staged release artifacts to ${out_dir}"
     ls -lh "${out_dir}"
     exit 0

@@ -48,7 +48,7 @@ QuantumLink is a macOS-first peer-to-peer mesh VPN scaffold with a Rust protocol
 - Monotonic replay protection in the packet core.
 - Privacy-preserving peer labels and minimized public peer records.
 
-The project documentation explicitly marks the rendezvous and relay binaries as development protocol tools. They are useful for beta validation but require TLS, authentication policy, rate limits, abuse monitoring, durable revocation, and retention controls before public production exposure.
+The project documentation explicitly marks the rendezvous and relay binaries as development protocol tools. They are useful for beta validation and now support bearer-token admission plus per-client IP rate limits, but they still require TLS, abuse monitoring, durable revocation, quota controls, and retention controls before broad public production exposure.
 
 ## Test Environments
 
