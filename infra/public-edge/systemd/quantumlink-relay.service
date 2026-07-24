@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=/etc/quantumlink/public-edge.env
-ExecStart=/opt/quantumlink/bin/qlinkctl relay --listen ${QLINK_RELAY_LISTEN}
+ExecStart=/opt/quantumlink/bin/qlinkctl relay --listen ${QLINK_RELAY_LISTEN} --auth-token ${QLINK_RELAY_AUTH_TOKEN} --rate-limit-per-window ${QLINK_RELAY_RATE_LIMIT_PER_WINDOW} --rate-limit-window-seconds ${QLINK_ADMISSION_RATE_LIMIT_WINDOW_SECONDS}
 Restart=always
 RestartSec=3
 User=quantumlink

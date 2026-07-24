@@ -1,5 +1,7 @@
-use crate::error::QlinkError;
-use crate::error::Result;
+use crate::{
+    admission::{AdmissionLimiter, ServiceAdmissionConfig},
+    error::{QlinkError, Result},
+};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -22,6 +24,8 @@ use tokio::{
 pub enum RelayMessage {
     Register {
         peer_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth_token: Option<String>,
     },
     Registered {
         peer_id: String,
@@ -42,17 +46,34 @@ pub struct RelayRegistry {
 }
 
 pub async fn run_relay(listen: &str) -> Result<()> {
+    run_relay_with_config(listen, ServiceAdmissionConfig::default()).await
+}
+
+pub async fn run_relay_with_config(listen: &str, admission: ServiceAdmissionConfig) -> Result<()> {
     let listener = TcpListener::bind(listen).await?;
     let registry = RelayRegistry::default();
-    serve_relay(listener, registry).await
+    serve_relay_with_config(listener, registry, admission).await
 }
 
 pub async fn serve_relay(listener: TcpListener, registry: RelayRegistry) -> Result<()> {
+    serve_relay_with_config(listener, registry, ServiceAdmissionConfig::default()).await
+}
+
+pub async fn serve_relay_with_config(
+    listener: TcpListener,
+    registry: RelayRegistry,
+    admission: ServiceAdmissionConfig,
+) -> Result<()> {
+    let limiter = AdmissionLimiter::new(&admission);
     loop {
-        let (stream, _) = listener.accept().await?;
+        let (stream, peer_addr) = listener.accept().await?;
         let registry = registry.clone();
+        let admission = admission.clone();
+        let limiter = limiter.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle_connection(stream, registry).await {
+            if let Err(error) =
+                handle_connection(stream, registry, admission, limiter, peer_addr).await
+            {
                 tracing::warn!(?error, "relay connection failed");
             }
         });
@@ -90,18 +111,29 @@ pub async fn spawn_dev_relay() -> Result<DevRelayServer> {
 }
 
 struct RelayClient {
+    #[cfg(test)]
     peer_id: String,
     reader: BufReader<OwnedReadHalf>,
     writer: OwnedWriteHalf,
 }
 
 impl RelayClient {
+    #[cfg(test)]
     async fn connect(server: &str, peer_id: impl Into<String>) -> Result<Self> {
+        Self::connect_with_auth(server, peer_id, None).await
+    }
+
+    async fn connect_with_auth(
+        server: &str,
+        peer_id: impl Into<String>,
+        auth_token: Option<&str>,
+    ) -> Result<Self> {
         let stream = TcpStream::connect(server).await?;
         let (reader, mut writer) = stream.into_split();
         let peer_id = peer_id.into();
         let register = RelayMessage::Register {
             peer_id: peer_id.clone(),
+            auth_token: auth_token.map(|token| token.to_string()),
         };
 
         writer
@@ -123,12 +155,14 @@ impl RelayClient {
         }
 
         Ok(Self {
+            #[cfg(test)]
             peer_id,
             reader,
             writer,
         })
     }
 
+    #[cfg(test)]
     async fn send_datagram(&mut self, destination: &str, payload: &[u8]) -> Result<()> {
         let message = RelayMessage::Datagram {
             source: self.peer_id.clone(),
@@ -142,6 +176,7 @@ impl RelayClient {
         Ok(())
     }
 
+    #[cfg(test)]
     async fn receive_datagram(&mut self) -> Result<Option<(String, Vec<u8>)>> {
         let mut line = String::new();
         if self.reader.read_line(&mut line).await? == 0 {
@@ -271,6 +306,15 @@ impl RelayCarrierSession {
         local_peer_id: impl Into<String>,
         remote_peer_id: impl Into<String>,
     ) -> Result<Self> {
+        Self::connect_initiator_with_auth(server, local_peer_id, remote_peer_id, None).await
+    }
+
+    pub async fn connect_initiator_with_auth(
+        server: &str,
+        local_peer_id: impl Into<String>,
+        remote_peer_id: impl Into<String>,
+        auth_token: Option<&str>,
+    ) -> Result<Self> {
         let local_peer_id = local_peer_id.into();
         let remote_peer_id = remote_peer_id.into();
         let stream = TcpStream::connect(server).await?;
@@ -279,6 +323,7 @@ impl RelayCarrierSession {
             .write_all(
                 serde_json::to_string(&RelayMessage::Register {
                     peer_id: local_peer_id.clone(),
+                    auth_token: auth_token.map(|token| token.to_string()),
                 })?
                 .as_bytes(),
             )
@@ -428,11 +473,24 @@ pub struct RelayResponderListener;
 impl RelayResponderListener {
     /// Runs the demux loop until the relay connection closes, invoking
     /// `on_session` for each new source peer.
-    pub async fn run<F>(server: &str, local_peer_id: String, mut on_session: F) -> Result<()>
+    pub async fn run<F>(server: &str, local_peer_id: String, on_session: F) -> Result<()>
     where
         F: FnMut(RelayCarrierSession),
     {
-        let client = RelayClient::connect(server, local_peer_id.clone()).await?;
+        Self::run_with_auth(server, local_peer_id, None, on_session).await
+    }
+
+    pub async fn run_with_auth<F>(
+        server: &str,
+        local_peer_id: String,
+        auth_token: Option<&str>,
+        mut on_session: F,
+    ) -> Result<()>
+    where
+        F: FnMut(RelayCarrierSession),
+    {
+        let client =
+            RelayClient::connect_with_auth(server, local_peer_id.clone(), auth_token).await?;
         let RelayClient { reader, writer, .. } = client;
         let writer = Arc::new(Mutex::new(writer));
         let mut reader = reader;
@@ -489,7 +547,13 @@ impl RelayResponderListener {
     }
 }
 
-async fn handle_connection(stream: TcpStream, registry: RelayRegistry) -> Result<()> {
+async fn handle_connection(
+    stream: TcpStream,
+    registry: RelayRegistry,
+    admission: ServiceAdmissionConfig,
+    limiter: AdmissionLimiter,
+    peer_addr: SocketAddr,
+) -> Result<()> {
     let (reader, writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
@@ -497,8 +561,23 @@ async fn handle_connection(stream: TcpStream, registry: RelayRegistry) -> Result
     let mut pending_writer = Some(writer);
 
     while reader.read_line(&mut line).await? != 0 {
+        if let Err(error) = limiter.check(peer_addr, "relay").await {
+            if let Some(writer) = pending_writer.as_mut() {
+                write_relay_error(writer, &error.to_string()).await?;
+            }
+            break;
+        }
         match serde_json::from_str::<RelayMessage>(line.trim_end()) {
-            Ok(RelayMessage::Register { peer_id }) => {
+            Ok(RelayMessage::Register {
+                peer_id,
+                auth_token,
+            }) => {
+                if let Err(error) = admission.require_token(auth_token.as_deref(), "relay") {
+                    if let Some(writer) = pending_writer.as_mut() {
+                        write_relay_error(writer, &error.to_string()).await?;
+                    }
+                    break;
+                }
                 if let Some(mut writer) = pending_writer.take() {
                     let registered = RelayMessage::Registered {
                         peer_id: peer_id.clone(),
@@ -517,6 +596,14 @@ async fn handle_connection(stream: TcpStream, registry: RelayRegistry) -> Result
                 destination,
                 payload_base64,
             }) => {
+                if registered_peer.as_deref() != Some(source.as_str()) {
+                    if let Some(peer_id) = &registered_peer {
+                        registry.peers.lock().await.remove(peer_id);
+                    }
+                    return Err(QlinkError::Protocol(
+                        "relay datagram source does not match registered peer".into(),
+                    ));
+                }
                 let frame = RelayMessage::Datagram {
                     source,
                     destination: destination.clone(),
@@ -548,26 +635,37 @@ async fn handle_connection(stream: TcpStream, registry: RelayRegistry) -> Result
     Ok(())
 }
 
+async fn write_relay_error(writer: &mut OwnedWriteHalf, message: &str) -> Result<()> {
+    let response = RelayMessage::Error {
+        message: message.to_string(),
+    };
+    writer
+        .write_all(serde_json::to_string(&response)?.as_bytes())
+        .await?;
+    writer.write_all(b"\n").await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
 
-    #[tokio::test]
-    async fn relay_client_forwards_datagrams_between_registered_peers() {
+    async fn spawn_configured_relay(
+        admission: ServiceAdmissionConfig,
+    ) -> (SocketAddr, JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let registry = RelayRegistry::default();
-
-        tokio::spawn(async move {
-            loop {
-                let (stream, _) = listener.accept().await.unwrap();
-                let registry = registry.clone();
-                tokio::spawn(async move {
-                    let _ = handle_connection(stream, registry).await;
-                });
-            }
+        let task = tokio::spawn(async move {
+            let _ = serve_relay_with_config(listener, registry, admission).await;
         });
+        (addr, task)
+    }
+
+    #[tokio::test]
+    async fn relay_client_forwards_datagrams_between_registered_peers() {
+        let (addr, _task) = spawn_configured_relay(ServiceAdmissionConfig::open()).await;
 
         let mut alice = RelayClient::connect(&addr.to_string(), "alice")
             .await
@@ -585,6 +683,67 @@ mod tests {
 
         assert_eq!(received.0, "alice");
         assert_eq!(received.1, b"hello");
+    }
+
+    #[tokio::test]
+    async fn relay_registration_requires_configured_auth_token() {
+        let (addr, _task) =
+            spawn_configured_relay(ServiceAdmissionConfig::open().with_auth_token("relay-secret"))
+                .await;
+
+        let missing = match RelayClient::connect(&addr.to_string(), "alice").await {
+            Ok(_) => panic!("relay accepted registration without auth token"),
+            Err(error) => error,
+        };
+        assert!(missing.to_string().contains("authentication failed"));
+
+        RelayClient::connect_with_auth(&addr.to_string(), "alice", Some("relay-secret"))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn relay_rejects_spoofed_datagram_source() {
+        let (addr, _task) = spawn_configured_relay(ServiceAdmissionConfig::open()).await;
+        let mut alice = RelayClient::connect(&addr.to_string(), "alice")
+            .await
+            .unwrap();
+        let mut bob = RelayClient::connect(&addr.to_string(), "bob")
+            .await
+            .unwrap();
+        let spoofed = RelayMessage::Datagram {
+            source: "mallory".to_string(),
+            destination: "bob".to_string(),
+            payload_base64: STANDARD.encode(b"spoofed"),
+        };
+        alice
+            .writer
+            .write_all(serde_json::to_string(&spoofed).unwrap().as_bytes())
+            .await
+            .unwrap();
+        alice.writer.write_all(b"\n").await.unwrap();
+
+        let received =
+            tokio::time::timeout(Duration::from_millis(100), bob.receive_datagram()).await;
+        assert!(received.is_err());
+    }
+
+    #[tokio::test]
+    async fn relay_rate_limits_per_client_ip() {
+        let (addr, _task) = spawn_configured_relay(
+            ServiceAdmissionConfig::open().with_rate_limit(1, Duration::from_secs(60)),
+        )
+        .await;
+
+        let mut alice = RelayClient::connect(&addr.to_string(), "alice")
+            .await
+            .unwrap();
+        alice.send_datagram("bob", b"blocked").await.unwrap();
+        let closed = tokio::time::timeout(Duration::from_secs(2), alice.receive_datagram())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(closed.is_none());
     }
 
     #[tokio::test]

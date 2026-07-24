@@ -1,4 +1,5 @@
 use crate::{
+    admission::{AdmissionLimiter, ServiceAdmissionConfig},
     discovery::{now_unix, PeerRecord},
     error::{QlinkError, Result},
 };
@@ -14,8 +15,28 @@ use tokio::{
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RendezvousRequest {
-    Publish { mesh_id: String, record: PeerRecord },
-    Lookup { mesh_id: String, peer_id: String },
+    Publish {
+        mesh_id: String,
+        record: PeerRecord,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth_token: Option<String>,
+    },
+    Lookup {
+        mesh_id: String,
+        peer_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth_token: Option<String>,
+    },
+}
+
+impl RendezvousRequest {
+    fn auth_token(&self) -> Option<&str> {
+        match self {
+            Self::Publish { auth_token, .. } | Self::Lookup { auth_token, .. } => {
+                auth_token.as_deref()
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,17 +73,37 @@ impl RendezvousStore {
 }
 
 pub async fn run_rendezvous(listen: &str) -> Result<()> {
+    run_rendezvous_with_config(listen, ServiceAdmissionConfig::default()).await
+}
+
+pub async fn run_rendezvous_with_config(
+    listen: &str,
+    admission: ServiceAdmissionConfig,
+) -> Result<()> {
     let listener = TcpListener::bind(listen).await?;
     let store = RendezvousStore::default();
-    serve_rendezvous(listener, store).await
+    serve_rendezvous_with_config(listener, store, admission).await
 }
 
 pub async fn serve_rendezvous(listener: TcpListener, store: RendezvousStore) -> Result<()> {
+    serve_rendezvous_with_config(listener, store, ServiceAdmissionConfig::default()).await
+}
+
+pub async fn serve_rendezvous_with_config(
+    listener: TcpListener,
+    store: RendezvousStore,
+    admission: ServiceAdmissionConfig,
+) -> Result<()> {
+    let limiter = AdmissionLimiter::new(&admission);
     loop {
-        let (stream, _) = listener.accept().await?;
+        let (stream, peer_addr) = listener.accept().await?;
         let store = store.clone();
+        let admission = admission.clone();
+        let limiter = limiter.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle_connection(stream, store).await {
+            if let Err(error) =
+                handle_connection(stream, store, admission, limiter, peer_addr).await
+            {
                 tracing::warn!(?error, "rendezvous connection failed");
             }
         });
@@ -102,13 +143,25 @@ pub async fn spawn_dev_rendezvous() -> Result<DevRendezvousServer> {
 #[derive(Debug, Clone)]
 pub struct RendezvousClient {
     server: String,
+    auth_token: Option<String>,
 }
 
 impl RendezvousClient {
     pub fn new(server: impl Into<String>) -> Self {
         Self {
             server: server.into(),
+            auth_token: None,
         }
+    }
+
+    pub fn with_auth_token(mut self, token: impl Into<String>) -> Self {
+        self.auth_token = Some(token.into());
+        self
+    }
+
+    pub fn with_optional_auth_token(mut self, token: Option<String>) -> Self {
+        self.auth_token = token;
+        self
     }
 
     pub async fn publish(&self, mesh_id: &str, record: PeerRecord) -> Result<String> {
@@ -116,6 +169,7 @@ impl RendezvousClient {
             .request(RendezvousRequest::Publish {
                 mesh_id: mesh_id.to_string(),
                 record,
+                auth_token: None,
             })
             .await?
         {
@@ -132,6 +186,7 @@ impl RendezvousClient {
             .request(RendezvousRequest::Lookup {
                 mesh_id: mesh_id.to_string(),
                 peer_id: peer_id.to_string(),
+                auth_token: None,
             })
             .await?
         {
@@ -144,7 +199,15 @@ impl RendezvousClient {
         }
     }
 
-    async fn request(&self, request: RendezvousRequest) -> Result<RendezvousResponse> {
+    async fn request(&self, mut request: RendezvousRequest) -> Result<RendezvousResponse> {
+        if let Some(token) = self.auth_token.as_ref() {
+            match &mut request {
+                RendezvousRequest::Publish { auth_token, .. }
+                | RendezvousRequest::Lookup { auth_token, .. } => {
+                    *auth_token = Some(token.clone());
+                }
+            }
+        }
         let stream = TcpStream::connect(&self.server).await?;
         let (reader, mut writer) = stream.into_split();
         writer
@@ -166,26 +229,55 @@ impl RendezvousClient {
     }
 }
 
-async fn handle_connection(stream: TcpStream, store: RendezvousStore) -> Result<()> {
+async fn handle_connection(
+    stream: TcpStream,
+    store: RendezvousStore,
+    admission: ServiceAdmissionConfig,
+    limiter: AdmissionLimiter,
+    peer_addr: SocketAddr,
+) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
 
     while reader.read_line(&mut line).await? != 0 {
+        if let Err(error) = limiter.check(peer_addr, "rendezvous").await {
+            let response = RendezvousResponse::Error {
+                message: error.to_string(),
+            };
+            writer
+                .write_all(serde_json::to_string(&response)?.as_bytes())
+                .await?;
+            writer.write_all(b"\n").await?;
+            line.clear();
+            continue;
+        }
         let response = match serde_json::from_str::<RendezvousRequest>(line.trim_end()) {
-            Ok(RendezvousRequest::Publish { mesh_id, record }) => {
-                let peer_id = record.body.peer_id.clone();
-                match store.publish(&mesh_id, record).await {
-                    Ok(()) => RendezvousResponse::Published { peer_id },
-                    Err(error) => RendezvousResponse::Error {
+            Ok(request) => {
+                if let Err(error) = admission.require_token(request.auth_token(), "rendezvous") {
+                    RendezvousResponse::Error {
                         message: error.to_string(),
-                    },
-                }
-            }
-            Ok(RendezvousRequest::Lookup { mesh_id, peer_id }) => {
-                match store.lookup(&mesh_id, &peer_id).await {
-                    Some(record) => RendezvousResponse::Found { record },
-                    None => RendezvousResponse::NotFound,
+                    }
+                } else {
+                    match request {
+                        RendezvousRequest::Publish {
+                            mesh_id, record, ..
+                        } => {
+                            let peer_id = record.body.peer_id.clone();
+                            match store.publish(&mesh_id, record).await {
+                                Ok(()) => RendezvousResponse::Published { peer_id },
+                                Err(error) => RendezvousResponse::Error {
+                                    message: error.to_string(),
+                                },
+                            }
+                        }
+                        RendezvousRequest::Lookup {
+                            mesh_id, peer_id, ..
+                        } => match store.lookup(&mesh_id, &peer_id).await {
+                            Some(record) => RendezvousResponse::Found { record },
+                            None => RendezvousResponse::NotFound,
+                        },
+                    }
                 }
             }
             Err(error) => RendezvousResponse::Error {
@@ -210,23 +302,9 @@ mod tests {
         crypto::DeviceKeypair,
         discovery::{CandidateEndpoint, CandidateType, UnsignedPeerRecord},
     };
+    use std::time::Duration;
 
-    #[tokio::test]
-    async fn rendezvous_client_publishes_and_looks_up_peer() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let store = RendezvousStore::default();
-
-        tokio::spawn(async move {
-            loop {
-                let (stream, _) = listener.accept().await.unwrap();
-                let store = store.clone();
-                tokio::spawn(async move {
-                    let _ = handle_connection(stream, store).await;
-                });
-            }
-        });
-
+    fn signed_record() -> (String, PeerRecord) {
         let keypair = DeviceKeypair::generate().unwrap();
         let body = UnsignedPeerRecord::new(
             "devmesh",
@@ -243,11 +321,62 @@ mod tests {
             1,
         );
         let record = PeerRecord::signed(body, &keypair).unwrap();
-        let peer_id = record.body.peer_id.clone();
+        (record.body.peer_id.clone(), record)
+    }
+
+    async fn spawn_configured_rendezvous(
+        admission: ServiceAdmissionConfig,
+    ) -> (SocketAddr, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let store = RendezvousStore::default();
+        let task = tokio::spawn(async move {
+            let _ = serve_rendezvous_with_config(listener, store, admission).await;
+        });
+        (addr, task)
+    }
+
+    #[tokio::test]
+    async fn rendezvous_client_publishes_and_looks_up_peer() {
+        let (addr, _task) = spawn_configured_rendezvous(ServiceAdmissionConfig::open()).await;
+        let (peer_id, record) = signed_record();
         let client = RendezvousClient::new(addr.to_string());
 
         assert_eq!(client.publish("devmesh", record).await.unwrap(), peer_id);
         let found = client.lookup("devmesh", &peer_id).await.unwrap().unwrap();
         assert_eq!(found.body.peer_id, peer_id);
+    }
+
+    #[tokio::test]
+    async fn rendezvous_requires_configured_auth_token() {
+        let (addr, _task) = spawn_configured_rendezvous(
+            ServiceAdmissionConfig::open().with_auth_token("edge-secret"),
+        )
+        .await;
+        let (peer_id, record) = signed_record();
+
+        let missing = RendezvousClient::new(addr.to_string())
+            .publish("devmesh", record.clone())
+            .await
+            .unwrap_err();
+        assert!(missing.to_string().contains("authentication failed"));
+
+        let client = RendezvousClient::new(addr.to_string()).with_auth_token("edge-secret");
+        assert_eq!(client.publish("devmesh", record).await.unwrap(), peer_id);
+        assert!(client.lookup("devmesh", &peer_id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn rendezvous_rate_limits_per_client_ip() {
+        let (addr, _task) = spawn_configured_rendezvous(
+            ServiceAdmissionConfig::open().with_rate_limit(1, Duration::from_secs(60)),
+        )
+        .await;
+        let (_, record) = signed_record();
+        let client = RendezvousClient::new(addr.to_string());
+
+        client.publish("devmesh", record).await.unwrap();
+        let error = client.lookup("devmesh", "qlink_missing").await.unwrap_err();
+        assert!(error.to_string().contains("rate limit exceeded"));
     }
 }

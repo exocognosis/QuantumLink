@@ -1,11 +1,15 @@
 # Public Beta Hardening Gates
 
-Do not expose public rendezvous or relay services until these gates are satisfied.
+Do not broadly expose public rendezvous or relay services until these gates are
+satisfied. Bearer-token admission and per-client IP rate limits are implemented;
+TLS, quotas, telemetry, revocation, and operator abuse workflows remain release
+gates.
 
 ## Rendezvous
 
-- Authenticate publication paths and reject malformed records without expensive work.
-- Enforce per-source and per-mesh rate limits.
+- Require non-placeholder admission tokens for publication and lookup paths.
+- Enforce per-source and per-mesh rate limits beyond the current per-client IP
+  window.
 - Bound request line size, record size, endpoint count, and concurrent TCP connections.
 - Add structured audit logs with redacted peer identifiers.
 - Add expiry pruning and abuse metrics to the service-level telemetry.
@@ -13,8 +17,9 @@ Do not expose public rendezvous or relay services until these gates are satisfie
 
 ## Relay
 
-- Authenticate or capability-gate peer registration.
-- Enforce payload size, per-peer queue depth, per-peer send rate, and idle timeouts.
+- Require non-placeholder admission tokens for peer registration.
+- Enforce payload size, per-peer queue depth, per-peer send rate, connection
+  quotas, and idle timeouts.
 - Protect against peer ID squatting and duplicate registration abuse.
 - Add backpressure metrics for dropped, queued, and forwarded datagrams.
 - Run relay-fallback stress with intentionally unreachable direct candidates.
