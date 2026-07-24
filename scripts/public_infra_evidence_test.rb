@@ -85,7 +85,13 @@ class PublicInfraEvidenceTest < Minitest::Test
         "rendezvous_auth_verified" => false,
         "relay_auth_verified" => false,
         "rendezvous_rate_limit_per_window" => 0,
-        "relay_rate_limit_per_window" => 0
+        "relay_rate_limit_per_window" => 0,
+        "rendezvous_metrics_scraped" => false,
+        "relay_metrics_scraped" => false,
+        "rendezvous_auth_failures_total" => 0,
+        "relay_auth_failures_total" => 0,
+        "rendezvous_requests_succeeded_total" => 0,
+        "relay_forwarded_datagrams_total" => 0
       )
     )
     stdout, _stderr, status = run_verifier("--require-public", "--expected-sha", COMMIT_SHA, path)
@@ -96,6 +102,9 @@ class PublicInfraEvidenceTest < Minitest::Test
     assert_includes report.fetch("blockers"), "stun must be a public host:port endpoint"
     assert_includes report.fetch("blockers"), "rendezvous negative auth proof must pass"
     assert_includes report.fetch("blockers"), "relay rate limit must be enabled"
+    assert_includes report.fetch("blockers"), "rendezvous metrics scrape must pass"
+    assert_includes report.fetch("blockers"), "relay auth failures must be visible in metrics"
+    assert_includes report.fetch("blockers"), "relay forwarded datagrams must be visible in metrics"
   end
 
   def test_forbidden_secret_markers_fail_the_evidence
@@ -118,6 +127,10 @@ class PublicInfraEvidenceTest < Minitest::Test
     assert_includes script, "quantumLinkPublicEdgeLiveEvidence"
     assert_includes script, "QLINK_RENDEZVOUS_AUTH_TOKEN_FILE"
     assert_includes script, "QLINK_RELAY_AUTH_TOKEN_FILE"
+    assert_includes script, "QLINK_RENDEZVOUS_METRICS_ADDR"
+    assert_includes script, "QLINK_RELAY_METRICS_ADDR"
+    assert_includes script, "rendezvousMetricsScraped"
+    assert_includes script, "relayMetricsScraped"
     refute_match(/--rendezvous-auth-token(?:\s|$)/, script)
     refute_match(/--relay-auth-token(?:\s|$)/, script)
     refute_match(/--turn-password(?:\s|$)/, script)
@@ -155,6 +168,15 @@ class PublicInfraEvidenceTest < Minitest::Test
       "rendezvous_rate_limit_per_window" => 120,
       "relay_rate_limit_per_window" => 240,
       "admission_rate_limit_window_seconds" => 60,
+      "rendezvous_metrics_addr" => "127.0.0.1:9571",
+      "relay_metrics_addr" => "127.0.0.1:9572",
+      "rendezvous_metrics_scraped" => true,
+      "relay_metrics_scraped" => true,
+      "rendezvous_auth_failures_total" => 1,
+      "relay_auth_failures_total" => 1,
+      "rendezvous_requests_succeeded_total" => 3,
+      "relay_forwarded_datagrams_total" => 3,
+      "relay_unknown_destination_drops_total" => 0,
       "prove_turn_relay" => false,
       "remote_peer_id" => "qlink_test",
       "advertise_addr" => "127.0.0.1:1",

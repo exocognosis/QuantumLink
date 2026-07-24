@@ -6,6 +6,7 @@ use crate::{
         connect_control_stream, split_control_stream, BoxedControlReader, BoxedControlWriter,
     },
     error::{QlinkError, Result},
+    service_metrics::ServiceMetrics,
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
@@ -52,9 +53,17 @@ pub async fn run_relay(listen: &str) -> Result<()> {
 }
 
 pub async fn run_relay_with_config(listen: &str, admission: ServiceAdmissionConfig) -> Result<()> {
+    run_relay_with_metrics(listen, admission, ServiceMetrics::default()).await
+}
+
+pub async fn run_relay_with_metrics(
+    listen: &str,
+    admission: ServiceAdmissionConfig,
+    metrics: ServiceMetrics,
+) -> Result<()> {
     let listener = TcpListener::bind(listen).await?;
     let registry = RelayRegistry::default();
-    serve_relay_with_config(listener, registry, admission).await
+    serve_relay_with_config_and_metrics(listener, registry, admission, metrics).await
 }
 
 #[cfg(feature = "public-edge-tls")]
@@ -63,13 +72,23 @@ pub async fn run_relay_with_optional_tls(
     admission: ServiceAdmissionConfig,
     tls: Option<ControlTlsServerConfig>,
 ) -> Result<()> {
+    run_relay_with_optional_tls_and_metrics(listen, admission, tls, ServiceMetrics::default()).await
+}
+
+#[cfg(feature = "public-edge-tls")]
+pub async fn run_relay_with_optional_tls_and_metrics(
+    listen: &str,
+    admission: ServiceAdmissionConfig,
+    tls: Option<ControlTlsServerConfig>,
+    metrics: ServiceMetrics,
+) -> Result<()> {
     match tls {
         Some(tls) => {
             let listener = TcpListener::bind(listen).await?;
             let registry = RelayRegistry::default();
-            serve_relay_with_tls(listener, registry, admission, tls).await
+            serve_relay_with_tls_and_metrics(listener, registry, admission, tls, metrics).await
         }
-        None => run_relay_with_config(listen, admission).await,
+        None => run_relay_with_metrics(listen, admission, metrics).await,
     }
 }
 
@@ -82,15 +101,27 @@ pub async fn serve_relay_with_config(
     registry: RelayRegistry,
     admission: ServiceAdmissionConfig,
 ) -> Result<()> {
+    serve_relay_with_config_and_metrics(listener, registry, admission, ServiceMetrics::default())
+        .await
+}
+
+pub async fn serve_relay_with_config_and_metrics(
+    listener: TcpListener,
+    registry: RelayRegistry,
+    admission: ServiceAdmissionConfig,
+    metrics: ServiceMetrics,
+) -> Result<()> {
     let limiter = AdmissionLimiter::new(&admission);
     loop {
         let (stream, peer_addr) = listener.accept().await?;
         let registry = registry.clone();
         let admission = admission.clone();
         let limiter = limiter.clone();
+        let metrics = metrics.clone();
         tokio::spawn(async move {
+            let _connection = metrics.connection_started();
             if let Err(error) =
-                handle_connection(stream, registry, admission, limiter, peer_addr).await
+                handle_connection(stream, registry, admission, limiter, peer_addr, metrics).await
             {
                 tracing::warn!(?error, "relay connection failed");
             }
@@ -105,6 +136,24 @@ pub async fn serve_relay_with_tls(
     admission: ServiceAdmissionConfig,
     tls: ControlTlsServerConfig,
 ) -> Result<()> {
+    serve_relay_with_tls_and_metrics(
+        listener,
+        registry,
+        admission,
+        tls,
+        ServiceMetrics::default(),
+    )
+    .await
+}
+
+#[cfg(feature = "public-edge-tls")]
+pub async fn serve_relay_with_tls_and_metrics(
+    listener: TcpListener,
+    registry: RelayRegistry,
+    admission: ServiceAdmissionConfig,
+    tls: ControlTlsServerConfig,
+    metrics: ServiceMetrics,
+) -> Result<()> {
     let acceptor = load_tls_acceptor(&tls)?;
     let limiter = AdmissionLimiter::new(&admission);
     loop {
@@ -113,12 +162,14 @@ pub async fn serve_relay_with_tls(
         let admission = admission.clone();
         let limiter = limiter.clone();
         let acceptor = acceptor.clone();
+        let metrics = metrics.clone();
         tokio::spawn(async move {
+            let _connection = metrics.connection_started();
             let result = async {
                 let stream = acceptor.accept(stream).await.map_err(|err| {
                     QlinkError::Protocol(format!("relay TLS handshake failed: {err}"))
                 })?;
-                handle_connection(stream, registry, admission, limiter, peer_addr).await
+                handle_connection(stream, registry, admission, limiter, peer_addr, metrics).await
             }
             .await;
             if let Err(error) = result {
@@ -611,6 +662,7 @@ async fn handle_connection(
     admission: ServiceAdmissionConfig,
     limiter: AdmissionLimiter,
     peer_addr: SocketAddr,
+    metrics: ServiceMetrics,
 ) -> Result<()> {
     let (reader, writer) = split_control_stream(stream);
     let mut reader = BufReader::new(reader);
@@ -620,6 +672,7 @@ async fn handle_connection(
 
     while reader.read_line(&mut line).await? != 0 {
         if let Err(error) = limiter.check(peer_addr, "relay").await {
+            metrics.rate_limited();
             if let Some(writer) = pending_writer.as_mut() {
                 write_relay_error(writer, &error.to_string()).await?;
             }
@@ -631,6 +684,7 @@ async fn handle_connection(
                 auth_token,
             }) => {
                 if let Err(error) = admission.require_token(auth_token.as_deref(), "relay") {
+                    metrics.auth_failure();
                     if let Some(writer) = pending_writer.as_mut() {
                         write_relay_error(writer, &error.to_string()).await?;
                     }
@@ -645,6 +699,8 @@ async fn handle_connection(
                         .await?;
                     writer.write_all(b"\n").await?;
                     registry.peers.lock().await.insert(peer_id.clone(), writer);
+                    metrics.relay_registration();
+                    metrics.request_succeeded();
                     registered_peer = Some(peer_id);
                 }
             }
@@ -655,6 +711,7 @@ async fn handle_connection(
                 payload_base64,
             }) => {
                 if registered_peer.as_deref() != Some(source.as_str()) {
+                    metrics.relay_spoofed_source_rejection();
                     if let Some(peer_id) = &registered_peer {
                         registry.peers.lock().await.remove(peer_id);
                     }
@@ -673,10 +730,15 @@ async fn handle_connection(
                         .write_all(serde_json::to_string(&frame)?.as_bytes())
                         .await?;
                     writer.write_all(b"\n").await?;
+                    metrics.relay_forwarded_datagram();
+                    metrics.request_succeeded();
+                } else {
+                    metrics.relay_unknown_destination_drop();
                 }
             }
             Ok(RelayMessage::Error { .. }) => {}
             Err(error) => {
+                metrics.malformed_request();
                 if let Some(peer_id) = &registered_peer {
                     registry.peers.lock().await.remove(peer_id);
                 }
@@ -802,6 +864,58 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(closed.is_none());
+    }
+
+    #[tokio::test]
+    async fn relay_records_service_metrics() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let registry = RelayRegistry::default();
+        let metrics = ServiceMetrics::default();
+        let metrics_for_server = metrics.clone();
+        let admission = ServiceAdmissionConfig::open().with_auth_token("relay-secret");
+        let _task = tokio::spawn(async move {
+            let _ = serve_relay_with_config_and_metrics(
+                listener,
+                registry,
+                admission,
+                metrics_for_server,
+            )
+            .await;
+        });
+
+        let missing = match RelayClient::connect(&addr.to_string(), "unauth").await {
+            Ok(_) => panic!("relay accepted registration without auth token"),
+            Err(error) => error,
+        };
+        assert!(missing.to_string().contains("authentication failed"));
+
+        let mut alice =
+            RelayClient::connect_with_auth(&addr.to_string(), "alice", Some("relay-secret"))
+                .await
+                .unwrap();
+        let mut bob =
+            RelayClient::connect_with_auth(&addr.to_string(), "bob", Some("relay-secret"))
+                .await
+                .unwrap();
+
+        alice.send_datagram("bob", b"hello").await.unwrap();
+        let received = tokio::time::timeout(Duration::from_secs(2), bob.receive_datagram())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(received.1, b"hello");
+
+        alice.send_datagram("missing", b"dropped").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        let rendered = metrics.snapshot("relay").render_open_metrics();
+        assert!(rendered.contains("quantumlink_relay_auth_failures_total 1"));
+        assert!(rendered.contains("quantumlink_relay_registrations_total 2"));
+        assert!(rendered.contains("quantumlink_relay_forwarded_datagrams_total 1"));
+        assert!(rendered.contains("quantumlink_relay_unknown_destination_drops_total 1"));
+        assert!(rendered.contains("quantumlink_relay_requests_succeeded_total 3"));
     }
 
     #[tokio::test]

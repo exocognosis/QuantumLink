@@ -16,6 +16,8 @@
 #   QLINK_TURN_PASSWORD or QLINK_TURN_PASSWORD_FILE
 #   QLINK_TURN_REALM
 #   QLINK_TURN_PERMIT_PEER_IP
+#   QLINK_RENDEZVOUS_METRICS_ADDR and QLINK_RELAY_METRICS_ADDR
+#     (usually SSH-forwarded loopback metrics endpoints)
 #
 # Example:
 #   scripts/public-edge-live-evidence.sh --env-file ./edge.env --build
@@ -51,6 +53,8 @@ MESH_ID="${QLINK_MESH_ID:-public-edge-live-evidence}"
 RENDEZVOUS_RATE_LIMIT_PER_WINDOW="${QLINK_RENDEZVOUS_RATE_LIMIT_PER_WINDOW:-120}"
 RELAY_RATE_LIMIT_PER_WINDOW="${QLINK_RELAY_RATE_LIMIT_PER_WINDOW:-240}"
 ADMISSION_RATE_LIMIT_WINDOW_SECONDS="${QLINK_ADMISSION_RATE_LIMIT_WINDOW_SECONDS:-60}"
+RENDEZVOUS_METRICS_ADDR="${QLINK_RENDEZVOUS_METRICS_ADDR:-}"
+RELAY_METRICS_ADDR="${QLINK_RELAY_METRICS_ADDR:-}"
 
 usage() {
   grep '^#' "$0" | sed 's/^# \{0,1\}//'
@@ -71,6 +75,8 @@ while [[ $# -gt 0 ]]; do
     --turn-username) TURN_USERNAME="$2"; shift 2 ;;
     --turn-realm) TURN_REALM="$2"; shift 2 ;;
     --turn-permit-peer-ip) TURN_PERMIT_PEER_IP="$2"; shift 2 ;;
+    --rendezvous-metrics-addr) RENDEZVOUS_METRICS_ADDR="$2"; shift 2 ;;
+    --relay-metrics-addr) RELAY_METRICS_ADDR="$2"; shift 2 ;;
     --run-dir) RUN_DIR="$2"; shift 2 ;;
     --mesh-id) MESH_ID="$2"; shift 2 ;;
     --count) COUNT="$2"; shift 2 ;;
@@ -105,6 +111,8 @@ if [[ -n "$ENV_FILE" ]]; then
   TURN_PASSWORD_FILE="${QLINK_TURN_PASSWORD_FILE:-$TURN_PASSWORD_FILE}"
   TURN_REALM="${QLINK_TURN_REALM:-$TURN_REALM}"
   TURN_PERMIT_PEER_IP="${QLINK_TURN_PERMIT_PEER_IP:-$TURN_PERMIT_PEER_IP}"
+  RENDEZVOUS_METRICS_ADDR="${QLINK_RENDEZVOUS_METRICS_ADDR:-$RENDEZVOUS_METRICS_ADDR}"
+  RELAY_METRICS_ADDR="${QLINK_RELAY_METRICS_ADDR:-$RELAY_METRICS_ADDR}"
   BIN="${QLINK_BIN:-$BIN}"
 fi
 
@@ -148,6 +156,8 @@ fi
 [[ -n "$TURN_PASSWORD" ]] || die "missing TURN password"
 [[ -n "$TURN_REALM" ]] || die "missing TURN realm"
 [[ -n "$TURN_PERMIT_PEER_IP" ]] || die "missing TURN permit peer IP for resident TURN proof"
+[[ -n "$RENDEZVOUS_METRICS_ADDR" ]] || die "missing QLINK_RENDEZVOUS_METRICS_ADDR or --rendezvous-metrics-addr"
+[[ -n "$RELAY_METRICS_ADDR" ]] || die "missing QLINK_RELAY_METRICS_ADDR or --relay-metrics-addr"
 
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
 if [[ -z "$RUN_DIR" ]]; then
@@ -171,6 +181,8 @@ smoke_common=(
   --rendezvous-rate-limit-per-window "$RENDEZVOUS_RATE_LIMIT_PER_WINDOW"
   --relay-rate-limit-per-window "$RELAY_RATE_LIMIT_PER_WINDOW"
   --admission-rate-limit-window-seconds "$ADMISSION_RATE_LIMIT_WINDOW_SECONDS"
+  --rendezvous-metrics-addr "$RENDEZVOUS_METRICS_ADDR"
+  --relay-metrics-addr "$RELAY_METRICS_ADDR"
 )
 if [[ "$BUILD" -eq 1 ]]; then
   smoke_common+=(--build)
@@ -255,6 +267,11 @@ ruby -rjson -rtime -e '
         "verification" => app_verification_path,
         "selectedPath" => app.fetch("selected_path"),
         "framesSent" => app.fetch("frames_sent"),
+        "rendezvousMetricsScraped" => app.fetch("rendezvous_metrics_scraped"),
+        "relayMetricsScraped" => app.fetch("relay_metrics_scraped"),
+        "rendezvousAuthFailuresTotal" => app.fetch("rendezvous_auth_failures_total"),
+        "relayAuthFailuresTotal" => app.fetch("relay_auth_failures_total"),
+        "relayForwardedDatagramsTotal" => app.fetch("relay_forwarded_datagrams_total"),
         "publicInfraReady" => app_verification.fetch("publicInfraReady")
       },
       "turnRelay" => {
@@ -262,6 +279,10 @@ ruby -rjson -rtime -e '
         "verification" => turn_verification_path,
         "selectedPath" => turn.fetch("selected_path"),
         "framesSent" => turn.fetch("frames_sent"),
+        "rendezvousMetricsScraped" => turn.fetch("rendezvous_metrics_scraped"),
+        "relayMetricsScraped" => turn.fetch("relay_metrics_scraped"),
+        "rendezvousAuthFailuresTotal" => turn.fetch("rendezvous_auth_failures_total"),
+        "relayAuthFailuresTotal" => turn.fetch("relay_auth_failures_total"),
         "publicInfraReady" => turn_verification.fetch("publicInfraReady")
       }
     }

@@ -13,10 +13,11 @@ admission with `scripts/public-infra-smoke.sh`.
 Do not treat the in-repo rendezvous and QuantumLink relay binaries as broadly
 open internet production services yet. They now support TLS for their control
 protocols behind the explicit `public-edge-tls` feature, bearer-token admission
-from credential files, per-client IP rate limits, and smoke proof that
-unauthenticated clients are rejected. Keep those two ports source-limited for
-named testers until connection quotas, abuse telemetry, retention policy, and
-off-host deployed evidence are in place.
+from credential files, per-client IP rate limits, loopback OpenMetrics service
+counters, and smoke proof that unauthenticated clients are rejected and counted.
+Keep those two ports source-limited for named testers until connection quotas,
+retention policy, durable revocation, and a complete operator abuse workflow
+are in place.
 
 STUN and coturn TURN may be internet-facing. Published TURN relay candidates
 are consumed by the mesh connector when the responder keeps a live allocation.
@@ -50,6 +51,8 @@ Expected default ports:
 | QuantumLink STUN auxiliary | UDP 3479-3480 | public |
 | TURN TLS | TCP 5349 | public when configured with a real certificate |
 | TURN relay allocation range | UDP 49160-49200 | public |
+| Rendezvous metrics | TCP 9571 | loopback only |
+| Relay metrics | TCP 9572 | loopback only |
 
 ## Deploy
 
@@ -74,8 +77,10 @@ sudo systemctl daemon-reload
 
 Edit `/etc/quantumlink/public-edge.env` before starting services. Set the real
 public IP, realm, TLS cert/key paths, rate-limit windows, and high-entropy TURN
-password. Write rendezvous and relay service tokens into root-owned credential
-files instead of `ExecStart` arguments:
+password. Keep `QLINK_RENDEZVOUS_METRICS_ADDR` and
+`QLINK_RELAY_METRICS_ADDR` bound to loopback unless a local collector owns a
+different private bind. Write rendezvous and relay service tokens into
+root-owned credential files instead of `ExecStart` arguments:
 
 ```sh
 openssl rand -base64 32 | sudo tee /etc/quantumlink/secrets/rendezvous-auth-token >/dev/null
@@ -144,6 +149,8 @@ QLINK_TURN_USERNAME=qlink-turn
 QLINK_TURN_PASSWORD_FILE=/path/to/turn-password
 QLINK_TURN_REALM=turn.quantumlink.example
 QLINK_TURN_PERMIT_PEER_IP=TESTER_PUBLIC_IP
+QLINK_RENDEZVOUS_METRICS_ADDR=127.0.0.1:9571
+QLINK_RELAY_METRICS_ADDR=127.0.0.1:9572
 ```
 
 Then run:
@@ -152,7 +159,9 @@ Then run:
 scripts/public-edge-live-evidence.sh --env-file ./edge-public.env --build
 ```
 
-If those values are already exported in the shell, omit `--env-file`.
+If those values are already exported in the shell, omit `--env-file`. For an
+off-host tester, forward the edge loopback metrics ports first, for example
+`ssh -N -L 9571:127.0.0.1:9571 -L 9572:127.0.0.1:9572 EDGE_HOST`.
 
 The orchestrator deliberately uses environment variables or token files for
 secrets instead of passing service tokens as command-line arguments. It records
@@ -175,6 +184,8 @@ scripts/public-infra-smoke.sh \
   --turn-username "$QLINK_TURN_USERNAME" \
   --turn-password "$QLINK_TURN_PASSWORD" \
   --turn-realm "$QLINK_TURN_REALM" \
+  --rendezvous-metrics-addr "$QLINK_RENDEZVOUS_METRICS_ADDR" \
+  --relay-metrics-addr "$QLINK_RELAY_METRICS_ADDR" \
   --build
 ```
 
@@ -195,6 +206,8 @@ scripts/public-infra-smoke.sh \
   --turn-password "$QLINK_TURN_PASSWORD" \
   --turn-realm "$QLINK_TURN_REALM" \
   --turn-permit-peer-ip "$TESTER_PUBLIC_IP" \
+  --rendezvous-metrics-addr "$QLINK_RENDEZVOUS_METRICS_ADDR" \
+  --relay-metrics-addr "$QLINK_RELAY_METRICS_ADDR" \
   --prove-turn-relay \
   --build
 ```
@@ -216,11 +229,14 @@ passing evidence file must show:
 - `rendezvous_auth_required`, `relay_auth_required`,
   `rendezvous_auth_verified`, and `relay_auth_verified` are `true` for public
   edge runs;
+- `rendezvous_metrics_scraped` and `relay_metrics_scraped` are `true`, with
+  auth failure counters greater than zero;
 - `turn_relayed` is non-empty when `--turn` was supplied;
 - `published_candidate_types` includes `ServerReflexive`;
 - `published_candidate_types` includes `QuantumLinkRelay`;
 - `published_candidate_types` includes `Relay` when `--turn` was supplied;
 - `selected_path` is `relay`;
+- `relay_forwarded_datagrams_total` is greater than or equal to `frames_sent`;
 - `frames_sent` matches the requested count.
 
 For `--prove-turn-relay`, the passing evidence changes to:
@@ -250,7 +266,8 @@ ruby scripts/verify-public-infra-evidence.rb \
 
 For TURN data-plane evidence, add `--require-turn-relay`. The verifier blocks
 loopback/private/documentation endpoints, missing TLS/auth/rate-limit proof,
-missing TURN proof, stale evidence, and obvious secret placeholders.
+missing metrics scrape proof, missing TURN proof, stale evidence, and obvious
+secret placeholders.
 
 ## Hardening Checks
 
@@ -259,7 +276,8 @@ Before widening tester access:
 - Confirm cloud firewall and host firewall expose only the listed ports.
 - Confirm rendezvous and QuantumLink relay require non-placeholder admission
   token files, present TLS certificates, enforce appropriate rate limits, and
-  remain source-limited during beta.
+  expose only loopback service metrics while remaining source-limited during
+  beta.
 - Confirm coturn uses long-term credentials and a constrained relay port range.
 - Confirm coturn has readable TLS cert/key paths before exposing TCP/UDP 5349.
 - Confirm `journalctl -u quantumlink-*` contains control-plane metadata only.

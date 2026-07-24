@@ -5,6 +5,7 @@ use crate::{
     control_transport::{connect_control_stream, split_control_stream},
     discovery::{now_unix, PeerRecord},
     error::{QlinkError, Result},
+    service_metrics::ServiceMetrics,
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
@@ -83,9 +84,17 @@ pub async fn run_rendezvous_with_config(
     listen: &str,
     admission: ServiceAdmissionConfig,
 ) -> Result<()> {
+    run_rendezvous_with_metrics(listen, admission, ServiceMetrics::default()).await
+}
+
+pub async fn run_rendezvous_with_metrics(
+    listen: &str,
+    admission: ServiceAdmissionConfig,
+    metrics: ServiceMetrics,
+) -> Result<()> {
     let listener = TcpListener::bind(listen).await?;
     let store = RendezvousStore::default();
-    serve_rendezvous_with_config(listener, store, admission).await
+    serve_rendezvous_with_config_and_metrics(listener, store, admission, metrics).await
 }
 
 #[cfg(feature = "public-edge-tls")]
@@ -94,13 +103,24 @@ pub async fn run_rendezvous_with_optional_tls(
     admission: ServiceAdmissionConfig,
     tls: Option<ControlTlsServerConfig>,
 ) -> Result<()> {
+    run_rendezvous_with_optional_tls_and_metrics(listen, admission, tls, ServiceMetrics::default())
+        .await
+}
+
+#[cfg(feature = "public-edge-tls")]
+pub async fn run_rendezvous_with_optional_tls_and_metrics(
+    listen: &str,
+    admission: ServiceAdmissionConfig,
+    tls: Option<ControlTlsServerConfig>,
+    metrics: ServiceMetrics,
+) -> Result<()> {
     match tls {
         Some(tls) => {
             let listener = TcpListener::bind(listen).await?;
             let store = RendezvousStore::default();
-            serve_rendezvous_with_tls(listener, store, admission, tls).await
+            serve_rendezvous_with_tls_and_metrics(listener, store, admission, tls, metrics).await
         }
-        None => run_rendezvous_with_config(listen, admission).await,
+        None => run_rendezvous_with_metrics(listen, admission, metrics).await,
     }
 }
 
@@ -113,15 +133,27 @@ pub async fn serve_rendezvous_with_config(
     store: RendezvousStore,
     admission: ServiceAdmissionConfig,
 ) -> Result<()> {
+    serve_rendezvous_with_config_and_metrics(listener, store, admission, ServiceMetrics::default())
+        .await
+}
+
+pub async fn serve_rendezvous_with_config_and_metrics(
+    listener: TcpListener,
+    store: RendezvousStore,
+    admission: ServiceAdmissionConfig,
+    metrics: ServiceMetrics,
+) -> Result<()> {
     let limiter = AdmissionLimiter::new(&admission);
     loop {
         let (stream, peer_addr) = listener.accept().await?;
         let store = store.clone();
         let admission = admission.clone();
         let limiter = limiter.clone();
+        let metrics = metrics.clone();
         tokio::spawn(async move {
+            let _connection = metrics.connection_started();
             if let Err(error) =
-                handle_connection(stream, store, admission, limiter, peer_addr).await
+                handle_connection(stream, store, admission, limiter, peer_addr, metrics).await
             {
                 tracing::warn!(?error, "rendezvous connection failed");
             }
@@ -136,6 +168,24 @@ pub async fn serve_rendezvous_with_tls(
     admission: ServiceAdmissionConfig,
     tls: ControlTlsServerConfig,
 ) -> Result<()> {
+    serve_rendezvous_with_tls_and_metrics(
+        listener,
+        store,
+        admission,
+        tls,
+        ServiceMetrics::default(),
+    )
+    .await
+}
+
+#[cfg(feature = "public-edge-tls")]
+pub async fn serve_rendezvous_with_tls_and_metrics(
+    listener: TcpListener,
+    store: RendezvousStore,
+    admission: ServiceAdmissionConfig,
+    tls: ControlTlsServerConfig,
+    metrics: ServiceMetrics,
+) -> Result<()> {
     let acceptor = load_tls_acceptor(&tls)?;
     let limiter = AdmissionLimiter::new(&admission);
     loop {
@@ -144,12 +194,14 @@ pub async fn serve_rendezvous_with_tls(
         let admission = admission.clone();
         let limiter = limiter.clone();
         let acceptor = acceptor.clone();
+        let metrics = metrics.clone();
         tokio::spawn(async move {
+            let _connection = metrics.connection_started();
             let result = async {
                 let stream = acceptor.accept(stream).await.map_err(|err| {
                     QlinkError::Protocol(format!("rendezvous TLS handshake failed: {err}"))
                 })?;
-                handle_connection(stream, store, admission, limiter, peer_addr).await
+                handle_connection(stream, store, admission, limiter, peer_addr, metrics).await
             }
             .await;
             if let Err(error) = result {
@@ -284,6 +336,7 @@ async fn handle_connection(
     admission: ServiceAdmissionConfig,
     limiter: AdmissionLimiter,
     peer_addr: SocketAddr,
+    metrics: ServiceMetrics,
 ) -> Result<()> {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
@@ -291,6 +344,7 @@ async fn handle_connection(
 
     while reader.read_line(&mut line).await? != 0 {
         if let Err(error) = limiter.check(peer_addr, "rendezvous").await {
+            metrics.rate_limited();
             let response = RendezvousResponse::Error {
                 message: error.to_string(),
             };
@@ -304,6 +358,7 @@ async fn handle_connection(
         let response = match serde_json::from_str::<RendezvousRequest>(line.trim_end()) {
             Ok(request) => {
                 if let Err(error) = admission.require_token(request.auth_token(), "rendezvous") {
+                    metrics.auth_failure();
                     RendezvousResponse::Error {
                         message: error.to_string(),
                     }
@@ -314,24 +369,43 @@ async fn handle_connection(
                         } => {
                             let peer_id = record.body.peer_id.clone();
                             match store.publish(&mesh_id, record).await {
-                                Ok(()) => RendezvousResponse::Published { peer_id },
-                                Err(error) => RendezvousResponse::Error {
-                                    message: error.to_string(),
-                                },
+                                Ok(()) => {
+                                    metrics.rendezvous_publish();
+                                    metrics.request_succeeded();
+                                    RendezvousResponse::Published { peer_id }
+                                }
+                                Err(error) => {
+                                    metrics.rendezvous_publish_failed();
+                                    RendezvousResponse::Error {
+                                        message: error.to_string(),
+                                    }
+                                }
                             }
                         }
                         RendezvousRequest::Lookup {
                             mesh_id, peer_id, ..
                         } => match store.lookup(&mesh_id, &peer_id).await {
-                            Some(record) => RendezvousResponse::Found { record },
-                            None => RendezvousResponse::NotFound,
+                            Some(record) => {
+                                metrics.rendezvous_lookup();
+                                metrics.request_succeeded();
+                                RendezvousResponse::Found { record }
+                            }
+                            None => {
+                                metrics.rendezvous_lookup();
+                                metrics.rendezvous_lookup_not_found();
+                                metrics.request_succeeded();
+                                RendezvousResponse::NotFound
+                            }
                         },
                     }
                 }
             }
-            Err(error) => RendezvousResponse::Error {
-                message: QlinkError::Json(error).to_string(),
-            },
+            Err(error) => {
+                metrics.malformed_request();
+                RendezvousResponse::Error {
+                    message: QlinkError::Json(error).to_string(),
+                }
+            }
         };
 
         writer
@@ -427,5 +501,47 @@ mod tests {
         client.publish("devmesh", record).await.unwrap();
         let error = client.lookup("devmesh", "qlink_missing").await.unwrap_err();
         assert!(error.to_string().contains("rate limit exceeded"));
+    }
+
+    #[tokio::test]
+    async fn rendezvous_records_service_metrics() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let store = RendezvousStore::default();
+        let metrics = ServiceMetrics::default();
+        let metrics_for_server = metrics.clone();
+        let admission = ServiceAdmissionConfig::open().with_auth_token("edge-secret");
+        let _task = tokio::spawn(async move {
+            let _ = serve_rendezvous_with_config_and_metrics(
+                listener,
+                store,
+                admission,
+                metrics_for_server,
+            )
+            .await;
+        });
+        let (peer_id, record) = signed_record();
+
+        let missing_auth = RendezvousClient::new(addr.to_string())
+            .publish("devmesh", record.clone())
+            .await
+            .unwrap_err();
+        assert!(missing_auth.to_string().contains("authentication failed"));
+
+        let client = RendezvousClient::new(addr.to_string()).with_auth_token("edge-secret");
+        client.publish("devmesh", record).await.unwrap();
+        assert!(client.lookup("devmesh", &peer_id).await.unwrap().is_some());
+        assert!(client
+            .lookup("devmesh", "qlink_missing")
+            .await
+            .unwrap()
+            .is_none());
+
+        let rendered = metrics.snapshot("rendezvous").render_open_metrics();
+        assert!(rendered.contains("quantumlink_rendezvous_auth_failures_total 1"));
+        assert!(rendered.contains("quantumlink_rendezvous_publishes_total 1"));
+        assert!(rendered.contains("quantumlink_rendezvous_lookups_total 2"));
+        assert!(rendered.contains("quantumlink_rendezvous_lookup_not_found_total 1"));
+        assert!(rendered.contains("quantumlink_rendezvous_requests_succeeded_total 3"));
     }
 }

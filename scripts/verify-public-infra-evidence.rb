@@ -122,6 +122,10 @@ def positive_integer?(value)
   value.is_a?(Integer) && value.positive?
 end
 
+def nonnegative_integer?(value)
+  value.is_a?(Integer) && value >= 0
+end
+
 def includes_candidate?(value, candidate)
   return false unless nonempty_string?(value)
 
@@ -229,6 +233,11 @@ if require_public
   block_unless(positive_integer?(evidence["rendezvous_rate_limit_per_window"]), "rendezvous rate limit must be enabled", blockers)
   block_unless(positive_integer?(evidence["relay_rate_limit_per_window"]), "relay rate limit must be enabled", blockers)
   block_unless(positive_integer?(evidence["admission_rate_limit_window_seconds"]), "admission rate-limit window must be positive", blockers)
+  block_unless(boolean_true?(evidence["rendezvous_metrics_scraped"]), "rendezvous metrics scrape must pass", blockers)
+  block_unless(boolean_true?(evidence["relay_metrics_scraped"]), "relay metrics scrape must pass", blockers)
+  block_unless(positive_integer?(evidence["rendezvous_auth_failures_total"]), "rendezvous auth failures must be visible in metrics", blockers)
+  block_unless(positive_integer?(evidence["relay_auth_failures_total"]), "relay auth failures must be visible in metrics", blockers)
+  block_unless(positive_integer?(evidence["rendezvous_requests_succeeded_total"]), "rendezvous successful requests must be visible in metrics", blockers)
 end
 
 %w[stun_reflexive published_candidate_types selected_path].each do |field|
@@ -237,6 +246,15 @@ end
 require_field(positive_integer?(evidence["frames_sent"]), "frames_sent must be a positive integer", failures)
 require_field(evidence["total_elapsed_ms"].is_a?(Integer) && evidence["total_elapsed_ms"] >= 0, "total_elapsed_ms must be a non-negative integer", failures)
 require_field(positive_integer?(evidence["direct_probe_timeout_ms"]), "direct_probe_timeout_ms must be a positive integer", failures)
+%w[
+  rendezvous_auth_failures_total
+  relay_auth_failures_total
+  rendezvous_requests_succeeded_total
+  relay_forwarded_datagrams_total
+  relay_unknown_destination_drops_total
+].each do |field|
+  require_field(nonnegative_integer?(evidence[field]), "#{field} must be a non-negative integer", failures)
+end
 
 turn_relay_mode = require_turn_relay || evidence["prove_turn_relay"] == true
 if turn_relay_mode
@@ -248,6 +266,15 @@ else
   block_unless(includes_candidate?(evidence["published_candidate_types"], "ServerReflexive"), "published candidates must include ServerReflexive", blockers)
   block_unless(includes_candidate?(evidence["published_candidate_types"], "QuantumLinkRelay"), "published candidates must include QuantumLinkRelay", blockers)
   block_unless(evidence["selected_path"] == "relay", "selected_path must be relay", blockers)
+  if require_public
+    block_unless(
+      positive_integer?(evidence["relay_forwarded_datagrams_total"]) &&
+        positive_integer?(evidence["frames_sent"]) &&
+        evidence["relay_forwarded_datagrams_total"] >= evidence["frames_sent"],
+      "relay forwarded datagrams must be visible in metrics",
+      blockers
+    )
+  end
 end
 
 if require_public

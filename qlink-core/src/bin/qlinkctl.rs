@@ -21,8 +21,10 @@ use qlink_core::{
         ConnectionOutcome, MeshConnector, MeshConnectorConfig, PathKind, ProbeOutcome,
     },
     mesh_transport::{MeshTransportConfig, MeshTransportHandle},
-    relay::{probe_relay_registration, run_relay_with_config},
-    rendezvous::{run_rendezvous_with_config, RendezvousClient},
+    metrics_endpoint::{spawn_metrics_endpoint, MetricsEndpoint, MetricsSnapshotProvider},
+    relay::{probe_relay_registration, run_relay_with_metrics},
+    rendezvous::{run_rendezvous_with_metrics, RendezvousClient},
+    service_metrics::ServiceMetrics,
     stun::{gather_server_reflexive_candidate, run_stun, spawn_dev_stun},
     traversal::gather_local_candidates,
 };
@@ -93,6 +95,8 @@ enum Command {
         rate_limit_per_window: u32,
         #[arg(long, default_value_t = 60)]
         rate_limit_window_seconds: u64,
+        #[arg(long)]
+        metrics_addr: Option<String>,
     },
     Relay {
         #[arg(long, default_value = "127.0.0.1:9472")]
@@ -109,6 +113,8 @@ enum Command {
         rate_limit_per_window: u32,
         #[arg(long, default_value_t = 60)]
         rate_limit_window_seconds: u64,
+        #[arg(long)]
+        metrics_addr: Option<String>,
     },
     /// Run a STUN binding server (reflects the client's public-facing
     /// address as XOR-MAPPED-ADDRESS). Stand this up on a public host so
@@ -413,6 +419,7 @@ async fn main() -> qlink_core::Result<()> {
             tls_key,
             rate_limit_per_window,
             rate_limit_window_seconds,
+            metrics_addr,
         } => {
             let admission = service_admission_config(
                 auth_token.as_deref(),
@@ -420,6 +427,13 @@ async fn main() -> qlink_core::Result<()> {
                 rate_limit_per_window,
                 rate_limit_window_seconds,
             )?;
+            let service_metrics = ServiceMetrics::default();
+            let _metrics_endpoint = start_service_metrics_endpoint(
+                "rendezvous",
+                metrics_addr.as_deref(),
+                service_metrics.clone(),
+            )
+            .await?;
             println!("rendezvous_listen={listen}");
             println!(
                 "rendezvous_tls_enabled={}",
@@ -436,8 +450,14 @@ async fn main() -> qlink_core::Result<()> {
                     rate_limit.window.as_secs()
                 );
             }
-            run_rendezvous_service(&listen, admission, tls_cert.as_deref(), tls_key.as_deref())
-                .await?;
+            run_rendezvous_service(
+                &listen,
+                admission,
+                tls_cert.as_deref(),
+                tls_key.as_deref(),
+                service_metrics,
+            )
+            .await?;
         }
         Command::Relay {
             listen,
@@ -447,6 +467,7 @@ async fn main() -> qlink_core::Result<()> {
             tls_key,
             rate_limit_per_window,
             rate_limit_window_seconds,
+            metrics_addr,
         } => {
             let admission = service_admission_config(
                 auth_token.as_deref(),
@@ -454,6 +475,13 @@ async fn main() -> qlink_core::Result<()> {
                 rate_limit_per_window,
                 rate_limit_window_seconds,
             )?;
+            let service_metrics = ServiceMetrics::default();
+            let _metrics_endpoint = start_service_metrics_endpoint(
+                "relay",
+                metrics_addr.as_deref(),
+                service_metrics.clone(),
+            )
+            .await?;
             println!("relay_listen={listen}");
             println!(
                 "relay_tls_enabled={}",
@@ -467,7 +495,14 @@ async fn main() -> qlink_core::Result<()> {
                     rate_limit.window.as_secs()
                 );
             }
-            run_relay_service(&listen, admission, tls_cert.as_deref(), tls_key.as_deref()).await?;
+            run_relay_service(
+                &listen,
+                admission,
+                tls_cert.as_deref(),
+                tls_key.as_deref(),
+                service_metrics,
+            )
+            .await?;
         }
         Command::Stun { listen } => {
             println!("stun_listen={listen}");
@@ -913,15 +948,17 @@ async fn run_rendezvous_service(
     admission: ServiceAdmissionConfig,
     tls_cert: Option<&str>,
     tls_key: Option<&str>,
+    metrics: ServiceMetrics,
 ) -> qlink_core::Result<()> {
     match (tls_cert, tls_key) {
         (Some(cert), Some(key)) => {
             #[cfg(feature = "public-edge-tls")]
             {
-                return qlink_core::rendezvous::run_rendezvous_with_optional_tls(
+                return qlink_core::rendezvous::run_rendezvous_with_optional_tls_and_metrics(
                     listen,
                     admission,
                     Some(ControlTlsServerConfig::new(cert, key)),
+                    metrics,
                 )
                 .await;
             }
@@ -933,7 +970,7 @@ async fn run_rendezvous_service(
                 ));
             }
         }
-        (None, None) => run_rendezvous_with_config(listen, admission).await,
+        (None, None) => run_rendezvous_with_metrics(listen, admission, metrics).await,
         _ => Err(qlink_core::QlinkError::Protocol(
             "rendezvous TLS requires both --tls-cert and --tls-key".into(),
         )),
@@ -945,15 +982,17 @@ async fn run_relay_service(
     admission: ServiceAdmissionConfig,
     tls_cert: Option<&str>,
     tls_key: Option<&str>,
+    metrics: ServiceMetrics,
 ) -> qlink_core::Result<()> {
     match (tls_cert, tls_key) {
         (Some(cert), Some(key)) => {
             #[cfg(feature = "public-edge-tls")]
             {
-                return qlink_core::relay::run_relay_with_optional_tls(
+                return qlink_core::relay::run_relay_with_optional_tls_and_metrics(
                     listen,
                     admission,
                     Some(ControlTlsServerConfig::new(cert, key)),
+                    metrics,
                 )
                 .await;
             }
@@ -965,11 +1004,34 @@ async fn run_relay_service(
                 ));
             }
         }
-        (None, None) => run_relay_with_config(listen, admission).await,
+        (None, None) => run_relay_with_metrics(listen, admission, metrics).await,
         _ => Err(qlink_core::QlinkError::Protocol(
             "relay TLS requires both --tls-cert and --tls-key".into(),
         )),
     }
+}
+
+async fn start_service_metrics_endpoint(
+    service_name: &'static str,
+    metrics_addr: Option<&str>,
+    metrics: ServiceMetrics,
+) -> qlink_core::Result<Option<MetricsEndpoint>> {
+    let Some(metrics_addr) = metrics_addr else {
+        return Ok(None);
+    };
+    let bind: SocketAddr = metrics_addr.parse().map_err(|err| {
+        qlink_core::QlinkError::Protocol(format!("invalid {service_name} --metrics-addr: {err}"))
+    })?;
+    if !bind.ip().is_loopback() {
+        return Err(qlink_core::QlinkError::Protocol(format!(
+            "{service_name} metrics endpoint must bind to a loopback address"
+        )));
+    }
+
+    let provider: MetricsSnapshotProvider = Arc::new(move || metrics.snapshot(service_name));
+    let endpoint = spawn_metrics_endpoint(bind, provider).await?;
+    println!("{service_name}_metrics_addr={}", endpoint.local_addr());
+    Ok(Some(endpoint))
 }
 
 #[cfg(not(feature = "dev-quic-carrier"))]

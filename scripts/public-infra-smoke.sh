@@ -37,6 +37,8 @@ RELAY_AUTH_TOKEN="${QLINK_RELAY_AUTH_TOKEN:-}"
 RENDEZVOUS_RATE_LIMIT_PER_WINDOW="${QLINK_RENDEZVOUS_RATE_LIMIT_PER_WINDOW:-0}"
 RELAY_RATE_LIMIT_PER_WINDOW="${QLINK_RELAY_RATE_LIMIT_PER_WINDOW:-0}"
 ADMISSION_RATE_LIMIT_WINDOW_SECONDS="${QLINK_ADMISSION_RATE_LIMIT_WINDOW_SECONDS:-60}"
+RENDEZVOUS_METRICS_ADDR="${QLINK_RENDEZVOUS_METRICS_ADDR:-}"
+RELAY_METRICS_ADDR="${QLINK_RELAY_METRICS_ADDR:-}"
 CONTROL_TLS="${QLINK_CONTROL_TLS:-0}"
 CONTROL_TLS_CA="${QLINK_CONTROL_TLS_CA:-}"
 CONTROL_TLS_CERT="${QLINK_CONTROL_TLS_CERT:-}"
@@ -80,6 +82,8 @@ while [[ $# -gt 0 ]]; do
     --rendezvous-rate-limit-per-window) RENDEZVOUS_RATE_LIMIT_PER_WINDOW="$2"; shift 2 ;;
     --relay-rate-limit-per-window) RELAY_RATE_LIMIT_PER_WINDOW="$2"; shift 2 ;;
     --admission-rate-limit-window-seconds) ADMISSION_RATE_LIMIT_WINDOW_SECONDS="$2"; shift 2 ;;
+    --rendezvous-metrics-addr) RENDEZVOUS_METRICS_ADDR="$2"; shift 2 ;;
+    --relay-metrics-addr) RELAY_METRICS_ADDR="$2"; shift 2 ;;
     --control-tls) CONTROL_TLS=1; shift ;;
     --control-tls-ca) CONTROL_TLS_CA="$2"; shift 2 ;;
     --control-tls-cert) CONTROL_TLS_CERT="$2"; shift 2 ;;
@@ -237,6 +241,29 @@ bool_for_nonempty() {
   fi
 }
 
+scrape_metrics() {
+  local addr="$1"
+  local out="$2"
+  ruby -rsocket -rtimeout -e '
+    Timeout.timeout(2) do
+      addr = ARGV.fetch(0)
+      out = ARGV.fetch(1)
+      host, port = addr.rpartition(":").values_at(0, 2)
+      socket = TCPSocket.new(host, Integer(port))
+      socket.write("GET /metrics HTTP/1.1\r\nHost: quantumlink-metrics\r\nConnection: close\r\n\r\n")
+      response = socket.read
+      body = response.to_s.split("\r\n\r\n", 2).last.to_s
+      File.write(out, body)
+    end
+  ' "$addr" "$out"
+}
+
+metric_value() {
+  local file="$1"
+  local name="$2"
+  awk -v name="$name" '$1 == name {print int($2); found=1; exit} END {if (!found) print 0}' "$file" 2>/dev/null
+}
+
 if [[ "$BUILD" -eq 1 ]]; then
   features="dev-quic-carrier"
   if [[ "$PROVE_TURN_RELAY" -eq 1 ]]; then
@@ -264,6 +291,8 @@ if [[ "$MODE" == "local" ]]; then
     RELAY="${RELAY:-$LOCAL_HOST:$((BASE_PORT + 1))}"
   fi
   STUN="${STUN:-$LOCAL_HOST:$((BASE_PORT + 2))}"
+  RENDEZVOUS_METRICS_ADDR="${RENDEZVOUS_METRICS_ADDR:-127.0.0.1:$((BASE_PORT + 4))}"
+  RELAY_METRICS_ADDR="${RELAY_METRICS_ADDR:-127.0.0.1:$((BASE_PORT + 5))}"
   if [[ "$PROVE_TURN_RELAY" -eq 1 ]]; then
     TURN="${TURN:-$LOCAL_HOST:$((BASE_PORT + 3))}"
     TURN_PERMIT_PEER_IP="${TURN_PERMIT_PEER_IP:-$LOCAL_HOST}"
@@ -289,6 +318,9 @@ if [[ "$MODE" == "local" ]]; then
       --rate-limit-window-seconds "$ADMISSION_RATE_LIMIT_WINDOW_SECONDS"
     )
   fi
+  if [[ -n "$RENDEZVOUS_METRICS_ADDR" ]]; then
+    rendezvous_args+=(--metrics-addr "$RENDEZVOUS_METRICS_ADDR")
+  fi
   "$BIN" "${rendezvous_args[@]}" > "$RUN_DIR/rendezvous.log" 2>&1 &
   PIDS+=("$!")
   log "starting local relay at $RELAY"
@@ -308,6 +340,9 @@ if [[ "$MODE" == "local" ]]; then
       --rate-limit-per-window "$RELAY_RATE_LIMIT_PER_WINDOW"
       --rate-limit-window-seconds "$ADMISSION_RATE_LIMIT_WINDOW_SECONDS"
     )
+  fi
+  if [[ -n "$RELAY_METRICS_ADDR" ]]; then
+    relay_args+=(--metrics-addr "$RELAY_METRICS_ADDR")
   fi
   "$BIN" "${relay_args[@]}" > "$RUN_DIR/relay.log" 2>&1 &
   PIDS+=("$!")
@@ -537,6 +572,40 @@ self_publish_turn_failures="$(sed -n 's/^turn_failure_count=//p' "$RESPONDER_LOG
 turn_responder_addr="$(sed -n 's/^turn_relayed_address=//p' "$RESPONDER_LOG" | tail -1)"
 turn_responder_port="$(sed -n 's/^turn_relayed_port=//p' "$RESPONDER_LOG" | tail -1)"
 
+rendezvous_metrics_scraped=false
+relay_metrics_scraped=false
+rendezvous_auth_failures_total=0
+relay_auth_failures_total=0
+rendezvous_requests_succeeded_total=0
+relay_forwarded_datagrams_total=0
+relay_unknown_destination_drops_total=0
+if [[ -n "$RENDEZVOUS_METRICS_ADDR" ]]; then
+  log "scraping rendezvous metrics at $RENDEZVOUS_METRICS_ADDR"
+  scrape_metrics "$RENDEZVOUS_METRICS_ADDR" "$RUN_DIR/rendezvous.metrics" \
+    || die "failed to scrape rendezvous metrics at $RENDEZVOUS_METRICS_ADDR"
+  rendezvous_metrics_scraped=true
+  rendezvous_auth_failures_total="$(metric_value "$RUN_DIR/rendezvous.metrics" quantumlink_rendezvous_auth_failures_total)"
+  rendezvous_requests_succeeded_total="$(metric_value "$RUN_DIR/rendezvous.metrics" quantumlink_rendezvous_requests_succeeded_total)"
+  if [[ -n "$RENDEZVOUS_AUTH_TOKEN" && "$rendezvous_auth_failures_total" -lt 1 ]]; then
+    die "rendezvous metrics did not record the negative auth probe"
+  fi
+fi
+if [[ -n "$RELAY_METRICS_ADDR" ]]; then
+  log "scraping relay metrics at $RELAY_METRICS_ADDR"
+  scrape_metrics "$RELAY_METRICS_ADDR" "$RUN_DIR/relay.metrics" \
+    || die "failed to scrape relay metrics at $RELAY_METRICS_ADDR"
+  relay_metrics_scraped=true
+  relay_auth_failures_total="$(metric_value "$RUN_DIR/relay.metrics" quantumlink_relay_auth_failures_total)"
+  relay_forwarded_datagrams_total="$(metric_value "$RUN_DIR/relay.metrics" quantumlink_relay_forwarded_datagrams_total)"
+  relay_unknown_destination_drops_total="$(metric_value "$RUN_DIR/relay.metrics" quantumlink_relay_unknown_destination_drops_total)"
+  if [[ -n "$RELAY_AUTH_TOKEN" && "$relay_auth_failures_total" -lt 1 ]]; then
+    die "relay metrics did not record the negative auth probe"
+  fi
+  if [[ "$expected_path" == "relay" && "$relay_forwarded_datagrams_total" -lt "$COUNT" ]]; then
+    die "relay metrics forwarded_datagrams_total=$relay_forwarded_datagrams_total; expected at least $COUNT"
+  fi
+fi
+
 git_sha="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
 EVIDENCE="$RUN_DIR/evidence.json"
 cat > "$EVIDENCE" <<EOF
@@ -559,6 +628,15 @@ cat > "$EVIDENCE" <<EOF
   "rendezvous_rate_limit_per_window": $RENDEZVOUS_RATE_LIMIT_PER_WINDOW,
   "relay_rate_limit_per_window": $RELAY_RATE_LIMIT_PER_WINDOW,
   "admission_rate_limit_window_seconds": $ADMISSION_RATE_LIMIT_WINDOW_SECONDS,
+  "rendezvous_metrics_addr": "$RENDEZVOUS_METRICS_ADDR",
+  "relay_metrics_addr": "$RELAY_METRICS_ADDR",
+  "rendezvous_metrics_scraped": $rendezvous_metrics_scraped,
+  "relay_metrics_scraped": $relay_metrics_scraped,
+  "rendezvous_auth_failures_total": $rendezvous_auth_failures_total,
+  "relay_auth_failures_total": $relay_auth_failures_total,
+  "rendezvous_requests_succeeded_total": $rendezvous_requests_succeeded_total,
+  "relay_forwarded_datagrams_total": $relay_forwarded_datagrams_total,
+  "relay_unknown_destination_drops_total": $relay_unknown_destination_drops_total,
   "prove_turn_relay": $([[ "$PROVE_TURN_RELAY" -eq 1 ]] && echo true || echo false),
   "remote_peer_id": "$REMOTE_PEER",
   "advertise_addr": "$ADVERTISE_ADDR",
