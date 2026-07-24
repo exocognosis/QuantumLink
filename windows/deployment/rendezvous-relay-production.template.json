@@ -20,12 +20,12 @@
     {
       "id": "rendezvous_dns",
       "status": "blocked",
-      "reason": "rv.quantumlinkvpn.com did not resolve during the 2026-07-09 production audit."
+      "reason": "rv.quantumlinkvpn.com did not resolve during the 2026-07-24 production prerequisite audit."
     },
     {
       "id": "relay_dns",
       "status": "blocked",
-      "reason": "relay.quantumlinkvpn.com did not resolve during the 2026-07-09 production audit."
+      "reason": "relay.quantumlinkvpn.com did not resolve during the 2026-07-24 production prerequisite audit."
     },
     {
       "id": "production_measurements",

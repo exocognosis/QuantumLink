@@ -93,8 +93,8 @@ Authenticode signing, and Windows validation gates are available.
   to a pinned official Wintun archive and checksum.
 - Confirm tag releases have `WINDOWS_SIGNING_CERT_PFX_BASE64` and
   `WINDOWS_SIGNING_CERT_PASSWORD` configured. Confirm
-  `WINDOWS_SIGNING_TIMESTAMP_URL` if using a timestamp URL other than the
-  workflow default.
+  `WINDOWS_SIGNING_TIMESTAMP_URL` is explicitly configured; production signing
+  must not rely on an implicit timestamp default.
 - For manual workflow runs, decide whether to enforce publisher identity with
   `expected_publisher_subject` and/or `expected_publisher_thumbprint`.
 - For optional upgrade validation, configure `upgrade_from_msi_url` and
@@ -126,6 +126,10 @@ Authenticode signing, and Windows validation gates are available.
 - Confirm `windows-release-evidence.json` records the selected MSI, checksum
   verification, Wintun DLL/license evidence, signature/timestamp policy, and
   any expected publisher subject or thumbprint checks.
+- Confirm a successful Windows Production Validation Matrix run exists for the
+  exact release commit, and provide its id through `production_validation_run_id`
+  or `WINDOWS_PRODUCTION_VALIDATION_RUN_ID` before publishing production
+  artifacts.
 - If install validation ran, confirm release evidence required
   `install-validation-report.json` and matched its MSI SHA-256 to the staged
   release MSI.

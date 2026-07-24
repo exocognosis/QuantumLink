@@ -27,6 +27,7 @@ class WindowsReleaseWorkflowContractTest < Minitest::Test
   ARTIFACT_EVIDENCE_PATH = "windows/build/release/windows-release-evidence.json"
   ARTIFACT_SBOM_PATH = "windows/build/release/windows-sbom.spdx.json"
   ARTIFACT_RELEASE_MANIFEST_PATH = "windows/build/release/windows-release-manifest.json"
+  ARTIFACT_PRODUCTION_VALIDATION_GATE_PATH = "windows/build/release/windows-production-validation-publication-gate.json"
   ARTIFACT_NAME = "QuantumLink-Windows-InstallValidation-${{ github.run_number }}"
 
   def setup
@@ -108,9 +109,14 @@ class WindowsReleaseWorkflowContractTest < Minitest::Test
     inputs = workflow_dispatch_inputs
 
     production_release = inputs.fetch("production_release")
-    assert_match(/requires signing.*install validation.*SBOM.*manifest.*release evidence.*rendezvous\/relay production evidence/i, production_release.fetch("description"))
+    assert_match(/requires signing.*timestamping.*install validation.*SBOM.*manifest.*release evidence.*rendezvous\/relay evidence.*production matrix evidence/i, production_release.fetch("description"))
     assert_equal "boolean", production_release.fetch("type")
     assert_equal false, production_release.fetch("default")
+
+    production_validation_run = inputs.fetch("production_validation_run_id")
+    assert_match(/successful Windows Production Validation Matrix run id.*exact release commit/i, production_validation_run.fetch("description"))
+    assert_equal "string", production_validation_run.fetch("type")
+    assert_equal "", production_validation_run.fetch("default")
 
     run_install_validation = inputs.fetch("run_install_validation")
     assert_match(/installs\/uninstalls the generated MSI.*uploads JSON evidence/i, run_install_validation.fetch("description"))
@@ -159,6 +165,11 @@ class WindowsReleaseWorkflowContractTest < Minitest::Test
 
     assert_equal "ruby/setup-ruby@v1", step.fetch("uses")
     assert_equal "3.3", step.fetch("with").fetch("ruby-version")
+  end
+
+  def test_workflow_has_actions_read_permission_for_publication_gate
+    assert_equal "read", @workflow_yaml.fetch("permissions").fetch("actions")
+    assert_equal "write", @workflow_yaml.fetch("permissions").fetch("contents")
   end
 
   def test_workflow_runs_validate_install_script_for_manual_opt_in
@@ -292,11 +303,39 @@ class WindowsReleaseWorkflowContractTest < Minitest::Test
   def test_workflow_requires_signing_and_install_validation_for_production_releases
     signing_step = workflow_step("Require Authenticode signing for production releases")
     validation_step = workflow_step("Require install validation for production releases")
+    availability_step = workflow_step("Decide if Authenticode signing is available")
+    signing_run = availability_step.fetch("run")
 
     assert_equal "(startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.production_release)) && steps.signing.outputs.available != 'true'", signing_step.fetch("if")
     assert_includes signing_step.fetch("run"), "Windows production releases require Authenticode signing secrets"
+    assert_equal "${{ secrets.WINDOWS_SIGNING_TIMESTAMP_URL }}", availability_step.fetch("env").fetch("WINDOWS_SIGNING_TIMESTAMP_URL")
+    assert_includes signing_run, "$hasTimestamp"
+    assert_includes signing_run, "WINDOWS_SIGNING_TIMESTAMP_URL"
+    assert_includes signing_run, "$hasCert -and $hasPassword -and $hasTimestamp"
     assert_equal "github.event_name == 'workflow_dispatch' && inputs.production_release && !inputs.run_install_validation", validation_step.fetch("if")
     assert_includes validation_step.fetch("run"), "Windows production releases require run_install_validation=true"
+  end
+
+  def test_workflow_requires_successful_production_validation_matrix_before_publication
+    gate_step = workflow_step("Require production validation matrix before publication")
+    release_step = workflow_step("Attach to GitHub Release")
+    upload_step = workflow_step("Upload release artifacts")
+    run = gate_step.fetch("run")
+
+    assert_equal "startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.production_release)", gate_step.fetch("if")
+    assert_equal "${{ github.token }}", gate_step.fetch("env").fetch("GH_TOKEN")
+    assert_equal "${{ inputs.production_validation_run_id || vars.WINDOWS_PRODUCTION_VALIDATION_RUN_ID }}", gate_step.fetch("env").fetch("PRODUCTION_VALIDATION_RUN_ID")
+    assert_in_order run, [
+      "$env:PRODUCTION_VALIDATION_RUN_ID",
+      "Production validation run id must be numeric.",
+      'gh api "repos/$env:GITHUB_REPOSITORY/actions/runs/$env:PRODUCTION_VALIDATION_RUN_ID"',
+      '[string]$run.name -ne "Windows Production Validation Matrix"',
+      '[string]$run.status -ne "completed" -or [string]$run.conclusion -ne "success"',
+      '[string]$run.head_sha -ne $env:GITHUB_SHA',
+      "windows\\build\\release\\windows-production-validation-publication-gate.json"
+    ]
+    assert_includes upload_step.fetch("with").fetch("path"), ARTIFACT_PRODUCTION_VALIDATION_GATE_PATH
+    assert_includes release_step.fetch("with").fetch("files"), ARTIFACT_PRODUCTION_VALIDATION_GATE_PATH
   end
 
   def test_workflow_requires_rendezvous_relay_production_evidence_for_production_releases
@@ -338,14 +377,18 @@ class WindowsReleaseWorkflowContractTest < Minitest::Test
     production_evidence_index = @workflow.index("- name: Require rendezvous/relay production evidence")
     verify_index = @workflow.index("- name: Verify Windows release evidence")
     upload_index = @workflow.index("- name: Upload release artifacts")
+    production_validation_index = @workflow.index("- name: Require production validation matrix before publication")
 
     refute_nil stage_index
     refute_nil production_evidence_index
     refute_nil verify_index
     refute_nil upload_index
+    refute_nil production_validation_index
     assert_operator stage_index, :<, verify_index
     assert_operator production_evidence_index, :<, stage_index
     assert_operator verify_index, :<, upload_index
+    assert_operator verify_index, :<, production_validation_index
+    assert_operator production_validation_index, :<, upload_index
 
     step = workflow_step("Verify Windows release evidence")
     env = step.fetch("env")

@@ -5,6 +5,7 @@ require "fileutils"
 require "json"
 require "minitest/autorun"
 require "open3"
+require "pathname"
 require "rbconfig"
 require "tmpdir"
 require "time"
@@ -17,6 +18,7 @@ class WindowsProductionValidationContractTest < Minitest::Test
   PLANNER_PATH = File.join(REPO_ROOT, "windows/scripts/plan-windows-validation-matrix.rb")
   GENERATOR_PATH = File.join(REPO_ROOT, "windows/scripts/generate-windows-validation-matrix-evidence.rb")
   VERIFIER_PATH = File.join(REPO_ROOT, "windows/scripts/verify-windows-validation-matrix-evidence.rb")
+  PREREQUISITE_AUDIT_PATH = File.join(REPO_ROOT, "windows/scripts/audit-windows-production-prerequisites.rb")
 
   EXPECTED_SHA = "a" * 40
   EXPECTED_REF = "refs/tags/v1.0.0"
@@ -136,6 +138,59 @@ class WindowsProductionValidationContractTest < Minitest::Test
       plan.fetch("lanes").each do |lane|
         assert_includes lane.fetch("blockers"), "external validation harness SHA-256 is unset or invalid"
       end
+    end
+  end
+
+  def test_prerequisite_audit_reports_live_external_gate_state_without_claiming_host_evidence
+    FileUtils.mkdir_p(File.join(REPO_ROOT, "build", "windows-prerequisite-audit-test"))
+    Dir.mktmpdir("fixture", File.join(REPO_ROOT, "build", "windows-prerequisite-audit-test")) do |directory|
+      repo_relative = lambda do |path|
+        Pathname.new(path).relative_path_from(Pathname.new(REPO_ROOT)).to_s
+      end
+      output = File.join(directory, "audit.json")
+      stdout, stderr, status = Open3.capture3(
+        RbConfig.ruby, PREREQUISITE_AUDIT_PATH,
+        "--repo-root", REPO_ROOT,
+        "--runner-inventory", repo_relative.call(write_json(directory, "runners.json", {
+          "inventoryAvailable" => true,
+          "runners" => [{ "status" => "online", "labels" => all_runner_labels(pinned_contract) }]
+        })),
+        "--secret-inventory", repo_relative.call(write_json(directory, "secrets.json", {
+          "inventoryAvailable" => true,
+          "names" => %w[
+            WINDOWS_RUNNER_INVENTORY_TOKEN
+            WINDOWS_SIGNING_CERT_PFX_BASE64
+            WINDOWS_SIGNING_CERT_PASSWORD
+            WINDOWS_SIGNING_TIMESTAMP_URL
+          ]
+        })),
+        "--variable-inventory", repo_relative.call(write_json(directory, "variables.json", {
+          "inventoryAvailable" => true,
+          "values" => {
+            "WINTUN_DOWNLOAD_URL" => "https://www.wintun.net/builds/wintun-0.14.1.zip",
+            "WINTUN_SHA256" => "07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51"
+          }
+        })),
+        "--dns-inventory", repo_relative.call(write_json(directory, "dns.json", {
+          "hosts" => [
+            { "host" => "rv.quantumlinkvpn.com", "status" => "resolved", "addressCount" => 1 },
+            { "host" => "relay.quantumlinkvpn.com", "status" => "resolved", "addressCount" => 1 }
+          ]
+        })),
+        "--output", repo_relative.call(output),
+        "--require-ready",
+        :chdir => REPO_ROOT
+      )
+
+      assert status.success?, "audit failed: #{stderr}\n#{stdout}"
+      assert_equal "pass", JSON.parse(stdout).fetch("status")
+      report = JSON.parse(File.read(output))
+      assert_equal "windowsProductionPrerequisitesAudit", report.fetch("evidenceKind")
+      assert_equal "pass", report.fetch("status")
+      assert_equal(
+        %w[self_hosted_validation_runners release_and_matrix_secrets wintun_release_variables control_plane_dns],
+        report.fetch("prerequisites").map { |entry| entry.fetch("id") }
+      )
     end
   end
 
