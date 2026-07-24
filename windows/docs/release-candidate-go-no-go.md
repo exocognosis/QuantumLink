@@ -1,7 +1,7 @@
 # Windows Release Candidate Go/No-Go
 
 Date: 2026-07-09
-Branch: `codex/windows-production-grade-closeout`
+Branch: `codex/windows-production-finalization`
 Target: Windows x64, IPv4 overlay, private/public mesh
 Decision: **NO-GO**
 
@@ -18,7 +18,16 @@ candidate while any blocker below remains open.
   IP Helper route ownership, strict WFP fail-closed refusal, and no production
   `netsh` fallback.
 - Packet processing emits no protected traffic before authenticated peer
-  session readiness and exposes no key or peer material in status.
+  session readiness; the `peer-session` install is direction- and
+  generation-bound to the live handshake,
+  leases, rotates on configured time/byte limits, and exposes no binding or
+  key material in status/debug output.
+- Strict WFP implements separate persistent/boot-time blocks, transactional
+  owned-object reconciliation, Wintun-LUID permits, probing, and elevated
+  uninstall cleanup without deleting unrelated provider objects.
+- A blocked-by-default production matrix workflow binds measured host evidence
+  to the exact signed MSI, release manifest, commit, and ref across eight
+  Windows/interop lanes.
 - Public mesh configuration enforces verified Dytallix identity, registry/RPC
   pinning, zero stale-proof grace, and stable rejection categories.
 - Rendezvous/relay evidence is fresh, control-specific, digest-bound to the
@@ -30,16 +39,17 @@ candidate while any blocker below remains open.
   categories, no raw mode, and no logs, payloads, addresses, routes, DNS, SSIDs,
   packet captures, secrets, wallets, or raw peer identifiers.
 
-## Remaining Implementation Blockers
+## Remaining Deployment And Host-Proof Blockers
 
-- Strict WFP still refuses startup because persistent/boot-time filter install,
-  upgrade, rollback, and uninstall lifecycle is not implemented and proven.
-- The Windows service has no live authenticated transport source that installs
-  peer-session keys into the packet pump; fail-closed readiness is implemented,
-  but a production two-peer data path is not yet established.
-- Production rendezvous/relay services and their control-specific proof files
-  are not deployed in this repository. The default production evidence
-  manifest is intentionally absent, so production release mode fails.
+- Strict WFP and authenticated packet-session lifecycle are implemented and
+  locally tested, but have not executed on signed Windows 10/11 and physical
+  hosts through real Wintun/BFE state.
+- Production rendezvous/relay services and their measured control-specific
+  proof files are not deployed. The blocked template cannot satisfy the
+  production release verifier.
+- The repository currently lacks the required signed artifact inputs and
+  labeled self-hosted Windows/interop runners, so the production matrix must
+  remain blocked rather than manufacture passing evidence.
 
 ## Required External Evidence
 

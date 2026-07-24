@@ -1,4 +1,6 @@
-use qlink_core::packet_core::{FfiCryptoPolicy, FfiRouteMode, InstalledPeerSession};
+use qlink_core::packet_core::{
+    FfiCryptoPolicy, FfiRouteMode, InstalledPeerSession, PeerSessionDirection,
+};
 use qlink_core::packet_core::{
     PacketDisposition, PacketTunnelCore, PacketTunnelCoreConfig, TunnelPacket,
 };
@@ -59,7 +61,7 @@ pub trait TunnelCoreAdapting {
 
 impl TunnelCoreAdapting for PacketTunnelCore {
     fn install_peer_session(&mut self, session: InstalledPeerSession) {
-        PacketTunnelCore::install_peer_session(self, session)
+        let _ = PacketTunnelCore::install_peer_session(self, session);
     }
 
     fn submit_tunnel_packet(
@@ -154,7 +156,10 @@ where
     }
 
     fn installed_peer_session(&self) -> Option<InstalledPeerSession> {
-        MeshFrameTransport::installed_peer_session(self)
+        MeshFrameTransport::installed_peer_session(self).map(|mut session| {
+            session.direction = PeerSessionDirection::Outbound;
+            session
+        })
     }
 
     fn last_transport_error(&self) -> Option<&str> {
@@ -183,7 +188,10 @@ where
     }
 
     fn installed_peer_session(&self) -> Option<InstalledPeerSession> {
-        MeshFrameTransport::installed_peer_session(self)
+        MeshFrameTransport::installed_peer_session(self).map(|mut session| {
+            session.direction = PeerSessionDirection::Inbound;
+            session
+        })
     }
 
     fn last_transport_error(&self) -> Option<&str> {
@@ -566,8 +574,11 @@ impl TransportFrameSink for LocalFrameQueue {
     fn installed_peer_session(&self) -> Option<InstalledPeerSession> {
         self.ready.then(|| InstalledPeerSession {
             peer_id: "local-loopback-peer".to_string(),
+            direction: PeerSessionDirection::Outbound,
+            generation: 1,
+            transcript_binding: [0; 32],
             expires_at_unix: u64::MAX,
-            rekey_after_packets: 0,
+            rekey_after_bytes: 0,
         })
     }
 
@@ -594,8 +605,11 @@ impl TransportFrameSource for LocalFrameQueue {
     fn installed_peer_session(&self) -> Option<InstalledPeerSession> {
         self.ready.then(|| InstalledPeerSession {
             peer_id: "local-loopback-peer".to_string(),
+            direction: PeerSessionDirection::Inbound,
+            generation: 1,
+            transcript_binding: [0; 32],
             expires_at_unix: u64::MAX,
-            rekey_after_packets: 0,
+            rekey_after_bytes: 0,
         })
     }
 
@@ -704,8 +718,11 @@ mod tests {
             fn installed_peer_session(&self) -> Option<InstalledPeerSession> {
                 Some(InstalledPeerSession {
                     peer_id: "failing-sink-peer".to_string(),
+                    direction: PeerSessionDirection::Outbound,
+                    generation: 1,
+                    transcript_binding: [0; 32],
                     expires_at_unix: u64::MAX,
-                    rekey_after_packets: 0,
+                    rekey_after_bytes: 0,
                 })
             }
 

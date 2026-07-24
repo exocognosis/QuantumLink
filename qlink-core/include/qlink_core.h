@@ -100,7 +100,7 @@ bool qlink_tunnel_core_install_peer_session(
     const uint8_t *peer_id,
     uintptr_t peer_id_len,
     uint64_t expires_at_unix,
-    uint64_t rekey_after_packets
+    uint64_t rekey_after_bytes
 );
 
 bool qlink_tunnel_core_clear_peer_session(QlinkTunnelCoreHandle *handle);

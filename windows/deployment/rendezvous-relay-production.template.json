@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 1,
+  "evidenceKind": "windowsRendezvousRelayDeploymentContract",
+  "status": "blocked",
+  "release": {
+    "commitSha": "",
+    "ref": ""
+  },
+  "deployment": {
+    "id": "",
+    "status": "blocked"
+  },
+  "rendezvousEndpoints": [
+    "https://rv.quantumlinkvpn.com"
+  ],
+  "relayEndpoints": [
+    "turns:relay.quantumlinkvpn.com:5349"
+  ],
+  "prerequisites": [
+    {
+      "id": "rendezvous_dns",
+      "status": "blocked",
+      "reason": "rv.quantumlinkvpn.com did not resolve during the 2026-07-09 production audit."
+    },
+    {
+      "id": "relay_dns",
+      "status": "blocked",
+      "reason": "relay.quantumlinkvpn.com did not resolve during the 2026-07-09 production audit."
+    },
+    {
+      "id": "production_measurements",
+      "status": "blocked",
+      "reason": "No endpoint-bound production control measurements have been supplied."
+    }
+  ],
+  "output": {
+    "manifest": "windows/validation/rendezvous-relay-production-evidence.json",
+    "controlDirectory": "windows/validation/rendezvous-relay",
+    "digestManifest": "windows/validation/rendezvous-relay-production-evidence-digests.json",
+    "checksums": "windows/validation/rendezvous-relay-production-evidence-SHA256SUMS.txt"
+  }
+}

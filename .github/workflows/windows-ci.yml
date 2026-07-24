@@ -30,6 +30,14 @@ jobs:
         with:
           arch: x64
 
+      - name: Pin the MSVC linker for Rust
+        shell: pwsh
+        run: |
+          $msvcLink = (Get-Command link.exe -All | Where-Object { $_.Source -match "\\MSVC\\" } | Select-Object -First 1).Source
+          if (-not $msvcLink) { throw "MSVC link.exe was not found after entering the developer environment." }
+          "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$msvcLink" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$msvcLink"
+
       - name: Check Windows host prerequisites
         shell: pwsh
         run: |

@@ -21,7 +21,8 @@
 //!    not a leaked one.
 
 use qlink_core::packet_core::{
-    InstalledPeerSession, PacketCoreMetrics, PacketDisposition, PacketTunnelCore, TunnelPacket,
+    InstalledPeerSession, PacketCoreMetrics, PacketDisposition, PacketTunnelCore,
+    PeerSessionDirection, TunnelPacket,
 };
 use quantumlink_proto::models::PacketPumpMetrics;
 use std::collections::HashMap;
@@ -35,13 +36,22 @@ pub enum PumpError {
     Core(#[from] qlink_core::QlinkError),
     #[error("transport send failed: {0}")]
     TransportSend(String),
+    #[error("authenticated packet-session readiness rejected: {0}")]
+    PeerSession(String),
 }
 
 /// Abstraction over the Rust packet core so tests can inject failures.
 /// `PacketTunnelCore` implements this directly — no FFI hop on Windows.
 pub trait TunnelCoreAdapting: Send {
-    fn install_peer_session(&mut self, session: InstalledPeerSession);
-    fn clear_peer_session(&mut self);
+    fn install_peer_session(&mut self, session: InstalledPeerSession) -> bool;
+    fn clear_peer_sessions(&mut self);
+    fn clear_peer_session_direction(&mut self, direction: PeerSessionDirection);
+    fn clear_peer_session(
+        &mut self,
+        peer_id: &str,
+        direction: PeerSessionDirection,
+        generation: u64,
+    ) -> bool;
     fn submit_tunnel_packet(
         &mut self,
         protocol_family: u32,
@@ -56,12 +66,25 @@ pub trait TunnelCoreAdapting: Send {
 }
 
 impl TunnelCoreAdapting for PacketTunnelCore {
-    fn install_peer_session(&mut self, session: InstalledPeerSession) {
+    fn install_peer_session(&mut self, session: InstalledPeerSession) -> bool {
         PacketTunnelCore::install_peer_session(self, session)
     }
 
-    fn clear_peer_session(&mut self) {
-        PacketTunnelCore::clear_peer_session(self)
+    fn clear_peer_sessions(&mut self) {
+        PacketTunnelCore::clear_peer_sessions(self)
+    }
+
+    fn clear_peer_session_direction(&mut self, direction: PeerSessionDirection) {
+        PacketTunnelCore::clear_peer_session_direction(self, direction)
+    }
+
+    fn clear_peer_session(
+        &mut self,
+        peer_id: &str,
+        direction: PeerSessionDirection,
+        generation: u64,
+    ) -> bool {
+        PacketTunnelCore::clear_peer_session(self, peer_id, direction, generation)
     }
 
     fn submit_tunnel_packet(
@@ -159,6 +182,8 @@ impl PacketPumpCounters {
 pub struct TunnelPacketPump<C: TunnelCoreAdapting> {
     core: Option<C>,
     counters: PacketPumpCounters,
+    active_peer_sessions: HashMap<(String, PeerSessionDirection), InstalledPeerSession>,
+    selected_outbound_peer: Option<(String, u64)>,
 }
 
 impl<C: TunnelCoreAdapting> TunnelPacketPump<C> {
@@ -166,6 +191,8 @@ impl<C: TunnelCoreAdapting> TunnelPacketPump<C> {
         Self {
             core,
             counters: PacketPumpCounters::default(),
+            active_peer_sessions: HashMap::new(),
+            selected_outbound_peer: None,
         }
     }
 
@@ -175,6 +202,73 @@ impl<C: TunnelCoreAdapting> TunnelPacketPump<C> {
 
     pub fn core_metrics(&self) -> Option<PacketCoreMetrics> {
         self.core.as_ref().map(|core| core.metrics())
+    }
+
+    pub fn install_peer_session(&mut self, session: InstalledPeerSession) -> bool {
+        let key = (session.peer_id.clone(), session.direction);
+        if let Some(current) = self.active_peer_sessions.get(&key) {
+            if current == &session {
+                return self
+                    .core
+                    .as_mut()
+                    .is_some_and(|core| core.install_peer_session(session));
+            }
+            if current.generation >= session.generation {
+                return false;
+            }
+        }
+        if session.direction == PeerSessionDirection::Outbound {
+            if let Some((selected_peer, selected_generation)) = &self.selected_outbound_peer {
+                if selected_peer != &session.peer_id && *selected_generation >= session.generation {
+                    return false;
+                }
+            }
+        }
+        let Some(core) = self.core.as_mut() else {
+            return false;
+        };
+        if !core.install_peer_session(session.clone()) {
+            return false;
+        }
+        if session.direction == PeerSessionDirection::Outbound {
+            self.selected_outbound_peer = Some((session.peer_id.clone(), session.generation));
+        }
+        self.active_peer_sessions.insert(key, session);
+        true
+    }
+
+    pub fn clear_peer_session(
+        &mut self,
+        peer_id: &str,
+        direction: PeerSessionDirection,
+        generation: u64,
+    ) -> bool {
+        let key = (peer_id.to_string(), direction);
+        let matches = self
+            .active_peer_sessions
+            .get(&key)
+            .is_some_and(|session| session.generation == generation);
+        if !matches {
+            return false;
+        }
+        self.active_peer_sessions.remove(&key);
+        if let Some(core) = self.core.as_mut() {
+            core.clear_peer_session(peer_id, direction, generation);
+        }
+        if direction == PeerSessionDirection::Outbound
+            && self.selected_outbound_peer.as_ref() == Some(&(peer_id.to_string(), generation))
+        {
+            self.selected_outbound_peer = None;
+        }
+        true
+    }
+
+    pub fn clear_all_peer_sessions(&mut self) {
+        self.active_peer_sessions.clear();
+        self.selected_outbound_peer = None;
+        if let Some(core) = self.core.as_mut() {
+            core.clear_peer_sessions();
+        }
     }
 
     /// Drives the outbound half: tunnel packets in, encrypted transport
@@ -200,7 +294,13 @@ impl<C: TunnelCoreAdapting> TunnelPacketPump<C> {
         // submit packets to the core. No plaintext crosses the encode
         // boundary while the data plane is unhealthy.
         if !sink.is_ready() {
-            core.clear_peer_session();
+            self.core
+                .as_mut()
+                .expect("packet core existence checked above")
+                .clear_peer_session_direction(PeerSessionDirection::Outbound);
+            self.active_peer_sessions
+                .retain(|(_, direction), _| *direction != PeerSessionDirection::Outbound);
+            self.selected_outbound_peer = None;
             self.counters.dropped_kill_switch += packets.len() as u64;
             return PacketPumpBatchResult {
                 packets_observed: packets.len(),
@@ -214,13 +314,24 @@ impl<C: TunnelCoreAdapting> TunnelPacketPump<C> {
             ..Default::default()
         };
 
-        for (family, packet) in packets {
-            if core.peer_session_required() {
-                match sink.installed_peer_session() {
-                    Some(session) => core.install_peer_session(session),
-                    None => core.clear_peer_session(),
+        if core.peer_session_required() {
+            let ready = sink
+                .installed_peer_session()
+                .filter(|session| session.direction == PeerSessionDirection::Outbound)
+                .is_some_and(|session| self.install_peer_session(session));
+            if !ready {
+                if let Some(core) = self.core.as_mut() {
+                    core.clear_peer_session_direction(PeerSessionDirection::Outbound);
                 }
+                self.selected_outbound_peer = None;
             }
+        }
+
+        let core = self
+            .core
+            .as_mut()
+            .expect("packet core existence checked above");
+        for (family, packet) in packets {
             match core.submit_tunnel_packet(*family, packet) {
                 Ok(PacketDisposition::QueuedForTransport) => {
                     result.queued_for_transport += 1;
@@ -262,18 +373,39 @@ impl<C: TunnelCoreAdapting> TunnelPacketPump<C> {
         peer_id: Option<&str>,
         peer_session: Option<InstalledPeerSession>,
     ) -> Result<(), PumpError> {
-        let Some(core) = self.core.as_mut() else {
+        let Some(core) = self.core.as_ref() else {
             self.counters.failed_inbound_frames += 1;
             return Err(PumpError::CoreUnavailable(
                 "Rust core is unavailable for inbound transport frame".into(),
             ));
         };
         if core.peer_session_required() {
-            match peer_session {
-                Some(session) => core.install_peer_session(session),
-                None => core.clear_peer_session(),
+            let attributed_peer = peer_id.filter(|peer| !peer.is_empty());
+            let session_matches = peer_session.as_ref().is_some_and(|session| {
+                session.direction == PeerSessionDirection::Inbound
+                    && attributed_peer == Some(session.peer_id.as_str())
+                    && self
+                        .selected_outbound_peer
+                        .as_ref()
+                        .is_some_and(|(selected, _)| selected == &session.peer_id)
+            });
+            if !session_matches {
+                self.counters.failed_inbound_frames += 1;
+                return Err(PumpError::PeerSession(
+                    "inbound lease does not match the attributed selected peer".into(),
+                ));
+            }
+            if !self.install_peer_session(peer_session.expect("session match checked")) {
+                self.counters.failed_inbound_frames += 1;
+                return Err(PumpError::PeerSession(
+                    "inbound lease is stale or conflicts with the active generation".into(),
+                ));
             }
         }
+        let core = self
+            .core
+            .as_mut()
+            .expect("packet core existence checked above");
         match core.accept_transport_frame(frame) {
             Ok(()) => {
                 self.counters.transport_frames_accepted += 1;
@@ -461,8 +593,11 @@ mod tests {
         let mut sink = ClosureSink::new(true);
         sink.peer_session = Some(InstalledPeerSession {
             peer_id: "qlink_peer".to_string(),
+            direction: PeerSessionDirection::Outbound,
+            generation: 1,
+            transcript_binding: [7; 32],
             expires_at_unix: now_unix_seconds() + 60,
-            rekey_after_packets: 0,
+            rekey_after_bytes: 0,
         });
         let packet = ipv4_packet([100, 127, 0, 9]);
 
@@ -472,6 +607,41 @@ mod tests {
         assert_eq!(result.transport_frames_emitted, 1);
         assert_eq!(result.dropped_fail_closed, 0);
         assert_eq!(sink.sent.borrow().len(), 1);
+    }
+
+    #[test]
+    fn rejected_attribution_does_not_clear_valid_inbound_session() {
+        let mut pump = TunnelPacketPump::new(Some(peer_session_required_core()));
+        let now = now_unix_seconds();
+        assert!(pump.install_peer_session(InstalledPeerSession {
+            peer_id: "qlink_peer".to_string(),
+            direction: PeerSessionDirection::Outbound,
+            generation: 1,
+            transcript_binding: [1; 32],
+            expires_at_unix: now + 60,
+            rekey_after_bytes: 1_024,
+        }));
+        let inbound = InstalledPeerSession {
+            peer_id: "qlink_peer".to_string(),
+            direction: PeerSessionDirection::Inbound,
+            generation: 2,
+            transcript_binding: [2; 32],
+            expires_at_unix: now + 60,
+            rekey_after_bytes: 1_024,
+        };
+        assert!(pump.install_peer_session(inbound.clone()));
+
+        let mut sender = test_core();
+        let packet = ipv4_packet([100, 127, 0, 9]);
+        sender.submit_tunnel_packet(2, &packet).unwrap();
+        let frame = sender.pop_transport_frame().unwrap();
+
+        assert!(pump
+            .accept_transport_frame(&frame, Some("wrong-peer"), Some(inbound.clone()))
+            .is_err());
+        pump.accept_transport_frame(&frame, Some("qlink_peer"), Some(inbound))
+            .unwrap();
+        assert!(pump.pop_tunnel_packet().is_some());
     }
 
     #[test]

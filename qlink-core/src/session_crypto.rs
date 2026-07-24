@@ -13,6 +13,48 @@ use shake::{ExtendableOutput, Shake256, Update, XofReader};
 pub const PQC_SESSION_VERSION: u8 = 1;
 pub const PQC_SESSION_SUITE: &str = "QLINK-FIPS203-MLKEM768-SHAKE256-v1";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PqcSessionRole {
+    Initiator,
+    Responder,
+}
+
+/// Produces a domain-separated transcript/context binding for an authenticated
+/// PQC session. The directional traffic keys remain exclusively owned by
+/// `PqcFrameProtector`; callers may use this sensitive in-process value only to
+/// bind readiness state to the exact handshake and peer identities.
+pub(crate) fn derive_packet_session_binding(
+    suite: &str,
+    handshake_hash: &[u8; 32],
+    mesh_id: &str,
+    initiator_peer_id: &str,
+    responder_peer_id: &str,
+    role: PqcSessionRole,
+) -> [u8; 32] {
+    let role = match role {
+        PqcSessionRole::Initiator => b"initiator".as_slice(),
+        PqcSessionRole::Responder => b"responder".as_slice(),
+    };
+    let mut hasher = Shake256::default();
+    hasher.update(b"QuantumLink packet session readiness binding v1");
+    absorb_binding_field(&mut hasher, suite.as_bytes());
+    absorb_binding_field(&mut hasher, handshake_hash);
+    absorb_binding_field(&mut hasher, mesh_id.as_bytes());
+    absorb_binding_field(&mut hasher, initiator_peer_id.as_bytes());
+    absorb_binding_field(&mut hasher, responder_peer_id.as_bytes());
+    absorb_binding_field(&mut hasher, role);
+
+    let mut binding = [0_u8; 32];
+    let mut reader = hasher.finalize_xof();
+    reader.read(&mut binding);
+    binding
+}
+
+fn absorb_binding_field(hasher: &mut Shake256, field: &[u8]) {
+    hasher.update(&(field.len() as u64).to_be_bytes());
+    hasher.update(field);
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PqcSessionContext {
     pub mesh_id: String,

@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use qlink_core::packet_core::{FfiRouteMode, InstalledPeerSession};
+use qlink_core::packet_core::{FfiRouteMode, InstalledPeerSession, PeerSessionDirection};
 use qlink_linux::{DryRunExecutor, LoopbackTunDevice, TunDeviceConfig, TunPacketIo};
 use qlink_proto::{DaemonConfig, DataPlaneState, PathKind};
 use qlinkd::data_plane::{
@@ -56,8 +56,11 @@ impl MeshFrameTransport for FakeMeshTransport {
     fn installed_peer_session(&self) -> Option<InstalledPeerSession> {
         self.peer_session_ready.then(|| InstalledPeerSession {
             peer_id: "fake-live-peer".to_string(),
+            direction: PeerSessionDirection::Outbound,
+            generation: 1,
+            transcript_binding: [0; 32],
             expires_at_unix: u64::MAX,
-            rekey_after_packets: 0,
+            rekey_after_bytes: 0,
         })
     }
 

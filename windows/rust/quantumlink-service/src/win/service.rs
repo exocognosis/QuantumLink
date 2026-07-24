@@ -48,6 +48,8 @@ fn run_service() -> anyhow_lite::Result<()> {
         state_dir.join(crate::config::SECRETS_DIR),
     )?);
     let platform = Arc::new(crate::win::platform::WindowsPlatform::default());
+    let startup_config = crate::config::load_for_connect(&state_dir)?;
+    platform.reconcile_startup(&startup_config)?;
     let engine = Arc::new(TunnelEngine::new(secret_store, platform, state_dir.clone()));
     let context = Arc::new(IpcContext {
         engine: Arc::clone(&engine),

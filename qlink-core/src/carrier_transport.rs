@@ -5,6 +5,7 @@ use crate::quic_transport::QuicDatagramSession;
 use crate::turn::TurnRelaySocket;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    io::ErrorKind,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -12,7 +13,12 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tokio::{net::UdpSocket, sync::Mutex};
+use tokio::sync::Notify;
+use tokio::{
+    net::UdpSocket,
+    sync::{mpsc, Mutex},
+    task::JoinHandle,
+};
 
 const CARRIER_MAGIC: &[u8; 6] = b"QLCAR1";
 const CARRIER_VERSION: u8 = 1;
@@ -27,6 +33,9 @@ const REASSEMBLY_TTL: Duration = Duration::from_secs(30);
 const MAX_COMPLETED_FRAGMENT_KEYS: usize = 256;
 const MAX_PENDING_MESSAGES: usize = 64;
 const MAX_PENDING_AUTHENTICATED_MESSAGE_LEN: usize = 64 * 1024;
+const MAX_LISTENER_SESSIONS: usize = 1_024;
+const LISTENER_SESSION_QUEUE_DEPTH: usize = 256;
+const LISTENER_ACCEPT_QUEUE_DEPTH: usize = 64;
 
 #[derive(Debug, Clone)]
 pub enum CarrierSession {
@@ -116,9 +125,149 @@ pub struct NativeUdpSession {
     next_message_id: Arc<AtomicU64>,
 }
 
+#[derive(Debug)]
+struct ListenerSession {
+    generation: u64,
+    sender: mpsc::Sender<Vec<u8>>,
+}
+
+/// Multiplexes successive native UDP sessions on one stable responder socket.
+/// Each remote address receives a bounded queue and an independent session
+/// object; malformed datagrams never allocate a session.
+pub struct NativeUdpListener {
+    accept_rx: Mutex<mpsc::Receiver<(NativeUdpSession, SocketAddr)>>,
+    shutdown: Arc<Notify>,
+    dispatcher: JoinHandle<()>,
+}
+
+impl NativeUdpListener {
+    pub fn new(socket: UdpSocket) -> Self {
+        let socket = Arc::new(socket);
+        let sessions = Arc::new(Mutex::new(HashMap::<SocketAddr, ListenerSession>::new()));
+        let generation_counter = Arc::new(AtomicU64::new(0));
+        let shutdown = Arc::new(Notify::new());
+        let (accept_tx, accept_rx) = mpsc::channel(LISTENER_ACCEPT_QUEUE_DEPTH);
+        let dispatcher_socket = socket.clone();
+        let dispatcher_sessions = sessions.clone();
+        let dispatcher_generation_counter = generation_counter.clone();
+        let dispatcher_shutdown = shutdown.clone();
+        let dispatcher = tokio::spawn(async move {
+            let mut buffer = vec![0_u8; MAX_UDP_DATAGRAM_LEN + 1];
+            loop {
+                let (len, peer_addr) = match dispatcher_socket.recv_from(&mut buffer).await {
+                    Ok(value) => value,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            ErrorKind::ConnectionReset
+                                | ErrorKind::Interrupted
+                                | ErrorKind::WouldBlock
+                        ) || error.raw_os_error() == Some(10054) =>
+                    {
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                if len > MAX_UDP_DATAGRAM_LEN {
+                    continue;
+                }
+                let bytes = buffer[..len].to_vec();
+                let Ok(datagram) = decode_datagram(&bytes) else {
+                    continue;
+                };
+
+                let mut sessions_guard = dispatcher_sessions.lock().await;
+                if let Some(entry) = sessions_guard.get(&peer_addr) {
+                    let generation = entry.generation;
+                    if entry.sender.try_send(bytes.clone()).is_ok() {
+                        if datagram.kind == DatagramKind::Close {
+                            sessions_guard.remove(&peer_addr);
+                        }
+                        continue;
+                    } else {
+                        let stale = sessions_guard
+                            .get(&peer_addr)
+                            .is_some_and(|current| current.generation == generation);
+                        if stale {
+                            sessions_guard.remove(&peer_addr);
+                        }
+                    }
+                }
+                if datagram.kind == DatagramKind::Close
+                    || sessions_guard.len() >= MAX_LISTENER_SESSIONS
+                {
+                    continue;
+                }
+
+                let (session_tx, session_rx) = mpsc::channel(LISTENER_SESSION_QUEUE_DEPTH);
+                if session_tx.try_send(bytes).is_err() {
+                    continue;
+                }
+                let generation = dispatcher_generation_counter.fetch_add(1, Ordering::SeqCst) + 1;
+                sessions_guard.insert(
+                    peer_addr,
+                    ListenerSession {
+                        generation,
+                        sender: session_tx,
+                    },
+                );
+                let session = NativeUdpSession::from_listener(
+                    dispatcher_socket.clone(),
+                    peer_addr,
+                    generation,
+                    session_rx,
+                    dispatcher_sessions.clone(),
+                    dispatcher_shutdown.clone(),
+                );
+                if accept_tx.try_send((session, peer_addr)).is_err() {
+                    if sessions_guard
+                        .get(&peer_addr)
+                        .is_some_and(|current| current.generation == generation)
+                    {
+                        sessions_guard.remove(&peer_addr);
+                    }
+                }
+            }
+        });
+        Self {
+            accept_rx: Mutex::new(accept_rx),
+            shutdown,
+            dispatcher,
+        }
+    }
+
+    pub async fn accept(&self) -> Result<(NativeUdpSession, SocketAddr)> {
+        self.accept_rx
+            .lock()
+            .await
+            .recv()
+            .await
+            .ok_or_else(|| QlinkError::Protocol("native UDP listener stopped".into()))
+    }
+
+    pub fn shutdown_signal(&self) -> Arc<Notify> {
+        self.shutdown.clone()
+    }
+}
+
+impl Drop for NativeUdpListener {
+    fn drop(&mut self) {
+        self.shutdown.notify_waiters();
+        self.dispatcher.abort();
+    }
+}
+
 #[derive(Debug, Clone)]
 enum DatagramTransport {
     Udp(Arc<UdpSocket>),
+    Listener {
+        socket: Arc<UdpSocket>,
+        remote_addr: SocketAddr,
+        rx: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
+        generation: u64,
+        sessions: Arc<Mutex<HashMap<SocketAddr, ListenerSession>>>,
+        shutdown: Arc<Notify>,
+    },
     #[cfg(feature = "turn-relay")]
     Turn(TurnRelaySocket),
 }
@@ -127,6 +276,13 @@ impl DatagramTransport {
     async fn send(&self, datagram: &[u8]) -> Result<usize> {
         match self {
             Self::Udp(socket) => socket.send(datagram).await.map_err(|err| {
+                QlinkError::Protocol(format!("failed to send native UDP datagram: {err}"))
+            }),
+            Self::Listener {
+                socket,
+                remote_addr,
+                ..
+            } => socket.send_to(datagram, *remote_addr).await.map_err(|err| {
                 QlinkError::Protocol(format!("failed to send native UDP datagram: {err}"))
             }),
             #[cfg(feature = "turn-relay")]
@@ -139,6 +295,23 @@ impl DatagramTransport {
             Self::Udp(socket) => socket.recv(buffer).await.map_err(|err| {
                 QlinkError::Protocol(format!("failed to receive native UDP datagram: {err}"))
             }),
+            Self::Listener { rx, shutdown, .. } => {
+                let bytes = tokio::select! {
+                    bytes = async {
+                        rx.lock().await.recv().await
+                    } => bytes,
+                    _ = shutdown.notified() => None,
+                }
+                .ok_or_else(|| QlinkError::Protocol("native UDP carrier closed".into()))?;
+                if bytes.len() > buffer.len() {
+                    return Err(QlinkError::Protocol(format!(
+                        "native UDP carrier datagram exceeds {} bytes",
+                        buffer.len()
+                    )));
+                }
+                buffer[..bytes.len()].copy_from_slice(&bytes);
+                Ok(bytes.len())
+            }
             #[cfg(feature = "turn-relay")]
             Self::Turn(socket) => socket.recv(buffer).await,
         }
@@ -149,8 +322,35 @@ impl DatagramTransport {
             Self::Udp(socket) => socket.try_send(datagram).map_err(|err| {
                 QlinkError::Protocol(format!("failed to send native UDP close datagram: {err}"))
             }),
+            Self::Listener {
+                socket,
+                remote_addr,
+                ..
+            } => socket.try_send_to(datagram, *remote_addr).map_err(|err| {
+                QlinkError::Protocol(format!("failed to send native UDP close datagram: {err}"))
+            }),
             #[cfg(feature = "turn-relay")]
             Self::Turn(socket) => socket.try_send(datagram),
+        }
+    }
+
+    fn clear_listener_session(&self) {
+        let Self::Listener {
+            remote_addr,
+            generation,
+            sessions,
+            ..
+        } = self
+        else {
+            return;
+        };
+        if let Ok(mut sessions) = sessions.try_lock() {
+            if sessions
+                .get(remote_addr)
+                .is_some_and(|entry| entry.generation == *generation)
+            {
+                sessions.remove(remote_addr);
+            }
         }
     }
 }
@@ -329,6 +529,24 @@ impl NativeUdpSession {
         }
     }
 
+    fn from_listener(
+        socket: Arc<UdpSocket>,
+        remote_addr: SocketAddr,
+        generation: u64,
+        listener_rx: mpsc::Receiver<Vec<u8>>,
+        listener_sessions: Arc<Mutex<HashMap<SocketAddr, ListenerSession>>>,
+        listener_shutdown: Arc<Notify>,
+    ) -> Self {
+        Self::from_transport(DatagramTransport::Listener {
+            socket,
+            remote_addr,
+            rx: Arc::new(Mutex::new(listener_rx)),
+            generation,
+            sessions: listener_sessions,
+            shutdown: listener_shutdown,
+        })
+    }
+
     async fn send_datagram(&self, kind: DatagramKind, payload: Vec<u8>) -> Result<()> {
         let datagram = encode_datagram(kind, &payload)?;
         self.transport.send(&datagram).await?;
@@ -358,6 +576,7 @@ impl NativeUdpSession {
             return;
         };
         let _ = self.transport.try_send(&datagram);
+        self.transport.clear_listener_session();
     }
 
     async fn send_message(&self, kind: MessageKind, payload: Vec<u8>) -> Result<()> {
@@ -876,6 +1095,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_udp_listener_accepts_successive_sessions() {
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let socket = UdpSocket::bind(bind).await.unwrap();
+        let server_addr = socket.local_addr().unwrap();
+        let listener = NativeUdpListener::new(socket);
+
+        for index in 0..2_u8 {
+            let client = NativeUdpSession::connect(bind, server_addr).await.unwrap();
+            client
+                .send_authenticated_message(vec![index])
+                .await
+                .unwrap();
+            let (server, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                server.receive_authenticated_message(1).await.unwrap(),
+                vec![index]
+            );
+            server.send_frame(vec![index + 1]).await.unwrap();
+            assert_eq!(client.receive_frame().await.unwrap(), vec![index + 1]);
+            server.close(b"rotate");
+        }
+    }
+
+    #[tokio::test]
     async fn native_udp_session_rejects_oversized_authenticated_messages() {
         let (left, right) = NativeUdpSession::loopback_pair().await.unwrap();
         let left = CarrierSession::from(left);
@@ -1214,6 +1457,9 @@ mod tests {
         match &left.transport {
             DatagramTransport::Udp(socket) => {
                 socket.send(&oversized).await.unwrap();
+            }
+            DatagramTransport::Listener { .. } => {
+                panic!("loopback pair should use native UDP sockets")
             }
             #[cfg(feature = "turn-relay")]
             DatagramTransport::Turn(_) => panic!("loopback pair should use native UDP sockets"),

@@ -228,10 +228,17 @@ Windows hardware or VMs.
 
 ## What uninstall cleans up
 
-- Stops and deletes the service. During graceful service shutdown, dynamic WFP
-  kill-switch filters and the Wintun adapter/session are expected to be torn
-  down; protected routes are expected to be removed by the service's disconnect
-  path. Verify these on every beta host.
+- Stops the service, which closes the dynamic WFP session containing tunnel
+  permit filters and tears down the Wintun adapter/session. The MSI then runs
+  `quantumlink-service.exe wfp-cleanup` as LocalSystem after `StopServices` and
+  before file removal. Cleanup deletes only filters linked to QuantumLink's
+  stable provider and sublayer keys, then deletes that sublayer and provider.
+  A cleanup failure fails the uninstall instead of silently leaving policy.
+- Major upgrades intentionally skip the uninstall cleanup action. The incoming
+  auto-start service reuses the stable provider/sublayer keys and atomically
+  reconciles stale QuantumLink-owned filters; this preserves strict block
+  coverage across the upgrade boundary. Upgrade validation must confirm the
+  provider remains linked to `QuantumLinkService` and is not disabled by BFE.
 - Schedules recursive removal of `C:\ProgramData\QuantumLink\` with WiX
   `util:RemoveFolderEx`, followed by normal `RemoveFolder` cleanup. State
   removal must be verified after uninstall. If config, logs, encrypted peer
@@ -239,6 +246,25 @@ Windows hardware or VMs.
   rerun.
 - The Wintun *driver* is reference-counted by Windows and removed when
   the last Wintun-using product uninstalls - no action needed.
+
+## Strict WFP lifecycle inspection
+
+Run these commands from an elevated PowerShell session on a Windows validation
+host. `wfp-probe` is read-only. `wfp-cleanup` is destructive and is intended for
+uninstall recovery or explicit operator cleanup while the service is stopped.
+
+```powershell
+& "C:\Program Files\QuantumLink\quantumlink-service.exe" wfp-probe
+Stop-Service QuantumLinkService
+& "C:\Program Files\QuantumLink\quantumlink-service.exe" wfp-cleanup
+```
+
+Strict mode owns a persistent `FWPM_PROVIDER0` whose service name is
+`QuantumLinkService`, a provider-linked persistent sublayer, separate
+`FWPM_FILTER_FLAG_BOOTTIME` block filters, and separate
+`FWPM_FILTER_FLAG_PERSISTENT` runtime block filters. Those flags are never
+combined on one filter. Tunnel permits have neither flag and exist only in the
+current service process's dynamic WFP session for the active Wintun LUID.
 
 ## Phase 8 security validation
 

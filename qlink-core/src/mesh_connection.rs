@@ -22,7 +22,7 @@ use crate::{
     pqc_session_wire::run_pqc_session_initiator,
     relay::RelayCarrierSession,
     rendezvous::RendezvousClient,
-    session_crypto::PqcSessionContext,
+    session_crypto::{derive_packet_session_binding, PqcSessionContext, PqcSessionRole},
     traversal::{candidate_socket_addr, HOST_PRIORITY},
 };
 use std::{
@@ -316,6 +316,7 @@ pub struct DirectLink {
     path_kind: PathKind,
     session: CarrierSession,
     frame_protector: PqcFrameProtector,
+    packet_session_binding: [u8; 32],
 }
 
 /// Relay-tunneled link. Same protected-frame data plane as [`DirectLink`] but
@@ -325,6 +326,7 @@ pub struct RelayLink {
     pub remote_peer_id: String,
     session: CarrierSession,
     frame_protector: PqcFrameProtector,
+    packet_session_binding: [u8; 32],
 }
 
 pub struct MeshLink {
@@ -368,6 +370,13 @@ impl MeshLink {
         match &self.inner {
             MeshLinkInner::Direct(link) => link.path_kind,
             MeshLinkInner::Relay(_) => PathKind::Relay,
+        }
+    }
+
+    pub(crate) fn packet_session_binding(&self) -> [u8; 32] {
+        match &self.inner {
+            MeshLinkInner::Direct(link) => link.packet_session_binding,
+            MeshLinkInner::Relay(link) => link.packet_session_binding,
         }
     }
 
@@ -841,11 +850,20 @@ impl MeshConnector {
                     registry_decision,
                     peer_record_source,
                 };
+                let packet_session_binding = derive_packet_session_binding(
+                    &session_keys.suite,
+                    &session_keys.handshake_hash,
+                    &self.config.mesh_id,
+                    &self.config.local_peer_id,
+                    remote_peer_id,
+                    PqcSessionRole::Initiator,
+                );
                 let link = MeshLink::direct(DirectLink {
                     remote_addr: address,
                     path_kind,
                     session,
                     frame_protector: PqcFrameProtector::new(session_keys),
+                    packet_session_binding,
                 });
                 Ok((link, outcome))
             }
@@ -1195,11 +1213,20 @@ impl MeshConnector {
                     registry_decision,
                     peer_record_source,
                 };
+                let packet_session_binding = derive_packet_session_binding(
+                    &session_keys.suite,
+                    &session_keys.handshake_hash,
+                    &self.config.mesh_id,
+                    &self.config.local_peer_id,
+                    remote_peer_id,
+                    PqcSessionRole::Initiator,
+                );
                 let link = MeshLink::direct(DirectLink {
                     remote_addr: address,
                     path_kind,
                     session,
                     frame_protector: PqcFrameProtector::new(session_keys),
+                    packet_session_binding,
                 });
                 Ok((link, outcome))
             }
@@ -1356,10 +1383,19 @@ impl MeshConnector {
             registry_decision,
             peer_record_source,
         };
+        let packet_session_binding = derive_packet_session_binding(
+            &session_keys.suite,
+            &session_keys.handshake_hash,
+            &self.config.mesh_id,
+            &self.config.local_peer_id,
+            remote_peer_id,
+            PqcSessionRole::Initiator,
+        );
         let link = MeshLink::relay(RelayLink {
             remote_peer_id: remote_peer_id.to_string(),
             session,
             frame_protector: PqcFrameProtector::new(session_keys),
+            packet_session_binding,
         });
         Ok((link, outcome))
     }

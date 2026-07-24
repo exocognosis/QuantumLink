@@ -69,7 +69,39 @@ Each control evidence file uses `schemaVersion: 1`,
 `evidenceKind: windowsRendezvousRelayControlEvidence`, and repeats the matching
 control name, deployment id, release commit/ref, endpoint-set digest,
 generation time, passing status, and redaction flag. Its `assertions` array
-must contain passing control-specific results:
+must contain control-specific results. Every passing assertion must set
+`measured: true` and reference a distinct source file with `source` and
+`sourceSha256`. `source` must be a safe repo-relative JSON path, and the digest
+must match the file's bytes. The verifier resolves and validates source files
+independently; a digest string without a source file is not evidence.
+
+Passing source files use this schema:
+
+```json
+{
+  "schemaVersion": 1,
+  "evidenceKind": "windowsRendezvousRelayAssertionSourceEvidence",
+  "control": "tls",
+  "assertion": "certificate_valid",
+  "status": "pass",
+  "measured": true,
+  "generatedAt": "2026-07-09T00:00:00Z",
+  "deploymentId": "<immutable-control-plane-deployment-id>",
+  "releaseCommitSha": "<40-or-64-character-release-commit>",
+  "releaseRef": "refs/tags/v1.0.0",
+  "endpointSetSha256": "<digest-of-the-declared-endpoint-set>",
+  "redacted": true
+}
+```
+
+Each source proof must bind the matching control and assertion plus the exact
+deployment, release, and endpoint set. It must be a measured pass, redacted,
+no more than seven days old or five minutes in the future, contained in the
+repository, and at most 1 MiB. Reusing one source file for multiple assertions
+is rejected. Blocked and failed control proofs remain structurally valid with
+`measured: false` assertions and do not claim source files.
+
+The required control-specific assertions are:
 
 - TLS: enabled, valid certificate, and tested rotation.
 - Authentication: authorized acceptance and unauthorized rejection.
@@ -89,6 +121,22 @@ entitlement tokens, production endpoint secrets, raw packet payloads, raw game
 payloads, packet captures, or raw support-bundle archives. Abuse logs must be
 redacted, and `rawPacketPayloadsCommitted` plus `rawGamePayloadsCommitted` must
 both be false.
+
+## Evidence Generation
+
+Start from the intentionally blocked deployment contract:
+
+- `windows/deployment/rendezvous-relay-production.template.json`
+
+After deployment, provide explicit measured control assertions and run
+`windows/scripts/generate-rendezvous-relay-production-evidence.rb`. The
+generator writes the manifest, distinct control proofs, digest manifest, and
+SHA-256 checksum list, including each source proof used by a passing assertion.
+It computes source digests from the referenced files and emits `pass` only when
+the deployment and every prerequisite are passing and each required assertion
+has schema-valid, release-bound source evidence. User-supplied digest strings
+are never sufficient. Missing measurements remain `blocked`; measured failures
+remain `fail`.
 
 ## Verification
 

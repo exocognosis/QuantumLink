@@ -150,6 +150,72 @@ def write_report(path, report)
   path.write("#{JSON.pretty_generate(report)}\n", encoding: "UTF-8")
 end
 
+def validate_assertion_source(repo_root, item, control, assertion, deployment_id, commit_sha, release_ref, endpoint_digest, failures, now, seen_sources)
+  label = "rendezvous/relay control #{control} assertion #{assertion}"
+  failures << "#{label} must be explicitly measured" unless item["measured"] == true
+
+  claimed_digest = item["sourceSha256"]
+  unless claimed_digest.is_a?(String) && claimed_digest.match?(/\A[0-9a-f]{64}\z/)
+    failures << "#{label} sourceSha256 must be a 64-character lowercase hexadecimal digest"
+  end
+
+  source_arg = item["source"]
+  source_path = repo_path(repo_root, source_arg)
+  if source_path.nil?
+    failures << "#{label} source must be a repo-relative path"
+    return nil
+  end
+  unless source_path.file?
+    failures << "#{label} source evidence file is missing: #{source_arg}"
+    return nil
+  end
+  unless contained_real_file?(repo_root, source_path)
+    failures << "#{label} source evidence must resolve inside the repository"
+    return nil
+  end
+  if source_path.size > MAX_EVIDENCE_BYTES
+    failures << "#{label} source evidence exceeds #{MAX_EVIDENCE_BYTES} bytes"
+    return nil
+  end
+
+  stat = source_path.stat
+  identities = [source_path.cleanpath.to_s, source_path.realpath.to_s, [stat.dev, stat.ino]].uniq
+  prior = identities.map { |identity| seen_sources[identity] }.compact.first
+  failures << "#{label} must use a distinct source evidence file; already used by #{prior}" if prior
+  identities.each { |identity| seen_sources[identity] = "#{control}/#{assertion}" }
+
+  source_text = source_path.read(encoding: "UTF-8", invalid: :replace, undef: :replace)
+  actual_digest = Digest::SHA256.file(source_path).hexdigest
+  failures << "#{label} source SHA-256 does not match" unless claimed_digest == actual_digest
+  failures << "forbidden secret marker found in #{label} source evidence" if source_text.match?(FORBIDDEN_MARKERS)
+
+  begin
+    source = JSON.parse(source_text)
+  rescue JSON::ParserError
+    failures << "#{label} source evidence must be valid JSON"
+    return nil
+  end
+  unless source.is_a?(Hash)
+    failures << "#{label} source evidence must be a JSON object"
+    return nil
+  end
+
+  failures << "#{label} source schemaVersion must be 1" unless source["schemaVersion"] == 1
+  failures << "#{label} source evidenceKind is invalid" unless source["evidenceKind"] == "windowsRendezvousRelayAssertionSourceEvidence"
+  failures << "#{label} source control does not match" unless source["control"] == control
+  failures << "#{label} source assertion does not match" unless source["assertion"] == assertion
+  failures << "#{label} source deploymentId does not match" unless source["deploymentId"] == deployment_id
+  failures << "#{label} source releaseCommitSha does not match" unless source["releaseCommitSha"] == commit_sha
+  failures << "#{label} source releaseRef does not match" unless source["releaseRef"] == release_ref
+  failures << "#{label} source endpointSetSha256 does not match" unless source["endpointSetSha256"] == endpoint_digest
+  failures << "#{label} source status must be pass" unless source["status"] == "pass"
+  failures << "#{label} source measured must be true" unless source["measured"] == true
+  failures << "#{label} source must be redacted" unless source["redacted"] == true
+  parse_fresh_timestamp(source["generatedAt"], "#{label} source generatedAt", failures, now)
+
+  { "assertion" => assertion, "source" => source_arg, "sha256" => actual_digest }
+end
+
 require_ready = false
 repo_root = Pathname.new(__dir__).join("../..").expand_path
 expected_sha = nil
@@ -279,6 +345,7 @@ if manifest_path&.file?
   controls_by_name = {}
   evidence_paths = {}
   evidence_digests = {}
+  source_evidence_files = {}
   controls.each do |entry|
     unless entry.is_a?(Hash) && nonempty_string?(entry["control"])
       failures << "rendezvousRelay.controls entries must be objects with a control name"
@@ -303,7 +370,8 @@ if manifest_path&.file?
       next
     end
 
-    validate_status(entry["status"], "rendezvous/relay control #{control} status", failures, blockers)
+    control_status = entry["status"]
+    validate_status(control_status, "rendezvous/relay control #{control} status", failures, blockers)
     failures << "rendezvous/relay control #{control} must be redacted" unless entry["redacted"] == true
     evidence_arg = entry["evidence"]
     evidence = repo_path(repo_root, evidence_arg)
@@ -351,7 +419,7 @@ if manifest_path&.file?
     failures << "rendezvous/relay control #{control} evidence schemaVersion must be 1" unless proof["schemaVersion"] == 1
     failures << "rendezvous/relay control #{control} evidenceKind is invalid" unless proof["evidenceKind"] == "windowsRendezvousRelayControlEvidence"
     failures << "rendezvous/relay control #{control} evidence control does not match" unless proof["control"] == control
-    failures << "rendezvous/relay control #{control} evidence status must be pass" unless proof["status"] == "pass"
+    failures << "rendezvous/relay control #{control} evidence status must match the manifest control status" unless proof["status"] == control_status
     failures << "rendezvous/relay control #{control} evidence must be redacted" unless proof["redacted"] == true
     parse_fresh_timestamp(proof["generatedAt"], "rendezvous/relay control #{control} generatedAt", failures, now)
     failures << "rendezvous/relay control #{control} deploymentId does not match" unless proof["deploymentId"] == deployment_id
@@ -360,20 +428,52 @@ if manifest_path&.file?
     failures << "rendezvous/relay control #{control} endpointSetSha256 does not match" unless proof["endpointSetSha256"] == calculated_endpoint_digest
 
     assertions = proof["assertions"]
-    assertions_by_name = if assertions.is_a?(Array)
-                           assertions.each_with_object({}) do |item, result|
-                             result[item["name"]] = item if item.is_a?(Hash) && nonempty_string?(item["name"])
-                           end
-                         else
-                           {}
-                         end
+    assertions_by_name = {}
+    if assertions.is_a?(Array)
+      assertions.each do |item|
+        unless item.is_a?(Hash) && nonempty_string?(item["name"])
+          failures << "rendezvous/relay control #{control} assertions must be named objects"
+          next
+        end
+        name = item["name"]
+        unless REQUIRED_ASSERTIONS.fetch(control).include?(name)
+          failures << "rendezvous/relay control #{control} has unknown assertion: #{name}"
+          next
+        end
+        if assertions_by_name.key?(name)
+          failures << "rendezvous/relay control #{control} has duplicate assertion: #{name}"
+          next
+        end
+        assertions_by_name[name] = item
+      end
+    end
     failures << "rendezvous/relay control #{control} assertions must be an array" unless assertions.is_a?(Array)
+    source_digests = []
     REQUIRED_ASSERTIONS.fetch(control).each do |assertion|
       item = assertions_by_name[assertion]
-      failures << "rendezvous/relay control #{control} missing passing assertion: #{assertion}" unless item && item["status"] == "pass"
+      if control_status == "pass"
+        unless item && item["status"] == "pass"
+          failures << "rendezvous/relay control #{control} missing passing assertion: #{assertion}"
+          next
+        end
+        source_digest = validate_assertion_source(
+          repo_root, item, control, assertion, deployment_id, commit_sha, release_ref,
+          calculated_endpoint_digest, failures, now, source_evidence_files
+        )
+        source_digests << source_digest if source_digest
+      elsif !item || !%w[blocked fail].include?(item["status"])
+        failures << "rendezvous/relay control #{control} missing blocked or failed assertion: #{assertion}"
+      elsif item["measured"] != false
+        failures << "rendezvous/relay control #{control} blocked or failed assertion #{assertion} must set measured to false"
+      end
     end
 
-    control_digests << { "control" => control, "evidence" => evidence_arg, "sha256" => digest }
+    control_digests << {
+      "control" => control,
+      "evidence" => evidence_arg,
+      "sha256" => digest,
+      "sources" => source_digests
+    }
   end
 end
 

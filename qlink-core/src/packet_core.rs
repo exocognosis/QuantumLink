@@ -39,11 +39,33 @@ pub struct PacketCoreMetrics {
     pub dropped_replay: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PeerSessionDirection {
+    Outbound,
+    Inbound,
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct InstalledPeerSession {
     pub peer_id: String,
+    pub direction: PeerSessionDirection,
+    pub generation: u64,
+    pub transcript_binding: [u8; 32],
     pub expires_at_unix: u64,
-    pub rekey_after_packets: u64,
+    pub rekey_after_bytes: u64,
+}
+
+impl std::fmt::Debug for InstalledPeerSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InstalledPeerSession")
+            .field("peer_id", &self.peer_id)
+            .field("direction", &self.direction)
+            .field("generation", &self.generation)
+            .field("transcript_binding", &"[redacted]")
+            .field("expires_at_unix", &self.expires_at_unix)
+            .field("rekey_after_bytes", &self.rekey_after_bytes)
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -51,8 +73,10 @@ pub struct PacketTunnelCore {
     policy: RoutePolicy,
     frame_codec: PacketFrameCodec,
     require_peer_session: bool,
-    peer_session: Option<InstalledPeerSession>,
-    peer_session_packets: u64,
+    outbound_peer_session: Option<InstalledPeerSession>,
+    inbound_peer_session: Option<InstalledPeerSession>,
+    outbound_peer_session_bytes: u64,
+    inbound_peer_session_bytes: u64,
     replay_window: ReplayWindow,
     next_packet_number: u64,
     transport_outbox: VecDeque<Vec<u8>>,
@@ -131,8 +155,10 @@ impl PacketTunnelCore {
             policy,
             frame_codec,
             require_peer_session: config.require_peer_session,
-            peer_session: None,
-            peer_session_packets: 0,
+            outbound_peer_session: None,
+            inbound_peer_session: None,
+            outbound_peer_session_bytes: 0,
+            inbound_peer_session_bytes: 0,
             replay_window: ReplayWindow::new(),
             next_packet_number: 1,
             transport_outbox: VecDeque::new(),
@@ -146,17 +172,83 @@ impl PacketTunnelCore {
         Self::new(config)
     }
 
-    pub fn install_peer_session(&mut self, session: InstalledPeerSession) {
-        if self.peer_session.as_ref() == Some(&session) {
-            return;
+    pub fn install_peer_session(&mut self, session: InstalledPeerSession) -> bool {
+        let (slot, bytes) = match session.direction {
+            PeerSessionDirection::Outbound => (
+                &mut self.outbound_peer_session,
+                &mut self.outbound_peer_session_bytes,
+            ),
+            PeerSessionDirection::Inbound => (
+                &mut self.inbound_peer_session,
+                &mut self.inbound_peer_session_bytes,
+            ),
+        };
+        if let Some(current) = slot.as_ref() {
+            if current == &session {
+                return true;
+            }
+            if current.peer_id == session.peer_id && current.generation >= session.generation {
+                return false;
+            }
         }
-        self.peer_session = Some(session);
-        self.peer_session_packets = 0;
+        let reset_inbound_replay = session.direction == PeerSessionDirection::Inbound;
+        *slot = Some(session);
+        *bytes = 0;
+        if reset_inbound_replay {
+            self.replay_window = ReplayWindow::new();
+        }
+        true
     }
 
-    pub fn clear_peer_session(&mut self) {
-        self.peer_session = None;
-        self.peer_session_packets = 0;
+    pub fn clear_peer_sessions(&mut self) {
+        self.outbound_peer_session = None;
+        self.inbound_peer_session = None;
+        self.outbound_peer_session_bytes = 0;
+        self.inbound_peer_session_bytes = 0;
+        self.replay_window = ReplayWindow::new();
+    }
+
+    pub fn clear_peer_session_direction(&mut self, direction: PeerSessionDirection) {
+        match direction {
+            PeerSessionDirection::Outbound => {
+                self.outbound_peer_session = None;
+                self.outbound_peer_session_bytes = 0;
+            }
+            PeerSessionDirection::Inbound => {
+                self.inbound_peer_session = None;
+                self.inbound_peer_session_bytes = 0;
+                self.replay_window = ReplayWindow::new();
+            }
+        }
+    }
+
+    pub fn clear_peer_session(
+        &mut self,
+        peer_id: &str,
+        direction: PeerSessionDirection,
+        generation: u64,
+    ) -> bool {
+        let (slot, packets) = match direction {
+            PeerSessionDirection::Outbound => (
+                &mut self.outbound_peer_session,
+                &mut self.outbound_peer_session_bytes,
+            ),
+            PeerSessionDirection::Inbound => (
+                &mut self.inbound_peer_session,
+                &mut self.inbound_peer_session_bytes,
+            ),
+        };
+        let matches = slot
+            .as_ref()
+            .is_some_and(|session| session.peer_id == peer_id && session.generation == generation);
+        if matches {
+            *slot = None;
+            *packets = 0;
+            if direction == PeerSessionDirection::Inbound {
+                self.replay_window = ReplayWindow::new();
+            }
+        }
+        matches
     }
 
     pub fn peer_session_required(&self) -> bool {
@@ -164,11 +256,12 @@ impl PacketTunnelCore {
     }
 
     pub fn peer_session_ready(&self) -> bool {
-        self.peer_session_block_reason().is_none()
+        self.peer_session_block_reason(PeerSessionDirection::Outbound)
+            .is_none()
     }
 
     pub fn peer_session_error(&self) -> Option<String> {
-        self.peer_session_block_reason()
+        self.peer_session_block_reason(PeerSessionDirection::Outbound)
     }
 
     pub fn submit_tunnel_packet(
@@ -191,7 +284,10 @@ impl PacketTunnelCore {
         }
 
         if self.require_peer_session {
-            if self.peer_session_block_reason().is_some() {
+            if self
+                .peer_session_block_reason(PeerSessionDirection::Outbound)
+                .is_some()
+            {
                 self.metrics.dropped_peer_session_unavailable += 1;
                 return Ok(PacketDisposition::DroppedPeerSessionUnavailable);
             }
@@ -207,7 +303,9 @@ impl PacketTunnelCore {
         )?;
         self.next_packet_number += 1;
         if self.require_peer_session {
-            self.peer_session_packets += 1;
+            self.outbound_peer_session_bytes = self
+                .outbound_peer_session_bytes
+                .saturating_add(frame.len() as u64);
         }
         self.metrics.transport_frames_out += 1;
         self.transport_outbox.push_back(frame);
@@ -220,7 +318,7 @@ impl PacketTunnelCore {
 
     pub fn accept_transport_frame(&mut self, frame: &[u8]) -> Result<()> {
         if self.require_peer_session {
-            if let Some(reason) = self.peer_session_block_reason() {
+            if let Some(reason) = self.peer_session_block_reason(PeerSessionDirection::Inbound) {
                 self.metrics.dropped_peer_session_unavailable += 1;
                 return Err(QlinkError::Protocol(reason));
             }
@@ -242,6 +340,11 @@ impl PacketTunnelCore {
         }
         self.metrics.transport_frames_in += 1;
         self.metrics.packets_to_tunnel += 1;
+        if self.require_peer_session {
+            self.inbound_peer_session_bytes = self
+                .inbound_peer_session_bytes
+                .saturating_add(frame.len() as u64);
+        }
         self.tunnel_outbox.push_back(TunnelPacket {
             protocol_family,
             bytes: packet,
@@ -257,20 +360,30 @@ impl PacketTunnelCore {
         self.metrics.clone()
     }
 
-    fn peer_session_block_reason(&self) -> Option<String> {
+    fn peer_session_block_reason(&self, direction: PeerSessionDirection) -> Option<String> {
         if !self.require_peer_session {
             return None;
         }
-        let Some(session) = self.peer_session.as_ref() else {
-            return Some("authenticated peer session keys are not installed".to_string());
+        let (session, packets) = match direction {
+            PeerSessionDirection::Outbound => (
+                self.outbound_peer_session.as_ref(),
+                self.outbound_peer_session_bytes,
+            ),
+            PeerSessionDirection::Inbound => (
+                self.inbound_peer_session.as_ref(),
+                self.inbound_peer_session_bytes,
+            ),
+        };
+        let Some(session) = session else {
+            return Some(format!(
+                "authenticated {direction:?} peer session readiness is not installed"
+            ));
         };
         let now = now_unix_seconds();
         if session.expires_at_unix <= now {
             return Some(format!("peer session for {} is expired", session.peer_id));
         }
-        if session.rekey_after_packets > 0
-            && self.peer_session_packets >= session.rekey_after_packets
-        {
+        if session.rekey_after_bytes > 0 && packets >= session.rekey_after_bytes {
             return Some(format!(
                 "peer session for {} requires rekey",
                 session.peer_id
@@ -599,7 +712,7 @@ mod tests {
         assert!(core
             .peer_session_error()
             .unwrap()
-            .contains("peer session keys are not installed"));
+            .contains("Outbound peer session readiness is not installed"));
         assert_eq!(core.metrics().dropped_peer_session_unavailable, 1);
     }
 
@@ -608,8 +721,11 @@ mod tests {
         let mut core = test_core_requiring_peer_session();
         core.install_peer_session(InstalledPeerSession {
             peer_id: "peer-a".to_string(),
+            direction: PeerSessionDirection::Outbound,
+            generation: 1,
+            transcript_binding: [7; 32],
             expires_at_unix: now_unix_seconds() + 60,
-            rekey_after_packets: 1,
+            rekey_after_bytes: 1,
         });
         let packet = test_ipv4_packet([100, 127, 0, 10]);
 
@@ -643,11 +759,64 @@ mod tests {
 
         assert!(error
             .to_string()
-            .contains("peer session keys are not installed"));
+            .contains("Inbound peer session readiness is not installed"));
         assert!(receiver.pop_tunnel_packet().is_none());
         assert_eq!(receiver.metrics().transport_frames_in, 0);
         assert_eq!(receiver.metrics().packets_to_tunnel, 0);
         assert_eq!(receiver.metrics().dropped_peer_session_unavailable, 1);
+    }
+
+    #[test]
+    fn inbound_lease_rotation_does_not_reset_outbound_rekey_budget() {
+        let mut core = test_core_requiring_peer_session();
+        let now = now_unix_seconds();
+        assert!(core.install_peer_session(InstalledPeerSession {
+            peer_id: "peer-a".to_string(),
+            direction: PeerSessionDirection::Outbound,
+            generation: 1,
+            transcript_binding: [1; 32],
+            expires_at_unix: now + 60,
+            rekey_after_bytes: 1,
+        }));
+        let packet = test_ipv4_packet([100, 127, 0, 10]);
+        assert_eq!(
+            core.submit_tunnel_packet(2, &packet).unwrap(),
+            PacketDisposition::QueuedForTransport
+        );
+
+        assert!(core.install_peer_session(InstalledPeerSession {
+            peer_id: "peer-a".to_string(),
+            direction: PeerSessionDirection::Inbound,
+            generation: 2,
+            transcript_binding: [2; 32],
+            expires_at_unix: now + 60,
+            rekey_after_bytes: 10,
+        }));
+        assert_eq!(
+            core.submit_tunnel_packet(2, &packet).unwrap(),
+            PacketDisposition::DroppedPeerSessionUnavailable
+        );
+    }
+
+    #[test]
+    fn stale_directional_clear_cannot_remove_newer_lease() {
+        let mut core = test_core_requiring_peer_session();
+        let session = InstalledPeerSession {
+            peer_id: "peer-a".to_string(),
+            direction: PeerSessionDirection::Outbound,
+            generation: 2,
+            transcript_binding: [3; 32],
+            expires_at_unix: now_unix_seconds() + 60,
+            rekey_after_bytes: 10,
+        };
+        assert!(core.install_peer_session(session));
+        assert!(!core.clear_peer_session("peer-a", PeerSessionDirection::Outbound, 1));
+
+        let packet = test_ipv4_packet([100, 127, 0, 10]);
+        assert_eq!(
+            core.submit_tunnel_packet(2, &packet).unwrap(),
+            PacketDisposition::QueuedForTransport
+        );
     }
 
     #[test]
@@ -664,6 +833,29 @@ mod tests {
         assert!(error.to_string().contains("replayed transport frame"));
         assert_eq!(receiver.metrics().transport_frames_in, 1);
         assert_eq!(receiver.metrics().dropped_replay, 1);
+    }
+
+    #[test]
+    fn authenticated_inbound_rotation_resets_replay_scope() {
+        let packet = test_ipv4_packet([100, 127, 0, 10]);
+        let mut sender = test_core(SUITE_FIPS203);
+        sender.submit_tunnel_packet(2, &packet).unwrap();
+        let frame = sender.pop_transport_frame().unwrap();
+        let mut receiver = test_core_requiring_peer_session();
+        let now = now_unix_seconds();
+
+        for generation in [1, 2] {
+            assert!(receiver.install_peer_session(InstalledPeerSession {
+                peer_id: "peer-a".to_string(),
+                direction: PeerSessionDirection::Inbound,
+                generation,
+                transcript_binding: [generation as u8; 32],
+                expires_at_unix: now + 60,
+                rekey_after_bytes: 1_024,
+            }));
+            receiver.accept_transport_frame(&frame).unwrap();
+            assert!(receiver.pop_tunnel_packet().is_some());
+        }
     }
 
     fn test_core(suite: &str) -> PacketTunnelCore {

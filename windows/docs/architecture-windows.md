@@ -21,7 +21,7 @@ UI (asInvoker)
                     ├── MeshTransportHandle (qlink-core QUIC/relay/rendezvous)
                     ├── TunnelAdapter (Wintun session)
                     ├── win::routes (IP Helper)     IP/routes/DNS
-                    ├── win::wfp (KillSwitchGuard)  dynamic/persistent filter plan
+                    ├── win::wfp (KillSwitchGuard)  boot/persistent/dynamic lifecycle
                     └── KillSwitchWatchdog          strict-mode deadline
 ```
 
@@ -33,12 +33,14 @@ Two service threads per session, mirroring the macOS pump contract:
   `handle_packets` → core encode → transport `send_frame`. The pump
   refuses to submit packets to the core while the transport is not
   ready (kill-switch gate) and counts every drop. Public, identity, and
-  rendezvous-backed Windows mesh configs set `requirePeerSession=true`;
-  until Windows has a real authenticated packet-session install source,
-  that gate remains unavailable and protected packets fail closed.
-  Explicit local loopback/development smoke configs do not enable the
-  production packet-session gate and do not use a static development
-  packet key.
+  rendezvous-backed Windows mesh configs set `requirePeerSession=true`.
+  Authenticated PQC mesh handshakes publish direction- and
+  generation-bound readiness leases; the service installs those leases
+  into the packet core before protected packets can leave. Session
+  lifetime and byte rotation limits come from `CryptoPolicy`. Traffic
+  keys remain owned by `PqcFrameProtector` and are never copied into the
+  packet core. Explicit local loopback/development smoke configs do not
+  enable this production gate and do not use a static development key.
 - **Inbound** (`qlink-pump-in`): transport `try_receive_frame_from_any`
   → pump `accept_transport_frame` (per-peer attribution) → core decode
   → Wintun send. If the authenticated peer session is unavailable or
@@ -84,14 +86,17 @@ accounts, hardware IDs, or installer state.
 - `PowerEvent` → `NetworkEvent::PostWake` → transport re-probe.
 - IP Helper notifications → `PathChanged`/`ReachabilityChanged` →
   transport re-probe/backoff reset.
-- Service crash: dynamic WFP session and Wintun handles are reclaimed
-  by the OS; protected prefixes lose their route (dark, not leaked).
-  `failClosed` uses dynamic-session filters so crash cleanup is owned by
-  BFE. `strict` has a persistent, boot-time fail-closed plan with
-  block+permit tunnel-interface coverage at ALE auth connect v4 and
-  outbound IP packet v4, but the current runtime refuses strict startup
-  rather than silently downgrading to dynamic filters until persistent
-  install/uninstall is implemented.
+- Service crash: dynamic tunnel-interface permits and Wintun handles are
+  reclaimed, while strict-mode product-owned persistent blocks remain.
+  `failClosed` uses dynamic-session filters. `strict` installs separate
+  boot-time and persistent blocks at ALE auth connect v4 and outbound IP
+  packet v4, then adds dynamic permits bound to the active Wintun LUID.
+  Reconciliation is transactional and only mutates QuantumLink-owned
+  provider/sublayer objects. MSI uninstall runs elevated cleanup after
+  service stop; major upgrades preserve the blocks for incoming service
+  startup reconciliation. Idle service startup reconciles persisted strict
+  routes from the validated configuration before reporting Running; changing
+  back to `failClosed` removes compatible product-owned persistent state.
 
 Named-pipe access is configured by `windowsSecurity.pipeSddl` in
 `config.json`; the default SDDL is

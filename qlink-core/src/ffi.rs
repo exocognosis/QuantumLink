@@ -5,7 +5,9 @@ use crate::{
     mesh_transport::{
         MeshTransportConfig, MeshTransportHandle, MeshTransportState, PeerTrustStatusRaw,
     },
-    packet_core::{InstalledPeerSession, PacketDisposition, PacketTunnelCore},
+    packet_core::{
+        InstalledPeerSession, PacketDisposition, PacketTunnelCore, PeerSessionDirection,
+    },
     tracing_bridge,
 };
 use std::{
@@ -265,7 +267,7 @@ pub unsafe extern "C" fn qlink_tunnel_core_install_peer_session(
     peer_id: *const u8,
     peer_id_len: usize,
     expires_at_unix: u64,
-    rekey_after_packets: u64,
+    rekey_after_bytes: u64,
 ) -> bool {
     let Some(handle) = handle.as_ref() else {
         return false;
@@ -279,8 +281,11 @@ pub unsafe extern "C" fn qlink_tunnel_core_install_peer_session(
 
     core.install_peer_session(InstalledPeerSession {
         peer_id: peer_id.to_string(),
+        direction: PeerSessionDirection::Outbound,
+        generation: 1,
+        transcript_binding: [0; 32],
         expires_at_unix,
-        rekey_after_packets,
+        rekey_after_bytes,
     });
     true
 }
@@ -296,7 +301,7 @@ pub unsafe extern "C" fn qlink_tunnel_core_clear_peer_session(
         return false;
     };
 
-    core.clear_peer_session();
+    core.clear_peer_sessions();
     true
 }
 

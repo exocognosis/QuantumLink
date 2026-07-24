@@ -11,6 +11,8 @@
 //!                `qlinkctl quic-loopback`); exits non-zero on failure.
 //! - `security-probe` bounded Windows runtime proof hooks for Wintun,
 //!                DPAPI, WFP, and network monitor lifecycle safety.
+//! - `wfp-probe` read-only inspection of QuantumLink-owned WFP objects.
+//! - `wfp-cleanup` elevated removal of QuantumLink-owned WFP objects.
 
 use clap::{Parser, Subcommand};
 use std::sync::Arc;
@@ -41,6 +43,12 @@ enum Commands {
     /// Run bounded Windows-native security proof hooks and print JSON.
     #[cfg(windows)]
     SecurityProbe,
+    /// Inspect QuantumLink-owned WFP provider, sublayer, and filter state.
+    #[cfg(windows)]
+    WfpProbe,
+    /// Remove only QuantumLink-owned WFP filters, sublayer, and provider.
+    #[cfg(windows)]
+    WfpCleanup,
 }
 
 fn init_tracing() {
@@ -143,6 +151,41 @@ fn main() -> std::process::ExitCode {
                 std::process::ExitCode::SUCCESS
             } else {
                 std::process::ExitCode::FAILURE
+            }
+        }
+        #[cfg(windows)]
+        Commands::WfpProbe => {
+            init_tracing();
+            match quantumlink_service::win::wfp::probe_owned_filter_state() {
+                Ok(report) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&report).unwrap_or_default()
+                    );
+                    if report.passed {
+                        std::process::ExitCode::SUCCESS
+                    } else {
+                        std::process::ExitCode::FAILURE
+                    }
+                }
+                Err(error) => {
+                    eprintln!("WFP probe failed: {error}");
+                    std::process::ExitCode::FAILURE
+                }
+            }
+        }
+        #[cfg(windows)]
+        Commands::WfpCleanup => {
+            init_tracing();
+            match quantumlink_service::win::wfp::cleanup_owned_persistent_filters() {
+                Ok(()) => {
+                    println!("ok");
+                    std::process::ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    eprintln!("WFP cleanup failed: {error}");
+                    std::process::ExitCode::FAILURE
+                }
             }
         }
     }
