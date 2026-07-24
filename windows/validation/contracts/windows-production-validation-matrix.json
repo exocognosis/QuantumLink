@@ -19,17 +19,17 @@
     {
       "id": "self_hosted_runners",
       "status": "blocked",
-      "reason": "GitHub reported zero self-hosted runners on 2026-07-09."
+      "reason": "GitHub reported zero online self-hosted Windows validation harness runners during the 2026-07-24 production prerequisite audit."
     },
     {
       "id": "authenticode_inputs",
       "status": "blocked",
-      "reason": "WINDOWS_SIGNING_CERT_PFX_BASE64, WINDOWS_SIGNING_CERT_PASSWORD, and WINDOWS_SIGNING_TIMESTAMP_URL were not configured on 2026-07-09."
+      "reason": "WINDOWS_RUNNER_INVENTORY_TOKEN, WINDOWS_SIGNING_CERT_PFX_BASE64, WINDOWS_SIGNING_CERT_PASSWORD, and WINDOWS_SIGNING_TIMESTAMP_URL were not configured during the 2026-07-24 production prerequisite audit."
     },
     {
       "id": "control_plane_dns",
       "status": "blocked",
-      "reason": "The intended rendezvous and relay hosts did not resolve on 2026-07-09."
+      "reason": "The intended rendezvous and relay hosts did not resolve during the 2026-07-24 production prerequisite audit."
     }
   ],
   "lanes": [

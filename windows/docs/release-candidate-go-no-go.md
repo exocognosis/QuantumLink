@@ -1,7 +1,7 @@
 # Windows Release Candidate Go/No-Go
 
-Date: 2026-07-09
-Branch: `codex/windows-production-finalization`
+Date: 2026-07-24
+Branch: `codex/windows-production-evidence-batch`
 Target: Windows x64, IPv4 overlay, private/public mesh
 Decision: **NO-GO**
 
@@ -30,9 +30,12 @@ candidate while any blocker below remains open.
   Windows/interop lanes.
 - Public mesh configuration enforces verified Dytallix identity, registry/RPC
   pinning, zero stale-proof grace, and stable rejection categories.
-- Rendezvous/relay evidence is fresh, control-specific, digest-bound to the
-  release commit/ref, deployment, and endpoint set, and shipped in the
-  checksummed release evidence set.
+- Rendezvous/relay evidence contracts require fresh, control-specific,
+  digest-bound proof for the release commit/ref, deployment, and endpoint set
+  before production publication. The current repository does not yet include
+  passing production endpoint evidence.
+- Production artifact publication is gated on a successful Windows Production
+  Validation Matrix run id bound to the exact release commit.
 - Windows validation orchestration emits bounded, redacted component reports
   and fails closed for missing, skipped, malformed, or unreadable evidence.
 - Support export uses a closed DTO allowlist, bounded fallback, stable failure
@@ -47,9 +50,10 @@ candidate while any blocker below remains open.
 - Production rendezvous/relay services and their measured control-specific
   proof files are not deployed. The blocked template cannot satisfy the
   production release verifier.
-- The repository currently lacks the required signed artifact inputs and
-  labeled self-hosted Windows/interop runners, so the production matrix must
-  remain blocked rather than manufacture passing evidence.
+- The repository currently lacks the required signed artifact inputs, explicit
+  timestamp-signing configuration, labeled self-hosted Windows/interop runners,
+  and live control-plane DNS, so the production matrix must remain blocked
+  rather than manufacture passing evidence.
 
 ## Required External Evidence
 

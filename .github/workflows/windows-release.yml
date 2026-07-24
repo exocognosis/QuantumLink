@@ -7,9 +7,13 @@ on:
   workflow_dispatch:
     inputs:
       production_release:
-        description: "Requires signing, timestamping, install validation, SBOM, manifest, release evidence, and rendezvous/relay production evidence before artifact upload."
+        description: "Requires signing, explicit timestamping, install validation, SBOM, manifest, release evidence, rendezvous/relay evidence, and production matrix evidence before artifact publication."
         type: boolean
         default: false
+      production_validation_run_id:
+        description: "Successful Windows Production Validation Matrix run id for this exact release commit. Required before production artifact publication; tag releases may use WINDOWS_PRODUCTION_VALIDATION_RUN_ID repo variable."
+        type: string
+        default: ""
       run_install_validation:
         description: "Installs/uninstalls the generated MSI on the GitHub Windows runner and uploads JSON evidence."
         type: boolean
@@ -59,6 +63,7 @@ on:
         default: "windows/validation/rendezvous-relay-production-evidence.json"
 
 permissions:
+  actions: read
   contents: write
 
 jobs:
@@ -220,18 +225,25 @@ jobs:
         env:
           WINDOWS_SIGNING_CERT_PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_CERT_PFX_BASE64 }}
           WINDOWS_SIGNING_CERT_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERT_PASSWORD }}
+          WINDOWS_SIGNING_TIMESTAMP_URL: ${{ secrets.WINDOWS_SIGNING_TIMESTAMP_URL }}
         run: |
           $ErrorActionPreference = "Stop"
 
           $hasCert = -not [string]::IsNullOrWhiteSpace($env:WINDOWS_SIGNING_CERT_PFX_BASE64)
           $hasPassword = -not [string]::IsNullOrWhiteSpace($env:WINDOWS_SIGNING_CERT_PASSWORD)
+          $hasTimestamp = -not [string]::IsNullOrWhiteSpace($env:WINDOWS_SIGNING_TIMESTAMP_URL)
 
           if ($hasCert -xor $hasPassword) {
             Write-Error "Partial Authenticode signing configuration. Configure both WINDOWS_SIGNING_CERT_PFX_BASE64 and WINDOWS_SIGNING_CERT_PASSWORD, or unset both to skip signing."
             exit 1
           }
 
-          $available = ($hasCert -and $hasPassword).ToString().ToLowerInvariant()
+          if (($hasCert -or $hasPassword) -and -not $hasTimestamp) {
+            Write-Error "Authenticode signing configuration is missing WINDOWS_SIGNING_TIMESTAMP_URL. Production signing must use an explicit timestamp endpoint."
+            exit 1
+          }
+
+          $available = ($hasCert -and $hasPassword -and $hasTimestamp).ToString().ToLowerInvariant()
           "available=$available" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
           Write-Host "Authenticode signing available: $available"
 
@@ -239,7 +251,7 @@ jobs:
         if: (startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.production_release)) && steps.signing.outputs.available != 'true'
         shell: pwsh
         run: |
-          Write-Error "Windows production releases require Authenticode signing secrets. Configure both WINDOWS_SIGNING_CERT_PFX_BASE64 and WINDOWS_SIGNING_CERT_PASSWORD before publishing a tag or setting production_release=true."
+          Write-Error "Windows production releases require Authenticode signing secrets and an explicit timestamp URL. Configure WINDOWS_SIGNING_CERT_PFX_BASE64, WINDOWS_SIGNING_CERT_PASSWORD, and WINDOWS_SIGNING_TIMESTAMP_URL before publishing a tag or setting production_release=true."
           exit 1
 
       - name: Require install validation for production releases
@@ -282,7 +294,8 @@ jobs:
 
             $timestampUrl = $env:WINDOWS_SIGNING_TIMESTAMP_URL
             if ([string]::IsNullOrWhiteSpace($timestampUrl)) {
-              $timestampUrl = "http://timestamp.digicert.com"
+              Write-Error "WINDOWS_SIGNING_TIMESTAMP_URL is required when Authenticode signing is enabled."
+              exit 1
             }
 
             & $signTool.FullName sign `
@@ -774,6 +787,55 @@ jobs:
 
           & .\windows\scripts\verify-windows-release.ps1 @arguments
 
+      - name: Require production validation matrix before publication
+        if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.production_release)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRODUCTION_VALIDATION_RUN_ID: ${{ inputs.production_validation_run_id || vars.WINDOWS_PRODUCTION_VALIDATION_RUN_ID }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if ([string]::IsNullOrWhiteSpace($env:PRODUCTION_VALIDATION_RUN_ID)) {
+            Write-Error "Windows production artifact publication requires a successful Windows Production Validation Matrix run id bound to this exact release commit. Set production_validation_run_id for manual dispatch or WINDOWS_PRODUCTION_VALIDATION_RUN_ID for tag release publication."
+            exit 1
+          }
+          if ($env:PRODUCTION_VALIDATION_RUN_ID -notmatch '^[0-9]+$') {
+            Write-Error "Production validation run id must be numeric."
+            exit 1
+          }
+
+          $run = gh api "repos/$env:GITHUB_REPOSITORY/actions/runs/$env:PRODUCTION_VALIDATION_RUN_ID" | ConvertFrom-Json
+          if ([string]$run.name -ne "Windows Production Validation Matrix") {
+            Write-Error "Production validation run must be from the Windows Production Validation Matrix workflow."
+            exit 1
+          }
+          if ([string]$run.status -ne "completed" -or [string]$run.conclusion -ne "success") {
+            Write-Error "Production validation matrix run is not completed successfully."
+            exit 1
+          }
+          if ([string]$run.head_sha -ne $env:GITHUB_SHA) {
+            Write-Error "Production validation matrix run head SHA does not match this release commit."
+            exit 1
+          }
+
+          $report = [ordered]@{
+            schemaVersion = 1
+            evidenceKind = "windowsProductionValidationMatrixPublicationGate"
+            status = "pass"
+            generatedAt = (Get-Date).ToUniversalTime().ToString("o")
+            runId = $env:PRODUCTION_VALIDATION_RUN_ID
+            runUrl = [string]$run.html_url
+            workflowName = [string]$run.name
+            release = [ordered]@{
+              commitSha = $env:GITHUB_SHA
+              ref = $env:GITHUB_REF
+            }
+          }
+          $reportPath = "windows\build\release\windows-production-validation-publication-gate.json"
+          New-Item -ItemType Directory -Path (Split-Path -Parent $reportPath) -Force | Out-Null
+          $report | ConvertTo-Json -Depth 6 | Set-Content -Path $reportPath -Encoding UTF8
+
       - name: Upload release artifacts
         uses: actions/upload-artifact@v7
         with:
@@ -785,6 +847,7 @@ jobs:
             windows/build/release/windows-sbom.spdx.json
             windows/build/release/windows-release-manifest.json
             windows/build/release/windows-release-evidence.json
+            windows/build/release/windows-production-validation-publication-gate.json
             windows/build/release/rendezvous-relay-*.json
           if-no-files-found: error
 
@@ -799,5 +862,6 @@ jobs:
             windows/build/release/windows-sbom.spdx.json
             windows/build/release/windows-release-manifest.json
             windows/build/release/windows-release-evidence.json
+            windows/build/release/windows-production-validation-publication-gate.json
             windows/build/release/rendezvous-relay-*.json
           fail_on_unmatched_files: true

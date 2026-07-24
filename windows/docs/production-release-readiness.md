@@ -1,8 +1,8 @@
 # Windows Production Release Readiness
 
-Date: 2026-07-09
-Branch: `codex/windows-production-finalization`
-Baseline commit: `76cf0283ccccc7514c55b43c387bc382fc97acd2`
+Date: 2026-07-24
+Branch: `codex/windows-production-evidence-batch`
+Baseline commit: `9df393163e94748978cea222597094ee32cf04d5`
 Target: Windows x64 IPv4-overlay private/public mesh
 
 This ledger is the production gate for the Windows release. The beta
@@ -64,6 +64,7 @@ run URL, release asset name, or manually archived validation bundle.
 | Production validation matrix contract | `windows/validation/contracts/windows-production-validation-matrix.json` |
 | Production validation workflow | `.github/workflows/windows-production-validation.yml` |
 | Production validation preflight plan | Pending GitHub Actions run |
+| Production prerequisite audit | `windows/scripts/audit-windows-production-prerequisites.rb` Pending ready audit |
 
 ## Task 4 Packet-Session Evidence
 
@@ -157,6 +158,22 @@ x64, two-host direct, hostile-NAT relay, strict-WFP leak/crash,
 upgrade/rollback/uninstall, and macOS-Windows interop lanes. Passing lane
 evidence must be measured by the provisioned host harness and digest-bound to
 the signed MSI and release manifest.
+
+`windows/scripts/audit-windows-production-prerequisites.rb` records the live
+external gate state for self-hosted validation runners, release/matrix secrets,
+Wintun variables, and control-plane DNS. Run it before production validation:
+
+```sh
+ruby windows/scripts/audit-windows-production-prerequisites.rb \
+  --output windows/build/validation/windows-production-prerequisites-audit.json
+```
+
+Use `--require-ready` only when preparing a production publication; missing
+runners, secrets, explicit timestamp configuration, Wintun variables, or DNS
+records must block instead of being converted into placeholder evidence.
+`windows-release.yml` also requires a successful Windows Production Validation
+Matrix run id, bound to the exact release commit, before publishing production
+artifacts to a GitHub Release.
 
 ## Automated Windows Validation Evidence
 
