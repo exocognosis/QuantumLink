@@ -32,8 +32,10 @@ Implemented baseline:
   rendezvous, STUN, TURN allocation, end-to-end PQC app-relay fallback, and
   local resident TURN data-plane proof.
 - Rendezvous and QuantumLink relay services support app-layer bearer-token
-  admission and per-client IP rate limits; the public smoke harness can prove
-  both client and service paths with redacted evidence.
+  admission, credential-file token loading, per-client IP rate limits, and
+  feature-gated TLS for the control protocol; the public smoke harness can
+  prove TLS use plus negative unauthenticated service rejection with redacted
+  evidence.
 - Default `qlink-core` builds keep the legacy Quinn/rustls/rcgen carrier dependencies out of the compiled dependency graph; the dev QUIC carrier remains available only with `--features dev-quic-carrier`.
 
 Dytallix wallet and registry boundary:
@@ -77,25 +79,26 @@ regenerate `peers.json` after rolling the new build.
 
 Not yet production-complete:
 
-- Open-internet rendezvous/QuantumLink-relay TLS, durable token revocation,
-  abuse monitoring, operational retention controls, and deployed hardening
-  evidence beyond the current allowlisted/tunneled public-edge runbook.
+- Durable service-token revocation, abuse monitoring, operational retention
+  controls, connection quotas, and deployed hardening evidence beyond the
+  current TLS/token/rate-limit public-edge runbook.
 - Deployed public TURN data-plane proof and RFC-complete ICE nomination against deployed public infrastructure beyond the current deterministic candidate ordering, connectivity-check paths, and local resident TURN proof.
 - Notarized Developer ID app and extension bundles.
 - Managed Device Attestation and SSO integration.
 - Full update signing pipeline with a post-quantum manifest layer.
 - Production Dytallix mainnet or hardened production registry trust root.
-- Hardened public relay abuse controls beyond bearer admission, rate limiting,
-  and registered-source validation.
+- Hardened public relay abuse controls beyond TLS, bearer admission, rate
+  limiting, and registered-source validation.
 - Removal of non-transport platform classical primitives: macOS/Windows privacy redaction still uses SHA-256-derived aliases; macOS CMS/profile signing still uses platform SHA-256 and interacts with platform AES behavior.
-- Removal of every classical primitive from every build/tooling path. Default `qlink-core` builds should exclude the dev Quinn/rustls/aws-lc/ring carrier graph, but optional dev-carrier builds, platform signing/redaction helpers, and lockfile contents remain outside a full zero-classical claim.
+- Removal of every classical primitive from every build/tooling path. Default `qlink-core` builds exclude the dev carrier and public-edge TLS dependency graphs, but optional dev-carrier/TLS builds, platform signing/redaction helpers, and lockfile contents remain outside a full zero-classical claim.
 - Full anonymity guarantees. QuantumLink minimizes app/control-plane metadata by default, but outer transport IPs, relay timing, account context, and endpoint behavior can still identify users unless a future relay/egress architecture is built specifically for that threat model.
 
-The development rendezvous and relay binaries now include bearer-token admission
-and per-client IP rate limits, but their client protocol remains raw TCP. Do not
-expose them broadly to the open internet without adding TLS, abuse monitoring,
-durable revocation, retention controls, and production Dytallix registry pinning
-for public meshes. For public validation before those controls land, use the
-allowlisted/tunneled edge runbook in `public-infra-runbook.md`.
+The development rendezvous and relay binaries now include feature-gated TLS,
+bearer-token admission, credential-file token loading, per-client IP rate
+limits, and relay registered-source validation. Do not expose them broadly to
+the open internet without adding abuse monitoring, durable service-token
+revocation, retention controls, connection quotas, and production Dytallix
+registry pinning for public meshes. For public validation before those controls
+land, use the source-limited TLS edge runbook in `public-infra-runbook.md`.
 
 For repository-scoped reviewer guides, see `../THREAT_MODEL.md` and `../QUANTUM_THREATS.md`.

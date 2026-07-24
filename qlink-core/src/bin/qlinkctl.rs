@@ -1,6 +1,8 @@
 #[cfg(feature = "dev-quic-carrier")]
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use clap::{Parser, Subcommand};
+#[cfg(feature = "public-edge-tls")]
+use qlink_core::control_transport::ControlTlsServerConfig;
 #[cfg(feature = "dev-quic-carrier")]
 use qlink_core::relay::RelayMessage;
 #[cfg(feature = "turn-relay")]
@@ -19,7 +21,7 @@ use qlink_core::{
         ConnectionOutcome, MeshConnector, MeshConnectorConfig, PathKind, ProbeOutcome,
     },
     mesh_transport::{MeshTransportConfig, MeshTransportHandle},
-    relay::run_relay_with_config,
+    relay::{probe_relay_registration, run_relay_with_config},
     rendezvous::{run_rendezvous_with_config, RendezvousClient},
     stun::{gather_server_reflexive_candidate, run_stun, spawn_dev_stun},
     traversal::gather_local_candidates,
@@ -45,6 +47,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    path::Path,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -80,6 +83,12 @@ enum Command {
         listen: String,
         #[arg(long)]
         auth_token: Option<String>,
+        #[arg(long)]
+        auth_token_file: Option<String>,
+        #[arg(long)]
+        tls_cert: Option<String>,
+        #[arg(long)]
+        tls_key: Option<String>,
         #[arg(long, default_value_t = 0)]
         rate_limit_per_window: u32,
         #[arg(long, default_value_t = 60)]
@@ -90,6 +99,12 @@ enum Command {
         listen: String,
         #[arg(long)]
         auth_token: Option<String>,
+        #[arg(long)]
+        auth_token_file: Option<String>,
+        #[arg(long)]
+        tls_cert: Option<String>,
+        #[arg(long)]
+        tls_key: Option<String>,
         #[arg(long, default_value_t = 0)]
         rate_limit_per_window: u32,
         #[arg(long, default_value_t = 60)]
@@ -142,6 +157,8 @@ enum Command {
         rendezvous: String,
         #[arg(long)]
         rendezvous_auth_token: Option<String>,
+        #[arg(long)]
+        control_tls_ca: Option<String>,
         #[arg(long, default_value = "devmesh")]
         mesh_id: String,
         #[arg(long)]
@@ -177,6 +194,18 @@ enum Command {
         server: String,
         #[arg(long)]
         auth_token: Option<String>,
+        #[arg(long)]
+        control_tls_ca: Option<String>,
+    },
+    RelayAdmissionSmoke {
+        #[arg(long, default_value = "127.0.0.1:9472")]
+        server: String,
+        #[arg(long, default_value = "qlinkctl-probe")]
+        peer_id: String,
+        #[arg(long)]
+        auth_token: Option<String>,
+        #[arg(long)]
+        control_tls_ca: Option<String>,
     },
     /// Drive the rendezvous → direct-probe → relay-fallback state machine end-to-end.
     /// `--scenario direct` advertises a working host candidate; `--scenario relay-fallback`
@@ -241,6 +270,8 @@ enum Command {
         rendezvous_auth_token: Option<String>,
         #[arg(long)]
         relay_auth_token: Option<String>,
+        #[arg(long)]
+        control_tls_ca: Option<String>,
         /// STUN server used to gather server-reflexive candidates before each
         /// signed record publish. Repeat to probe multiple public edges.
         #[arg(long = "stun")]
@@ -298,6 +329,8 @@ enum Command {
         rendezvous_auth_token: Option<String>,
         #[arg(long)]
         relay_auth_token: Option<String>,
+        #[arg(long)]
+        control_tls_ca: Option<String>,
     },
     /// Attack the real PQC channel and assert every attack fails closed.
     /// Runs an app-layer battery (tamper / replay / downgrade / key-isolation
@@ -375,15 +408,23 @@ async fn main() -> qlink_core::Result<()> {
         Command::Rendezvous {
             listen,
             auth_token,
+            auth_token_file,
+            tls_cert,
+            tls_key,
             rate_limit_per_window,
             rate_limit_window_seconds,
         } => {
             let admission = service_admission_config(
                 auth_token.as_deref(),
+                auth_token_file.as_deref(),
                 rate_limit_per_window,
                 rate_limit_window_seconds,
             )?;
             println!("rendezvous_listen={listen}");
+            println!(
+                "rendezvous_tls_enabled={}",
+                tls_cert.is_some() && tls_key.is_some()
+            );
             println!(
                 "rendezvous_auth_required={}",
                 admission.auth_token_configured()
@@ -395,20 +436,29 @@ async fn main() -> qlink_core::Result<()> {
                     rate_limit.window.as_secs()
                 );
             }
-            run_rendezvous_with_config(&listen, admission).await?;
+            run_rendezvous_service(&listen, admission, tls_cert.as_deref(), tls_key.as_deref())
+                .await?;
         }
         Command::Relay {
             listen,
             auth_token,
+            auth_token_file,
+            tls_cert,
+            tls_key,
             rate_limit_per_window,
             rate_limit_window_seconds,
         } => {
             let admission = service_admission_config(
                 auth_token.as_deref(),
+                auth_token_file.as_deref(),
                 rate_limit_per_window,
                 rate_limit_window_seconds,
             )?;
             println!("relay_listen={listen}");
+            println!(
+                "relay_tls_enabled={}",
+                tls_cert.is_some() && tls_key.is_some()
+            );
             println!("relay_auth_required={}", admission.auth_token_configured());
             if let Some(rate_limit) = admission.rate_limit() {
                 println!("relay_rate_limit_per_window={}", rate_limit.max_events);
@@ -417,7 +467,7 @@ async fn main() -> qlink_core::Result<()> {
                     rate_limit.window.as_secs()
                 );
             }
-            run_relay_with_config(&listen, admission).await?;
+            run_relay_service(&listen, admission, tls_cert.as_deref(), tls_key.as_deref()).await?;
         }
         Command::Stun { listen } => {
             println!("stun_listen={listen}");
@@ -484,6 +534,7 @@ async fn main() -> qlink_core::Result<()> {
         Command::TurnRelayResponder {
             rendezvous,
             rendezvous_auth_token,
+            control_tls_ca,
             mesh_id,
             turn,
             bind_addr,
@@ -495,6 +546,7 @@ async fn main() -> qlink_core::Result<()> {
             turn_realm,
             max_frames,
         } => {
+            install_control_tls_ca(control_tls_ca.as_deref())?;
             run_turn_relay_responder(
                 &rendezvous,
                 rendezvous_auth_token.as_deref(),
@@ -531,7 +583,12 @@ async fn main() -> qlink_core::Result<()> {
                 "relay-smoke is disabled until relay has an end-to-end PQC session".into(),
             ));
         }
-        Command::RendezvousSmoke { server, auth_token } => {
+        Command::RendezvousSmoke {
+            server,
+            auth_token,
+            control_tls_ca,
+        } => {
+            install_control_tls_ca(control_tls_ca.as_deref())?;
             let keypair = DeviceKeypair::generate()?;
             let public = keypair.public_key();
             let body = UnsignedPeerRecord::new(
@@ -562,6 +619,18 @@ async fn main() -> qlink_core::Result<()> {
             println!("endpoint_count={}", found.body.endpoints.len());
             println!("record_verified=true");
         }
+        Command::RelayAdmissionSmoke {
+            server,
+            peer_id,
+            auth_token,
+            control_tls_ca,
+        } => {
+            install_control_tls_ca(control_tls_ca.as_deref())?;
+            probe_relay_registration(&server, peer_id.clone(), auth_token.as_deref()).await?;
+            println!("relay_server={server}");
+            println!("peer_id={peer_id}");
+            println!("relay_registration_accepted=true");
+        }
         Command::MeshConnect { scenario } => {
             run_mesh_connect_demo(&scenario).await?;
         }
@@ -583,7 +652,9 @@ async fn main() -> qlink_core::Result<()> {
             turn_username,
             turn_password,
             turn_realm,
+            control_tls_ca,
         } => {
+            install_control_tls_ca(control_tls_ca.as_deref())?;
             run_publish_self(
                 &rendezvous,
                 &mesh_id,
@@ -619,7 +690,9 @@ async fn main() -> qlink_core::Result<()> {
             relay,
             rendezvous_auth_token,
             relay_auth_token,
+            control_tls_ca,
         } => {
+            install_control_tls_ca(control_tls_ca.as_deref())?;
             let run = run_direct_send_detailed(
                 &rendezvous,
                 &mesh_id,
@@ -760,17 +833,13 @@ fn selected_path_label(outcome: &ConnectionOutcome) -> &'static str {
 
 fn service_admission_config(
     auth_token: Option<&str>,
+    auth_token_file: Option<&str>,
     rate_limit_per_window: u32,
     rate_limit_window_seconds: u64,
 ) -> qlink_core::Result<ServiceAdmissionConfig> {
     let mut admission = ServiceAdmissionConfig::open();
-    if let Some(token) = auth_token {
-        if token.trim().is_empty() {
-            return Err(qlink_core::QlinkError::Protocol(
-                "service auth token must not be empty".into(),
-            ));
-        }
-        admission = admission.with_auth_token(token.to_string());
+    if let Some(token) = read_service_auth_token(auth_token, auth_token_file)? {
+        admission = admission.with_auth_token(token);
     }
     if rate_limit_per_window > 0 {
         if rate_limit_window_seconds == 0 {
@@ -784,6 +853,123 @@ fn service_admission_config(
         );
     }
     Ok(admission)
+}
+
+fn read_service_auth_token(
+    auth_token: Option<&str>,
+    auth_token_file: Option<&str>,
+) -> qlink_core::Result<Option<String>> {
+    match (auth_token, auth_token_file) {
+        (Some(_), Some(_)) => Err(qlink_core::QlinkError::Protocol(
+            "use either --auth-token or --auth-token-file, not both".into(),
+        )),
+        (Some(token), None) => validate_service_auth_token(token),
+        (None, Some(path)) => {
+            let token = std::fs::read_to_string(path).map_err(|err| {
+                qlink_core::QlinkError::Protocol(format!(
+                    "failed to read service auth token file {path}: {err}"
+                ))
+            })?;
+            validate_service_auth_token(trim_secret_file(&token))
+        }
+        (None, None) => Ok(None),
+    }
+}
+
+fn trim_secret_file(secret: &str) -> &str {
+    secret.trim_matches(|ch| ch == '\n' || ch == '\r')
+}
+
+fn validate_service_auth_token(token: &str) -> qlink_core::Result<Option<String>> {
+    let token = token.trim();
+    if token.is_empty() {
+        return Err(qlink_core::QlinkError::Protocol(
+            "service auth token must not be empty".into(),
+        ));
+    }
+    if token.starts_with("replace-with-") {
+        return Err(qlink_core::QlinkError::Protocol(
+            "service auth token still contains a public-edge template placeholder".into(),
+        ));
+    }
+    Ok(Some(token.to_string()))
+}
+
+fn install_control_tls_ca(path: Option<&str>) -> qlink_core::Result<()> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    if !Path::new(path).is_file() {
+        return Err(qlink_core::QlinkError::Protocol(format!(
+            "control TLS CA file does not exist: {path}"
+        )));
+    }
+    std::env::set_var("QLINK_CONTROL_TLS_CA", path);
+    Ok(())
+}
+
+async fn run_rendezvous_service(
+    listen: &str,
+    admission: ServiceAdmissionConfig,
+    tls_cert: Option<&str>,
+    tls_key: Option<&str>,
+) -> qlink_core::Result<()> {
+    match (tls_cert, tls_key) {
+        (Some(cert), Some(key)) => {
+            #[cfg(feature = "public-edge-tls")]
+            {
+                return qlink_core::rendezvous::run_rendezvous_with_optional_tls(
+                    listen,
+                    admission,
+                    Some(ControlTlsServerConfig::new(cert, key)),
+                )
+                .await;
+            }
+            #[cfg(not(feature = "public-edge-tls"))]
+            {
+                let _ = (cert, key);
+                return Err(qlink_core::QlinkError::Protocol(
+                    "rendezvous TLS requires qlinkctl built with --features public-edge-tls".into(),
+                ));
+            }
+        }
+        (None, None) => run_rendezvous_with_config(listen, admission).await,
+        _ => Err(qlink_core::QlinkError::Protocol(
+            "rendezvous TLS requires both --tls-cert and --tls-key".into(),
+        )),
+    }
+}
+
+async fn run_relay_service(
+    listen: &str,
+    admission: ServiceAdmissionConfig,
+    tls_cert: Option<&str>,
+    tls_key: Option<&str>,
+) -> qlink_core::Result<()> {
+    match (tls_cert, tls_key) {
+        (Some(cert), Some(key)) => {
+            #[cfg(feature = "public-edge-tls")]
+            {
+                return qlink_core::relay::run_relay_with_optional_tls(
+                    listen,
+                    admission,
+                    Some(ControlTlsServerConfig::new(cert, key)),
+                )
+                .await;
+            }
+            #[cfg(not(feature = "public-edge-tls"))]
+            {
+                let _ = (cert, key);
+                return Err(qlink_core::QlinkError::Protocol(
+                    "relay TLS requires qlinkctl built with --features public-edge-tls".into(),
+                ));
+            }
+        }
+        (None, None) => run_relay_with_config(listen, admission).await,
+        _ => Err(qlink_core::QlinkError::Protocol(
+            "relay TLS requires both --tls-cert and --tls-key".into(),
+        )),
+    }
 }
 
 #[cfg(not(feature = "dev-quic-carrier"))]

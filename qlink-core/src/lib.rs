@@ -1,5 +1,6 @@
 pub mod admission;
 pub mod carrier_transport;
+pub mod control_transport;
 pub mod crypto;
 pub mod discovery;
 pub mod dytallix_identity;
@@ -94,6 +95,12 @@ mod pqc_policy_tests {
             manifest.contains("dev-quic-carrier = [\"dep:quinn\", \"dep:rustls\", \"dep:rcgen\"]"),
             "qlink-core must track Quinn/rustls as an explicit dev-only carrier"
         );
+        assert!(
+            manifest.contains(
+                "public-edge-tls = [\"dep:rustls\", \"dep:rustls-pemfile\", \"dep:tokio-rustls\"]"
+            ),
+            "public edge TLS must stay explicit and off by default"
+        );
     }
 
     #[test]
@@ -111,7 +118,13 @@ mod pqc_policy_tests {
         }
         assert!(
             manifest.contains("dev-quic-carrier = [\"dep:quinn\", \"dep:rustls\", \"dep:rcgen\"]"),
-            "dev-quic-carrier must be the only feature that enables Quinn/rustls/rcgen"
+            "dev-quic-carrier must be the only feature that enables Quinn/rcgen"
+        );
+        assert!(
+            manifest.contains(
+                "public-edge-tls = [\"dep:rustls\", \"dep:rustls-pemfile\", \"dep:tokio-rustls\"]"
+            ),
+            "rustls control-plane service support must stay isolated behind public-edge-tls"
         );
     }
 

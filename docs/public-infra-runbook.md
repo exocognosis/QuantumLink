@@ -11,14 +11,12 @@ fallback, resident TURN data-plane behavior, and app-layer rendezvous/relay
 admission with `scripts/public-infra-smoke.sh`.
 
 Do not treat the in-repo rendezvous and QuantumLink relay binaries as broadly
-open internet production services yet. They now support bearer-token admission
-and per-client IP rate limits, but their client protocol is still raw TCP
-without TLS. Until client-side TLS lands, expose those two ports only through
-one of:
-
-- a source-allowlisted firewall for named testers;
-- a private overlay such as WireGuard;
-- an SSH tunnel for one-off validation.
+open internet production services yet. They now support TLS for their control
+protocols behind the explicit `public-edge-tls` feature, bearer-token admission
+from credential files, per-client IP rate limits, and smoke proof that
+unauthenticated clients are rejected. Keep those two ports source-limited for
+named testers until connection quotas, abuse telemetry, retention policy, and
+off-host deployed evidence are in place.
 
 STUN and coturn TURN may be internet-facing. Published TURN relay candidates
 are consumed by the mesh connector when the responder keeps a live allocation.
@@ -35,7 +33,7 @@ resident TURN allocation and requires the connector to report
 Use the templates under `infra/public-edge/`:
 
 - `public-edge.env.example`: central port, path, realm, and TURN values.
-- `systemd/quantumlink-rendezvous.service`: raw TCP rendezvous service.
+- `systemd/quantumlink-rendezvous.service`: TLS rendezvous service.
 - `systemd/quantumlink-relay.service`: end-to-end PQC relay carrier.
 - `systemd/quantumlink-stun-primary.service`: auxiliary STUN port for NAT mapping checks.
 - `systemd/quantumlink-stun-secondary.service`: second auxiliary STUN port for NAT mapping checks.
@@ -46,11 +44,11 @@ Expected default ports:
 
 | Service | Port | Exposure |
 |---|---:|---|
-| Rendezvous | TCP 9471 | token-authenticated plus allowlisted/tunneled until TLS |
-| QuantumLink relay | TCP 9472 | token-authenticated plus allowlisted/tunneled until TLS |
+| Rendezvous | TCP 9471 | TLS plus token admission; source-limited for beta |
+| QuantumLink relay | TCP 9472 | TLS plus token admission; source-limited for beta |
 | coturn STUN/TURN | UDP 3478 | public |
 | QuantumLink STUN auxiliary | UDP 3479-3480 | public |
-| TURN TLS | TCP 5349 | public |
+| TURN TLS | TCP 5349 | public when configured with a real certificate |
 | TURN relay allocation range | UDP 49160-49200 | public |
 
 ## Deploy
@@ -59,37 +57,70 @@ On a clean Ubuntu edge host:
 
 ```sh
 sudo useradd --system --home /var/lib/quantumlink --shell /usr/sbin/nologin quantumlink || true
+sudo apt-get update
+sudo apt-get install -y coturn
 sudo install -d -o quantumlink -g quantumlink /opt/quantumlink/bin /var/lib/quantumlink /var/log/quantumlink
 sudo install -d -o turnserver -g turnserver -m 0750 /var/log/turnserver
 
-cargo build -p qlink-core --release --bin qlinkctl --features dev-quic-carrier
+cargo build -p qlink-core --release --bin qlinkctl --features dev-quic-carrier,public-edge-tls
 sudo install -m 0755 target/release/qlinkctl /opt/quantumlink/bin/qlinkctl
 
-sudo install -d /etc/quantumlink
+sudo install -d -m 0755 /etc/quantumlink /etc/quantumlink/tls
+sudo install -d -m 0750 /etc/quantumlink/secrets
 sudo install -m 0640 infra/public-edge/public-edge.env.example /etc/quantumlink/public-edge.env
 sudo install -m 0644 infra/public-edge/systemd/*.service /etc/systemd/system/
 sudo systemctl daemon-reload
 ```
 
 Edit `/etc/quantumlink/public-edge.env` before starting services. Set the real
-public IP, realm, high-entropy rendezvous and relay admission tokens, rate-limit
-windows, and high-entropy TURN password. Then apply equivalent firewall rules
-from `infra/public-edge/ufw.rules.example`.
+public IP, realm, TLS cert/key paths, rate-limit windows, and high-entropy TURN
+password. Write rendezvous and relay service tokens into root-owned credential
+files instead of `ExecStart` arguments:
 
-Start the raw QuantumLink services only after admission tokens are set and
-firewall allowlisting is in place:
+```sh
+openssl rand -base64 32 | sudo tee /etc/quantumlink/secrets/rendezvous-auth-token >/dev/null
+openssl rand -base64 32 | sudo tee /etc/quantumlink/secrets/relay-auth-token >/dev/null
+sudo chown root:root /etc/quantumlink/secrets/*-auth-token
+sudo chmod 0400 /etc/quantumlink/secrets/*-auth-token
+```
+
+Install a real edge certificate and key at the paths configured by
+`QLINK_RENDEZVOUS_TLS_CERT`, `QLINK_RENDEZVOUS_TLS_KEY`,
+`QLINK_RELAY_TLS_CERT`, and `QLINK_RELAY_TLS_KEY`. For shared beta testing,
+prefer a publicly trusted certificate for the DNS name testers will use; for a
+private rehearsal, distribute the matching CA file and pass
+`--control-tls-ca`.
+
+Then apply equivalent firewall rules from
+`infra/public-edge/ufw.rules.example`.
+
+Start the QuantumLink services only after TLS files, credential files, and
+firewall allowlisting are in place:
 
 ```sh
 sudo systemctl enable --now quantumlink-rendezvous quantumlink-relay
 sudo systemctl enable --now quantumlink-stun-primary quantumlink-stun-secondary
 ```
 
-For TURN, install coturn, render `turnserver.conf.template` with the values from
-`/etc/quantumlink/public-edge.env`, then restart coturn. coturn owns UDP 3478
-and also answers STUN binding requests there. Keep coturn's relay port range
-narrow and explicitly opened in the host and cloud firewalls.
+For TURN, render `turnserver.conf.template` with the values from
+`/etc/quantumlink/public-edge.env`, install it to `/etc/turnserver.conf`, then
+restart coturn:
 
-TURN TLS on TCP/UDP 5349 requires `QLINK_TURN_CERT` and `QLINK_TURN_PKEY` to
+```sh
+set -a
+. /etc/quantumlink/public-edge.env
+set +a
+envsubst < infra/public-edge/coturn/turnserver.conf.template | sudo tee /etc/turnserver.conf >/dev/null
+sudo chown root:turnserver /etc/turnserver.conf
+sudo chmod 0640 /etc/turnserver.conf
+sudo systemctl enable --now coturn
+```
+
+coturn owns UDP 3478 and also answers STUN binding requests there. Keep
+coturn's relay port range narrow and explicitly opened in the host and cloud
+firewalls.
+
+TURN TLS on TCP 5349 requires `QLINK_TURN_CERT` and `QLINK_TURN_PKEY` to
 point to readable certificate and private-key files. Use a real edge certificate
 for shared testing; a short-lived self-signed cert is acceptable only for
 allocation-path smoke proof.
@@ -100,9 +131,10 @@ From a tester machine outside the edge host, run:
 
 ```sh
 scripts/public-infra-smoke.sh \
-  --rendezvous EDGE_HOST:9471 \
-  --relay EDGE_HOST:9472 \
+  --rendezvous tls://EDGE_HOST:9471 \
+  --relay tls://EDGE_HOST:9472 \
   --stun EDGE_HOST:3478 \
+  --control-tls-ca /path/to/control-ca-or-public-chain.pem \
   --rendezvous-auth-token "$QLINK_RENDEZVOUS_AUTH_TOKEN" \
   --relay-auth-token "$QLINK_RELAY_AUTH_TOKEN" \
   --turn EDGE_HOST:3478 \
@@ -118,9 +150,10 @@ tester machine's public egress address:
 
 ```sh
 scripts/public-infra-smoke.sh \
-  --rendezvous EDGE_HOST:9471 \
-  --relay EDGE_HOST:9472 \
+  --rendezvous tls://EDGE_HOST:9471 \
+  --relay tls://EDGE_HOST:9472 \
   --stun EDGE_HOST:3478 \
+  --control-tls-ca /path/to/control-ca-or-public-chain.pem \
   --rendezvous-auth-token "$QLINK_RENDEZVOUS_AUTH_TOKEN" \
   --relay-auth-token "$QLINK_RELAY_AUTH_TOKEN" \
   --turn EDGE_HOST:3478 \
@@ -136,6 +169,7 @@ For an offline local rehearsal:
 
 ```sh
 scripts/public-infra-smoke.sh --local --admission-token local-edge-secret --build
+scripts/public-infra-smoke.sh --local --control-tls --admission-token local-edge-secret --build
 scripts/public-infra-smoke.sh --local --prove-turn-relay --admission-token local-edge-secret --build
 ```
 
@@ -143,8 +177,11 @@ The smoke run writes `build/public-infra-smoke/<timestamp>/evidence.json`. A
 passing evidence file must show:
 
 - `stun_reflexive` is non-empty;
-- `rendezvous_auth_required` and `relay_auth_required` match the intended edge
-  admission mode;
+- `rendezvous_tls_enabled` and `relay_tls_enabled` are `true` for public edge
+  runs;
+- `rendezvous_auth_required`, `relay_auth_required`,
+  `rendezvous_auth_verified`, and `relay_auth_verified` are `true` for public
+  edge runs;
 - `turn_relayed` is non-empty when `--turn` was supplied;
 - `published_candidate_types` includes `ServerReflexive`;
 - `published_candidate_types` includes `QuantumLinkRelay`;
@@ -174,8 +211,8 @@ Before widening tester access:
 
 - Confirm cloud firewall and host firewall expose only the listed ports.
 - Confirm rendezvous and QuantumLink relay require non-placeholder admission
-  tokens, enforce appropriate rate limits, and remain source-limited or tunneled
-  until TLS lands.
+  token files, present TLS certificates, enforce appropriate rate limits, and
+  remain source-limited during beta.
 - Confirm coturn uses long-term credentials and a constrained relay port range.
 - Confirm coturn has readable TLS cert/key paths before exposing TCP/UDP 5349.
 - Confirm `journalctl -u quantumlink-*` contains control-plane metadata only.

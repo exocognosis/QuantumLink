@@ -1,13 +1,16 @@
+#[cfg(feature = "public-edge-tls")]
+use crate::control_transport::{load_tls_acceptor, ControlTlsServerConfig};
 use crate::{
     admission::{AdmissionLimiter, ServiceAdmissionConfig},
+    control_transport::{connect_control_stream, split_control_stream},
     discovery::{now_unix, PeerRecord},
     error::{QlinkError, Result},
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::{TcpListener, TcpStream},
+    io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
+    net::TcpListener,
     sync::RwLock,
     task::JoinHandle,
 };
@@ -85,6 +88,22 @@ pub async fn run_rendezvous_with_config(
     serve_rendezvous_with_config(listener, store, admission).await
 }
 
+#[cfg(feature = "public-edge-tls")]
+pub async fn run_rendezvous_with_optional_tls(
+    listen: &str,
+    admission: ServiceAdmissionConfig,
+    tls: Option<ControlTlsServerConfig>,
+) -> Result<()> {
+    match tls {
+        Some(tls) => {
+            let listener = TcpListener::bind(listen).await?;
+            let store = RendezvousStore::default();
+            serve_rendezvous_with_tls(listener, store, admission, tls).await
+        }
+        None => run_rendezvous_with_config(listen, admission).await,
+    }
+}
+
 pub async fn serve_rendezvous(listener: TcpListener, store: RendezvousStore) -> Result<()> {
     serve_rendezvous_with_config(listener, store, ServiceAdmissionConfig::default()).await
 }
@@ -105,6 +124,36 @@ pub async fn serve_rendezvous_with_config(
                 handle_connection(stream, store, admission, limiter, peer_addr).await
             {
                 tracing::warn!(?error, "rendezvous connection failed");
+            }
+        });
+    }
+}
+
+#[cfg(feature = "public-edge-tls")]
+pub async fn serve_rendezvous_with_tls(
+    listener: TcpListener,
+    store: RendezvousStore,
+    admission: ServiceAdmissionConfig,
+    tls: ControlTlsServerConfig,
+) -> Result<()> {
+    let acceptor = load_tls_acceptor(&tls)?;
+    let limiter = AdmissionLimiter::new(&admission);
+    loop {
+        let (stream, peer_addr) = listener.accept().await?;
+        let store = store.clone();
+        let admission = admission.clone();
+        let limiter = limiter.clone();
+        let acceptor = acceptor.clone();
+        tokio::spawn(async move {
+            let result = async {
+                let stream = acceptor.accept(stream).await.map_err(|err| {
+                    QlinkError::Protocol(format!("rendezvous TLS handshake failed: {err}"))
+                })?;
+                handle_connection(stream, store, admission, limiter, peer_addr).await
+            }
+            .await;
+            if let Err(error) = result {
+                tracing::warn!(?error, "rendezvous TLS connection failed");
             }
         });
     }
@@ -208,8 +257,8 @@ impl RendezvousClient {
                 }
             }
         }
-        let stream = TcpStream::connect(&self.server).await?;
-        let (reader, mut writer) = stream.into_split();
+        let stream = connect_control_stream(&self.server, None).await?;
+        let (reader, mut writer) = split_control_stream(stream);
         writer
             .write_all(serde_json::to_string(&request)?.as_bytes())
             .await?;
@@ -230,13 +279,13 @@ impl RendezvousClient {
 }
 
 async fn handle_connection(
-    stream: TcpStream,
+    stream: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
     store: RendezvousStore,
     admission: ServiceAdmissionConfig,
     limiter: AdmissionLimiter,
     peer_addr: SocketAddr,
 ) -> Result<()> {
-    let (reader, mut writer) = stream.into_split();
+    let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
 
