@@ -127,7 +127,41 @@ allocation-path smoke proof.
 
 ## Proof
 
-From a tester machine outside the edge host, run:
+From a tester machine outside the edge host, prefer the live evidence
+orchestrator. It runs both required public paths, verifies each
+`evidence.json` with `scripts/verify-public-infra-evidence.rb`, and writes a
+single redacted manifest under
+`build/public-edge-live-evidence/<timestamp>/manifest.json`:
+
+Create a tester-side `edge-public.env` containing:
+
+```sh
+QLINK_PUBLIC_EDGE_HOST=EDGE_HOST
+QLINK_CONTROL_TLS_CA=/path/to/control-ca-or-public-chain.pem
+QLINK_RENDEZVOUS_AUTH_TOKEN_FILE=/path/to/rendezvous-auth-token
+QLINK_RELAY_AUTH_TOKEN_FILE=/path/to/relay-auth-token
+QLINK_TURN_USERNAME=qlink-turn
+QLINK_TURN_PASSWORD_FILE=/path/to/turn-password
+QLINK_TURN_REALM=turn.quantumlink.example
+QLINK_TURN_PERMIT_PEER_IP=TESTER_PUBLIC_IP
+```
+
+Then run:
+
+```sh
+scripts/public-edge-live-evidence.sh --env-file ./edge-public.env --build
+```
+
+If those values are already exported in the shell, omit `--env-file`.
+
+The orchestrator deliberately uses environment variables or token files for
+secrets instead of passing service tokens as command-line arguments. It records
+only credential-source metadata such as `file` or `environment` in the manifest.
+
+If you need to debug one proof at a time, run the underlying smoke command
+directly. This default command proves TLS rendezvous/relay admission, STUN,
+TURN allocation, signed candidate publication, and app-layer PQC fallback
+through the QuantumLink relay:
 
 ```sh
 scripts/public-infra-smoke.sh \
@@ -205,6 +239,19 @@ published QuantumLink PQC relay candidate rather than a local direct path. In
 `--prove-turn-relay` mode, the resident responder publishes only its TURN relay
 candidate and accepts the native carrier through TURN Send/Data indications.
 
+To reject local or placeholder evidence before a release ledger link, run:
+
+```sh
+ruby scripts/verify-public-infra-evidence.rb \
+  --require-public \
+  --expected-sha "$(git rev-parse HEAD)" \
+  build/public-infra-smoke/<timestamp>/evidence.json
+```
+
+For TURN data-plane evidence, add `--require-turn-relay`. The verifier blocks
+loopback/private/documentation endpoints, missing TLS/auth/rate-limit proof,
+missing TURN proof, stale evidence, and obvious secret placeholders.
+
 ## Hardening Checks
 
 Before widening tester access:
@@ -218,5 +265,5 @@ Before widening tester access:
 - Confirm `journalctl -u quantumlink-*` contains control-plane metadata only.
 - Rotate the rendezvous, relay, and TURN credentials and redeploy if any appear
   in a shared transcript.
-- Re-run `scripts/public-infra-smoke.sh` from an off-host network after every
-  firewall, DNS, binary, or unit-file change.
+- Re-run `scripts/public-edge-live-evidence.sh` from an off-host network after
+  every firewall, DNS, binary, or unit-file change.

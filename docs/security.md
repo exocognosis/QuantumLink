@@ -80,8 +80,9 @@ regenerate `peers.json` after rolling the new build.
 Not yet production-complete:
 
 - Durable service-token revocation, abuse monitoring, operational retention
-  controls, connection quotas, and deployed hardening evidence beyond the
-  current TLS/token/rate-limit public-edge runbook.
+  controls, connection quotas, and actual deployed hardening evidence beyond
+  the current TLS/token/rate-limit public-edge runbook. The repository includes
+  a verifier to prevent local rehearsal evidence from satisfying that gate.
 - Deployed public TURN data-plane proof and RFC-complete ICE nomination against deployed public infrastructure beyond the current deterministic candidate ordering, connectivity-check paths, and local resident TURN proof.
 - Notarized Developer ID app and extension bundles.
 - Managed Device Attestation and SSO integration.
