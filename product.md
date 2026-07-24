@@ -203,9 +203,12 @@ Production gaps include:
   including peer-session readiness under live packet flow.
 - Deployed public TURN data-plane proof and RFC-complete ICE nomination behavior
   against deployed public infrastructure.
-- Public rendezvous and relay TLS, durable credential revocation, abuse
-  monitoring, retention controls, and deployed hardening evidence beyond the
-  current token-auth/rate-limit baseline.
+- Public rendezvous and relay TLS plus credential-file service admission now
+  exist behind the explicit public-edge TLS feature, but durable credential
+  revocation, abuse monitoring, retention controls, connection quotas, and
+  actual deployed hardening evidence remain open. The repo now includes an
+  off-host public-edge evidence orchestrator and verifier so live proof can be
+  gated before a release ledger link.
 - Signed Sparkle/platform update pipeline paired with a post-quantum release
   manifest layer.
 - Production Dytallix mainnet or hardened registry trust root for public

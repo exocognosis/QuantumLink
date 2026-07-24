@@ -2,8 +2,9 @@
 
 Do not broadly expose public rendezvous or relay services until these gates are
 satisfied. Bearer-token admission and per-client IP rate limits are implemented;
-TLS, quotas, telemetry, revocation, and operator abuse workflows remain release
-gates.
+TLS control-plane support is implemented behind the explicit `public-edge-tls`
+feature. Live off-host evidence, quotas, telemetry, revocation, and operator
+abuse workflows remain release gates.
 
 ## Rendezvous
 
@@ -30,4 +31,8 @@ gates.
 - Resource sampling shows no unbounded CPU, memory, file descriptor, or socket growth.
 - Expired peer records and stale certificate rotation tests pass.
 - Public services run behind firewall rules that expose only intended ports.
+- Off-host `scripts/public-edge-live-evidence.sh` produces a passing
+  `manifest.json` with both app-relay and resident TURN relay proofs.
+- `scripts/verify-public-infra-evidence.rb --require-public` rejects local,
+  placeholder, stale, unauthenticated, non-TLS, and no-rate-limit evidence.
 - Incident rollback path is documented and tested.

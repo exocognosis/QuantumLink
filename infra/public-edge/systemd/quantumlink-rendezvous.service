@@ -6,7 +6,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=/etc/quantumlink/public-edge.env
-ExecStart=/opt/quantumlink/bin/qlinkctl rendezvous --listen ${QLINK_RENDEZVOUS_LISTEN} --auth-token ${QLINK_RENDEZVOUS_AUTH_TOKEN} --rate-limit-per-window ${QLINK_RENDEZVOUS_RATE_LIMIT_PER_WINDOW} --rate-limit-window-seconds ${QLINK_ADMISSION_RATE_LIMIT_WINDOW_SECONDS}
+LoadCredential=rendezvous-auth-token:/etc/quantumlink/secrets/rendezvous-auth-token
+ExecStart=/opt/quantumlink/bin/qlinkctl rendezvous --listen ${QLINK_RENDEZVOUS_LISTEN} --auth-token-file ${CREDENTIALS_DIRECTORY}/rendezvous-auth-token --tls-cert ${QLINK_RENDEZVOUS_TLS_CERT} --tls-key ${QLINK_RENDEZVOUS_TLS_KEY} --rate-limit-per-window ${QLINK_RENDEZVOUS_RATE_LIMIT_PER_WINDOW} --rate-limit-window-seconds ${QLINK_ADMISSION_RATE_LIMIT_WINDOW_SECONDS}
 Restart=always
 RestartSec=3
 User=quantumlink

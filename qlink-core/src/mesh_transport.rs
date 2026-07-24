@@ -31,6 +31,7 @@
 use crate::quic_transport::QuicEndpoint;
 use crate::{
     carrier_transport::CarrierSession,
+    control_transport::ControlEndpoint,
     crypto::{shake256_xof, DeviceKeypair},
     discovery::{now_unix, CandidateEndpoint, CandidateType, PeerRecord, UnsignedPeerRecord},
     dytallix_identity::{
@@ -1581,7 +1582,8 @@ impl MeshTransportHandle {
             .unwrap_or(local_addr);
         let mut candidates = extra_candidates;
         if let Some(relay_server) = connector_config.relay_server.as_deref() {
-            let relay_addr: SocketAddr = relay_server.parse().map_err(|err| {
+            let relay_endpoint = ControlEndpoint::parse(relay_server)?;
+            let relay_addr: SocketAddr = relay_endpoint.address().parse().map_err(|err| {
                 QlinkError::Protocol(format!("invalid configured relay_url: {err}"))
             })?;
             candidates.push(quantum_link_relay_candidate(relay_addr));

@@ -15,7 +15,7 @@ server-name=${QLINK_TURN_REALM}
 
 fingerprint
 lt-cred-mech
-user=${QLINK_TURN_USER}:${QLINK_TURN_PASSWORD}
+user=${QLINK_TURN_USERNAME}:${QLINK_TURN_PASSWORD}
 stale-nonce=600
 
 min-port=${QLINK_TURN_MIN_PORT}
@@ -23,6 +23,12 @@ max-port=${QLINK_TURN_MAX_PORT}
 
 no-loopback-peers
 no-multicast-peers
+denied-peer-ip=0.0.0.0-0.255.255.255
+denied-peer-ip=10.0.0.0-10.255.255.255
+denied-peer-ip=127.0.0.0-127.255.255.255
+denied-peer-ip=169.254.0.0-169.254.255.255
+denied-peer-ip=172.16.0.0-172.31.255.255
+denied-peer-ip=192.168.0.0-192.168.255.255
 no-cli
 no-tlsv1
 no-tlsv1_1

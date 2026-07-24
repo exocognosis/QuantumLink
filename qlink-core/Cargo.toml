@@ -43,6 +43,7 @@ rand_core_06 = { package = "rand_core", version = "0.6", features = ["getrandom"
 rcgen = { version = "0.14.7", optional = true }
 reqwest = { version = "0.12", features = ["json"] }
 rustls = { version = "0.23", optional = true }
+rustls-pemfile = { version = "2", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha1 = { version = "0.10", optional = true }
@@ -52,6 +53,7 @@ shake = "0.1"
 slh-dsa = { version = "=0.2.0-rc.4", features = ["zeroize"] }
 thiserror = "1"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-rustls = { version = "0.26", optional = true }
 tracing = "0.1"
 zeroize = { version = "1", features = ["derive"] }
 
@@ -59,6 +61,7 @@ zeroize = { version = "1", features = ["derive"] }
 default = ["native-udp-carrier"]
 native-udp-carrier = []
 dev-quic-carrier = ["dep:quinn", "dep:rustls", "dep:rcgen"]
+public-edge-tls = ["dep:rustls", "dep:rustls-pemfile", "dep:tokio-rustls"]
 # Standard TURN relay-candidate client. Off by default; pulls in the classical
 # HMAC-SHA1 + MD5 primitives that RFC 5389/5766 TURN auth mandates.
 turn-relay = ["dep:hmac", "dep:md-5", "dep:sha1"]

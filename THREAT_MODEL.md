@@ -132,7 +132,7 @@ Capabilities:
 Security expectation:
 
 - Several control paths bound message size or reject malformed input, for example inbound identity assertions are capped at 32 KiB.
-- Development rendezvous and relay services are raw TCP JSON services with optional bearer-token admission and per-client IP rate limits; keep them source-limited or tunneled until TLS lands.
+- Development rendezvous and relay services can run TLS JSON control protocols with optional bearer-token admission, credential-file token loading, and per-client IP rate limits; keep them source-limited during beta until abuse controls are deployed.
 - Production deployments still need connection quotas, abuse monitoring, durable authenticated service access, token revocation, and resource accounting.
 
 7. Key compromise adversary

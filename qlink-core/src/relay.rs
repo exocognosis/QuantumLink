@@ -1,5 +1,10 @@
+#[cfg(feature = "public-edge-tls")]
+use crate::control_transport::{load_tls_acceptor, ControlTlsServerConfig};
 use crate::{
     admission::{AdmissionLimiter, ServiceAdmissionConfig},
+    control_transport::{
+        connect_control_stream, split_control_stream, BoxedControlReader, BoxedControlWriter,
+    },
     error::{QlinkError, Result},
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -10,11 +15,8 @@ use std::{
     sync::Arc,
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::{
-        tcp::{OwnedReadHalf, OwnedWriteHalf},
-        TcpListener, TcpStream,
-    },
+    io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
+    net::TcpListener,
     sync::{mpsc, Mutex},
     task::JoinHandle,
 };
@@ -42,7 +44,7 @@ pub enum RelayMessage {
 
 #[derive(Default, Clone)]
 pub struct RelayRegistry {
-    peers: Arc<Mutex<HashMap<String, OwnedWriteHalf>>>,
+    peers: Arc<Mutex<HashMap<String, BoxedControlWriter>>>,
 }
 
 pub async fn run_relay(listen: &str) -> Result<()> {
@@ -53,6 +55,22 @@ pub async fn run_relay_with_config(listen: &str, admission: ServiceAdmissionConf
     let listener = TcpListener::bind(listen).await?;
     let registry = RelayRegistry::default();
     serve_relay_with_config(listener, registry, admission).await
+}
+
+#[cfg(feature = "public-edge-tls")]
+pub async fn run_relay_with_optional_tls(
+    listen: &str,
+    admission: ServiceAdmissionConfig,
+    tls: Option<ControlTlsServerConfig>,
+) -> Result<()> {
+    match tls {
+        Some(tls) => {
+            let listener = TcpListener::bind(listen).await?;
+            let registry = RelayRegistry::default();
+            serve_relay_with_tls(listener, registry, admission, tls).await
+        }
+        None => run_relay_with_config(listen, admission).await,
+    }
 }
 
 pub async fn serve_relay(listener: TcpListener, registry: RelayRegistry) -> Result<()> {
@@ -75,6 +93,36 @@ pub async fn serve_relay_with_config(
                 handle_connection(stream, registry, admission, limiter, peer_addr).await
             {
                 tracing::warn!(?error, "relay connection failed");
+            }
+        });
+    }
+}
+
+#[cfg(feature = "public-edge-tls")]
+pub async fn serve_relay_with_tls(
+    listener: TcpListener,
+    registry: RelayRegistry,
+    admission: ServiceAdmissionConfig,
+    tls: ControlTlsServerConfig,
+) -> Result<()> {
+    let acceptor = load_tls_acceptor(&tls)?;
+    let limiter = AdmissionLimiter::new(&admission);
+    loop {
+        let (stream, peer_addr) = listener.accept().await?;
+        let registry = registry.clone();
+        let admission = admission.clone();
+        let limiter = limiter.clone();
+        let acceptor = acceptor.clone();
+        tokio::spawn(async move {
+            let result = async {
+                let stream = acceptor.accept(stream).await.map_err(|err| {
+                    QlinkError::Protocol(format!("relay TLS handshake failed: {err}"))
+                })?;
+                handle_connection(stream, registry, admission, limiter, peer_addr).await
+            }
+            .await;
+            if let Err(error) = result {
+                tracing::warn!(?error, "relay TLS connection failed");
             }
         });
     }
@@ -110,11 +158,21 @@ pub async fn spawn_dev_relay() -> Result<DevRelayServer> {
     Ok(DevRelayServer { local_addr, task })
 }
 
+pub async fn probe_relay_registration(
+    server: &str,
+    peer_id: impl Into<String>,
+    auth_token: Option<&str>,
+) -> Result<()> {
+    RelayClient::connect_with_auth(server, peer_id, auth_token)
+        .await
+        .map(|_| ())
+}
+
 struct RelayClient {
     #[cfg(test)]
     peer_id: String,
-    reader: BufReader<OwnedReadHalf>,
-    writer: OwnedWriteHalf,
+    reader: BufReader<BoxedControlReader>,
+    writer: BoxedControlWriter,
 }
 
 impl RelayClient {
@@ -128,8 +186,8 @@ impl RelayClient {
         peer_id: impl Into<String>,
         auth_token: Option<&str>,
     ) -> Result<Self> {
-        let stream = TcpStream::connect(server).await?;
-        let (reader, mut writer) = stream.into_split();
+        let stream = connect_control_stream(server, None).await?;
+        let (reader, mut writer) = split_control_stream(stream);
         let peer_id = peer_id.into();
         let register = RelayMessage::Register {
             peer_id: peer_id.clone(),
@@ -228,7 +286,7 @@ const RELAY_KIND_AUTHENTICATED: u8 = 1;
 pub struct RelayCarrierSession {
     remote_peer_id: String,
     local_peer_id: String,
-    writer: Arc<Mutex<OwnedWriteHalf>>,
+    writer: Arc<Mutex<BoxedControlWriter>>,
     inbound: Arc<Mutex<RelayInboundState>>,
 }
 
@@ -242,7 +300,7 @@ enum RelaySource {
     /// Initiator: read directly off the relay connection, keeping only
     /// datagrams whose source is the peer we dialed.
     Connection {
-        reader: BufReader<OwnedReadHalf>,
+        reader: BufReader<BoxedControlReader>,
         remote_peer_id: String,
     },
     /// Responder: pre-demultiplexed payloads for this one source peer.
@@ -317,8 +375,8 @@ impl RelayCarrierSession {
     ) -> Result<Self> {
         let local_peer_id = local_peer_id.into();
         let remote_peer_id = remote_peer_id.into();
-        let stream = TcpStream::connect(server).await?;
-        let (reader, mut writer) = stream.into_split();
+        let stream = connect_control_stream(server, None).await?;
+        let (reader, mut writer) = split_control_stream(stream);
         writer
             .write_all(
                 serde_json::to_string(&RelayMessage::Register {
@@ -362,7 +420,7 @@ impl RelayCarrierSession {
     fn responder(
         remote_peer_id: String,
         local_peer_id: String,
-        writer: Arc<Mutex<OwnedWriteHalf>>,
+        writer: Arc<Mutex<BoxedControlWriter>>,
         rx: mpsc::UnboundedReceiver<Vec<u8>>,
     ) -> Self {
         Self {
@@ -548,13 +606,13 @@ impl RelayResponderListener {
 }
 
 async fn handle_connection(
-    stream: TcpStream,
+    stream: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
     registry: RelayRegistry,
     admission: ServiceAdmissionConfig,
     limiter: AdmissionLimiter,
     peer_addr: SocketAddr,
 ) -> Result<()> {
-    let (reader, writer) = stream.into_split();
+    let (reader, writer) = split_control_stream(stream);
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
     let mut registered_peer: Option<String> = None;
@@ -635,7 +693,7 @@ async fn handle_connection(
     Ok(())
 }
 
-async fn write_relay_error(writer: &mut OwnedWriteHalf, message: &str) -> Result<()> {
+async fn write_relay_error(writer: &mut BoxedControlWriter, message: &str) -> Result<()> {
     let response = RelayMessage::Error {
         message: message.to_string(),
     };
