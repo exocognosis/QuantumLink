@@ -15,6 +15,7 @@
 #     --turn qlink.example.com:3478 --turn-username qlink --turn-password "$TURN_PASSWORD" --build
 #   scripts/public-infra-smoke.sh --local --admission-token local-edge-secret --build
 #   scripts/public-infra-smoke.sh --local --prove-turn-relay --admission-token local-edge-secret --build
+#   scripts/public-infra-smoke.sh --local --control-tls --admission-token local-edge-secret --build
 
 set -euo pipefail
 
@@ -36,6 +37,10 @@ RELAY_AUTH_TOKEN="${QLINK_RELAY_AUTH_TOKEN:-}"
 RENDEZVOUS_RATE_LIMIT_PER_WINDOW="${QLINK_RENDEZVOUS_RATE_LIMIT_PER_WINDOW:-0}"
 RELAY_RATE_LIMIT_PER_WINDOW="${QLINK_RELAY_RATE_LIMIT_PER_WINDOW:-0}"
 ADMISSION_RATE_LIMIT_WINDOW_SECONDS="${QLINK_ADMISSION_RATE_LIMIT_WINDOW_SECONDS:-60}"
+CONTROL_TLS="${QLINK_CONTROL_TLS:-0}"
+CONTROL_TLS_CA="${QLINK_CONTROL_TLS_CA:-}"
+CONTROL_TLS_CERT="${QLINK_CONTROL_TLS_CERT:-}"
+CONTROL_TLS_KEY="${QLINK_CONTROL_TLS_KEY:-}"
 BIN="${QLINK_BIN:-$ROOT/target/release/qlinkctl}"
 BUILD=0
 PROVE_TURN_RELAY=0
@@ -75,6 +80,10 @@ while [[ $# -gt 0 ]]; do
     --rendezvous-rate-limit-per-window) RENDEZVOUS_RATE_LIMIT_PER_WINDOW="$2"; shift 2 ;;
     --relay-rate-limit-per-window) RELAY_RATE_LIMIT_PER_WINDOW="$2"; shift 2 ;;
     --admission-rate-limit-window-seconds) ADMISSION_RATE_LIMIT_WINDOW_SECONDS="$2"; shift 2 ;;
+    --control-tls) CONTROL_TLS=1; shift ;;
+    --control-tls-ca) CONTROL_TLS_CA="$2"; shift 2 ;;
+    --control-tls-cert) CONTROL_TLS_CERT="$2"; shift 2 ;;
+    --control-tls-key) CONTROL_TLS_KEY="$2"; shift 2 ;;
     --base-port) BASE_PORT="$2"; shift 2 ;;
     --responder-bind) RESPONDER_BIND="$2"; shift 2 ;;
     --advertise-addr) ADVERTISE_ADDR="$2"; shift 2 ;;
@@ -99,6 +108,12 @@ mkdir -p "$RUN_DIR"
 
 PIDS=()
 cleanup() {
+  if [[ -n "${rendezvous_auth_token_file:-}" && -e "${rendezvous_auth_token_file:-}" ]]; then
+    rm "$rendezvous_auth_token_file"
+  fi
+  if [[ -n "${relay_auth_token_file:-}" && -e "${relay_auth_token_file:-}" ]]; then
+    rm "$relay_auth_token_file"
+  fi
   for pid in "${PIDS[@]:-}"; do
     kill "$pid" 2>/dev/null || true
   done
@@ -150,7 +165,68 @@ wait_log_pattern() {
 require_endpoint() {
   local value="$1"
   local name="$2"
-  [[ "$value" == *:* ]] || die "$name must be host:port"
+  local endpoint
+  endpoint="$(control_host_port "$value")"
+  [[ "$endpoint" == *:* ]] || die "$name must be host:port, tcp://host:port, or tls://host:port"
+}
+
+control_host_port() {
+  local value="$1"
+  value="${value#tcp://}"
+  value="${value#tls://}"
+  echo "$value"
+}
+
+endpoint_is_tls() {
+  [[ "$1" == tls://* ]]
+}
+
+generate_local_control_tls() {
+  [[ "$CONTROL_TLS" == "1" ]] || return 0
+  if [[ -z "$CONTROL_TLS_CERT" ]]; then
+    CONTROL_TLS_CERT="$RUN_DIR/control-tls.crt"
+  fi
+  if [[ -z "$CONTROL_TLS_KEY" ]]; then
+    CONTROL_TLS_KEY="$RUN_DIR/control-tls.key"
+  fi
+  if [[ -z "$CONTROL_TLS_CA" ]]; then
+    CONTROL_TLS_CA="$CONTROL_TLS_CERT"
+  fi
+  if [[ -f "$CONTROL_TLS_CERT" && -f "$CONTROL_TLS_KEY" ]]; then
+    return 0
+  fi
+  command -v openssl >/dev/null 2>&1 || die "--control-tls local mode requires openssl to generate a local test certificate"
+  local openssl_conf="$RUN_DIR/control-tls-openssl.cnf"
+  cat > "$openssl_conf" <<EOF
+[req]
+prompt = no
+distinguished_name = dn
+x509_extensions = v3_req
+
+[dn]
+CN = localhost
+
+[v3_req]
+subjectAltName = @alt_names
+
+[alt_names]
+DNS.1 = localhost
+IP.1 = 127.0.0.1
+EOF
+  openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+    -keyout "$CONTROL_TLS_KEY" \
+    -out "$CONTROL_TLS_CERT" \
+    -config "$openssl_conf" \
+    > "$RUN_DIR/openssl-control-tls.log" 2>&1 \
+    || die "failed to generate local control TLS certificate; see $RUN_DIR/openssl-control-tls.log"
+  chmod 600 "$CONTROL_TLS_KEY"
+}
+
+write_secret_file() {
+  local path="$1"
+  local value="$2"
+  umask 077
+  printf '%s\n' "$value" > "$path"
 }
 
 bool_for_nonempty() {
@@ -168,6 +244,9 @@ if [[ "$BUILD" -eq 1 ]]; then
   elif [[ -n "$TURN" ]]; then
     features="dev-quic-carrier,turn-relay"
   fi
+  if [[ "$CONTROL_TLS" == "1" || "$RENDEZVOUS" == tls://* || "$RELAY" == tls://* ]]; then
+    features="$features,public-edge-tls"
+  fi
   log "building qlinkctl release binary with features=$features"
   cargo build -p qlink-core --release --bin qlinkctl --features "$features" \
     > "$RUN_DIR/build.log" 2>&1
@@ -176,8 +255,14 @@ fi
 [[ -x "$BIN" ]] || die "qlinkctl not executable at $BIN; use --build or --qlink-bin"
 
 if [[ "$MODE" == "local" ]]; then
-  RENDEZVOUS="${RENDEZVOUS:-$LOCAL_HOST:$BASE_PORT}"
-  RELAY="${RELAY:-$LOCAL_HOST:$((BASE_PORT + 1))}"
+  if [[ "$CONTROL_TLS" == "1" ]]; then
+    RENDEZVOUS="${RENDEZVOUS:-tls://$LOCAL_HOST:$BASE_PORT}"
+    RELAY="${RELAY:-tls://$LOCAL_HOST:$((BASE_PORT + 1))}"
+    generate_local_control_tls
+  else
+    RENDEZVOUS="${RENDEZVOUS:-$LOCAL_HOST:$BASE_PORT}"
+    RELAY="${RELAY:-$LOCAL_HOST:$((BASE_PORT + 1))}"
+  fi
   STUN="${STUN:-$LOCAL_HOST:$((BASE_PORT + 2))}"
   if [[ "$PROVE_TURN_RELAY" -eq 1 ]]; then
     TURN="${TURN:-$LOCAL_HOST:$((BASE_PORT + 3))}"
@@ -185,9 +270,18 @@ if [[ "$MODE" == "local" ]]; then
   fi
 
   log "starting local rendezvous at $RENDEZVOUS"
-  rendezvous_args=(rendezvous --listen "$RENDEZVOUS")
+  rendezvous_listen="$(control_host_port "$RENDEZVOUS")"
+  relay_listen="$(control_host_port "$RELAY")"
+  rendezvous_args=(rendezvous --listen "$rendezvous_listen")
   if [[ -n "$RENDEZVOUS_AUTH_TOKEN" ]]; then
-    rendezvous_args+=(--auth-token "$RENDEZVOUS_AUTH_TOKEN")
+    rendezvous_auth_token_file="$RUN_DIR/rendezvous-auth-token"
+    write_secret_file "$rendezvous_auth_token_file" "$RENDEZVOUS_AUTH_TOKEN"
+    rendezvous_args+=(--auth-token-file "$rendezvous_auth_token_file")
+  fi
+  if endpoint_is_tls "$RENDEZVOUS"; then
+    [[ -n "$CONTROL_TLS_CERT" && -n "$CONTROL_TLS_KEY" ]] \
+      || die "local TLS rendezvous requires --control-tls-cert/--control-tls-key or --control-tls"
+    rendezvous_args+=(--tls-cert "$CONTROL_TLS_CERT" --tls-key "$CONTROL_TLS_KEY")
   fi
   if [[ "$RENDEZVOUS_RATE_LIMIT_PER_WINDOW" -gt 0 ]]; then
     rendezvous_args+=(
@@ -198,9 +292,16 @@ if [[ "$MODE" == "local" ]]; then
   "$BIN" "${rendezvous_args[@]}" > "$RUN_DIR/rendezvous.log" 2>&1 &
   PIDS+=("$!")
   log "starting local relay at $RELAY"
-  relay_args=(relay --listen "$RELAY")
+  relay_args=(relay --listen "$relay_listen")
   if [[ -n "$RELAY_AUTH_TOKEN" ]]; then
-    relay_args+=(--auth-token "$RELAY_AUTH_TOKEN")
+    relay_auth_token_file="$RUN_DIR/relay-auth-token"
+    write_secret_file "$relay_auth_token_file" "$RELAY_AUTH_TOKEN"
+    relay_args+=(--auth-token-file "$relay_auth_token_file")
+  fi
+  if endpoint_is_tls "$RELAY"; then
+    [[ -n "$CONTROL_TLS_CERT" && -n "$CONTROL_TLS_KEY" ]] \
+      || die "local TLS relay requires --control-tls-cert/--control-tls-key or --control-tls"
+    relay_args+=(--tls-cert "$CONTROL_TLS_CERT" --tls-key "$CONTROL_TLS_KEY")
   fi
   if [[ "$RELAY_RATE_LIMIT_PER_WINDOW" -gt 0 ]]; then
     relay_args+=(
@@ -232,17 +333,55 @@ if [[ "$PROVE_TURN_RELAY" -eq 1 ]]; then
 fi
 
 log "waiting for rendezvous=$RENDEZVOUS and relay=$RELAY"
-wait_tcp "$RENDEZVOUS" || die "rendezvous did not accept TCP connections"
-wait_tcp "$RELAY" || die "relay did not accept TCP connections"
+wait_tcp "$(control_host_port "$RENDEZVOUS")" || die "rendezvous did not accept TCP connections"
+wait_tcp "$(control_host_port "$RELAY")" || die "relay did not accept TCP connections"
 
 log "proving rendezvous publish/lookup"
 rendezvous_smoke_args=(rendezvous-smoke --server "$RENDEZVOUS")
 if [[ -n "$RENDEZVOUS_AUTH_TOKEN" ]]; then
   rendezvous_smoke_args+=(--auth-token "$RENDEZVOUS_AUTH_TOKEN")
 fi
+if [[ -n "$CONTROL_TLS_CA" ]]; then
+  rendezvous_smoke_args+=(--control-tls-ca "$CONTROL_TLS_CA")
+fi
 "$BIN" "${rendezvous_smoke_args[@]}" > "$RUN_DIR/rendezvous-smoke.log" 2>&1
 grep -q '^record_verified=true$' "$RUN_DIR/rendezvous-smoke.log" \
   || die "rendezvous smoke did not verify the published record"
+
+rendezvous_auth_verified=false
+if [[ -n "$RENDEZVOUS_AUTH_TOKEN" ]]; then
+  unauth_rendezvous_args=(rendezvous-smoke --server "$RENDEZVOUS")
+  if [[ -n "$CONTROL_TLS_CA" ]]; then
+    unauth_rendezvous_args+=(--control-tls-ca "$CONTROL_TLS_CA")
+  fi
+  if "$BIN" "${unauth_rendezvous_args[@]}" > "$RUN_DIR/rendezvous-unauth.log" 2>&1; then
+    die "rendezvous accepted unauthenticated publish/lookup"
+  fi
+  grep -qi 'authentication failed' "$RUN_DIR/rendezvous-unauth.log" \
+    || die "rendezvous unauthenticated probe failed for an unexpected reason"
+  rendezvous_auth_verified=true
+fi
+
+relay_auth_verified=false
+if [[ -n "$RELAY_AUTH_TOKEN" ]]; then
+  unauth_relay_args=(relay-admission-smoke --server "$RELAY" --peer-id qlink-unauth-probe)
+  if [[ -n "$CONTROL_TLS_CA" ]]; then
+    unauth_relay_args+=(--control-tls-ca "$CONTROL_TLS_CA")
+  fi
+  if "$BIN" "${unauth_relay_args[@]}" > "$RUN_DIR/relay-unauth.log" 2>&1; then
+    die "relay accepted unauthenticated registration"
+  fi
+  grep -qi 'authentication failed' "$RUN_DIR/relay-unauth.log" \
+    || die "relay unauthenticated probe failed for an unexpected reason"
+  relay_auth_args=(relay-admission-smoke --server "$RELAY" --peer-id qlink-auth-probe --auth-token "$RELAY_AUTH_TOKEN")
+  if [[ -n "$CONTROL_TLS_CA" ]]; then
+    relay_auth_args+=(--control-tls-ca "$CONTROL_TLS_CA")
+  fi
+  "$BIN" "${relay_auth_args[@]}" > "$RUN_DIR/relay-admission.log" 2>&1
+  grep -q '^relay_registration_accepted=true$' "$RUN_DIR/relay-admission.log" \
+    || die "relay authenticated admission probe did not register"
+  relay_auth_verified=true
+fi
 
 log "proving STUN reflexive candidate"
 "$BIN" stun-gather --server "$STUN" --bind-addr 0.0.0.0:0 \
@@ -292,6 +431,9 @@ if [[ "$PROVE_TURN_RELAY" -eq 1 ]]; then
   if [[ -n "$TURN_REALM" ]]; then
     publish_args+=(--turn-realm "$TURN_REALM")
   fi
+  if [[ -n "$CONTROL_TLS_CA" ]]; then
+    publish_args+=(--control-tls-ca "$CONTROL_TLS_CA")
+  fi
 else
   publish_args=(publish-self
     --rendezvous "$RENDEZVOUS"
@@ -307,6 +449,9 @@ else
   fi
   if [[ -n "$RELAY_AUTH_TOKEN" ]]; then
     publish_args+=(--relay-auth-token "$RELAY_AUTH_TOKEN")
+  fi
+  if [[ -n "$CONTROL_TLS_CA" ]]; then
+    publish_args+=(--control-tls-ca "$CONTROL_TLS_CA")
   fi
   if [[ -n "$TURN" ]]; then
     publish_args+=(--turn "$TURN")
@@ -348,6 +493,7 @@ direct_send_args=(direct-send
   --rendezvous "$RENDEZVOUS"
   --mesh-id "$MESH_ID"
   --remote-peer-id "$REMOTE_PEER"
+  --relay "$RELAY"
   --bind-addr 0.0.0.0:0
   --payload public-infra-smoke
   --count "$COUNT"
@@ -359,6 +505,9 @@ if [[ -n "$RENDEZVOUS_AUTH_TOKEN" ]]; then
 fi
 if [[ -n "$RELAY_AUTH_TOKEN" ]]; then
   direct_send_args+=(--relay-auth-token "$RELAY_AUTH_TOKEN")
+fi
+if [[ -n "$CONTROL_TLS_CA" ]]; then
+  direct_send_args+=(--control-tls-ca "$CONTROL_TLS_CA")
 fi
 "$BIN" "${direct_send_args[@]}" > "$RUN_DIR/direct-send.log" 2>&1
 
@@ -400,8 +549,13 @@ cat > "$EVIDENCE" <<EOF
   "relay": "$RELAY",
   "stun": "$STUN",
   "turn": "$TURN",
+  "control_tls_ca_configured": $(bool_for_nonempty "$CONTROL_TLS_CA"),
+  "rendezvous_tls_enabled": $(endpoint_is_tls "$RENDEZVOUS" && echo true || echo false),
+  "relay_tls_enabled": $(endpoint_is_tls "$RELAY" && echo true || echo false),
   "rendezvous_auth_required": $(bool_for_nonempty "$RENDEZVOUS_AUTH_TOKEN"),
   "relay_auth_required": $(bool_for_nonempty "$RELAY_AUTH_TOKEN"),
+  "rendezvous_auth_verified": $rendezvous_auth_verified,
+  "relay_auth_verified": $relay_auth_verified,
   "rendezvous_rate_limit_per_window": $RENDEZVOUS_RATE_LIMIT_PER_WINDOW,
   "relay_rate_limit_per_window": $RELAY_RATE_LIMIT_PER_WINDOW,
   "admission_rate_limit_window_seconds": $ADMISSION_RATE_LIMIT_WINDOW_SECONDS,
@@ -422,6 +576,8 @@ cat > "$EVIDENCE" <<EOF
   "total_elapsed_ms": ${total_elapsed_ms:-0}
 }
 EOF
+
+rm -f "${rendezvous_auth_token_file:-}" "${relay_auth_token_file:-}"
 
 log "PASS public infra smoke"
 echo "evidence=$EVIDENCE"

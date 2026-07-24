@@ -1,9 +1,9 @@
 # Replace TESTER_CIDR with the current tester egress CIDR before applying.
-# Rendezvous and QuantumLink relay are raw TCP today, so keep them source
-# allowlisted or tunnel them over WireGuard/SSH.
+# Rendezvous and QuantumLink relay should run TLS plus token admission. Keep
+# them source-limited for beta until abuse telemetry and quotas are deployed.
 
-ufw allow from TESTER_CIDR to any port 9471 proto tcp comment 'QuantumLink rendezvous allowlisted'
-ufw allow from TESTER_CIDR to any port 9472 proto tcp comment 'QuantumLink PQC relay allowlisted'
+ufw allow from TESTER_CIDR to any port 9471 proto tcp comment 'QuantumLink TLS rendezvous allowlisted'
+ufw allow from TESTER_CIDR to any port 9472 proto tcp comment 'QuantumLink TLS PQC relay allowlisted'
 
 # coturn on 3478 provides public STUN/TURN discovery/allocation. The in-repo
 # STUN helpers live on auxiliary ports for two-destination NAT classification.
