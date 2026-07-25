@@ -128,7 +128,30 @@ Start from the intentionally blocked deployment contract:
 
 - `windows/deployment/rendezvous-relay-production.template.json`
 
-After deployment, provide explicit measured control assertions and run
+After deployment, run public-edge evidence from an off-host tester and collect
+the Windows measurement bundle:
+
+```sh
+scripts/public-edge-live-evidence.sh --env-file ./edge.env --build
+
+ruby windows/scripts/collect-rendezvous-relay-production-measurements.rb \
+  --contract windows/deployment/rendezvous-relay-production.json \
+  --public-edge-manifest build/public-edge-live-evidence/<run>/manifest.json \
+  --operator-source windows/validation/operator-sources/tls/certificate_valid.json \
+  --operator-source windows/validation/operator-sources/tls/rotation_tested.json \
+  --output windows/build/validation/rendezvous-relay-production-measurements.json
+```
+
+The collector intentionally maps only the assertions proved by public-edge
+smoke: TLS enabled, authorized traffic accepted, and unauthorized traffic
+rejected. It leaves certificate rotation, signed-record policy, rate-limit
+denials, abuse-log redaction, revocation propagation, retention, key rotation,
+endpoint rotation, and incident shutdown blocked unless separate operator
+source files are supplied. Each `--operator-source` must already be a redacted
+`windowsRendezvousRelayAssertionSourceEvidence` JSON file bound to the same
+deployment id, release commit/ref, and endpoint-set digest.
+
+After collecting measurements, run
 `windows/scripts/generate-rendezvous-relay-production-evidence.rb`. The
 generator writes the manifest, distinct control proofs, digest manifest, and
 SHA-256 checksum list, including each source proof used by a passing assertion.
