@@ -240,15 +240,19 @@ if require_public
   block_unless(positive_integer?(evidence["rendezvous_requests_succeeded_total"]), "rendezvous successful requests must be visible in metrics", blockers)
   block_unless(boolean_true?(evidence["bounds_verified"]), "request bounds proof must pass", blockers)
   block_unless(boolean_true?(evidence["relay_payload_limit_verified"]), "relay payload limit proof must pass", blockers)
+  block_unless(boolean_true?(evidence["relay_saturation_limit_verified"]), "relay saturation limit proof must pass", blockers)
   block_unless(positive_integer?(evidence["max_request_line_bytes"]), "request line limit must be configured", blockers)
   block_unless(positive_integer?(evidence["max_concurrent_connections"]), "connection limit must be configured", blockers)
   block_unless(positive_integer?(evidence["idle_timeout_seconds"]), "idle timeout must be configured", blockers)
   block_unless(positive_integer?(evidence["relay_max_payload_bytes"]), "relay payload limit must be configured", blockers)
   block_unless(positive_integer?(evidence["relay_max_peer_id_bytes"]), "relay peer ID limit must be configured", blockers)
   block_unless(positive_integer?(evidence["relay_max_registered_peers"]), "relay registered-peer limit must be configured", blockers)
+  block_unless(positive_integer?(evidence["relay_max_peer_datagrams_per_window"]), "relay peer datagram limit must be configured", blockers)
+  block_unless(positive_integer?(evidence["relay_peer_datagram_window_seconds"]), "relay peer datagram window must be configured", blockers)
   block_unless(positive_integer?(evidence["rendezvous_request_too_large_total"]), "rendezvous oversized requests must be visible in metrics", blockers)
   block_unless(positive_integer?(evidence["relay_request_too_large_total"]), "relay oversized requests must be visible in metrics", blockers)
   block_unless(positive_integer?(evidence["relay_payload_too_large_total"]), "relay payload quota rejections must be visible in metrics", blockers)
+  block_unless(positive_integer?(evidence["relay_peer_rate_limited_total"]), "relay saturation rejections must be visible in metrics", blockers)
 end
 
 %w[stun_reflexive published_candidate_types selected_path].each do |field|
@@ -266,6 +270,7 @@ require_field(positive_integer?(evidence["direct_probe_timeout_ms"]), "direct_pr
   rendezvous_request_too_large_total
   relay_request_too_large_total
   relay_payload_too_large_total
+  relay_peer_rate_limited_total
   relay_duplicate_registration_rejections_total
 ].each do |field|
   require_field(nonnegative_integer?(evidence[field]), "#{field} must be a non-negative integer", failures)
@@ -277,6 +282,8 @@ end
   relay_max_payload_bytes
   relay_max_peer_id_bytes
   relay_max_registered_peers
+  relay_max_peer_datagrams_per_window
+  relay_peer_datagram_window_seconds
 ].each do |field|
   require_field(positive_integer?(evidence[field]), "#{field} must be a positive integer", failures)
 end

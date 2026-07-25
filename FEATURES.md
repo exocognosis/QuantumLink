@@ -52,9 +52,10 @@ This feature list is synchronized with the current repository implementation. It
 ## Not Production-Complete
 
 - Public rendezvous/relay TLS is implemented behind `public-edge-tls`, but
-  durable revocation, abuse monitoring, retention controls, connection quotas,
-  and actual off-host deployed hardening evidence remain open. The repository
-  now has an off-host evidence orchestrator and verifier to gate that proof.
+  durable revocation and actual off-host deployed hardening evidence remain
+  open. The repository now has an off-host evidence orchestrator, verifier,
+  service quotas, starter alert rules, and retention templates to gate that
+  proof.
 - RFC-complete public ICE nomination behavior and TURN relay-candidate data-plane proof against deployed public infrastructure.
 - Notarized Developer ID app and tunnel extension bundle.
 - Real-hardware validation of signed/provisioned Network Extension builds, including peer-session readiness under live packet flow.

@@ -63,6 +63,8 @@ IDLE_TIMEOUT_SECONDS="${QLINK_IDLE_TIMEOUT_SECONDS:-300}"
 RELAY_MAX_PAYLOAD_BYTES="${QLINK_RELAY_MAX_PAYLOAD_BYTES:-65536}"
 RELAY_MAX_PEER_ID_BYTES="${QLINK_RELAY_MAX_PEER_ID_BYTES:-256}"
 RELAY_MAX_REGISTERED_PEERS="${QLINK_RELAY_MAX_REGISTERED_PEERS:-2048}"
+RELAY_MAX_PEER_DATAGRAMS_PER_WINDOW="${QLINK_RELAY_MAX_PEER_DATAGRAMS_PER_WINDOW:-120}"
+RELAY_PEER_DATAGRAM_WINDOW_SECONDS="${QLINK_RELAY_PEER_DATAGRAM_WINDOW_SECONDS:-60}"
 
 usage() {
   grep '^#' "$0" | sed 's/^# \{0,1\}//'
@@ -91,6 +93,8 @@ while [[ $# -gt 0 ]]; do
     --relay-max-payload-bytes) RELAY_MAX_PAYLOAD_BYTES="$2"; shift 2 ;;
     --relay-max-peer-id-bytes) RELAY_MAX_PEER_ID_BYTES="$2"; shift 2 ;;
     --relay-max-registered-peers) RELAY_MAX_REGISTERED_PEERS="$2"; shift 2 ;;
+    --relay-max-peer-datagrams-per-window) RELAY_MAX_PEER_DATAGRAMS_PER_WINDOW="$2"; shift 2 ;;
+    --relay-peer-datagram-window-seconds) RELAY_PEER_DATAGRAM_WINDOW_SECONDS="$2"; shift 2 ;;
     --run-dir) RUN_DIR="$2"; shift 2 ;;
     --mesh-id) MESH_ID="$2"; shift 2 ;;
     --count) COUNT="$2"; shift 2 ;;
@@ -133,6 +137,8 @@ if [[ -n "$ENV_FILE" ]]; then
   RELAY_MAX_PAYLOAD_BYTES="${QLINK_RELAY_MAX_PAYLOAD_BYTES:-$RELAY_MAX_PAYLOAD_BYTES}"
   RELAY_MAX_PEER_ID_BYTES="${QLINK_RELAY_MAX_PEER_ID_BYTES:-$RELAY_MAX_PEER_ID_BYTES}"
   RELAY_MAX_REGISTERED_PEERS="${QLINK_RELAY_MAX_REGISTERED_PEERS:-$RELAY_MAX_REGISTERED_PEERS}"
+  RELAY_MAX_PEER_DATAGRAMS_PER_WINDOW="${QLINK_RELAY_MAX_PEER_DATAGRAMS_PER_WINDOW:-$RELAY_MAX_PEER_DATAGRAMS_PER_WINDOW}"
+  RELAY_PEER_DATAGRAM_WINDOW_SECONDS="${QLINK_RELAY_PEER_DATAGRAM_WINDOW_SECONDS:-$RELAY_PEER_DATAGRAM_WINDOW_SECONDS}"
   BIN="${QLINK_BIN:-$BIN}"
 fi
 
@@ -209,6 +215,8 @@ smoke_common=(
   --relay-max-payload-bytes "$RELAY_MAX_PAYLOAD_BYTES"
   --relay-max-peer-id-bytes "$RELAY_MAX_PEER_ID_BYTES"
   --relay-max-registered-peers "$RELAY_MAX_REGISTERED_PEERS"
+  --relay-max-peer-datagrams-per-window "$RELAY_MAX_PEER_DATAGRAMS_PER_WINDOW"
+  --relay-peer-datagram-window-seconds "$RELAY_PEER_DATAGRAM_WINDOW_SECONDS"
 )
 if [[ "$BUILD" -eq 1 ]]; then
   smoke_common+=(--build)
@@ -297,11 +305,13 @@ ruby -rjson -rtime -e '
         "relayMetricsScraped" => app.fetch("relay_metrics_scraped"),
         "boundsVerified" => app.fetch("bounds_verified"),
         "relayPayloadLimitVerified" => app.fetch("relay_payload_limit_verified"),
+        "relaySaturationLimitVerified" => app.fetch("relay_saturation_limit_verified"),
         "rendezvousAuthFailuresTotal" => app.fetch("rendezvous_auth_failures_total"),
         "relayAuthFailuresTotal" => app.fetch("relay_auth_failures_total"),
         "rendezvousRequestTooLargeTotal" => app.fetch("rendezvous_request_too_large_total"),
         "relayRequestTooLargeTotal" => app.fetch("relay_request_too_large_total"),
         "relayPayloadTooLargeTotal" => app.fetch("relay_payload_too_large_total"),
+        "relayPeerRateLimitedTotal" => app.fetch("relay_peer_rate_limited_total"),
         "relayForwardedDatagramsTotal" => app.fetch("relay_forwarded_datagrams_total"),
         "publicInfraReady" => app_verification.fetch("publicInfraReady")
       },
@@ -314,11 +324,13 @@ ruby -rjson -rtime -e '
         "relayMetricsScraped" => turn.fetch("relay_metrics_scraped"),
         "boundsVerified" => turn.fetch("bounds_verified"),
         "relayPayloadLimitVerified" => turn.fetch("relay_payload_limit_verified"),
+        "relaySaturationLimitVerified" => turn.fetch("relay_saturation_limit_verified"),
         "rendezvousAuthFailuresTotal" => turn.fetch("rendezvous_auth_failures_total"),
         "relayAuthFailuresTotal" => turn.fetch("relay_auth_failures_total"),
         "rendezvousRequestTooLargeTotal" => turn.fetch("rendezvous_request_too_large_total"),
         "relayRequestTooLargeTotal" => turn.fetch("relay_request_too_large_total"),
         "relayPayloadTooLargeTotal" => turn.fetch("relay_payload_too_large_total"),
+        "relayPeerRateLimitedTotal" => turn.fetch("relay_peer_rate_limited_total"),
         "publicInfraReady" => turn_verification.fetch("publicInfraReady")
       }
     }

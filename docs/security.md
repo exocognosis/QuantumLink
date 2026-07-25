@@ -79,27 +79,28 @@ regenerate `peers.json` after rolling the new build.
 
 Not yet production-complete:
 
-- Durable service-token revocation, abuse monitoring, operational retention
-  controls, connection quotas, and actual deployed hardening evidence beyond
-  the current TLS/token/rate-limit public-edge runbook. The repository includes
-  a verifier to prevent local rehearsal evidence from satisfying that gate.
+- Durable service-token revocation and actual deployed hardening evidence beyond
+  the current TLS/token/rate-limit/quota public-edge runbook. The repository
+  includes alert/retention templates and a verifier to prevent local rehearsal
+  evidence from satisfying that gate.
 - Deployed public TURN data-plane proof and RFC-complete ICE nomination against deployed public infrastructure beyond the current deterministic candidate ordering, connectivity-check paths, and local resident TURN proof.
 - Notarized Developer ID app and extension bundles.
 - Managed Device Attestation and SSO integration.
 - Full update signing pipeline with a post-quantum manifest layer.
 - Production Dytallix mainnet or hardened production registry trust root.
-- Hardened public relay abuse controls beyond TLS, bearer admission, rate
-  limiting, and registered-source validation.
+- Hardened public relay abuse controls beyond TLS, bearer admission, source and
+  per-peer rate limiting, registered-source validation, and bounded payloads.
 - Removal of non-transport platform classical primitives: macOS/Windows privacy redaction still uses SHA-256-derived aliases; macOS CMS/profile signing still uses platform SHA-256 and interacts with platform AES behavior.
 - Removal of every classical primitive from every build/tooling path. Default `qlink-core` builds exclude the dev carrier and public-edge TLS dependency graphs, but optional dev-carrier/TLS builds, platform signing/redaction helpers, and lockfile contents remain outside a full zero-classical claim.
 - Full anonymity guarantees. QuantumLink minimizes app/control-plane metadata by default, but outer transport IPs, relay timing, account context, and endpoint behavior can still identify users unless a future relay/egress architecture is built specifically for that threat model.
 
 The development rendezvous and relay binaries now include feature-gated TLS,
 bearer-token admission, credential-file token loading, per-client IP rate
-limits, and relay registered-source validation. Do not expose them broadly to
-the open internet without adding abuse monitoring, durable service-token
-revocation, retention controls, connection quotas, and production Dytallix
-registry pinning for public meshes. For public validation before those controls
-land, use the source-limited TLS edge runbook in `public-infra-runbook.md`.
+limits, service bounds, per-peer relay saturation quotas, and relay
+registered-source validation. Do not expose them broadly to the open internet
+without durable service-token revocation, live operator alert/retention proof,
+and production Dytallix registry pinning for public meshes. For public
+validation before those controls land, use the source-limited TLS edge runbook
+in `public-infra-runbook.md`.
 
 For repository-scoped reviewer guides, see `../THREAT_MODEL.md` and `../QUANTUM_THREATS.md`.

@@ -14,6 +14,8 @@ pub const DEFAULT_IDLE_TIMEOUT_SECONDS: u64 = 300;
 pub const DEFAULT_RELAY_MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 pub const DEFAULT_RELAY_MAX_PEER_ID_BYTES: usize = 256;
 pub const DEFAULT_RELAY_MAX_REGISTERED_PEERS: usize = 2048;
+pub const DEFAULT_RELAY_MAX_PEER_DATAGRAMS_PER_WINDOW: u32 = 120;
+pub const DEFAULT_RELAY_PEER_DATAGRAM_WINDOW_SECONDS: u64 = 60;
 
 #[derive(Clone)]
 pub struct ServiceAdmissionConfig {
@@ -91,6 +93,8 @@ pub struct ServiceLimitsConfig {
     pub relay_max_payload_bytes: usize,
     pub relay_max_peer_id_bytes: usize,
     pub relay_max_registered_peers: usize,
+    pub relay_max_peer_datagrams_per_window: u32,
+    pub relay_peer_datagram_window: Duration,
 }
 
 impl ServiceLimitsConfig {
@@ -102,6 +106,8 @@ impl ServiceLimitsConfig {
             relay_max_payload_bytes: usize::MAX,
             relay_max_peer_id_bytes: usize::MAX,
             relay_max_registered_peers: usize::MAX,
+            relay_max_peer_datagrams_per_window: 0,
+            relay_peer_datagram_window: Duration::ZERO,
         }
     }
 
@@ -134,6 +140,16 @@ impl ServiceLimitsConfig {
         self.relay_max_registered_peers = value;
         self
     }
+
+    pub fn with_relay_max_peer_datagrams_per_window(mut self, value: u32) -> Self {
+        self.relay_max_peer_datagrams_per_window = value;
+        self
+    }
+
+    pub fn with_relay_peer_datagram_window(mut self, value: Duration) -> Self {
+        self.relay_peer_datagram_window = value;
+        self
+    }
 }
 
 impl Default for ServiceLimitsConfig {
@@ -145,6 +161,10 @@ impl Default for ServiceLimitsConfig {
             relay_max_payload_bytes: DEFAULT_RELAY_MAX_PAYLOAD_BYTES,
             relay_max_peer_id_bytes: DEFAULT_RELAY_MAX_PEER_ID_BYTES,
             relay_max_registered_peers: DEFAULT_RELAY_MAX_REGISTERED_PEERS,
+            relay_max_peer_datagrams_per_window: DEFAULT_RELAY_MAX_PEER_DATAGRAMS_PER_WINDOW,
+            relay_peer_datagram_window: Duration::from_secs(
+                DEFAULT_RELAY_PEER_DATAGRAM_WINDOW_SECONDS,
+            ),
         }
     }
 }

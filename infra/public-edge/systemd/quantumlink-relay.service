@@ -5,9 +5,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+LogNamespace=quantumlink
 EnvironmentFile=/etc/quantumlink/public-edge.env
 LoadCredential=relay-auth-token:/etc/quantumlink/secrets/relay-auth-token
-ExecStart=/opt/quantumlink/bin/qlinkctl relay --listen ${QLINK_RELAY_LISTEN} --auth-token-file ${CREDENTIALS_DIRECTORY}/relay-auth-token --tls-cert ${QLINK_RELAY_TLS_CERT} --tls-key ${QLINK_RELAY_TLS_KEY} --rate-limit-per-window ${QLINK_RELAY_RATE_LIMIT_PER_WINDOW} --rate-limit-window-seconds ${QLINK_ADMISSION_RATE_LIMIT_WINDOW_SECONDS} --metrics-addr ${QLINK_RELAY_METRICS_ADDR} --max-request-line-bytes ${QLINK_MAX_REQUEST_LINE_BYTES} --max-concurrent-connections ${QLINK_MAX_CONCURRENT_CONNECTIONS} --idle-timeout-seconds ${QLINK_IDLE_TIMEOUT_SECONDS} --max-relay-payload-bytes ${QLINK_RELAY_MAX_PAYLOAD_BYTES} --max-relay-peer-id-bytes ${QLINK_RELAY_MAX_PEER_ID_BYTES} --max-relay-registered-peers ${QLINK_RELAY_MAX_REGISTERED_PEERS}
+ExecStart=/opt/quantumlink/bin/qlinkctl relay --listen ${QLINK_RELAY_LISTEN} --auth-token-file ${CREDENTIALS_DIRECTORY}/relay-auth-token --tls-cert ${QLINK_RELAY_TLS_CERT} --tls-key ${QLINK_RELAY_TLS_KEY} --rate-limit-per-window ${QLINK_RELAY_RATE_LIMIT_PER_WINDOW} --rate-limit-window-seconds ${QLINK_ADMISSION_RATE_LIMIT_WINDOW_SECONDS} --metrics-addr ${QLINK_RELAY_METRICS_ADDR} --max-request-line-bytes ${QLINK_MAX_REQUEST_LINE_BYTES} --max-concurrent-connections ${QLINK_MAX_CONCURRENT_CONNECTIONS} --idle-timeout-seconds ${QLINK_IDLE_TIMEOUT_SECONDS} --max-relay-payload-bytes ${QLINK_RELAY_MAX_PAYLOAD_BYTES} --max-relay-peer-id-bytes ${QLINK_RELAY_MAX_PEER_ID_BYTES} --max-relay-registered-peers ${QLINK_RELAY_MAX_REGISTERED_PEERS} --max-relay-peer-datagrams-per-window ${QLINK_RELAY_MAX_PEER_DATAGRAMS_PER_WINDOW} --relay-peer-datagram-window-seconds ${QLINK_RELAY_PEER_DATAGRAM_WINDOW_SECONDS}
 Restart=always
 RestartSec=3
 User=quantumlink

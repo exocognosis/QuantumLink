@@ -45,6 +45,8 @@ IDLE_TIMEOUT_SECONDS="${QLINK_IDLE_TIMEOUT_SECONDS:-300}"
 RELAY_MAX_PAYLOAD_BYTES="${QLINK_RELAY_MAX_PAYLOAD_BYTES:-65536}"
 RELAY_MAX_PEER_ID_BYTES="${QLINK_RELAY_MAX_PEER_ID_BYTES:-256}"
 RELAY_MAX_REGISTERED_PEERS="${QLINK_RELAY_MAX_REGISTERED_PEERS:-2048}"
+RELAY_MAX_PEER_DATAGRAMS_PER_WINDOW="${QLINK_RELAY_MAX_PEER_DATAGRAMS_PER_WINDOW:-120}"
+RELAY_PEER_DATAGRAM_WINDOW_SECONDS="${QLINK_RELAY_PEER_DATAGRAM_WINDOW_SECONDS:-60}"
 CONTROL_TLS="${QLINK_CONTROL_TLS:-0}"
 CONTROL_TLS_CA="${QLINK_CONTROL_TLS_CA:-}"
 CONTROL_TLS_CERT="${QLINK_CONTROL_TLS_CERT:-}"
@@ -96,6 +98,8 @@ while [[ $# -gt 0 ]]; do
     --relay-max-payload-bytes) RELAY_MAX_PAYLOAD_BYTES="$2"; shift 2 ;;
     --relay-max-peer-id-bytes) RELAY_MAX_PEER_ID_BYTES="$2"; shift 2 ;;
     --relay-max-registered-peers) RELAY_MAX_REGISTERED_PEERS="$2"; shift 2 ;;
+    --relay-max-peer-datagrams-per-window) RELAY_MAX_PEER_DATAGRAMS_PER_WINDOW="$2"; shift 2 ;;
+    --relay-peer-datagram-window-seconds) RELAY_PEER_DATAGRAM_WINDOW_SECONDS="$2"; shift 2 ;;
     --control-tls) CONTROL_TLS=1; shift ;;
     --control-tls-ca) CONTROL_TLS_CA="$2"; shift 2 ;;
     --control-tls-cert) CONTROL_TLS_CERT="$2"; shift 2 ;;
@@ -299,6 +303,19 @@ probe_relay_payload_limit() {
   "$BIN" "${args[@]}" > "$RUN_DIR/relay-quota-smoke.log" 2>&1
 }
 
+probe_relay_saturation_limit() {
+  local endpoint="$1"
+  local max_datagrams_per_window="$2"
+  local args=(relay-saturation-smoke --server "$endpoint" --peer-id qlink-saturation-probe --max-datagrams-per-window "$max_datagrams_per_window")
+  if [[ -n "$RELAY_AUTH_TOKEN" ]]; then
+    args+=(--auth-token "$RELAY_AUTH_TOKEN")
+  fi
+  if [[ -n "$CONTROL_TLS_CA" ]]; then
+    args+=(--control-tls-ca "$CONTROL_TLS_CA")
+  fi
+  "$BIN" "${args[@]}" > "$RUN_DIR/relay-saturation-smoke.log" 2>&1
+}
+
 if [[ "$BUILD" -eq 1 ]]; then
   features="dev-quic-carrier"
   if [[ "$PROVE_TURN_RELAY" -eq 1 ]]; then
@@ -374,6 +391,8 @@ if [[ "$MODE" == "local" ]]; then
     --max-relay-payload-bytes "$RELAY_MAX_PAYLOAD_BYTES"
     --max-relay-peer-id-bytes "$RELAY_MAX_PEER_ID_BYTES"
     --max-relay-registered-peers "$RELAY_MAX_REGISTERED_PEERS"
+    --max-relay-peer-datagrams-per-window "$RELAY_MAX_PEER_DATAGRAMS_PER_WINDOW"
+    --relay-peer-datagram-window-seconds "$RELAY_PEER_DATAGRAM_WINDOW_SECONDS"
   )
   if [[ -n "$RELAY_AUTH_TOKEN" ]]; then
     relay_auth_token_file="$RUN_DIR/relay-auth-token"
@@ -470,6 +489,7 @@ fi
 
 bounds_verified=false
 relay_payload_limit_verified=false
+relay_saturation_limit_verified=false
 log "proving rendezvous and relay request-line bounds"
 probe_oversized_line "$RENDEZVOUS" "$MAX_REQUEST_LINE_BYTES" \
   || die "rendezvous oversized-line probe failed"
@@ -481,6 +501,11 @@ log "proving relay payload-size quota"
 probe_relay_payload_limit "$RELAY" "$RELAY_MAX_PAYLOAD_BYTES" \
   || die "relay payload quota probe failed"
 relay_payload_limit_verified=true
+
+log "proving relay per-peer saturation quota"
+probe_relay_saturation_limit "$RELAY" "$RELAY_MAX_PEER_DATAGRAMS_PER_WINDOW" \
+  || die "relay saturation quota probe failed"
+relay_saturation_limit_verified=true
 
 log "proving STUN reflexive candidate"
 "$BIN" stun-gather --server "$STUN" --bind-addr 0.0.0.0:0 \
@@ -646,6 +671,7 @@ relay_unknown_destination_drops_total=0
 rendezvous_request_too_large_total=0
 relay_request_too_large_total=0
 relay_payload_too_large_total=0
+relay_peer_rate_limited_total=0
 relay_duplicate_registration_rejections_total=0
 if [[ -n "$RENDEZVOUS_METRICS_ADDR" ]]; then
   log "scraping rendezvous metrics at $RENDEZVOUS_METRICS_ADDR"
@@ -672,6 +698,7 @@ if [[ -n "$RELAY_METRICS_ADDR" ]]; then
   relay_unknown_destination_drops_total="$(metric_value "$RUN_DIR/relay.metrics" quantumlink_relay_unknown_destination_drops_total)"
   relay_request_too_large_total="$(metric_value "$RUN_DIR/relay.metrics" quantumlink_relay_request_too_large_total)"
   relay_payload_too_large_total="$(metric_value "$RUN_DIR/relay.metrics" quantumlink_relay_payload_too_large_total)"
+  relay_peer_rate_limited_total="$(metric_value "$RUN_DIR/relay.metrics" quantumlink_relay_peer_rate_limited_total)"
   relay_duplicate_registration_rejections_total="$(metric_value "$RUN_DIR/relay.metrics" quantumlink_relay_duplicate_registration_rejections_total)"
   if [[ -n "$RELAY_AUTH_TOKEN" && "$relay_auth_failures_total" -lt 1 ]]; then
     die "relay metrics did not record the negative auth probe"
@@ -681,6 +708,9 @@ if [[ -n "$RELAY_METRICS_ADDR" ]]; then
   fi
   if [[ "$relay_payload_too_large_total" -lt 1 ]]; then
     die "relay metrics did not record the payload quota probe"
+  fi
+  if [[ "$relay_peer_rate_limited_total" -lt 1 ]]; then
+    die "relay metrics did not record the peer saturation probe"
   fi
   if [[ "$expected_path" == "relay" && "$relay_forwarded_datagrams_total" -lt "$COUNT" ]]; then
     die "relay metrics forwarded_datagrams_total=$relay_forwarded_datagrams_total; expected at least $COUNT"
@@ -715,12 +745,15 @@ cat > "$EVIDENCE" <<EOF
   "relay_metrics_scraped": $relay_metrics_scraped,
   "bounds_verified": $bounds_verified,
   "relay_payload_limit_verified": $relay_payload_limit_verified,
+  "relay_saturation_limit_verified": $relay_saturation_limit_verified,
   "max_request_line_bytes": $MAX_REQUEST_LINE_BYTES,
   "max_concurrent_connections": $MAX_CONCURRENT_CONNECTIONS,
   "idle_timeout_seconds": $IDLE_TIMEOUT_SECONDS,
   "relay_max_payload_bytes": $RELAY_MAX_PAYLOAD_BYTES,
   "relay_max_peer_id_bytes": $RELAY_MAX_PEER_ID_BYTES,
   "relay_max_registered_peers": $RELAY_MAX_REGISTERED_PEERS,
+  "relay_max_peer_datagrams_per_window": $RELAY_MAX_PEER_DATAGRAMS_PER_WINDOW,
+  "relay_peer_datagram_window_seconds": $RELAY_PEER_DATAGRAM_WINDOW_SECONDS,
   "rendezvous_auth_failures_total": $rendezvous_auth_failures_total,
   "relay_auth_failures_total": $relay_auth_failures_total,
   "rendezvous_requests_succeeded_total": $rendezvous_requests_succeeded_total,
@@ -729,6 +762,7 @@ cat > "$EVIDENCE" <<EOF
   "rendezvous_request_too_large_total": $rendezvous_request_too_large_total,
   "relay_request_too_large_total": $relay_request_too_large_total,
   "relay_payload_too_large_total": $relay_payload_too_large_total,
+  "relay_peer_rate_limited_total": $relay_peer_rate_limited_total,
   "relay_duplicate_registration_rejections_total": $relay_duplicate_registration_rejections_total,
   "prove_turn_relay": $([[ "$PROVE_TURN_RELAY" -eq 1 ]] && echo true || echo false),
   "remote_peer_id": "$REMOTE_PEER",

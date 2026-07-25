@@ -29,6 +29,7 @@ struct ServiceMetricsInner {
     relay_registration_rejections_total: AtomicU64,
     relay_duplicate_registration_rejections_total: AtomicU64,
     relay_payload_too_large_total: AtomicU64,
+    relay_peer_rate_limited_total: AtomicU64,
     relay_forwarded_datagrams_total: AtomicU64,
     relay_unknown_destination_drops_total: AtomicU64,
     relay_spoofed_source_rejections_total: AtomicU64,
@@ -160,6 +161,12 @@ impl ServiceMetrics {
     pub fn relay_payload_too_large(&self) {
         self.inner
             .relay_payload_too_large_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn relay_peer_rate_limited(&self) {
+        self.inner
+            .relay_peer_rate_limited_total
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -344,6 +351,15 @@ impl ServiceMetrics {
         push_counter(
             snapshot,
             prefix,
+            "peer_rate_limited_total",
+            "Relay datagrams rejected because a registered peer exceeded its datagram window.",
+            self.inner
+                .relay_peer_rate_limited_total
+                .load(Ordering::Relaxed),
+        );
+        push_counter(
+            snapshot,
+            prefix,
             "forwarded_datagrams_total",
             "Relay datagrams forwarded to a registered destination.",
             self.inner
@@ -424,6 +440,7 @@ mod tests {
         metrics.relay_registration();
         metrics.relay_duplicate_registration_rejection();
         metrics.relay_payload_too_large();
+        metrics.relay_peer_rate_limited();
         metrics.relay_forwarded_datagram();
         metrics.relay_unknown_destination_drop();
         metrics.relay_spoofed_source_rejection();
@@ -433,6 +450,7 @@ mod tests {
         assert!(rendered.contains("quantumlink_relay_registrations_total 1"));
         assert!(rendered.contains("quantumlink_relay_duplicate_registration_rejections_total 1"));
         assert!(rendered.contains("quantumlink_relay_payload_too_large_total 1"));
+        assert!(rendered.contains("quantumlink_relay_peer_rate_limited_total 1"));
         assert!(rendered.contains("quantumlink_relay_forwarded_datagrams_total 1"));
         assert!(rendered.contains("quantumlink_relay_unknown_destination_drops_total 1"));
         assert!(rendered.contains("quantumlink_relay_spoofed_source_rejections_total 1"));

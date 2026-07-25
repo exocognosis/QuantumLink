@@ -1,0 +1,93 @@
+groups:
+  - name: quantumlink-public-edge
+    interval: 30s
+    rules:
+      - alert: QuantumLinkRendezvousMetricsMissing
+        expr: absent(quantumlink_rendezvous_connections_accepted_total)
+        for: 2m
+        labels:
+          severity: critical
+          service: rendezvous
+        annotations:
+          summary: QuantumLink rendezvous metrics are missing
+          description: The public-edge rendezvous metrics endpoint has not produced the expected OpenMetrics series.
+
+      - alert: QuantumLinkRelayMetricsMissing
+        expr: absent(quantumlink_relay_connections_accepted_total)
+        for: 2m
+        labels:
+          severity: critical
+          service: relay
+        annotations:
+          summary: QuantumLink relay metrics are missing
+          description: The public-edge relay metrics endpoint has not produced the expected OpenMetrics series.
+
+      - alert: QuantumLinkRendezvousAuthFailureSpike
+        expr: increase(quantumlink_rendezvous_auth_failures_total[5m]) > 20
+        for: 1m
+        labels:
+          severity: warning
+          service: rendezvous
+        annotations:
+          summary: QuantumLink rendezvous auth failures increased
+          description: The rendezvous service is rejecting a burst of unauthenticated requests.
+
+      - alert: QuantumLinkRelayAuthFailureSpike
+        expr: increase(quantumlink_relay_auth_failures_total[5m]) > 20
+        for: 1m
+        labels:
+          severity: warning
+          service: relay
+        annotations:
+          summary: QuantumLink relay auth failures increased
+          description: The relay service is rejecting a burst of unauthenticated registrations.
+
+      - alert: QuantumLinkRelayPeerSaturation
+        expr: increase(quantumlink_relay_peer_rate_limited_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          service: relay
+        annotations:
+          summary: QuantumLink relay peer saturation quota tripped
+          description: At least one registered relay peer exceeded the configured datagram window.
+
+      - alert: QuantumLinkRelayPayloadQuotaRejections
+        expr: increase(quantumlink_relay_payload_too_large_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          service: relay
+        annotations:
+          summary: QuantumLink relay payload quota rejected datagrams
+          description: Relay payload-size bounds are actively rejecting oversized datagrams.
+
+      - alert: QuantumLinkRelayConnectionLimitReached
+        expr: increase(quantumlink_relay_connection_limit_rejections_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          service: relay
+        annotations:
+          summary: QuantumLink relay connection limit reached
+          description: The relay service rejected connections because the configured concurrency ceiling was exhausted.
+
+      - alert: QuantumLinkRendezvousConnectionLimitReached
+        expr: increase(quantumlink_rendezvous_connection_limit_rejections_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          service: rendezvous
+        annotations:
+          summary: QuantumLink rendezvous connection limit reached
+          description: The rendezvous service rejected connections because the configured concurrency ceiling was exhausted.
+
+      - alert: QuantumLinkRelayRegisteredPeersHigh
+        expr: quantumlink_relay_registered_peers > 1600
+        for: 5m
+        labels:
+          severity: warning
+          service: relay
+        annotations:
+          summary: QuantumLink relay registered-peer count is high
+          description: Relay registered peers are above 80 percent of the default public-edge peer cap.

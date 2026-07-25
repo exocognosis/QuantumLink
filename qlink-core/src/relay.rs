@@ -46,6 +46,13 @@ pub enum RelayMessage {
 #[derive(Default, Clone)]
 pub struct RelayRegistry {
     peers: Arc<Mutex<HashMap<String, BoxedControlWriter>>>,
+    peer_datagram_buckets: Arc<Mutex<HashMap<String, RelayPeerDatagramBucket>>>,
+}
+
+#[derive(Debug, Clone)]
+struct RelayPeerDatagramBucket {
+    window_started: tokio::time::Instant,
+    count: u32,
 }
 
 pub async fn run_relay(listen: &str) -> Result<()> {
@@ -860,8 +867,7 @@ async fn handle_connection(
                 {
                     metrics.malformed_request();
                     if let Some(peer_id) = &registered_peer {
-                        registry.peers.lock().await.remove(peer_id);
-                        metrics.relay_registration_ended();
+                        end_relay_registration(&registry, peer_id, &metrics).await;
                     }
                     return Err(QlinkError::Protocol(format!(
                         "relay peer ID exceeds {} bytes",
@@ -871,8 +877,7 @@ async fn handle_connection(
                 if encoded_payload_exceeds_limit(&payload_base64, limits.relay_max_payload_bytes) {
                     metrics.relay_payload_too_large();
                     if let Some(peer_id) = &registered_peer {
-                        registry.peers.lock().await.remove(peer_id);
-                        metrics.relay_registration_ended();
+                        end_relay_registration(&registry, peer_id, &metrics).await;
                     }
                     return Err(QlinkError::Protocol(format!(
                         "relay datagram payload exceeds {} bytes",
@@ -882,12 +887,19 @@ async fn handle_connection(
                 if registered_peer.as_deref() != Some(source.as_str()) {
                     metrics.relay_spoofed_source_rejection();
                     if let Some(peer_id) = &registered_peer {
-                        registry.peers.lock().await.remove(peer_id);
-                        metrics.relay_registration_ended();
+                        end_relay_registration(&registry, peer_id, &metrics).await;
                     }
                     return Err(QlinkError::Protocol(
                         "relay datagram source does not match registered peer".into(),
                     ));
+                }
+                if let Err(error) =
+                    check_peer_datagram_quota(&registry, &source, limits, &metrics).await
+                {
+                    if let Some(peer_id) = &registered_peer {
+                        end_relay_registration(&registry, peer_id, &metrics).await;
+                    }
+                    return Err(error);
                 }
                 let frame = RelayMessage::Datagram {
                     source,
@@ -910,8 +922,7 @@ async fn handle_connection(
             Err(error) => {
                 metrics.malformed_request();
                 if let Some(peer_id) = &registered_peer {
-                    registry.peers.lock().await.remove(peer_id);
-                    metrics.relay_registration_ended();
+                    end_relay_registration(&registry, peer_id, &metrics).await;
                 }
                 return Err(error.into());
             }
@@ -920,11 +931,51 @@ async fn handle_connection(
     }
 
     if let Some(peer_id) = registered_peer {
-        registry.peers.lock().await.remove(&peer_id);
-        metrics.relay_registration_ended();
+        end_relay_registration(&registry, &peer_id, &metrics).await;
     }
 
     Ok(())
+}
+
+async fn check_peer_datagram_quota(
+    registry: &RelayRegistry,
+    peer_id: &str,
+    limits: ServiceLimitsConfig,
+    metrics: &ServiceMetrics,
+) -> Result<()> {
+    if limits.relay_max_peer_datagrams_per_window == 0
+        || limits.relay_peer_datagram_window.is_zero()
+    {
+        return Ok(());
+    }
+    let now = tokio::time::Instant::now();
+    let mut buckets = registry.peer_datagram_buckets.lock().await;
+    let bucket = buckets
+        .entry(peer_id.to_string())
+        .or_insert_with(|| RelayPeerDatagramBucket {
+            window_started: now,
+            count: 0,
+        });
+    if now.duration_since(bucket.window_started) >= limits.relay_peer_datagram_window {
+        bucket.window_started = now;
+        bucket.count = 0;
+    }
+    if bucket.count >= limits.relay_max_peer_datagrams_per_window {
+        metrics.relay_peer_rate_limited();
+        return Err(QlinkError::Protocol(format!(
+            "relay peer datagram rate exceeded: {} per {}s",
+            limits.relay_max_peer_datagrams_per_window,
+            limits.relay_peer_datagram_window.as_secs()
+        )));
+    }
+    bucket.count += 1;
+    Ok(())
+}
+
+async fn end_relay_registration(registry: &RelayRegistry, peer_id: &str, metrics: &ServiceMetrics) {
+    registry.peers.lock().await.remove(peer_id);
+    registry.peer_datagram_buckets.lock().await.remove(peer_id);
+    metrics.relay_registration_ended();
 }
 
 async fn read_bounded_line<R: AsyncRead + Unpin>(
@@ -1199,6 +1250,35 @@ mod tests {
         let rendered = metrics.snapshot("relay").render_open_metrics();
         assert!(rendered.contains("quantumlink_relay_duplicate_registration_rejections_total 1"));
         assert!(rendered.contains("quantumlink_relay_payload_too_large_total 1"));
+        assert!(rendered.contains("quantumlink_relay_registered_peers 0"));
+    }
+
+    #[tokio::test]
+    async fn relay_rejects_per_peer_datagram_saturation() {
+        let metrics = ServiceMetrics::default();
+        let limits = ServiceLimitsConfig::default()
+            .with_relay_max_peer_datagrams_per_window(1)
+            .with_relay_peer_datagram_window(Duration::from_secs(60));
+        let (addr, _task) =
+            spawn_limited_relay(ServiceAdmissionConfig::open(), limits, metrics.clone()).await;
+
+        let mut alice = RelayClient::connect(&addr.to_string(), "alice")
+            .await
+            .unwrap();
+
+        alice.send_datagram("missing", b"first").await.unwrap();
+        alice.send_datagram("missing", b"second").await.unwrap();
+
+        let closed = tokio::time::timeout(Duration::from_secs(2), alice.receive_datagram())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(closed.is_none());
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        let rendered = metrics.snapshot("relay").render_open_metrics();
+        assert!(rendered.contains("quantumlink_relay_peer_rate_limited_total 1"));
+        assert!(rendered.contains("quantumlink_relay_unknown_destination_drops_total 1"));
         assert!(rendered.contains("quantumlink_relay_registered_peers 0"));
     }
 

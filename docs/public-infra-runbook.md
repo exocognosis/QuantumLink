@@ -15,10 +15,10 @@ open internet production services yet. They now support TLS for their control
 protocols behind the explicit `public-edge-tls` feature, bearer-token admission
 from credential files, per-client IP rate limits, loopback OpenMetrics service
 counters, bounded request lines, connection ceilings, idle timeouts, relay
-payload/peer caps, and smoke proof that unauthenticated and oversized clients
-are rejected and counted. Keep those two ports source-limited for named testers
-until per-peer saturation quotas, retention policy, durable revocation, and a
-complete operator abuse workflow are in place.
+payload/peer caps, per-peer relay datagram saturation quotas, and smoke proof
+that unauthenticated, oversized, and saturated clients are rejected and counted.
+Keep those two ports source-limited for named testers until durable revocation
+and a complete deployed operator abuse workflow are in place.
 
 STUN and coturn TURN may be internet-facing. Published TURN relay candidates
 are consumed by the mesh connector when the responder keeps a live allocation.
@@ -41,6 +41,11 @@ Use the templates under `infra/public-edge/`:
 - `systemd/quantumlink-stun-secondary.service`: second auxiliary STUN port for NAT mapping checks.
 - `coturn/turnserver.conf.template`: authenticated coturn allocation service.
 - `ufw.rules.example`: source allowlisting and public UDP/TURN firewall shape.
+- `prometheus/quantumlink-public-edge-alerts.yml`: starter alert rules for
+  auth failures, missing metrics, relay saturation, payload rejections, and
+  connection-limit exhaustion.
+- `journald/quantumlink-retention.conf.example`: bounded journald retention for
+  the `quantumlink` log namespace.
 
 Expected default ports:
 
@@ -73,6 +78,7 @@ sudo install -d -m 0755 /etc/quantumlink /etc/quantumlink/tls
 sudo install -d -m 0750 /etc/quantumlink/secrets
 sudo install -m 0640 infra/public-edge/public-edge.env.example /etc/quantumlink/public-edge.env
 sudo install -m 0644 infra/public-edge/systemd/*.service /etc/systemd/system/
+sudo install -m 0644 infra/public-edge/journald/quantumlink-retention.conf.example /etc/systemd/journald@quantumlink.conf
 sudo systemctl daemon-reload
 ```
 
@@ -158,6 +164,8 @@ QLINK_IDLE_TIMEOUT_SECONDS=300
 QLINK_RELAY_MAX_PAYLOAD_BYTES=65536
 QLINK_RELAY_MAX_PEER_ID_BYTES=256
 QLINK_RELAY_MAX_REGISTERED_PEERS=2048
+QLINK_RELAY_MAX_PEER_DATAGRAMS_PER_WINDOW=120
+QLINK_RELAY_PEER_DATAGRAM_WINDOW_SECONDS=60
 ```
 
 Then run:
@@ -199,6 +207,8 @@ scripts/public-infra-smoke.sh \
   --relay-max-payload-bytes "$QLINK_RELAY_MAX_PAYLOAD_BYTES" \
   --relay-max-peer-id-bytes "$QLINK_RELAY_MAX_PEER_ID_BYTES" \
   --relay-max-registered-peers "$QLINK_RELAY_MAX_REGISTERED_PEERS" \
+  --relay-max-peer-datagrams-per-window "$QLINK_RELAY_MAX_PEER_DATAGRAMS_PER_WINDOW" \
+  --relay-peer-datagram-window-seconds "$QLINK_RELAY_PEER_DATAGRAM_WINDOW_SECONDS" \
   --build
 ```
 
@@ -227,6 +237,8 @@ scripts/public-infra-smoke.sh \
   --relay-max-payload-bytes "$QLINK_RELAY_MAX_PAYLOAD_BYTES" \
   --relay-max-peer-id-bytes "$QLINK_RELAY_MAX_PEER_ID_BYTES" \
   --relay-max-registered-peers "$QLINK_RELAY_MAX_REGISTERED_PEERS" \
+  --relay-max-peer-datagrams-per-window "$QLINK_RELAY_MAX_PEER_DATAGRAMS_PER_WINDOW" \
+  --relay-peer-datagram-window-seconds "$QLINK_RELAY_PEER_DATAGRAM_WINDOW_SECONDS" \
   --prove-turn-relay \
   --build
 ```
@@ -250,11 +262,13 @@ passing evidence file must show:
   edge runs;
 - `rendezvous_metrics_scraped` and `relay_metrics_scraped` are `true`, with
   auth failure counters greater than zero;
-- `bounds_verified` and `relay_payload_limit_verified` are `true`;
+- `bounds_verified`, `relay_payload_limit_verified`, and
+  `relay_saturation_limit_verified` are `true`;
 - `rendezvous_request_too_large_total`, `relay_request_too_large_total`, and
   `relay_payload_too_large_total` are greater than zero;
+- `relay_peer_rate_limited_total` is greater than zero;
 - request-line, connection, idle-timeout, relay-payload, peer-ID, and
-  registered-peer limits are positive;
+  registered-peer limits plus relay peer datagram window limits are positive;
 - `turn_relayed` is non-empty when `--turn` was supplied;
 - `published_candidate_types` includes `ServerReflexive`;
 - `published_candidate_types` includes `QuantumLinkRelay`;
@@ -302,6 +316,10 @@ Before widening tester access:
   token files, present TLS certificates, enforce appropriate rate limits, and
   expose only loopback service metrics while enforcing request, connection,
   idle-timeout, and relay quota bounds during source-limited beta.
+- Confirm `infra/public-edge/prometheus/quantumlink-public-edge-alerts.yml` is
+  loaded by the operator's alert manager or equivalent monitoring path.
+- Confirm `journald@quantumlink` retention is active if the systemd units use
+  `LogNamespace=quantumlink`.
 - Confirm coturn uses long-term credentials and a constrained relay port range.
 - Confirm coturn has readable TLS cert/key paths before exposing TCP/UDP 5349.
 - Confirm `journalctl -u quantumlink-*` contains control-plane metadata only.

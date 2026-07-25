@@ -134,6 +134,10 @@ enum Command {
         max_relay_peer_id_bytes: usize,
         #[arg(long, default_value_t = 2048)]
         max_relay_registered_peers: usize,
+        #[arg(long, default_value_t = 120)]
+        max_relay_peer_datagrams_per_window: u32,
+        #[arg(long, default_value_t = 60)]
+        relay_peer_datagram_window_seconds: u64,
     },
     ControlOversizeSmoke {
         #[arg(long)]
@@ -150,6 +154,18 @@ enum Command {
         peer_id: String,
         #[arg(long)]
         max_payload_bytes: usize,
+        #[arg(long)]
+        auth_token: Option<String>,
+        #[arg(long)]
+        control_tls_ca: Option<String>,
+    },
+    RelaySaturationSmoke {
+        #[arg(long)]
+        server: String,
+        #[arg(long, default_value = "qlink-saturation-probe")]
+        peer_id: String,
+        #[arg(long)]
+        max_datagrams_per_window: u32,
         #[arg(long)]
         auth_token: Option<String>,
         #[arg(long)]
@@ -476,6 +492,10 @@ async fn main() -> qlink_core::Result<()> {
                 ServiceLimitsConfig::default().relay_max_payload_bytes,
                 ServiceLimitsConfig::default().relay_max_peer_id_bytes,
                 ServiceLimitsConfig::default().relay_max_registered_peers,
+                ServiceLimitsConfig::default().relay_max_peer_datagrams_per_window,
+                ServiceLimitsConfig::default()
+                    .relay_peer_datagram_window
+                    .as_secs(),
             )?;
             let service_metrics = ServiceMetrics::default();
             let _metrics_endpoint = start_service_metrics_endpoint(
@@ -537,6 +557,8 @@ async fn main() -> qlink_core::Result<()> {
             max_relay_payload_bytes,
             max_relay_peer_id_bytes,
             max_relay_registered_peers,
+            max_relay_peer_datagrams_per_window,
+            relay_peer_datagram_window_seconds,
         } => {
             let admission = service_admission_config(
                 auth_token.as_deref(),
@@ -551,6 +573,8 @@ async fn main() -> qlink_core::Result<()> {
                 max_relay_payload_bytes,
                 max_relay_peer_id_bytes,
                 max_relay_registered_peers,
+                max_relay_peer_datagrams_per_window,
+                relay_peer_datagram_window_seconds,
             )?;
             let service_metrics = ServiceMetrics::default();
             let _metrics_endpoint = start_service_metrics_endpoint(
@@ -590,6 +614,14 @@ async fn main() -> qlink_core::Result<()> {
                 "relay_max_registered_peers={}",
                 limits.relay_max_registered_peers
             );
+            println!(
+                "relay_max_peer_datagrams_per_window={}",
+                limits.relay_max_peer_datagrams_per_window
+            );
+            println!(
+                "relay_peer_datagram_window_seconds={}",
+                limits.relay_peer_datagram_window.as_secs()
+            );
             run_relay_service(
                 &listen,
                 admission,
@@ -618,6 +650,22 @@ async fn main() -> qlink_core::Result<()> {
             install_control_tls_ca(control_tls_ca.as_deref())?;
             run_relay_quota_smoke(&server, &peer_id, max_payload_bytes, auth_token.as_deref())
                 .await?;
+        }
+        Command::RelaySaturationSmoke {
+            server,
+            peer_id,
+            max_datagrams_per_window,
+            auth_token,
+            control_tls_ca,
+        } => {
+            install_control_tls_ca(control_tls_ca.as_deref())?;
+            run_relay_saturation_smoke(
+                &server,
+                &peer_id,
+                max_datagrams_per_window,
+                auth_token.as_deref(),
+            )
+            .await?;
         }
         Command::Stun { listen } => {
             println!("stun_listen={listen}");
@@ -1145,6 +1193,8 @@ fn service_limits_config(
     max_relay_payload_bytes: usize,
     max_relay_peer_id_bytes: usize,
     max_relay_registered_peers: usize,
+    max_relay_peer_datagrams_per_window: u32,
+    relay_peer_datagram_window_seconds: u64,
 ) -> qlink_core::Result<ServiceLimitsConfig> {
     if max_request_line_bytes == 0 {
         return Err(qlink_core::QlinkError::Protocol(
@@ -1166,6 +1216,11 @@ fn service_limits_config(
             "--max-relay-registered-peers must be positive".into(),
         ));
     }
+    if max_relay_peer_datagrams_per_window > 0 && relay_peer_datagram_window_seconds == 0 {
+        return Err(qlink_core::QlinkError::Protocol(
+            "--relay-peer-datagram-window-seconds must be positive when peer datagram quotas are enabled".into(),
+        ));
+    }
 
     Ok(ServiceLimitsConfig {
         max_request_line_bytes,
@@ -1174,6 +1229,8 @@ fn service_limits_config(
         relay_max_payload_bytes: max_relay_payload_bytes,
         relay_max_peer_id_bytes: max_relay_peer_id_bytes,
         relay_max_registered_peers: max_relay_registered_peers,
+        relay_max_peer_datagrams_per_window: max_relay_peer_datagrams_per_window,
+        relay_peer_datagram_window: Duration::from_secs(relay_peer_datagram_window_seconds),
     })
 }
 
@@ -1274,6 +1331,63 @@ async fn run_relay_quota_smoke(
     let _ = tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut response)).await;
     println!("relay_payload_quota_probe_sent=true");
     println!("relay_payload_quota_probe_bytes={}", max_payload_bytes + 1);
+    Ok(())
+}
+
+async fn run_relay_saturation_smoke(
+    server: &str,
+    peer_id: &str,
+    max_datagrams_per_window: u32,
+    auth_token: Option<&str>,
+) -> qlink_core::Result<()> {
+    if max_datagrams_per_window == 0 {
+        return Err(qlink_core::QlinkError::Protocol(
+            "--max-datagrams-per-window must be positive".into(),
+        ));
+    }
+    let stream = connect_control_stream(server, None).await?;
+    let (reader, mut writer) = split_control_stream(stream);
+    let mut reader = BufReader::new(reader);
+    let register = RelayMessage::Register {
+        peer_id: peer_id.to_string(),
+        auth_token: auth_token.map(|token| token.to_string()),
+    };
+    writer
+        .write_all(serde_json::to_string(&register)?.as_bytes())
+        .await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await?;
+
+    let mut line = String::new();
+    reader.read_line(&mut line).await?;
+    match serde_json::from_str::<RelayMessage>(line.trim_end())? {
+        RelayMessage::Registered { peer_id: confirmed } if confirmed == peer_id => {}
+        RelayMessage::Error { message } => return Err(qlink_core::QlinkError::Protocol(message)),
+        other => {
+            return Err(qlink_core::QlinkError::Protocol(format!(
+                "unexpected relay saturation probe response: {other:?}"
+            )))
+        }
+    }
+
+    let datagram = RelayMessage::Datagram {
+        source: peer_id.to_string(),
+        destination: "qlink-saturation-missing".to_string(),
+        payload_base64: STANDARD.encode(b"quota-probe"),
+    };
+    let line = serde_json::to_string(&datagram)?;
+    for _ in 0..=max_datagrams_per_window {
+        writer.write_all(line.as_bytes()).await?;
+        writer.write_all(b"\n").await?;
+    }
+    writer.flush().await?;
+    let mut response = String::new();
+    let _ = tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut response)).await;
+    println!("relay_saturation_probe_sent=true");
+    println!(
+        "relay_saturation_probe_datagrams={}",
+        max_datagrams_per_window + 1
+    );
     Ok(())
 }
 

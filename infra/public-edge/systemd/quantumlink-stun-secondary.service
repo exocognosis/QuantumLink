@@ -5,6 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+LogNamespace=quantumlink
 EnvironmentFile=/etc/quantumlink/public-edge.env
 ExecStart=/opt/quantumlink/bin/qlinkctl stun --listen ${QLINK_STUN_SECONDARY_LISTEN}
 Restart=always
