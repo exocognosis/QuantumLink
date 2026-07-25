@@ -6,7 +6,14 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+
+pub const DEFAULT_MAX_REQUEST_LINE_BYTES: usize = 128 * 1024;
+pub const DEFAULT_MAX_CONCURRENT_CONNECTIONS: u32 = 1024;
+pub const DEFAULT_IDLE_TIMEOUT_SECONDS: u64 = 300;
+pub const DEFAULT_RELAY_MAX_PAYLOAD_BYTES: usize = 64 * 1024;
+pub const DEFAULT_RELAY_MAX_PEER_ID_BYTES: usize = 256;
+pub const DEFAULT_RELAY_MAX_REGISTERED_PEERS: usize = 2048;
 
 #[derive(Clone)]
 pub struct ServiceAdmissionConfig {
@@ -74,6 +81,114 @@ impl fmt::Debug for ServiceAdmissionConfig {
 pub struct RateLimitConfig {
     pub max_events: u32,
     pub window: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServiceLimitsConfig {
+    pub max_request_line_bytes: usize,
+    pub max_concurrent_connections: u32,
+    pub idle_timeout: Duration,
+    pub relay_max_payload_bytes: usize,
+    pub relay_max_peer_id_bytes: usize,
+    pub relay_max_registered_peers: usize,
+}
+
+impl ServiceLimitsConfig {
+    pub fn unbounded_for_tests() -> Self {
+        Self {
+            max_request_line_bytes: usize::MAX,
+            max_concurrent_connections: 0,
+            idle_timeout: Duration::ZERO,
+            relay_max_payload_bytes: usize::MAX,
+            relay_max_peer_id_bytes: usize::MAX,
+            relay_max_registered_peers: usize::MAX,
+        }
+    }
+
+    pub fn with_max_request_line_bytes(mut self, value: usize) -> Self {
+        self.max_request_line_bytes = value;
+        self
+    }
+
+    pub fn with_max_concurrent_connections(mut self, value: u32) -> Self {
+        self.max_concurrent_connections = value;
+        self
+    }
+
+    pub fn with_idle_timeout(mut self, value: Duration) -> Self {
+        self.idle_timeout = value;
+        self
+    }
+
+    pub fn with_relay_max_payload_bytes(mut self, value: usize) -> Self {
+        self.relay_max_payload_bytes = value;
+        self
+    }
+
+    pub fn with_relay_max_peer_id_bytes(mut self, value: usize) -> Self {
+        self.relay_max_peer_id_bytes = value;
+        self
+    }
+
+    pub fn with_relay_max_registered_peers(mut self, value: usize) -> Self {
+        self.relay_max_registered_peers = value;
+        self
+    }
+}
+
+impl Default for ServiceLimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_request_line_bytes: DEFAULT_MAX_REQUEST_LINE_BYTES,
+            max_concurrent_connections: DEFAULT_MAX_CONCURRENT_CONNECTIONS,
+            idle_timeout: Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECONDS),
+            relay_max_payload_bytes: DEFAULT_RELAY_MAX_PAYLOAD_BYTES,
+            relay_max_peer_id_bytes: DEFAULT_RELAY_MAX_PEER_ID_BYTES,
+            relay_max_registered_peers: DEFAULT_RELAY_MAX_REGISTERED_PEERS,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ServiceLimits {
+    config: ServiceLimitsConfig,
+    connection_slots: Option<Arc<Semaphore>>,
+}
+
+impl ServiceLimits {
+    pub fn new(config: ServiceLimitsConfig) -> Self {
+        Self {
+            config,
+            connection_slots: if config.max_concurrent_connections > 0 {
+                Some(Arc::new(Semaphore::new(
+                    config.max_concurrent_connections as usize,
+                )))
+            } else {
+                None
+            },
+        }
+    }
+
+    pub fn config(&self) -> ServiceLimitsConfig {
+        self.config
+    }
+
+    pub fn try_start_connection(&self, service: &str) -> Result<ServiceConnectionPermit> {
+        let Some(connection_slots) = &self.connection_slots else {
+            return Ok(ServiceConnectionPermit { _permit: None });
+        };
+        let permit = connection_slots.clone().try_acquire_owned().map_err(|_| {
+            QlinkError::Protocol(format!("{service} concurrent connection limit exceeded"))
+        })?;
+        Ok(ServiceConnectionPermit {
+            _permit: Some(permit),
+        })
+    }
+}
+
+#[derive(Debug)]
+pub struct ServiceConnectionPermit {
+    _permit: Option<OwnedSemaphorePermit>,
 }
 
 #[derive(Debug, Clone)]

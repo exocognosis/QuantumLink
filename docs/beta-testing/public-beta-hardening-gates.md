@@ -1,18 +1,20 @@
 # Public Beta Hardening Gates
 
 Do not broadly expose public rendezvous or relay services until these gates are
-satisfied. Bearer-token admission, per-client IP rate limits, and loopback
-OpenMetrics service counters are implemented; TLS control-plane support is
-implemented behind the explicit `public-edge-tls` feature. Quotas, durable
-revocation, retention controls, and operator abuse workflows remain release
-gates.
+satisfied. Bearer-token admission, per-client IP rate limits, loopback
+OpenMetrics service counters, bounded request lines, connection ceilings, idle
+timeouts, and relay payload/registration caps are implemented; TLS
+control-plane support is implemented behind the explicit `public-edge-tls`
+feature. Per-peer saturation quotas, durable revocation, retention controls,
+and operator abuse workflows remain release gates.
 
 ## Rendezvous
 
 - Require non-placeholder admission tokens for publication and lookup paths.
 - Enforce per-source and per-mesh rate limits beyond the current per-client IP
   window.
-- Bound request line size, record size, endpoint count, and concurrent TCP connections.
+- Extend record-specific bounds for endpoint count and per-mesh publication
+  volume beyond the current request-line and connection ceilings.
 - Add structured audit logs with redacted peer identifiers.
 - Add expiry-pruning counters and connect the service metrics to the operator
   alerting pipeline.
@@ -21,8 +23,8 @@ gates.
 ## Relay
 
 - Require non-placeholder admission tokens for peer registration.
-- Enforce payload size, per-peer queue depth, per-peer send rate, connection
-  quotas, and idle timeouts.
+- Extend per-peer queue depth and per-peer send-rate quotas beyond the current
+  payload, registered-peer, connection, and idle-timeout caps.
 - Protect against peer ID squatting and duplicate registration abuse.
 - Extend backpressure metrics for queued datagrams and per-peer saturation.
 - Run relay-fallback stress with intentionally unreachable direct candidates.

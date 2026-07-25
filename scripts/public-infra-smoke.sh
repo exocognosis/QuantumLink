@@ -39,6 +39,12 @@ RELAY_RATE_LIMIT_PER_WINDOW="${QLINK_RELAY_RATE_LIMIT_PER_WINDOW:-0}"
 ADMISSION_RATE_LIMIT_WINDOW_SECONDS="${QLINK_ADMISSION_RATE_LIMIT_WINDOW_SECONDS:-60}"
 RENDEZVOUS_METRICS_ADDR="${QLINK_RENDEZVOUS_METRICS_ADDR:-}"
 RELAY_METRICS_ADDR="${QLINK_RELAY_METRICS_ADDR:-}"
+MAX_REQUEST_LINE_BYTES="${QLINK_MAX_REQUEST_LINE_BYTES:-131072}"
+MAX_CONCURRENT_CONNECTIONS="${QLINK_MAX_CONCURRENT_CONNECTIONS:-1024}"
+IDLE_TIMEOUT_SECONDS="${QLINK_IDLE_TIMEOUT_SECONDS:-300}"
+RELAY_MAX_PAYLOAD_BYTES="${QLINK_RELAY_MAX_PAYLOAD_BYTES:-65536}"
+RELAY_MAX_PEER_ID_BYTES="${QLINK_RELAY_MAX_PEER_ID_BYTES:-256}"
+RELAY_MAX_REGISTERED_PEERS="${QLINK_RELAY_MAX_REGISTERED_PEERS:-2048}"
 CONTROL_TLS="${QLINK_CONTROL_TLS:-0}"
 CONTROL_TLS_CA="${QLINK_CONTROL_TLS_CA:-}"
 CONTROL_TLS_CERT="${QLINK_CONTROL_TLS_CERT:-}"
@@ -84,6 +90,12 @@ while [[ $# -gt 0 ]]; do
     --admission-rate-limit-window-seconds) ADMISSION_RATE_LIMIT_WINDOW_SECONDS="$2"; shift 2 ;;
     --rendezvous-metrics-addr) RENDEZVOUS_METRICS_ADDR="$2"; shift 2 ;;
     --relay-metrics-addr) RELAY_METRICS_ADDR="$2"; shift 2 ;;
+    --max-request-line-bytes) MAX_REQUEST_LINE_BYTES="$2"; shift 2 ;;
+    --max-concurrent-connections) MAX_CONCURRENT_CONNECTIONS="$2"; shift 2 ;;
+    --idle-timeout-seconds) IDLE_TIMEOUT_SECONDS="$2"; shift 2 ;;
+    --relay-max-payload-bytes) RELAY_MAX_PAYLOAD_BYTES="$2"; shift 2 ;;
+    --relay-max-peer-id-bytes) RELAY_MAX_PEER_ID_BYTES="$2"; shift 2 ;;
+    --relay-max-registered-peers) RELAY_MAX_REGISTERED_PEERS="$2"; shift 2 ;;
     --control-tls) CONTROL_TLS=1; shift ;;
     --control-tls-ca) CONTROL_TLS_CA="$2"; shift 2 ;;
     --control-tls-cert) CONTROL_TLS_CERT="$2"; shift 2 ;;
@@ -264,6 +276,29 @@ metric_value() {
   awk -v name="$name" '$1 == name {print int($2); found=1; exit} END {if (!found) print 0}' "$file" 2>/dev/null
 }
 
+probe_oversized_line() {
+  local endpoint="$1"
+  local max_bytes="$2"
+  local args=(control-oversize-smoke --server "$endpoint" --max-request-line-bytes "$max_bytes")
+  if [[ -n "$CONTROL_TLS_CA" ]]; then
+    args+=(--control-tls-ca "$CONTROL_TLS_CA")
+  fi
+  "$BIN" "${args[@]}" > "$RUN_DIR/control-oversize-$(basename "$endpoint" | tr -c 'A-Za-z0-9' '_').log" 2>&1
+}
+
+probe_relay_payload_limit() {
+  local endpoint="$1"
+  local max_payload_bytes="$2"
+  local args=(relay-quota-smoke --server "$endpoint" --peer-id qlink-quota-probe --max-payload-bytes "$max_payload_bytes")
+  if [[ -n "$RELAY_AUTH_TOKEN" ]]; then
+    args+=(--auth-token "$RELAY_AUTH_TOKEN")
+  fi
+  if [[ -n "$CONTROL_TLS_CA" ]]; then
+    args+=(--control-tls-ca "$CONTROL_TLS_CA")
+  fi
+  "$BIN" "${args[@]}" > "$RUN_DIR/relay-quota-smoke.log" 2>&1
+}
+
 if [[ "$BUILD" -eq 1 ]]; then
   features="dev-quic-carrier"
   if [[ "$PROVE_TURN_RELAY" -eq 1 ]]; then
@@ -301,7 +336,13 @@ if [[ "$MODE" == "local" ]]; then
   log "starting local rendezvous at $RENDEZVOUS"
   rendezvous_listen="$(control_host_port "$RENDEZVOUS")"
   relay_listen="$(control_host_port "$RELAY")"
-  rendezvous_args=(rendezvous --listen "$rendezvous_listen")
+  rendezvous_args=(
+    rendezvous
+    --listen "$rendezvous_listen"
+    --max-request-line-bytes "$MAX_REQUEST_LINE_BYTES"
+    --max-concurrent-connections "$MAX_CONCURRENT_CONNECTIONS"
+    --idle-timeout-seconds "$IDLE_TIMEOUT_SECONDS"
+  )
   if [[ -n "$RENDEZVOUS_AUTH_TOKEN" ]]; then
     rendezvous_auth_token_file="$RUN_DIR/rendezvous-auth-token"
     write_secret_file "$rendezvous_auth_token_file" "$RENDEZVOUS_AUTH_TOKEN"
@@ -324,7 +365,16 @@ if [[ "$MODE" == "local" ]]; then
   "$BIN" "${rendezvous_args[@]}" > "$RUN_DIR/rendezvous.log" 2>&1 &
   PIDS+=("$!")
   log "starting local relay at $RELAY"
-  relay_args=(relay --listen "$relay_listen")
+  relay_args=(
+    relay
+    --listen "$relay_listen"
+    --max-request-line-bytes "$MAX_REQUEST_LINE_BYTES"
+    --max-concurrent-connections "$MAX_CONCURRENT_CONNECTIONS"
+    --idle-timeout-seconds "$IDLE_TIMEOUT_SECONDS"
+    --max-relay-payload-bytes "$RELAY_MAX_PAYLOAD_BYTES"
+    --max-relay-peer-id-bytes "$RELAY_MAX_PEER_ID_BYTES"
+    --max-relay-registered-peers "$RELAY_MAX_REGISTERED_PEERS"
+  )
   if [[ -n "$RELAY_AUTH_TOKEN" ]]; then
     relay_auth_token_file="$RUN_DIR/relay-auth-token"
     write_secret_file "$relay_auth_token_file" "$RELAY_AUTH_TOKEN"
@@ -417,6 +467,20 @@ if [[ -n "$RELAY_AUTH_TOKEN" ]]; then
     || die "relay authenticated admission probe did not register"
   relay_auth_verified=true
 fi
+
+bounds_verified=false
+relay_payload_limit_verified=false
+log "proving rendezvous and relay request-line bounds"
+probe_oversized_line "$RENDEZVOUS" "$MAX_REQUEST_LINE_BYTES" \
+  || die "rendezvous oversized-line probe failed"
+probe_oversized_line "$RELAY" "$MAX_REQUEST_LINE_BYTES" \
+  || die "relay oversized-line probe failed"
+bounds_verified=true
+
+log "proving relay payload-size quota"
+probe_relay_payload_limit "$RELAY" "$RELAY_MAX_PAYLOAD_BYTES" \
+  || die "relay payload quota probe failed"
+relay_payload_limit_verified=true
 
 log "proving STUN reflexive candidate"
 "$BIN" stun-gather --server "$STUN" --bind-addr 0.0.0.0:0 \
@@ -579,6 +643,10 @@ relay_auth_failures_total=0
 rendezvous_requests_succeeded_total=0
 relay_forwarded_datagrams_total=0
 relay_unknown_destination_drops_total=0
+rendezvous_request_too_large_total=0
+relay_request_too_large_total=0
+relay_payload_too_large_total=0
+relay_duplicate_registration_rejections_total=0
 if [[ -n "$RENDEZVOUS_METRICS_ADDR" ]]; then
   log "scraping rendezvous metrics at $RENDEZVOUS_METRICS_ADDR"
   scrape_metrics "$RENDEZVOUS_METRICS_ADDR" "$RUN_DIR/rendezvous.metrics" \
@@ -586,8 +654,12 @@ if [[ -n "$RENDEZVOUS_METRICS_ADDR" ]]; then
   rendezvous_metrics_scraped=true
   rendezvous_auth_failures_total="$(metric_value "$RUN_DIR/rendezvous.metrics" quantumlink_rendezvous_auth_failures_total)"
   rendezvous_requests_succeeded_total="$(metric_value "$RUN_DIR/rendezvous.metrics" quantumlink_rendezvous_requests_succeeded_total)"
+  rendezvous_request_too_large_total="$(metric_value "$RUN_DIR/rendezvous.metrics" quantumlink_rendezvous_request_too_large_total)"
   if [[ -n "$RENDEZVOUS_AUTH_TOKEN" && "$rendezvous_auth_failures_total" -lt 1 ]]; then
     die "rendezvous metrics did not record the negative auth probe"
+  fi
+  if [[ "$rendezvous_request_too_large_total" -lt 1 ]]; then
+    die "rendezvous metrics did not record the oversized-line probe"
   fi
 fi
 if [[ -n "$RELAY_METRICS_ADDR" ]]; then
@@ -598,8 +670,17 @@ if [[ -n "$RELAY_METRICS_ADDR" ]]; then
   relay_auth_failures_total="$(metric_value "$RUN_DIR/relay.metrics" quantumlink_relay_auth_failures_total)"
   relay_forwarded_datagrams_total="$(metric_value "$RUN_DIR/relay.metrics" quantumlink_relay_forwarded_datagrams_total)"
   relay_unknown_destination_drops_total="$(metric_value "$RUN_DIR/relay.metrics" quantumlink_relay_unknown_destination_drops_total)"
+  relay_request_too_large_total="$(metric_value "$RUN_DIR/relay.metrics" quantumlink_relay_request_too_large_total)"
+  relay_payload_too_large_total="$(metric_value "$RUN_DIR/relay.metrics" quantumlink_relay_payload_too_large_total)"
+  relay_duplicate_registration_rejections_total="$(metric_value "$RUN_DIR/relay.metrics" quantumlink_relay_duplicate_registration_rejections_total)"
   if [[ -n "$RELAY_AUTH_TOKEN" && "$relay_auth_failures_total" -lt 1 ]]; then
     die "relay metrics did not record the negative auth probe"
+  fi
+  if [[ "$relay_request_too_large_total" -lt 1 ]]; then
+    die "relay metrics did not record the oversized-line probe"
+  fi
+  if [[ "$relay_payload_too_large_total" -lt 1 ]]; then
+    die "relay metrics did not record the payload quota probe"
   fi
   if [[ "$expected_path" == "relay" && "$relay_forwarded_datagrams_total" -lt "$COUNT" ]]; then
     die "relay metrics forwarded_datagrams_total=$relay_forwarded_datagrams_total; expected at least $COUNT"
@@ -632,11 +713,23 @@ cat > "$EVIDENCE" <<EOF
   "relay_metrics_addr": "$RELAY_METRICS_ADDR",
   "rendezvous_metrics_scraped": $rendezvous_metrics_scraped,
   "relay_metrics_scraped": $relay_metrics_scraped,
+  "bounds_verified": $bounds_verified,
+  "relay_payload_limit_verified": $relay_payload_limit_verified,
+  "max_request_line_bytes": $MAX_REQUEST_LINE_BYTES,
+  "max_concurrent_connections": $MAX_CONCURRENT_CONNECTIONS,
+  "idle_timeout_seconds": $IDLE_TIMEOUT_SECONDS,
+  "relay_max_payload_bytes": $RELAY_MAX_PAYLOAD_BYTES,
+  "relay_max_peer_id_bytes": $RELAY_MAX_PEER_ID_BYTES,
+  "relay_max_registered_peers": $RELAY_MAX_REGISTERED_PEERS,
   "rendezvous_auth_failures_total": $rendezvous_auth_failures_total,
   "relay_auth_failures_total": $relay_auth_failures_total,
   "rendezvous_requests_succeeded_total": $rendezvous_requests_succeeded_total,
   "relay_forwarded_datagrams_total": $relay_forwarded_datagrams_total,
   "relay_unknown_destination_drops_total": $relay_unknown_destination_drops_total,
+  "rendezvous_request_too_large_total": $rendezvous_request_too_large_total,
+  "relay_request_too_large_total": $relay_request_too_large_total,
+  "relay_payload_too_large_total": $relay_payload_too_large_total,
+  "relay_duplicate_registration_rejections_total": $relay_duplicate_registration_rejections_total,
   "prove_turn_relay": $([[ "$PROVE_TURN_RELAY" -eq 1 ]] && echo true || echo false),
   "remote_peer_id": "$REMOTE_PEER",
   "advertise_addr": "$ADVERTISE_ADDR",

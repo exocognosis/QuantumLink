@@ -88,10 +88,16 @@ class PublicInfraEvidenceTest < Minitest::Test
         "relay_rate_limit_per_window" => 0,
         "rendezvous_metrics_scraped" => false,
         "relay_metrics_scraped" => false,
+        "bounds_verified" => false,
+        "relay_payload_limit_verified" => false,
+        "max_concurrent_connections" => 0,
         "rendezvous_auth_failures_total" => 0,
         "relay_auth_failures_total" => 0,
         "rendezvous_requests_succeeded_total" => 0,
-        "relay_forwarded_datagrams_total" => 0
+        "relay_forwarded_datagrams_total" => 0,
+        "rendezvous_request_too_large_total" => 0,
+        "relay_request_too_large_total" => 0,
+        "relay_payload_too_large_total" => 0
       )
     )
     stdout, _stderr, status = run_verifier("--require-public", "--expected-sha", COMMIT_SHA, path)
@@ -105,6 +111,9 @@ class PublicInfraEvidenceTest < Minitest::Test
     assert_includes report.fetch("blockers"), "rendezvous metrics scrape must pass"
     assert_includes report.fetch("blockers"), "relay auth failures must be visible in metrics"
     assert_includes report.fetch("blockers"), "relay forwarded datagrams must be visible in metrics"
+    assert_includes report.fetch("blockers"), "request bounds proof must pass"
+    assert_includes report.fetch("blockers"), "connection limit must be configured"
+    assert_includes report.fetch("blockers"), "relay payload quota rejections must be visible in metrics"
   end
 
   def test_forbidden_secret_markers_fail_the_evidence
@@ -129,8 +138,12 @@ class PublicInfraEvidenceTest < Minitest::Test
     assert_includes script, "QLINK_RELAY_AUTH_TOKEN_FILE"
     assert_includes script, "QLINK_RENDEZVOUS_METRICS_ADDR"
     assert_includes script, "QLINK_RELAY_METRICS_ADDR"
+    assert_includes script, "QLINK_MAX_REQUEST_LINE_BYTES"
+    assert_includes script, "QLINK_RELAY_MAX_PAYLOAD_BYTES"
     assert_includes script, "rendezvousMetricsScraped"
     assert_includes script, "relayMetricsScraped"
+    assert_includes script, "boundsVerified"
+    assert_includes script, "relayPayloadLimitVerified"
     refute_match(/--rendezvous-auth-token(?:\s|$)/, script)
     refute_match(/--relay-auth-token(?:\s|$)/, script)
     refute_match(/--turn-password(?:\s|$)/, script)
@@ -172,11 +185,23 @@ class PublicInfraEvidenceTest < Minitest::Test
       "relay_metrics_addr" => "127.0.0.1:9572",
       "rendezvous_metrics_scraped" => true,
       "relay_metrics_scraped" => true,
+      "bounds_verified" => true,
+      "relay_payload_limit_verified" => true,
+      "max_request_line_bytes" => 131_072,
+      "max_concurrent_connections" => 1_024,
+      "idle_timeout_seconds" => 300,
+      "relay_max_payload_bytes" => 65_536,
+      "relay_max_peer_id_bytes" => 256,
+      "relay_max_registered_peers" => 2_048,
       "rendezvous_auth_failures_total" => 1,
       "relay_auth_failures_total" => 1,
       "rendezvous_requests_succeeded_total" => 3,
       "relay_forwarded_datagrams_total" => 3,
       "relay_unknown_destination_drops_total" => 0,
+      "rendezvous_request_too_large_total" => 1,
+      "relay_request_too_large_total" => 1,
+      "relay_payload_too_large_total" => 1,
+      "relay_duplicate_registration_rejections_total" => 0,
       "prove_turn_relay" => false,
       "remote_peer_id" => "qlink_test",
       "advertise_addr" => "127.0.0.1:1",

@@ -1,7 +1,7 @@
 #[cfg(feature = "public-edge-tls")]
 use crate::control_transport::{load_tls_acceptor, ControlTlsServerConfig};
 use crate::{
-    admission::{AdmissionLimiter, ServiceAdmissionConfig},
+    admission::{AdmissionLimiter, ServiceAdmissionConfig, ServiceLimits, ServiceLimitsConfig},
     control_transport::{
         connect_control_stream, split_control_stream, BoxedControlReader, BoxedControlWriter,
     },
@@ -16,7 +16,7 @@ use std::{
     sync::Arc,
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     net::TcpListener,
     sync::{mpsc, Mutex},
     task::JoinHandle,
@@ -53,7 +53,13 @@ pub async fn run_relay(listen: &str) -> Result<()> {
 }
 
 pub async fn run_relay_with_config(listen: &str, admission: ServiceAdmissionConfig) -> Result<()> {
-    run_relay_with_metrics(listen, admission, ServiceMetrics::default()).await
+    run_relay_with_metrics_and_limits(
+        listen,
+        admission,
+        ServiceMetrics::default(),
+        ServiceLimitsConfig::default(),
+    )
+    .await
 }
 
 pub async fn run_relay_with_metrics(
@@ -61,9 +67,19 @@ pub async fn run_relay_with_metrics(
     admission: ServiceAdmissionConfig,
     metrics: ServiceMetrics,
 ) -> Result<()> {
+    run_relay_with_metrics_and_limits(listen, admission, metrics, ServiceLimitsConfig::default())
+        .await
+}
+
+pub async fn run_relay_with_metrics_and_limits(
+    listen: &str,
+    admission: ServiceAdmissionConfig,
+    metrics: ServiceMetrics,
+    limits: ServiceLimitsConfig,
+) -> Result<()> {
     let listener = TcpListener::bind(listen).await?;
     let registry = RelayRegistry::default();
-    serve_relay_with_config_and_metrics(listener, registry, admission, metrics).await
+    serve_relay_with_config_metrics_and_limits(listener, registry, admission, metrics, limits).await
 }
 
 #[cfg(feature = "public-edge-tls")]
@@ -82,13 +98,34 @@ pub async fn run_relay_with_optional_tls_and_metrics(
     tls: Option<ControlTlsServerConfig>,
     metrics: ServiceMetrics,
 ) -> Result<()> {
+    run_relay_with_optional_tls_metrics_and_limits(
+        listen,
+        admission,
+        tls,
+        metrics,
+        ServiceLimitsConfig::default(),
+    )
+    .await
+}
+
+#[cfg(feature = "public-edge-tls")]
+pub async fn run_relay_with_optional_tls_metrics_and_limits(
+    listen: &str,
+    admission: ServiceAdmissionConfig,
+    tls: Option<ControlTlsServerConfig>,
+    metrics: ServiceMetrics,
+    limits: ServiceLimitsConfig,
+) -> Result<()> {
     match tls {
         Some(tls) => {
             let listener = TcpListener::bind(listen).await?;
             let registry = RelayRegistry::default();
-            serve_relay_with_tls_and_metrics(listener, registry, admission, tls, metrics).await
+            serve_relay_with_tls_metrics_and_limits(
+                listener, registry, admission, tls, metrics, limits,
+            )
+            .await
         }
-        None => run_relay_with_metrics(listen, admission, metrics).await,
+        None => run_relay_with_metrics_and_limits(listen, admission, metrics, limits).await,
     }
 }
 
@@ -111,17 +148,47 @@ pub async fn serve_relay_with_config_and_metrics(
     admission: ServiceAdmissionConfig,
     metrics: ServiceMetrics,
 ) -> Result<()> {
+    serve_relay_with_config_metrics_and_limits(
+        listener,
+        registry,
+        admission,
+        metrics,
+        ServiceLimitsConfig::default(),
+    )
+    .await
+}
+
+pub async fn serve_relay_with_config_metrics_and_limits(
+    listener: TcpListener,
+    registry: RelayRegistry,
+    admission: ServiceAdmissionConfig,
+    metrics: ServiceMetrics,
+    limits: ServiceLimitsConfig,
+) -> Result<()> {
     let limiter = AdmissionLimiter::new(&admission);
+    let service_limits = ServiceLimits::new(limits);
     loop {
         let (stream, peer_addr) = listener.accept().await?;
+        let connection_permit = match service_limits.try_start_connection("relay") {
+            Ok(permit) => permit,
+            Err(error) => {
+                metrics.connection_limit_rejection();
+                tracing::warn!(?error, %peer_addr, "relay connection rejected");
+                continue;
+            }
+        };
         let registry = registry.clone();
         let admission = admission.clone();
         let limiter = limiter.clone();
         let metrics = metrics.clone();
+        let limits = service_limits.config();
         tokio::spawn(async move {
+            let _connection_permit = connection_permit;
             let _connection = metrics.connection_started();
-            if let Err(error) =
-                handle_connection(stream, registry, admission, limiter, peer_addr, metrics).await
+            if let Err(error) = handle_connection(
+                stream, registry, admission, limiter, peer_addr, metrics, limits,
+            )
+            .await
             {
                 tracing::warn!(?error, "relay connection failed");
             }
@@ -154,22 +221,56 @@ pub async fn serve_relay_with_tls_and_metrics(
     tls: ControlTlsServerConfig,
     metrics: ServiceMetrics,
 ) -> Result<()> {
+    serve_relay_with_tls_metrics_and_limits(
+        listener,
+        registry,
+        admission,
+        tls,
+        metrics,
+        ServiceLimitsConfig::default(),
+    )
+    .await
+}
+
+#[cfg(feature = "public-edge-tls")]
+pub async fn serve_relay_with_tls_metrics_and_limits(
+    listener: TcpListener,
+    registry: RelayRegistry,
+    admission: ServiceAdmissionConfig,
+    tls: ControlTlsServerConfig,
+    metrics: ServiceMetrics,
+    limits: ServiceLimitsConfig,
+) -> Result<()> {
     let acceptor = load_tls_acceptor(&tls)?;
     let limiter = AdmissionLimiter::new(&admission);
+    let service_limits = ServiceLimits::new(limits);
     loop {
         let (stream, peer_addr) = listener.accept().await?;
+        let connection_permit = match service_limits.try_start_connection("relay") {
+            Ok(permit) => permit,
+            Err(error) => {
+                metrics.connection_limit_rejection();
+                tracing::warn!(?error, %peer_addr, "relay TLS connection rejected");
+                continue;
+            }
+        };
         let registry = registry.clone();
         let admission = admission.clone();
         let limiter = limiter.clone();
         let acceptor = acceptor.clone();
         let metrics = metrics.clone();
+        let limits = service_limits.config();
         tokio::spawn(async move {
+            let _connection_permit = connection_permit;
             let _connection = metrics.connection_started();
             let result = async {
                 let stream = acceptor.accept(stream).await.map_err(|err| {
                     QlinkError::Protocol(format!("relay TLS handshake failed: {err}"))
                 })?;
-                handle_connection(stream, registry, admission, limiter, peer_addr, metrics).await
+                handle_connection(
+                    stream, registry, admission, limiter, peer_addr, metrics, limits,
+                )
+                .await
             }
             .await;
             if let Err(error) = result {
@@ -663,14 +764,25 @@ async fn handle_connection(
     limiter: AdmissionLimiter,
     peer_addr: SocketAddr,
     metrics: ServiceMetrics,
+    limits: ServiceLimitsConfig,
 ) -> Result<()> {
     let (reader, writer) = split_control_stream(stream);
     let mut reader = BufReader::new(reader);
-    let mut line = String::new();
+    let mut line = Vec::new();
     let mut registered_peer: Option<String> = None;
     let mut pending_writer = Some(writer);
 
-    while reader.read_line(&mut line).await? != 0 {
+    loop {
+        match read_bounded_line(&mut reader, &mut line, limits, "relay", &metrics).await {
+            Ok(true) => {}
+            Ok(false) => break,
+            Err(error) => {
+                if let Some(writer) = pending_writer.as_mut() {
+                    write_relay_error(writer, &error.to_string()).await?;
+                }
+                break;
+            }
+        }
         if let Err(error) = limiter.check(peer_addr, "relay").await {
             metrics.rate_limited();
             if let Some(writer) = pending_writer.as_mut() {
@@ -678,11 +790,25 @@ async fn handle_connection(
             }
             break;
         }
-        match serde_json::from_str::<RelayMessage>(line.trim_end()) {
+        match serde_json::from_slice::<RelayMessage>(trim_line(&line)) {
             Ok(RelayMessage::Register {
                 peer_id,
                 auth_token,
             }) => {
+                if peer_id.len() > limits.relay_max_peer_id_bytes {
+                    metrics.relay_registration_rejection();
+                    if let Some(writer) = pending_writer.as_mut() {
+                        write_relay_error(
+                            writer,
+                            &format!(
+                                "relay peer ID exceeds {} bytes",
+                                limits.relay_max_peer_id_bytes
+                            ),
+                        )
+                        .await?;
+                    }
+                    break;
+                }
                 if let Err(error) = admission.require_token(auth_token.as_deref(), "relay") {
                     metrics.auth_failure();
                     if let Some(writer) = pending_writer.as_mut() {
@@ -691,6 +817,25 @@ async fn handle_connection(
                     break;
                 }
                 if let Some(mut writer) = pending_writer.take() {
+                    let mut peers = registry.peers.lock().await;
+                    if peers.contains_key(&peer_id) {
+                        metrics.relay_duplicate_registration_rejection();
+                        write_relay_error(&mut writer, "relay peer ID is already registered")
+                            .await?;
+                        break;
+                    }
+                    if peers.len() >= limits.relay_max_registered_peers {
+                        metrics.relay_registration_rejection();
+                        write_relay_error(
+                            &mut writer,
+                            &format!(
+                                "relay registered peer limit exceeded: {}",
+                                limits.relay_max_registered_peers
+                            ),
+                        )
+                        .await?;
+                        break;
+                    }
                     let registered = RelayMessage::Registered {
                         peer_id: peer_id.clone(),
                     };
@@ -698,7 +843,7 @@ async fn handle_connection(
                         .write_all(serde_json::to_string(&registered)?.as_bytes())
                         .await?;
                     writer.write_all(b"\n").await?;
-                    registry.peers.lock().await.insert(peer_id.clone(), writer);
+                    peers.insert(peer_id.clone(), writer);
                     metrics.relay_registration();
                     metrics.request_succeeded();
                     registered_peer = Some(peer_id);
@@ -710,10 +855,35 @@ async fn handle_connection(
                 destination,
                 payload_base64,
             }) => {
+                if source.len() > limits.relay_max_peer_id_bytes
+                    || destination.len() > limits.relay_max_peer_id_bytes
+                {
+                    metrics.malformed_request();
+                    if let Some(peer_id) = &registered_peer {
+                        registry.peers.lock().await.remove(peer_id);
+                        metrics.relay_registration_ended();
+                    }
+                    return Err(QlinkError::Protocol(format!(
+                        "relay peer ID exceeds {} bytes",
+                        limits.relay_max_peer_id_bytes
+                    )));
+                }
+                if encoded_payload_exceeds_limit(&payload_base64, limits.relay_max_payload_bytes) {
+                    metrics.relay_payload_too_large();
+                    if let Some(peer_id) = &registered_peer {
+                        registry.peers.lock().await.remove(peer_id);
+                        metrics.relay_registration_ended();
+                    }
+                    return Err(QlinkError::Protocol(format!(
+                        "relay datagram payload exceeds {} bytes",
+                        limits.relay_max_payload_bytes
+                    )));
+                }
                 if registered_peer.as_deref() != Some(source.as_str()) {
                     metrics.relay_spoofed_source_rejection();
                     if let Some(peer_id) = &registered_peer {
                         registry.peers.lock().await.remove(peer_id);
+                        metrics.relay_registration_ended();
                     }
                     return Err(QlinkError::Protocol(
                         "relay datagram source does not match registered peer".into(),
@@ -741,6 +911,7 @@ async fn handle_connection(
                 metrics.malformed_request();
                 if let Some(peer_id) = &registered_peer {
                     registry.peers.lock().await.remove(peer_id);
+                    metrics.relay_registration_ended();
                 }
                 return Err(error.into());
             }
@@ -750,9 +921,75 @@ async fn handle_connection(
 
     if let Some(peer_id) = registered_peer {
         registry.peers.lock().await.remove(&peer_id);
+        metrics.relay_registration_ended();
     }
 
     Ok(())
+}
+
+async fn read_bounded_line<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    line: &mut Vec<u8>,
+    limits: ServiceLimitsConfig,
+    service: &str,
+    metrics: &ServiceMetrics,
+) -> Result<bool> {
+    line.clear();
+    loop {
+        let mut byte = [0_u8; 1];
+        let read = if limits.idle_timeout.is_zero() {
+            reader.read(&mut byte).await?
+        } else {
+            match tokio::time::timeout(limits.idle_timeout, reader.read(&mut byte)).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    metrics.idle_timeout();
+                    return Err(QlinkError::Protocol(format!(
+                        "{service} idle timeout exceeded"
+                    )));
+                }
+            }
+        };
+        if read == 0 {
+            return Ok(!line.is_empty());
+        }
+        line.push(byte[0]);
+        if line.len() > limits.max_request_line_bytes {
+            metrics.request_too_large();
+            return Err(QlinkError::Protocol(format!(
+                "{service} request line exceeds {} bytes",
+                limits.max_request_line_bytes
+            )));
+        }
+        if byte[0] == b'\n' {
+            return Ok(true);
+        }
+    }
+}
+
+fn trim_line(line: &[u8]) -> &[u8] {
+    let line = line.strip_suffix(b"\n").unwrap_or(line);
+    line.strip_suffix(b"\r").unwrap_or(line)
+}
+
+fn encoded_payload_exceeds_limit(payload_base64: &str, max_payload_bytes: usize) -> bool {
+    decoded_payload_len_upper_bound(payload_base64) > max_payload_bytes
+}
+
+fn decoded_payload_len_upper_bound(payload_base64: &str) -> usize {
+    let padding = payload_base64
+        .as_bytes()
+        .iter()
+        .rev()
+        .take_while(|byte| **byte == b'=')
+        .count()
+        .min(2);
+    payload_base64
+        .len()
+        .saturating_add(3)
+        .saturating_div(4)
+        .saturating_mul(3)
+        .saturating_sub(padding)
 }
 
 async fn write_relay_error(writer: &mut BoxedControlWriter, message: &str) -> Result<()> {
@@ -779,6 +1016,23 @@ mod tests {
         let registry = RelayRegistry::default();
         let task = tokio::spawn(async move {
             let _ = serve_relay_with_config(listener, registry, admission).await;
+        });
+        (addr, task)
+    }
+
+    async fn spawn_limited_relay(
+        admission: ServiceAdmissionConfig,
+        limits: ServiceLimitsConfig,
+        metrics: ServiceMetrics,
+    ) -> (SocketAddr, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let registry = RelayRegistry::default();
+        let task = tokio::spawn(async move {
+            let _ = serve_relay_with_config_metrics_and_limits(
+                listener, registry, admission, metrics, limits,
+            )
+            .await;
         });
         (addr, task)
     }
@@ -916,6 +1170,36 @@ mod tests {
         assert!(rendered.contains("quantumlink_relay_forwarded_datagrams_total 1"));
         assert!(rendered.contains("quantumlink_relay_unknown_destination_drops_total 1"));
         assert!(rendered.contains("quantumlink_relay_requests_succeeded_total 3"));
+    }
+
+    #[tokio::test]
+    async fn relay_rejects_duplicate_registrations_and_oversized_payloads() {
+        let metrics = ServiceMetrics::default();
+        let limits = ServiceLimitsConfig::default().with_relay_max_payload_bytes(3);
+        let (addr, _task) =
+            spawn_limited_relay(ServiceAdmissionConfig::open(), limits, metrics.clone()).await;
+
+        let mut alice = RelayClient::connect(&addr.to_string(), "alice")
+            .await
+            .unwrap();
+        let duplicate = match RelayClient::connect(&addr.to_string(), "alice").await {
+            Ok(_) => panic!("relay accepted duplicate registration"),
+            Err(error) => error,
+        };
+        assert!(duplicate.to_string().contains("already registered"));
+
+        alice.send_datagram("bob", b"oversized").await.unwrap();
+        let closed = tokio::time::timeout(Duration::from_secs(2), alice.receive_datagram())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(closed.is_none());
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        let rendered = metrics.snapshot("relay").render_open_metrics();
+        assert!(rendered.contains("quantumlink_relay_duplicate_registration_rejections_total 1"));
+        assert!(rendered.contains("quantumlink_relay_payload_too_large_total 1"));
+        assert!(rendered.contains("quantumlink_relay_registered_peers 0"));
     }
 
     #[tokio::test]

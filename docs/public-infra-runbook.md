@@ -14,10 +14,11 @@ Do not treat the in-repo rendezvous and QuantumLink relay binaries as broadly
 open internet production services yet. They now support TLS for their control
 protocols behind the explicit `public-edge-tls` feature, bearer-token admission
 from credential files, per-client IP rate limits, loopback OpenMetrics service
-counters, and smoke proof that unauthenticated clients are rejected and counted.
-Keep those two ports source-limited for named testers until connection quotas,
-retention policy, durable revocation, and a complete operator abuse workflow
-are in place.
+counters, bounded request lines, connection ceilings, idle timeouts, relay
+payload/peer caps, and smoke proof that unauthenticated and oversized clients
+are rejected and counted. Keep those two ports source-limited for named testers
+until per-peer saturation quotas, retention policy, durable revocation, and a
+complete operator abuse workflow are in place.
 
 STUN and coturn TURN may be internet-facing. Published TURN relay candidates
 are consumed by the mesh connector when the responder keeps a live allocation.
@@ -151,6 +152,12 @@ QLINK_TURN_REALM=turn.quantumlink.example
 QLINK_TURN_PERMIT_PEER_IP=TESTER_PUBLIC_IP
 QLINK_RENDEZVOUS_METRICS_ADDR=127.0.0.1:9571
 QLINK_RELAY_METRICS_ADDR=127.0.0.1:9572
+QLINK_MAX_REQUEST_LINE_BYTES=131072
+QLINK_MAX_CONCURRENT_CONNECTIONS=1024
+QLINK_IDLE_TIMEOUT_SECONDS=300
+QLINK_RELAY_MAX_PAYLOAD_BYTES=65536
+QLINK_RELAY_MAX_PEER_ID_BYTES=256
+QLINK_RELAY_MAX_REGISTERED_PEERS=2048
 ```
 
 Then run:
@@ -186,6 +193,12 @@ scripts/public-infra-smoke.sh \
   --turn-realm "$QLINK_TURN_REALM" \
   --rendezvous-metrics-addr "$QLINK_RENDEZVOUS_METRICS_ADDR" \
   --relay-metrics-addr "$QLINK_RELAY_METRICS_ADDR" \
+  --max-request-line-bytes "$QLINK_MAX_REQUEST_LINE_BYTES" \
+  --max-concurrent-connections "$QLINK_MAX_CONCURRENT_CONNECTIONS" \
+  --idle-timeout-seconds "$QLINK_IDLE_TIMEOUT_SECONDS" \
+  --relay-max-payload-bytes "$QLINK_RELAY_MAX_PAYLOAD_BYTES" \
+  --relay-max-peer-id-bytes "$QLINK_RELAY_MAX_PEER_ID_BYTES" \
+  --relay-max-registered-peers "$QLINK_RELAY_MAX_REGISTERED_PEERS" \
   --build
 ```
 
@@ -208,6 +221,12 @@ scripts/public-infra-smoke.sh \
   --turn-permit-peer-ip "$TESTER_PUBLIC_IP" \
   --rendezvous-metrics-addr "$QLINK_RENDEZVOUS_METRICS_ADDR" \
   --relay-metrics-addr "$QLINK_RELAY_METRICS_ADDR" \
+  --max-request-line-bytes "$QLINK_MAX_REQUEST_LINE_BYTES" \
+  --max-concurrent-connections "$QLINK_MAX_CONCURRENT_CONNECTIONS" \
+  --idle-timeout-seconds "$QLINK_IDLE_TIMEOUT_SECONDS" \
+  --relay-max-payload-bytes "$QLINK_RELAY_MAX_PAYLOAD_BYTES" \
+  --relay-max-peer-id-bytes "$QLINK_RELAY_MAX_PEER_ID_BYTES" \
+  --relay-max-registered-peers "$QLINK_RELAY_MAX_REGISTERED_PEERS" \
   --prove-turn-relay \
   --build
 ```
@@ -231,6 +250,11 @@ passing evidence file must show:
   edge runs;
 - `rendezvous_metrics_scraped` and `relay_metrics_scraped` are `true`, with
   auth failure counters greater than zero;
+- `bounds_verified` and `relay_payload_limit_verified` are `true`;
+- `rendezvous_request_too_large_total`, `relay_request_too_large_total`, and
+  `relay_payload_too_large_total` are greater than zero;
+- request-line, connection, idle-timeout, relay-payload, peer-ID, and
+  registered-peer limits are positive;
 - `turn_relayed` is non-empty when `--turn` was supplied;
 - `published_candidate_types` includes `ServerReflexive`;
 - `published_candidate_types` includes `QuantumLinkRelay`;
@@ -276,8 +300,8 @@ Before widening tester access:
 - Confirm cloud firewall and host firewall expose only the listed ports.
 - Confirm rendezvous and QuantumLink relay require non-placeholder admission
   token files, present TLS certificates, enforce appropriate rate limits, and
-  expose only loopback service metrics while remaining source-limited during
-  beta.
+  expose only loopback service metrics while enforcing request, connection,
+  idle-timeout, and relay quota bounds during source-limited beta.
 - Confirm coturn uses long-term credentials and a constrained relay port range.
 - Confirm coturn has readable TLS cert/key paths before exposing TCP/UDP 5349.
 - Confirm `journalctl -u quantumlink-*` contains control-plane metadata only.

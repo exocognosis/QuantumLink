@@ -18,6 +18,8 @@
 #   QLINK_TURN_PERMIT_PEER_IP
 #   QLINK_RENDEZVOUS_METRICS_ADDR and QLINK_RELAY_METRICS_ADDR
 #     (usually SSH-forwarded loopback metrics endpoints)
+#   QLINK_MAX_REQUEST_LINE_BYTES, QLINK_MAX_CONCURRENT_CONNECTIONS,
+#     QLINK_IDLE_TIMEOUT_SECONDS, and relay quota envs
 #
 # Example:
 #   scripts/public-edge-live-evidence.sh --env-file ./edge.env --build
@@ -55,6 +57,12 @@ RELAY_RATE_LIMIT_PER_WINDOW="${QLINK_RELAY_RATE_LIMIT_PER_WINDOW:-240}"
 ADMISSION_RATE_LIMIT_WINDOW_SECONDS="${QLINK_ADMISSION_RATE_LIMIT_WINDOW_SECONDS:-60}"
 RENDEZVOUS_METRICS_ADDR="${QLINK_RENDEZVOUS_METRICS_ADDR:-}"
 RELAY_METRICS_ADDR="${QLINK_RELAY_METRICS_ADDR:-}"
+MAX_REQUEST_LINE_BYTES="${QLINK_MAX_REQUEST_LINE_BYTES:-131072}"
+MAX_CONCURRENT_CONNECTIONS="${QLINK_MAX_CONCURRENT_CONNECTIONS:-1024}"
+IDLE_TIMEOUT_SECONDS="${QLINK_IDLE_TIMEOUT_SECONDS:-300}"
+RELAY_MAX_PAYLOAD_BYTES="${QLINK_RELAY_MAX_PAYLOAD_BYTES:-65536}"
+RELAY_MAX_PEER_ID_BYTES="${QLINK_RELAY_MAX_PEER_ID_BYTES:-256}"
+RELAY_MAX_REGISTERED_PEERS="${QLINK_RELAY_MAX_REGISTERED_PEERS:-2048}"
 
 usage() {
   grep '^#' "$0" | sed 's/^# \{0,1\}//'
@@ -77,6 +85,12 @@ while [[ $# -gt 0 ]]; do
     --turn-permit-peer-ip) TURN_PERMIT_PEER_IP="$2"; shift 2 ;;
     --rendezvous-metrics-addr) RENDEZVOUS_METRICS_ADDR="$2"; shift 2 ;;
     --relay-metrics-addr) RELAY_METRICS_ADDR="$2"; shift 2 ;;
+    --max-request-line-bytes) MAX_REQUEST_LINE_BYTES="$2"; shift 2 ;;
+    --max-concurrent-connections) MAX_CONCURRENT_CONNECTIONS="$2"; shift 2 ;;
+    --idle-timeout-seconds) IDLE_TIMEOUT_SECONDS="$2"; shift 2 ;;
+    --relay-max-payload-bytes) RELAY_MAX_PAYLOAD_BYTES="$2"; shift 2 ;;
+    --relay-max-peer-id-bytes) RELAY_MAX_PEER_ID_BYTES="$2"; shift 2 ;;
+    --relay-max-registered-peers) RELAY_MAX_REGISTERED_PEERS="$2"; shift 2 ;;
     --run-dir) RUN_DIR="$2"; shift 2 ;;
     --mesh-id) MESH_ID="$2"; shift 2 ;;
     --count) COUNT="$2"; shift 2 ;;
@@ -113,6 +127,12 @@ if [[ -n "$ENV_FILE" ]]; then
   TURN_PERMIT_PEER_IP="${QLINK_TURN_PERMIT_PEER_IP:-$TURN_PERMIT_PEER_IP}"
   RENDEZVOUS_METRICS_ADDR="${QLINK_RENDEZVOUS_METRICS_ADDR:-$RENDEZVOUS_METRICS_ADDR}"
   RELAY_METRICS_ADDR="${QLINK_RELAY_METRICS_ADDR:-$RELAY_METRICS_ADDR}"
+  MAX_REQUEST_LINE_BYTES="${QLINK_MAX_REQUEST_LINE_BYTES:-$MAX_REQUEST_LINE_BYTES}"
+  MAX_CONCURRENT_CONNECTIONS="${QLINK_MAX_CONCURRENT_CONNECTIONS:-$MAX_CONCURRENT_CONNECTIONS}"
+  IDLE_TIMEOUT_SECONDS="${QLINK_IDLE_TIMEOUT_SECONDS:-$IDLE_TIMEOUT_SECONDS}"
+  RELAY_MAX_PAYLOAD_BYTES="${QLINK_RELAY_MAX_PAYLOAD_BYTES:-$RELAY_MAX_PAYLOAD_BYTES}"
+  RELAY_MAX_PEER_ID_BYTES="${QLINK_RELAY_MAX_PEER_ID_BYTES:-$RELAY_MAX_PEER_ID_BYTES}"
+  RELAY_MAX_REGISTERED_PEERS="${QLINK_RELAY_MAX_REGISTERED_PEERS:-$RELAY_MAX_REGISTERED_PEERS}"
   BIN="${QLINK_BIN:-$BIN}"
 fi
 
@@ -183,6 +203,12 @@ smoke_common=(
   --admission-rate-limit-window-seconds "$ADMISSION_RATE_LIMIT_WINDOW_SECONDS"
   --rendezvous-metrics-addr "$RENDEZVOUS_METRICS_ADDR"
   --relay-metrics-addr "$RELAY_METRICS_ADDR"
+  --max-request-line-bytes "$MAX_REQUEST_LINE_BYTES"
+  --max-concurrent-connections "$MAX_CONCURRENT_CONNECTIONS"
+  --idle-timeout-seconds "$IDLE_TIMEOUT_SECONDS"
+  --relay-max-payload-bytes "$RELAY_MAX_PAYLOAD_BYTES"
+  --relay-max-peer-id-bytes "$RELAY_MAX_PEER_ID_BYTES"
+  --relay-max-registered-peers "$RELAY_MAX_REGISTERED_PEERS"
 )
 if [[ "$BUILD" -eq 1 ]]; then
   smoke_common+=(--build)
@@ -269,8 +295,13 @@ ruby -rjson -rtime -e '
         "framesSent" => app.fetch("frames_sent"),
         "rendezvousMetricsScraped" => app.fetch("rendezvous_metrics_scraped"),
         "relayMetricsScraped" => app.fetch("relay_metrics_scraped"),
+        "boundsVerified" => app.fetch("bounds_verified"),
+        "relayPayloadLimitVerified" => app.fetch("relay_payload_limit_verified"),
         "rendezvousAuthFailuresTotal" => app.fetch("rendezvous_auth_failures_total"),
         "relayAuthFailuresTotal" => app.fetch("relay_auth_failures_total"),
+        "rendezvousRequestTooLargeTotal" => app.fetch("rendezvous_request_too_large_total"),
+        "relayRequestTooLargeTotal" => app.fetch("relay_request_too_large_total"),
+        "relayPayloadTooLargeTotal" => app.fetch("relay_payload_too_large_total"),
         "relayForwardedDatagramsTotal" => app.fetch("relay_forwarded_datagrams_total"),
         "publicInfraReady" => app_verification.fetch("publicInfraReady")
       },
@@ -281,8 +312,13 @@ ruby -rjson -rtime -e '
         "framesSent" => turn.fetch("frames_sent"),
         "rendezvousMetricsScraped" => turn.fetch("rendezvous_metrics_scraped"),
         "relayMetricsScraped" => turn.fetch("relay_metrics_scraped"),
+        "boundsVerified" => turn.fetch("bounds_verified"),
+        "relayPayloadLimitVerified" => turn.fetch("relay_payload_limit_verified"),
         "rendezvousAuthFailuresTotal" => turn.fetch("rendezvous_auth_failures_total"),
         "relayAuthFailuresTotal" => turn.fetch("relay_auth_failures_total"),
+        "rendezvousRequestTooLargeTotal" => turn.fetch("rendezvous_request_too_large_total"),
+        "relayRequestTooLargeTotal" => turn.fetch("relay_request_too_large_total"),
+        "relayPayloadTooLargeTotal" => turn.fetch("relay_payload_too_large_total"),
         "publicInfraReady" => turn_verification.fetch("publicInfraReady")
       }
     }

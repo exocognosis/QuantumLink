@@ -84,9 +84,11 @@ The control plane is layered:
 The development rendezvous and relay services in this repository include
 bearer-token admission and per-client IP rate limits for public-edge rehearsal,
 but they are not hardened public infrastructure by themselves. A production
-deployment now has TLS and basic service-level abuse counters behind explicit
-public-edge configuration, but still needs durable revocation, retention
-controls, connection quotas, operator alerting, and operational runbooks.
+deployment now has TLS, basic service-level abuse counters, bounded control
+requests, connection ceilings, idle timeouts, and relay payload/registration
+caps behind explicit public-edge configuration, but still needs durable
+revocation, retention controls, per-peer saturation quotas, operator alerting,
+and operational runbooks.
 
 ### On-chain identity verification
 
@@ -206,9 +208,10 @@ Production gaps include:
   against deployed public infrastructure.
 - Public rendezvous and relay TLS plus credential-file service admission now
   exist behind the explicit public-edge TLS feature, with loopback service
-  metrics and off-host evidence gates for auth/relay counters. Durable
-  credential revocation, retention controls, connection quotas, operator
-  alerting, and actual deployed hardening evidence remain open.
+  metrics and off-host evidence gates for auth, bounds, and relay quota
+  counters. Durable credential revocation, retention controls, per-peer
+  saturation quotas, operator alerting, and actual deployed hardening evidence
+  remain open.
 - Signed Sparkle/platform update pipeline paired with a post-quantum release
   manifest layer.
 - Production Dytallix mainnet or hardened registry trust root for public
