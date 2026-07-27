@@ -17,38 +17,41 @@
 //!   acceptance, exercising the full encode → decode path (and the fail-closed
 //!   peer-session gate) without a network.
 //!
-//! Peer-session-key installation into packet-frame encryption is the shared,
-//! cross-platform production gap the product spec calls out ("production
-//! peer-session key installation into packet-frame encryption"). Like the
-//! Windows engine — whose sink reports `peer_session_key_available = false` for
-//! identity/public meshes — the `Mesh` variant reports `peer_session_ready() ==
-//! false` and installs no session, so protected packets fail closed until that
-//! wiring lands. The `LocalEcho` variant installs a synthetic session so the
-//! on-device data path can be demonstrated and tested end to end.
+//! Authenticated packet-session leases emitted by the shared transport are
+//! installed into the SteamOS packet core. Ready, rekey, clear, expiry, and
+//! inbound per-frame leases therefore follow the same contract as Windows.
 
-use crate::data_plane::{DataPlaneError, MeshFrameTransport};
+use crate::data_plane::{
+    DataPlaneError, InboundTransportFrame, MeshFrameTransport, PeerSessionUpdate,
+};
 use crate::identity::DeviceIdentity;
 use base64::Engine as _;
 use qlink_core::crypto::DeviceKeypair;
-use qlink_core::mesh_transport::{MeshTransportConfig, MeshTransportHandle};
+use qlink_core::dytallix_identity::{DytallixRegistryLookupConfig, MeshTrustPolicy};
+use qlink_core::mesh_transport::{
+    MeshTransportConfig, MeshTransportHandle, PacketSessionDirection, PacketSessionEvent,
+    PacketSessionLease,
+};
 use qlink_core::packet_core::{InstalledPeerSession, PeerSessionDirection};
-use qlink_proto::{peer_store_path_from_state_dir, DaemonConfig, PathKind};
+use qlink_core::peer_acl::PeerAcl;
+use qlink_proto::{
+    load_peer_store_at, peer_store_path_from_state_dir, DaemonConfig, MeshTrustMode, PathKind,
+    StoredPeer,
+};
 use std::collections::VecDeque;
-use std::path::Path;
+use std::io::Read;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Default mesh identifier for a SteamOS node until per-mesh configuration is
-/// exposed. Keeping it stable lets peers on the same gamer mesh discover each
-/// other; operators override it by joining a named mesh in a later revision.
-pub const DEFAULT_MESH_ID: &str = "steam-default-mesh";
-/// Sentinel remote peer id used before any invite is imported. Matches the
-/// value the Windows engine and `qlinkctl` use for the primary slot; real
-/// peers are added at runtime via [`MeshTransportHandle::add_peer`].
-pub const UNCONFIGURED_REMOTE_PEER_ID: &str = "qlink_unconfigured";
 /// Local QUIC bind address. `0.0.0.0:0` lets the OS pick an ephemeral port.
 pub const MESH_BIND_ADDR: &str = "0.0.0.0:0";
 /// Peer id attributed to the development local-echo loopback session.
 pub const LOCAL_ECHO_PEER_ID: &str = "local-echo-peer";
+const MESH_PEER_RECORD_STORE_FILE: &str = "mesh-peer-records.json";
+const MAX_AUTH_TOKEN_BYTES: u64 = 8 * 1024;
 
 /// `MeshTransportState::Ready` discriminant (mirrors the Windows engine's
 /// `state_code() == 1` readiness check).
@@ -59,7 +62,11 @@ const MESH_PATH_RELAY: u32 = 2;
 /// The active encrypted transport behind the daemon packet pump.
 pub enum DaemonMeshTransport {
     /// Production: shared qlink-core mesh transport.
-    Mesh(Arc<MeshTransportHandle>),
+    Mesh {
+        handle: Arc<MeshTransportHandle>,
+        selected_peer_id: String,
+        trusted_peer_store_path: PathBuf,
+    },
     /// Development/local-smoke: frames are queued back for inbound acceptance.
     LocalEcho(VecDeque<Vec<u8>>),
 }
@@ -67,7 +74,12 @@ pub enum DaemonMeshTransport {
 impl std::fmt::Debug for DaemonMeshTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Mesh(_) => f.write_str("DaemonMeshTransport::Mesh"),
+            Self::Mesh {
+                selected_peer_id, ..
+            } => f
+                .debug_struct("DaemonMeshTransport::Mesh")
+                .field("selected_peer_id", selected_peer_id)
+                .finish_non_exhaustive(),
             Self::LocalEcho(queue) => f
                 .debug_struct("DaemonMeshTransport::LocalEcho")
                 .field("queued_frames", &queue.len())
@@ -84,13 +96,13 @@ impl DaemonMeshTransport {
 
     /// `true` when this is the production mesh transport (not local echo).
     pub fn is_mesh(&self) -> bool {
-        matches!(self, Self::Mesh(_))
+        matches!(self, Self::Mesh { .. })
     }
 
     /// A one-line, non-sensitive description for logs and the daemon banner.
     pub fn describe(&self) -> String {
         match self {
-            Self::Mesh(handle) => format!(
+            Self::Mesh { handle, .. } => format!(
                 "mesh(state={}, path={})",
                 handle.state_code(),
                 handle.path_kind_code()
@@ -101,40 +113,86 @@ impl DaemonMeshTransport {
 
     /// Releases transport resources. Idempotent; safe to call on shutdown.
     pub fn shutdown(&self) {
-        if let Self::Mesh(handle) = self {
+        if let Self::Mesh { handle, .. } = self {
             handle.shutdown();
         }
+    }
+
+    pub fn validate_selected_peer(&self, at_unix: u64) -> Result<(), DataPlaneError> {
+        let Self::Mesh {
+            selected_peer_id,
+            trusted_peer_store_path,
+            ..
+        } = self
+        else {
+            return Ok(());
+        };
+        selected_peer_is_authorized(trusted_peer_store_path, selected_peer_id, at_unix)
+    }
+}
+
+fn selected_peer_is_authorized(
+    trusted_peer_store_path: &Path,
+    selected_peer_id: &str,
+    at_unix: u64,
+) -> Result<(), DataPlaneError> {
+    let store = load_peer_store_at(trusted_peer_store_path).map_err(|error| {
+        DataPlaneError::Transport(format!(
+            "failed to reload trusted peer store {}: {error}",
+            trusted_peer_store_path.display()
+        ))
+    })?;
+    let selected_still_current = store
+        .dial_candidates(at_unix)
+        .iter()
+        .any(|peer| peer.peer_id == selected_peer_id)
+        && store
+            .selected_peer_id
+            .as_deref()
+            .is_none_or(|selected| selected == selected_peer_id);
+    if selected_still_current {
+        Ok(())
+    } else {
+        Err(DataPlaneError::Transport(format!(
+            "selected peer {selected_peer_id} was removed, revoked, expired, or replaced"
+        )))
     }
 }
 
 impl MeshFrameTransport for DaemonMeshTransport {
     fn is_ready(&self) -> bool {
         match self {
-            Self::Mesh(handle) => handle.state_code() == MESH_STATE_READY,
+            Self::Mesh { handle, .. } => {
+                handle.state_code() == MESH_STATE_READY
+                    && matches!(handle.default_packet_session(), Ok(Some(_)))
+            }
             Self::LocalEcho(_) => true,
         }
     }
 
     fn path_kind(&self) -> PathKind {
         match self {
-            Self::Mesh(handle) => path_kind_from_code(handle.path_kind_code()),
+            Self::Mesh { handle, .. } => path_kind_from_code(handle.path_kind_code()),
             Self::LocalEcho(_) => PathKind::Direct,
         }
     }
 
     fn peer_session_ready(&self) -> bool {
         match self {
-            // Shared production gap: no peer-session key is installed into the
-            // packet core yet, so the production transport fails closed just
-            // like the Windows engine. LocalEcho installs a synthetic session.
-            Self::Mesh(_) => false,
+            Self::Mesh { handle, .. } => {
+                matches!(handle.default_packet_session(), Ok(Some(_)))
+            }
             Self::LocalEcho(_) => true,
         }
     }
 
     fn installed_peer_session(&self) -> Option<InstalledPeerSession> {
         match self {
-            Self::Mesh(_) => None,
+            Self::Mesh { handle, .. } => handle
+                .default_packet_session()
+                .ok()
+                .flatten()
+                .map(installed_peer_session),
             Self::LocalEcho(_) => Some(InstalledPeerSession {
                 peer_id: LOCAL_ECHO_PEER_ID.to_string(),
                 direction: PeerSessionDirection::Outbound,
@@ -146,9 +204,33 @@ impl MeshFrameTransport for DaemonMeshTransport {
         }
     }
 
+    fn take_peer_session_updates(&self) -> Vec<PeerSessionUpdate> {
+        let Self::Mesh { handle, .. } = self else {
+            return Vec::new();
+        };
+        let mut updates = Vec::new();
+        while let Some(event) = handle.try_receive_packet_session_event() {
+            updates.push(match event {
+                PacketSessionEvent::Ready(session) => {
+                    PeerSessionUpdate::Ready(installed_peer_session(session))
+                }
+                PacketSessionEvent::Cleared {
+                    peer_id,
+                    direction,
+                    generation,
+                } => PeerSessionUpdate::Cleared {
+                    peer_id,
+                    direction: installed_direction(direction),
+                    generation,
+                },
+            });
+        }
+        updates
+    }
+
     fn send_frame(&mut self, frame: Vec<u8>) -> Result<(), DataPlaneError> {
         match self {
-            Self::Mesh(handle) => handle
+            Self::Mesh { handle, .. } => handle
                 .send_frame(frame)
                 .map_err(|error| DataPlaneError::Transport(error.to_string())),
             Self::LocalEcho(queue) => {
@@ -158,13 +240,50 @@ impl MeshFrameTransport for DaemonMeshTransport {
         }
     }
 
-    fn try_receive_frame(&mut self) -> Option<Vec<u8>> {
+    fn try_receive_frame(&mut self) -> Option<InboundTransportFrame> {
         match self {
-            Self::Mesh(handle) => handle
-                .try_receive_frame_from_any()
-                .map(|inbound| inbound.frame),
-            Self::LocalEcho(queue) => queue.pop_front(),
+            Self::Mesh { handle, .. } => {
+                handle
+                    .try_receive_frame_from_any()
+                    .map(|inbound| InboundTransportFrame {
+                        frame: inbound.frame,
+                        peer_session: installed_peer_session(inbound.packet_session),
+                    })
+            }
+            Self::LocalEcho(queue) => queue.pop_front().map(|frame| InboundTransportFrame {
+                frame,
+                peer_session: InstalledPeerSession {
+                    peer_id: LOCAL_ECHO_PEER_ID.to_string(),
+                    direction: PeerSessionDirection::Inbound,
+                    generation: 1,
+                    transcript_binding: [0; 32],
+                    expires_at_unix: u64::MAX,
+                    rekey_after_bytes: 0,
+                },
+            }),
         }
+    }
+
+    fn last_transport_error(&self) -> Option<&str> {
+        None
+    }
+}
+
+fn installed_direction(direction: PacketSessionDirection) -> PeerSessionDirection {
+    match direction {
+        PacketSessionDirection::Outbound => PeerSessionDirection::Outbound,
+        PacketSessionDirection::Inbound => PeerSessionDirection::Inbound,
+    }
+}
+
+fn installed_peer_session(session: PacketSessionLease) -> InstalledPeerSession {
+    InstalledPeerSession {
+        peer_id: session.peer_id,
+        direction: installed_direction(session.direction),
+        generation: session.generation,
+        transcript_binding: session.transcript_binding,
+        expires_at_unix: session.expires_at_unix,
+        rekey_after_bytes: session.rekey_after_bytes,
     }
 }
 
@@ -183,25 +302,182 @@ pub fn daemon_mesh_transport_config(
     config: &DaemonConfig,
     identity: &DeviceIdentity,
     state_dir: &Path,
+    peer: &StoredPeer,
 ) -> Result<MeshTransportConfig, DataPlaneError> {
-    let peer_store_path = peer_store_path_from_state_dir(state_dir);
+    if peer.trust_mode == MeshTrustMode::DevelopmentOptional {
+        return Err(DataPlaneError::Transport(
+            "development-optional peers are not accepted by the resident network transport"
+                .to_string(),
+        ));
+    }
+    if peer.trust_mode == MeshTrustMode::PublicDytallixRequired
+        && config.dytallix_identity.is_none()
+    {
+        return Err(DataPlaneError::Transport(
+            "public Dytallix peer requires pinned dytallixIdentity configuration".to_string(),
+        ));
+    }
+    let peer_store_path = state_dir.join(MESH_PEER_RECORD_STORE_FILE);
     let rendezvous_url = config
         .rendezvous_servers
         .first()
         .cloned()
         .unwrap_or_default();
+    let rendezvous_auth_token =
+        load_optional_auth_token(config.rendezvous_auth_token_file.as_deref(), "rendezvous")?;
+    let relay_auth_token =
+        load_optional_auth_token(config.relay_auth_token_file.as_deref(), "relay")?;
+    let mesh_trust_policy = mesh_trust_policy(peer.trust_mode);
+    let dytallix_identity =
+        config
+            .dytallix_identity
+            .as_ref()
+            .map(|settings| DytallixRegistryLookupConfig {
+                endpoint: settings.endpoint.clone(),
+                contract_address: settings.contract_address.clone(),
+                network_id: Some(settings.network_id.clone()),
+                chain_id: Some(settings.chain_id.clone()),
+                allowed_rpc_endpoints: settings.allowed_rpc_endpoints.clone(),
+            });
     let mesh_config_json = serde_json::json!({
-        "meshId": DEFAULT_MESH_ID,
+        "meshId": peer.mesh_id,
         "localPeerId": identity.peer_id(),
-        "remotePeerId": UNCONFIGURED_REMOTE_PEER_ID,
+        "remotePeerId": peer.peer_id,
         "rendezvousUrl": rendezvous_url,
+        "rendezvousAuthToken": rendezvous_auth_token,
         "relayUrl": config.relay_servers.first(),
+        "relayAuthToken": relay_auth_token,
         "bindAddr": MESH_BIND_ADDR,
         "peerStorePath": peer_store_path.to_string_lossy(),
         "peerStoreKeyB64": base64::engine::general_purpose::STANDARD.encode(identity.peer_store_key()),
+        "meshTrustPolicy": mesh_trust_policy,
+        "dytallixIdentity": dytallix_identity,
+        "inboundAcl": PeerAcl::new().with_allow([peer.peer_id.clone()]),
     });
     serde_json::from_value(mesh_config_json)
         .map_err(|error| DataPlaneError::Transport(format!("mesh transport config: {error}")))
+}
+
+fn mesh_trust_policy(mode: MeshTrustMode) -> MeshTrustPolicy {
+    match mode {
+        MeshTrustMode::PrivateFriends => MeshTrustPolicy::PrivatePreferred,
+        MeshTrustMode::PublicDytallixRequired => MeshTrustPolicy::PublicRequired,
+        MeshTrustMode::DevelopmentOptional => MeshTrustPolicy::DevelopmentOptional,
+    }
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+pub fn select_packet_peer(
+    config: &DaemonConfig,
+    state_dir: &Path,
+    at_unix: u64,
+) -> Result<StoredPeer, DataPlaneError> {
+    let store_path = peer_store_path_from_state_dir(state_dir);
+    let store = load_peer_store_at(&store_path).map_err(|error| {
+        DataPlaneError::Transport(format!(
+            "failed to load trusted peer store {}: {error}",
+            store_path.display()
+        ))
+    })?;
+    let candidates = store.dial_candidates(at_unix);
+    if let Some(active_peer_id) = config
+        .active_peer_id
+        .as_deref()
+        .or(store.selected_peer_id.as_deref())
+    {
+        return candidates
+            .into_iter()
+            .find(|peer| peer.peer_id == active_peer_id)
+            .ok_or_else(|| {
+                DataPlaneError::Transport(format!(
+                    "configured active peer {active_peer_id} is missing, expired, or revoked"
+                ))
+            });
+    }
+    match candidates.as_slice() {
+        [peer] => Ok(peer.clone()),
+        [] => Err(DataPlaneError::Transport(
+            "no eligible trusted peer is available; import a current invite".to_string(),
+        )),
+        _ => Err(DataPlaneError::Transport(format!(
+            "{} eligible peers are available; set activePeerId explicitly",
+            candidates.len()
+        ))),
+    }
+}
+
+fn load_optional_auth_token(
+    path: Option<&str>,
+    service: &str,
+) -> Result<Option<String>, DataPlaneError> {
+    path.map(|path| load_auth_token(Path::new(path), service))
+        .transpose()
+}
+
+fn load_auth_token(path: &Path, service: &str) -> Result<String, DataPlaneError> {
+    if !path.is_absolute() {
+        return Err(DataPlaneError::Transport(format!(
+            "{service} auth token file must use an absolute path"
+        )));
+    }
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        DataPlaneError::Transport(format!(
+            "failed to inspect {service} auth token file {}: {error}",
+            path.display()
+        ))
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(DataPlaneError::Transport(format!(
+            "{service} auth token path {} is not a regular file",
+            path.display()
+        )));
+    }
+    if metadata.len() > MAX_AUTH_TOKEN_BYTES {
+        return Err(DataPlaneError::Transport(format!(
+            "{service} auth token file exceeds {MAX_AUTH_TOKEN_BYTES} bytes"
+        )));
+    }
+    #[cfg(unix)]
+    if metadata.mode() & 0o077 != 0 {
+        return Err(DataPlaneError::Transport(format!(
+            "{service} auth token file {} must not be group- or world-accessible",
+            path.display()
+        )));
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    let file = options.open(path).map_err(|error| {
+        DataPlaneError::Transport(format!(
+            "failed to open {service} auth token file {}: {error}",
+            path.display()
+        ))
+    })?;
+    let mut token = String::new();
+    file.take(MAX_AUTH_TOKEN_BYTES + 1)
+        .read_to_string(&mut token)
+        .map_err(|error| {
+            DataPlaneError::Transport(format!(
+                "failed to read {service} auth token file {}: {error}",
+                path.display()
+            ))
+        })?;
+    let token = token.trim();
+    if token.is_empty() {
+        return Err(DataPlaneError::Transport(format!(
+            "{service} auth token file {} is empty",
+            path.display()
+        )));
+    }
+    Ok(token.to_string())
 }
 
 /// Builds the live daemon mesh transport. With no rendezvous server configured
@@ -218,7 +494,8 @@ pub fn build_daemon_mesh_transport(
         return Ok(DaemonMeshTransport::local_echo());
     }
 
-    let mesh_config = daemon_mesh_transport_config(config, identity, state_dir)?;
+    let peer = select_packet_peer(config, state_dir, now_unix())?;
+    let mesh_config = daemon_mesh_transport_config(config, identity, state_dir, &peer)?;
     let owned_keypair = identity
         .keypair()
         .seed()
@@ -232,7 +509,11 @@ pub fn build_daemon_mesh_transport(
 
     let handle = MeshTransportHandle::new_with_keypair(mesh_config, Some(Arc::new(owned_keypair)))
         .map_err(|error| DataPlaneError::Transport(error.to_string()))?;
-    Ok(DaemonMeshTransport::Mesh(Arc::new(handle)))
+    Ok(DaemonMeshTransport::Mesh {
+        handle: Arc::new(handle),
+        selected_peer_id: peer.peer_id,
+        trusted_peer_store_path: peer_store_path_from_state_dir(state_dir),
+    })
 }
 
 #[cfg(test)]
@@ -242,6 +523,7 @@ mod tests {
     use crate::identity::load_or_generate_device_identity;
     use qlink_core::packet_core::{FfiRouteMode, PacketTunnelCore};
     use qlink_linux::{LoopbackTunDevice, TunDeviceConfig, TunPacketIo};
+    use qlink_proto::{store_peer_store_at, MeshTrustMode, PeerStore};
 
     fn identity() -> (tempfile::TempDir, DeviceIdentity) {
         let temp = tempfile::tempdir().unwrap();
@@ -258,6 +540,19 @@ mod tests {
         )
         .unwrap();
         DataPlaneRuntime::new(tun, core)
+    }
+
+    fn peer(peer_id: &str, mesh_id: &str) -> StoredPeer {
+        StoredPeer {
+            peer_id: peer_id.to_string(),
+            alias: "trusted deck".to_string(),
+            mesh_id: mesh_id.to_string(),
+            party_id: "party-a".to_string(),
+            trust_mode: MeshTrustMode::PrivateFriends,
+            trust_source: "invite".to_string(),
+            revoked: false,
+            expires_at_unix: u64::MAX,
+        }
     }
 
     fn ipv4_packet(destination: [u8; 4]) -> Vec<u8> {
@@ -280,6 +575,27 @@ mod tests {
     }
 
     #[test]
+    fn packet_session_conversion_preserves_authenticated_lease_fields() {
+        let lease = PacketSessionLease {
+            peer_id: "peer-a".to_string(),
+            direction: PacketSessionDirection::Inbound,
+            generation: 7,
+            transcript_binding: [9; 32],
+            expires_at_unix: 42,
+            rekey_after_bytes: 4096,
+        };
+
+        let installed = installed_peer_session(lease);
+
+        assert_eq!(installed.peer_id, "peer-a");
+        assert_eq!(installed.direction, PeerSessionDirection::Inbound);
+        assert_eq!(installed.generation, 7);
+        assert_eq!(installed.transcript_binding, [9; 32]);
+        assert_eq!(installed.expires_at_unix, 42);
+        assert_eq!(installed.rekey_after_bytes, 4096);
+    }
+
+    #[test]
     fn no_rendezvous_config_builds_local_echo_transport() {
         let (temp, identity) = identity();
         let config = DaemonConfig::default();
@@ -296,23 +612,125 @@ mod tests {
     #[test]
     fn mesh_transport_config_carries_identity_and_endpoints() {
         let (temp, identity) = identity();
+        let selected_peer = peer("peer-a", "mesh-a");
         let config = DaemonConfig {
             rendezvous_servers: vec!["127.0.0.1:9471".to_string()],
             relay_servers: vec!["127.0.0.1:9472".to_string()],
             ..DaemonConfig::default()
         };
 
-        let mesh_config = daemon_mesh_transport_config(&config, &identity, temp.path()).unwrap();
+        let mesh_config =
+            daemon_mesh_transport_config(&config, &identity, temp.path(), &selected_peer).unwrap();
 
-        assert_eq!(mesh_config.mesh_id, DEFAULT_MESH_ID);
+        assert_eq!(mesh_config.mesh_id, "mesh-a");
         assert_eq!(mesh_config.local_peer_id, identity.peer_id());
-        assert_eq!(mesh_config.remote_peer_id, UNCONFIGURED_REMOTE_PEER_ID);
+        assert_eq!(mesh_config.remote_peer_id, "peer-a");
         assert_eq!(mesh_config.rendezvous_url, "127.0.0.1:9471");
         assert_eq!(mesh_config.relay_url.as_deref(), Some("127.0.0.1:9472"));
+        assert_eq!(
+            mesh_config
+                .inbound_acl
+                .as_ref()
+                .unwrap()
+                .allow
+                .as_ref()
+                .unwrap(),
+            &["peer-a".to_string()].into_iter().collect()
+        );
         let decoded = base64::engine::general_purpose::STANDARD
             .decode(mesh_config.peer_store_key_b64.as_ref().unwrap())
             .unwrap();
         assert_eq!(decoded.len(), 32);
+        assert!(mesh_config
+            .peer_store_path
+            .as_deref()
+            .unwrap()
+            .ends_with(MESH_PEER_RECORD_STORE_FILE));
+    }
+
+    #[test]
+    fn packet_peer_selection_requires_one_unambiguous_eligible_peer() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let store = PeerStore {
+            selected_peer_id: None,
+            peers: vec![peer("peer-a", "mesh-a"), peer("peer-b", "mesh-a")],
+        };
+        store_peer_store_at(&state_dir, &store).unwrap();
+
+        let ambiguous = select_packet_peer(&DaemonConfig::default(), &state_dir, 1).unwrap_err();
+        assert!(ambiguous.to_string().contains("set activePeerId"));
+
+        let config = DaemonConfig {
+            active_peer_id: Some("peer-b".to_string()),
+            ..DaemonConfig::default()
+        };
+        let selected = select_packet_peer(&config, &state_dir, 1).unwrap();
+        assert_eq!(selected.peer_id, "peer-b");
+    }
+
+    #[test]
+    fn packet_peer_selection_rejects_revoked_or_expired_active_peer() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let mut revoked = peer("peer-a", "mesh-a");
+        revoked.revoked = true;
+        let mut expired = peer("peer-b", "mesh-a");
+        expired.expires_at_unix = 10;
+        store_peer_store_at(
+            &state_dir,
+            &PeerStore {
+                selected_peer_id: None,
+                peers: vec![revoked, expired],
+            },
+        )
+        .unwrap();
+
+        let config = DaemonConfig {
+            active_peer_id: Some("peer-a".to_string()),
+            ..DaemonConfig::default()
+        };
+        let error = select_packet_peer(&config, &state_dir, 20).unwrap_err();
+        assert!(error.to_string().contains("expired, or revoked"));
+    }
+
+    #[test]
+    fn selected_peer_revalidation_fails_after_revocation_or_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let store_path = peer_store_path_from_state_dir(&state_dir);
+        let mut store = PeerStore {
+            selected_peer_id: Some("peer-a".to_string()),
+            peers: vec![peer("peer-a", "mesh-a"), peer("peer-b", "mesh-a")],
+        };
+        store_peer_store_at(&state_dir, &store).unwrap();
+        selected_peer_is_authorized(&store_path, "peer-a", 1).unwrap();
+
+        store.revoke("peer-a");
+        store.select("peer-b", 1);
+        store_peer_store_at(&state_dir, &store).unwrap();
+        let error = selected_peer_is_authorized(&store_path, "peer-a", 1).unwrap_err();
+        assert!(error.to_string().contains("revoked, expired, or replaced"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_token_loader_requires_owner_only_regular_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let token_path = temp.path().join("rendezvous.token");
+        std::fs::write(&token_path, "test-token\n").unwrap();
+        std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert_eq!(
+            load_auth_token(&token_path, "rendezvous").unwrap(),
+            "test-token"
+        );
+
+        std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let error = load_auth_token(&token_path, "rendezvous").unwrap_err();
+        assert!(error.to_string().contains("group- or world-accessible"));
     }
 
     #[test]

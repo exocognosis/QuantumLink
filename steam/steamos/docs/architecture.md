@@ -56,7 +56,22 @@ The default resident daemon builds and reports a dry-run Linux network plan duri
 
 Successful activated starts persist a small ownership record under the daemon state directory with the interface, route mode, protected CIDR, fwmark, route table, nftables family/table, schema version, and activation timestamp. Deactivation reconstructs the owned Linux runtime plan from that record, tears down nftables before network objects, removes the record only after successful cleanup, and leaves it in place when cleanup fails so the operator can retry. If no record exists, deactivation is a no-op. The packaged systemd unit wires this through `ExecStop=/usr/local/bin/qlinkd --deactivate-network` and `ExecStopPost=/usr/local/bin/qlinkd --deactivate-network`; `ExecStopPost` is an idempotent crash/start-failure cleanup backstop.
 
-After successful activated network application, the daemon opens the configured TUN device (non-blocking, so the single-threaded resident pump never stalls on an idle interface), initializes a `qlink-core` packet tunnel core, builds the live `DaemonMeshTransport`, and drives the bidirectional pump in `pump_and_serve_once` alongside the control socket. `dataPlane.state` reaches `ready` and `transportReady` becomes true once the transport reports ready — proven end to end over the local-echo development transport. Over the real `MeshTransportHandle`, protected packets still fail closed until peer-session-key installation into packet-frame encryption lands; this is the shared cross-platform gap that the macOS and Windows silos also carry, and `qlinkctl doctor` reports that boundary explicitly. This confirms local packet movement and transport wiring, not two-Deck live peer reachability, which remains a hardware-validation gate.
+After successful activated network application, the daemon opens the configured
+TUN device, initializes a `qlink-core` packet tunnel core, builds the live
+`DaemonMeshTransport`, and drives the bidirectional pump alongside the control
+socket. The production mesh path carries the exact authenticated outbound lease
+and per-frame inbound lease from `MeshTransportHandle` into the packet core.
+Ready and clear events preserve peer ID, direction, generation, transcript
+binding, expiry, and byte rekey limit.
+
+The trusted invite store remains separate from the shared-core signed peer
+record cache. Exactly one current, non-revoked packet target is selected,
+automatically only when unambiguous or explicitly through
+`qlinkctl peer select`. Its peer ID and mesh ID configure the transport, and an
+exact inbound ACL rejects other peers before packet processing. The resident
+loop rechecks the selected peer on disk and drops the complete transport after
+removal, revocation, expiry, or replacement. Two-Deck live reachability remains
+a hardware-validation gate.
 
 If packet I/O startup fails after network activation, the daemon invokes record-backed deactivation before exiting. That keeps an operator from being left with active routes or nftables rules when the TUN reader/writer cannot start.
 
@@ -66,4 +81,8 @@ Full-tunnel planning currently renders `0.0.0.0/0` as the protected CIDR so the 
 
 ## Boundaries
 
-The SteamOS silo contains the daemon, CLI, Linux TUN/network helpers, systemd unit, installer assets, and game profile helpers. The shared protocol core remains in `qlink-core`. The resident packet pump is now wired to the live mesh transport. Production readiness still requires peer-session-key installation into packet-frame encryption over the real transport, Deck-host two-Deck data-plane validation, public rendezvous/relay hardening, public Dytallix registry evidence, signed release packaging, and broader game compatibility testing.
+The SteamOS silo contains the daemon, CLI, Linux TUN/network helpers, systemd
+unit, installer assets, and game profile helpers. The shared protocol core
+remains in `qlink-core`. Production readiness still requires Deck-host
+two-Deck data-plane validation, complete live rendezvous/relay and Dytallix
+evidence, production signing evidence, and broader game compatibility testing.

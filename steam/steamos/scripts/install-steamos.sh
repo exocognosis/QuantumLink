@@ -9,6 +9,7 @@ DESTDIR="${DESTDIR:-}"
 BINDIR="${BINDIR:-/usr/local/bin}"
 SYSD_UNIT_DIR="${SYSD_UNIT_DIR:-/etc/systemd/system}"
 CONFIG_DIR="${CONFIG_DIR:-/etc/quantumlink}"
+SECRETS_DIR="$CONFIG_DIR/secrets"
 STATE_DIR="${STATE_DIR:-/var/lib/quantumlink}"
 UNIT_NAME="qlinkd.service"
 ACTIVATED_SAMPLE_NAME="activate-network.conf.sample"
@@ -52,6 +53,7 @@ validate_paths() {
         reject_symlink_components "BINDIR target" "$DESTDIR$BINDIR"
         reject_symlink_components "SYSD_UNIT_DIR target" "$DESTDIR$SYSD_UNIT_DIR"
         reject_symlink_components "CONFIG_DIR target" "$DESTDIR$CONFIG_DIR"
+        reject_symlink_components "SECRETS_DIR target" "$DESTDIR$SECRETS_DIR"
         reject_symlink_components "STATE_DIR target" "$DESTDIR$STATE_DIR"
         guarded_mkdir DESTDIR "$DESTDIR" 0755
     fi
@@ -275,6 +277,7 @@ guarded_install_file "BINDIR target" "$QLINKD_SRC" "$DESTDIR$BINDIR/qlinkd" 0755
 guarded_install_file "BINDIR target" "$QLINKCTL_SRC" "$DESTDIR$BINDIR/qlinkctl" 0755
 
 guarded_mkdir "CONFIG_DIR target" "$DESTDIR$CONFIG_DIR" 0750
+guarded_mkdir "SECRETS_DIR target" "$DESTDIR$SECRETS_DIR" 0700
 guarded_mkdir "STATE_DIR target" "$DESTDIR$STATE_DIR" 0750
 
 # Steam-safe bypass policy and per-game routing profiles. qlinkd loads these

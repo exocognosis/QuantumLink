@@ -68,6 +68,25 @@ rejects missing files, parent-directory traversal, private-key markers, wallet
 seed markers, entitlement-token markers, raw packet captures, and raw support
 bundle archives.
 
+When the shared public-edge live-evidence run already exists, bridge it into
+the SteamOS contract instead of copying its claims manually:
+
+```sh
+python3 steam/steamos/scripts/bridge-public-edge-evidence.py \
+  --public-edge-manifest validation/public-edge/<timestamp>/manifest.json \
+  --dytallix-evidence-root validation/dytallix/<timestamp> \
+  --output-root steam/steamos/validation/non-hardware/<timestamp>
+```
+
+The bridge first runs the shared public-edge verifier, confines referenced
+files to their evidence roots, rejects secret-like content, and records source
+hashes. It can pass only the controls proven by that source: TLS,
+authentication, rate limits, revocation propagation, and relay denial.
+Signed-record expiry, abuse-log samples, retention, key rotation, endpoint
+rotation, and incident shutdown remain blocked until their own live evidence is
+provided. Omit the Dytallix root or add `--allow-blocked` only when intentionally
+creating a valid but incomplete evidence bundle.
+
 Minimum `metadata.json` shape:
 
 ```json
@@ -167,3 +186,7 @@ bash steam/steamos/scripts/steamos-rc-dry-run.sh \
 The dry run must produce a valid signed package with
 `nonHardwareProductionReady=true` while still leaving `productionReady=false`
 until Steam Deck evidence is linked.
+
+CI runs the same positive path on compatible Linux with ephemeral Ed25519 keys
+through `steam/steamos/tests/compatible-linux-signed-rc-proof-test.sh`. That
+proof validates release mechanics only; it is not production signing evidence.

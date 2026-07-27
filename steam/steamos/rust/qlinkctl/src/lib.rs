@@ -53,6 +53,7 @@ pub fn format_guide() -> String {
         "- qlinkctl invite import <encoded-invite> stores a private mesh peer invite.",
         "- qlinkctl invite decode <code> inspects an invite without storing it.",
         "- qlinkctl peer list lists stored peers.",
+        "- qlinkctl peer select <peer-id> selects the single protected packet target.",
         "- qlinkctl peer trust <peer-id> explains trust source, mesh mode, and Dytallix requirements.",
         "- qlinkctl peer revoke <peer-id> marks a peer revoked; qlinkctl peer remove <peer-id> deletes it.",
         "",
@@ -158,6 +159,7 @@ pub fn format_onboarding_checklist(status: &DaemonStatus, peer_store: &PeerStore
         "- qlinkctl status".to_string(),
         "- qlinkctl doctor".to_string(),
         "- qlinkctl invite import <encoded-invite>".to_string(),
+        "- qlinkctl peer select <peer-id>".to_string(),
         "- qlinkctl peer trust <peer-id>".to_string(),
         "- qlinkctl support-bundle --output <path>".to_string(),
         "".to_string(),
@@ -222,6 +224,19 @@ pub fn remove_peer_from_store(state_dir: &Path, peer_id: &str) -> Result<(), Pee
 pub fn revoke_peer_in_store(state_dir: &Path, peer_id: &str) -> Result<(), PeerCommandError> {
     let mut store = load_peer_store_for_state_dir(state_dir)?;
     if !store.revoke(peer_id) {
+        return Err(PeerCommandError::UnknownPeer(peer_id.to_string()));
+    }
+    store_peer_store_at(state_dir, &store)?;
+    Ok(())
+}
+
+pub fn select_peer_in_store(
+    state_dir: &Path,
+    peer_id: &str,
+    now_unix: u64,
+) -> Result<(), PeerCommandError> {
+    let mut store = load_peer_store_for_state_dir(state_dir)?;
+    if !store.select(peer_id, now_unix) {
         return Err(PeerCommandError::UnknownPeer(peer_id.to_string()));
     }
     store_peer_store_at(state_dir, &store)?;
@@ -960,6 +975,7 @@ mod tests {
     fn format_onboarding_checklist_marks_active_peer_and_live_transport_ready() {
         let status = status_with_data_plane(DataPlaneState::Ready, true, true, None);
         let peer_store = PeerStore {
+            selected_peer_id: None,
             peers: vec![StoredPeer {
                 peer_id: "peer-a".to_string(),
                 alias: "deck two".to_string(),
@@ -1063,6 +1079,32 @@ mod tests {
             peer_from_store(&state_dir, "peer-host-deck").unwrap_err(),
             PeerCommandError::UnknownPeer(_)
         ));
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn peer_store_select_persists_only_current_non_revoked_peer() {
+        let state_dir = unique_temp_dir("qlinkctl-peer-select");
+        let mut store = PeerStore::default();
+        store.upsert(StoredPeer {
+            peer_id: "peer-a".to_string(),
+            alias: "deck".to_string(),
+            mesh_id: "mesh-a".to_string(),
+            party_id: "party-a".to_string(),
+            trust_mode: MeshTrustMode::PrivateFriends,
+            trust_source: "invite".to_string(),
+            revoked: false,
+            expires_at_unix: 100,
+        });
+        store_peer_store_at(&state_dir, &store).unwrap();
+
+        select_peer_in_store(&state_dir, "peer-a", 10).unwrap();
+        let selected = load_peer_store_for_state_dir(&state_dir).unwrap();
+        assert_eq!(selected.selected_peer_id.as_deref(), Some("peer-a"));
+
+        revoke_peer_in_store(&state_dir, "peer-a").unwrap();
+        let revoked = load_peer_store_for_state_dir(&state_dir).unwrap();
+        assert_eq!(revoked.selected_peer_id, None);
         let _ = std::fs::remove_dir_all(state_dir);
     }
 

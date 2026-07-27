@@ -66,6 +66,18 @@ bash steam/steamos/scripts/collect-production-evidence.sh \
   --output steam/steamos/validation/non-hardware/<timestamp>/production-evidence-manifest.json
 ```
 
+To translate a verified shared public-edge run into that bundle:
+
+```sh
+python3 steam/steamos/scripts/bridge-public-edge-evidence.py \
+  --public-edge-manifest validation/public-edge/<timestamp>/manifest.json \
+  --dytallix-evidence-root validation/dytallix/<timestamp> \
+  --output-root steam/steamos/validation/non-hardware/<timestamp>
+```
+
+The bridge fails closed unless the resulting evidence is ready. Use
+`--allow-blocked` only to retain an incomplete bundle for gap analysis.
+
 The verifier validates production signatures with:
 
 ```sh
@@ -92,6 +104,10 @@ bash steam/steamos/scripts/steamos-rc-dry-run.sh \
 Expected RC dry-run result: `valid=true`, `signatureValidated=true`,
 `nonHardwareProductionEvidenceValidated=true`,
 `nonHardwareProductionReady=true`, and `productionReady=false`.
+
+The release workflow exercises this path on compatible Linux with ephemeral
+Ed25519 keys. It proves the positive signing and verification path while
+remaining distinct from protected production-key evidence.
 
 ## Verification
 

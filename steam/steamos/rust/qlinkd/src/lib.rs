@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(unix)]
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
@@ -1159,6 +1159,8 @@ where
 /// shutdown-signal latency when neither the TUN nor the transport has work.
 #[cfg(unix)]
 const RESIDENT_IDLE_POLL: Duration = Duration::from_millis(5);
+#[cfg(unix)]
+const TRUSTED_PEER_RECHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 #[cfg(unix)]
 static RESIDENT_SHUTDOWN: AtomicBool = AtomicBool::new(false);
@@ -1235,7 +1237,20 @@ pub fn serve_resident_loop(
 ) -> std::io::Result<()> {
     let mut buffer = vec![0_u8; DATA_PLANE_MTU];
     let mut result = Ok(());
+    let mut next_peer_check = Instant::now() + TRUSTED_PEER_RECHECK_INTERVAL;
     while !shutdown.load(Ordering::SeqCst) {
+        if Instant::now() >= next_peer_check {
+            let peer_error = transport.as_ref().and_then(|transport| {
+                transport
+                    .validate_selected_peer(current_unix_seconds())
+                    .err()
+            });
+            if let Some(error) = peer_error {
+                eprintln!("qlinkd trusted peer changed; dropping transport: {error}");
+                transport.take();
+            }
+            next_peer_check = Instant::now() + TRUSTED_PEER_RECHECK_INTERVAL;
+        }
         match pump_and_serve_once(engine, transport.as_mut(), listener, &mut buffer) {
             Ok(did_work) => {
                 if !did_work {

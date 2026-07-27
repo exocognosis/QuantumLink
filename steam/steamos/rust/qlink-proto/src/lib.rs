@@ -23,11 +23,30 @@ pub struct DaemonConfig {
     pub overlay_cidr: String,
     pub overlay_ipv4_address: String,
     pub route_mode: RouteMode,
+    #[serde(default)]
+    pub active_peer_id: Option<String>,
     pub rendezvous_servers: Vec<String>,
     pub relay_servers: Vec<String>,
+    #[serde(default)]
+    pub rendezvous_auth_token_file: Option<String>,
+    #[serde(default)]
+    pub relay_auth_token_file: Option<String>,
+    #[serde(default)]
+    pub dytallix_identity: Option<DytallixIdentityLookupConfig>,
     pub kill_switch: bool,
     pub low_latency: bool,
     pub voice_chat_safe: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DytallixIdentityLookupConfig {
+    pub endpoint: String,
+    pub contract_address: String,
+    pub network_id: String,
+    pub chain_id: String,
+    #[serde(default)]
+    pub allowed_rpc_endpoints: Vec<String>,
 }
 
 impl DaemonConfig {
@@ -41,8 +60,27 @@ impl DaemonConfig {
             &self.overlay_cidr,
             &self.overlay_ipv4_address,
         )?;
+        validate_optional_nonempty("activePeerId", self.active_peer_id.as_deref())?;
         validate_server_entries("rendezvousServers", &self.rendezvous_servers)?;
         validate_server_entries("relayServers", &self.relay_servers)?;
+        validate_optional_nonempty(
+            "rendezvousAuthTokenFile",
+            self.rendezvous_auth_token_file.as_deref(),
+        )?;
+        validate_optional_nonempty("relayAuthTokenFile", self.relay_auth_token_file.as_deref())?;
+        if let Some(identity) = self.dytallix_identity.as_ref() {
+            validate_nonempty("dytallixIdentity.endpoint", &identity.endpoint)?;
+            validate_nonempty(
+                "dytallixIdentity.contractAddress",
+                &identity.contract_address,
+            )?;
+            validate_nonempty("dytallixIdentity.networkId", &identity.network_id)?;
+            validate_nonempty("dytallixIdentity.chainId", &identity.chain_id)?;
+            validate_server_entries(
+                "dytallixIdentity.allowedRpcEndpoints",
+                &identity.allowed_rpc_endpoints,
+            )?;
+        }
         Ok(())
     }
 }
@@ -59,6 +97,8 @@ pub enum ConfigValidationError {
     InvalidOverlayIpv4Address { value: String, reason: String },
     #[error("invalid {field}[{index}]: must not be empty")]
     EmptyServerEntry { field: &'static str, index: usize },
+    #[error("invalid {field}: must not be empty")]
+    EmptyConfigEntry { field: &'static str },
 }
 
 const MAX_LINUX_INTERFACE_NAME_BYTES: usize = 15;
@@ -198,6 +238,23 @@ fn validate_server_entries(
     Ok(())
 }
 
+fn validate_nonempty(field: &'static str, value: &str) -> Result<(), ConfigValidationError> {
+    if value.trim().is_empty() {
+        return Err(ConfigValidationError::EmptyConfigEntry { field });
+    }
+    Ok(())
+}
+
+fn validate_optional_nonempty(
+    field: &'static str,
+    value: Option<&str>,
+) -> Result<(), ConfigValidationError> {
+    if let Some(value) = value {
+        validate_nonempty(field, value)?;
+    }
+    Ok(())
+}
+
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
@@ -205,8 +262,12 @@ impl Default for DaemonConfig {
             overlay_cidr: "100.64.0.0/10".to_string(),
             overlay_ipv4_address: "100.64.10.2".to_string(),
             route_mode: RouteMode::GameOnly,
+            active_peer_id: None,
             rendezvous_servers: Vec::new(),
             relay_servers: Vec::new(),
+            rendezvous_auth_token_file: None,
+            relay_auth_token_file: None,
+            dytallix_identity: None,
             kill_switch: true,
             low_latency: true,
             voice_chat_safe: true,
@@ -416,6 +477,8 @@ pub struct StoredPeer {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PeerStore {
+    #[serde(default)]
+    pub selected_peer_id: Option<String>,
     pub peers: Vec<StoredPeer>,
 }
 
@@ -437,16 +500,33 @@ impl PeerStore {
     pub fn remove(&mut self, peer_id: &str) -> bool {
         let original_len = self.peers.len();
         self.peers.retain(|peer| peer.peer_id != peer_id);
-        self.peers.len() != original_len
+        let removed = self.peers.len() != original_len;
+        if removed && self.selected_peer_id.as_deref() == Some(peer_id) {
+            self.selected_peer_id = None;
+        }
+        removed
     }
 
     pub fn revoke(&mut self, peer_id: &str) -> bool {
         if let Some(peer) = self.peers.iter_mut().find(|peer| peer.peer_id == peer_id) {
             peer.revoked = true;
+            if self.selected_peer_id.as_deref() == Some(peer_id) {
+                self.selected_peer_id = None;
+            }
             true
         } else {
             false
         }
+    }
+
+    pub fn select(&mut self, peer_id: &str, now_unix: u64) -> bool {
+        let eligible = self.peers.iter().any(|peer| {
+            peer.peer_id == peer_id && !peer.revoked && peer.expires_at_unix > now_unix
+        });
+        if eligible {
+            self.selected_peer_id = Some(peer_id.to_string());
+        }
+        eligible
     }
 
     pub fn dial_candidates(&self, now_unix: u64) -> Vec<StoredPeer> {
@@ -665,6 +745,39 @@ mod tests {
     #[test]
     fn default_config_passes_validation() {
         DaemonConfig::default().validate().unwrap();
+    }
+
+    #[test]
+    fn production_transport_settings_round_trip() {
+        let config: DaemonConfig = serde_json::from_value(serde_json::json!({
+            "interfaceName": "qlink0",
+            "overlayCidr": "100.64.0.0/10",
+            "overlayIpv4Address": "100.64.10.2",
+            "routeMode": "gameOnly",
+            "activePeerId": "peer-a",
+            "rendezvousServers": ["tls://rv.example:9471"],
+            "relayServers": ["tls://relay.example:9472"],
+            "rendezvousAuthTokenFile": "/etc/quantumlink/secrets/rv.token",
+            "relayAuthTokenFile": "/etc/quantumlink/secrets/relay.token",
+            "dytallixIdentity": {
+                "endpoint": "https://registry.example",
+                "contractAddress": "quantumlink-node-registry",
+                "networkId": "dytallix-mainnet",
+                "chainId": "dytallix-1",
+                "allowedRpcEndpoints": ["https://rpc.example"]
+            },
+            "killSwitch": true,
+            "lowLatency": true,
+            "voiceChatSafe": true
+        }))
+        .unwrap();
+
+        config.validate().unwrap();
+        assert_eq!(config.active_peer_id.as_deref(), Some("peer-a"));
+        assert_eq!(
+            config.dytallix_identity.as_ref().unwrap().network_id,
+            "dytallix-mainnet"
+        );
     }
 
     #[test]

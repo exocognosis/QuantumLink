@@ -2,7 +2,6 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-STEAMOS_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 EVIDENCE_ROOT="${QLINK_STEAMOS_PRODUCTION_EVIDENCE_ROOT:-}"
 OUTPUT_MANIFEST="${QLINK_STEAMOS_OUTPUT_MANIFEST:-}"
@@ -227,16 +226,16 @@ if not isinstance(rendezvous_endpoints, list) or not rendezvous_endpoints:
     fail("metadata.rendezvousRelay.rendezvousEndpoints must be a non-empty array")
     rendezvous_endpoints = []
 for endpoint in rendezvous_endpoints:
-    if not is_nonempty_string(endpoint) or not secure_url(str(endpoint), {"https"}):
-        fail("metadata.rendezvousRelay.rendezvousEndpoints entries must be https URLs")
+    if not is_nonempty_string(endpoint) or not secure_url(str(endpoint), {"https", "tls"}):
+        fail("metadata.rendezvousRelay.rendezvousEndpoints entries must use https or tls")
 
 relay_endpoints = rendezvous_meta.get("relayEndpoints")
 if not isinstance(relay_endpoints, list) or not relay_endpoints:
     fail("metadata.rendezvousRelay.relayEndpoints must be a non-empty array")
     relay_endpoints = []
 for endpoint in relay_endpoints:
-    if not is_nonempty_string(endpoint) or not secure_url(str(endpoint), {"turns", "https"}):
-        fail("metadata.rendezvousRelay.relayEndpoints entries must use turns or https")
+    if not is_nonempty_string(endpoint) or not secure_url(str(endpoint), {"turns", "https", "tls"}):
+        fail("metadata.rendezvousRelay.relayEndpoints entries must use turns, https, or tls")
 
 control_meta = rendezvous_meta.get("controls")
 if not isinstance(control_meta, dict):

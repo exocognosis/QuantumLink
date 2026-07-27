@@ -179,6 +179,8 @@ else:
         if "sha256" in entry and not is_sha256(entry.get("sha256")):
             fail(f"Dytallix case {case_name} sha256 must be a 64-character lowercase hex digest")
 
+dytallix_ready = len(failures) == dytallix_failures_at_start and len(blockers) == dytallix_blockers_at_start
+
 rendezvous = manifest.get("rendezvousRelay")
 rendezvous_failures_at_start = len(failures)
 rendezvous_blockers_at_start = len(blockers)
@@ -209,16 +211,16 @@ else:
         fail("rendezvousRelay.rendezvousEndpoints must be a non-empty array")
         rendezvous_endpoints = []
     for endpoint in rendezvous_endpoints:
-        if not is_nonempty_string(endpoint) or not endpoint_has_secure_scheme(str(endpoint), {"https"}):
-            fail("rendezvous endpoint must be an https URL")
+        if not is_nonempty_string(endpoint) or not endpoint_has_secure_scheme(str(endpoint), {"https", "tls"}):
+            fail("rendezvous endpoint must use https or tls")
 
     relay_endpoints = rendezvous.get("relayEndpoints")
     if not isinstance(relay_endpoints, list) or not relay_endpoints:
         fail("rendezvousRelay.relayEndpoints must be a non-empty array")
         relay_endpoints = []
     for endpoint in relay_endpoints:
-        if not is_nonempty_string(endpoint) or not endpoint_has_secure_scheme(str(endpoint), {"turns", "https"}):
-            fail("relay endpoint must use turns or https")
+        if not is_nonempty_string(endpoint) or not endpoint_has_secure_scheme(str(endpoint), {"turns", "https", "tls"}):
+            fail("relay endpoint must use turns, https, or tls")
 
     if rendezvous.get("abuseLogsRedacted") is not True:
         fail("rendezvousRelay.abuseLogsRedacted must be true")
@@ -256,7 +258,6 @@ else:
         if "sha256" in entry and not is_sha256(entry.get("sha256")):
             fail(f"rendezvous/relay control {control_name} sha256 must be a 64-character lowercase hex digest")
 
-dytallix_ready = len(failures) == dytallix_failures_at_start and len(blockers) == dytallix_blockers_at_start
 rendezvous_ready = len(failures) == rendezvous_failures_at_start and len(blockers) == rendezvous_blockers_at_start
 ready = not failures and not blockers
 report = {

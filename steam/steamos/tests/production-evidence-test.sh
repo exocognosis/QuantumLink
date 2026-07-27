@@ -163,6 +163,8 @@ PY
 bash "$VERIFIER" "$BLOCKED" >"$TMP_ROOT/blocked.out" 2>"$TMP_ROOT/blocked.err"
 assert_json_bool "$TMP_ROOT/blocked.out" "valid" "true"
 assert_json_bool "$TMP_ROOT/blocked.out" "productionEvidenceReady" "false"
+assert_json_bool "$TMP_ROOT/blocked.out" "dytallixReady" "true"
+assert_json_bool "$TMP_ROOT/blocked.out" "rendezvousRelayReady" "false"
 assert_contains "$TMP_ROOT/blocked.out" "rendezvous/relay control tls status is blocked"
 
 echo "production-evidence-test: ok"

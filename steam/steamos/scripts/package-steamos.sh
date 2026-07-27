@@ -120,19 +120,22 @@ done
 
 cat > "$PAYLOAD_ROOT/config/config.example.json" <<'JSON'
 {
-  "meshName": "quantumlink-steamos",
-  "tunName": "qlink0",
+  "interfaceName": "qlink0",
   "overlayCidr": "100.64.0.0/10",
-  "rendezvous": {
-    "endpoint": "https://rendezvous.example.quantumlink.invalid",
-    "requireSignedRecords": true,
-    "requireEntitlement": true
-  },
-  "relay": {
-    "endpoint": "turns:relay.example.quantumlink.invalid:5349",
-    "requireEntitlement": true
-  },
-  "gameProfilesDir": "/etc/quantumlink/games"
+  "overlayIpv4Address": "100.64.10.2",
+  "routeMode": "gameOnly",
+  "activePeerId": null,
+  "rendezvousServers": [
+    "tls://rendezvous.example.quantumlink.invalid:9471"
+  ],
+  "relayServers": [
+    "tls://relay.example.quantumlink.invalid:9472"
+  ],
+  "rendezvousAuthTokenFile": "/etc/quantumlink/secrets/rendezvous.token",
+  "relayAuthTokenFile": "/etc/quantumlink/secrets/relay.token",
+  "killSwitch": true,
+  "lowLatency": true,
+  "voiceChatSafe": true
 }
 JSON
 

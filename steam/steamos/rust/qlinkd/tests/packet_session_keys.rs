@@ -4,7 +4,8 @@ use qlink_core::packet_core::{FfiRouteMode, InstalledPeerSession, PeerSessionDir
 use qlink_linux::{LoopbackTunDevice, TunDeviceConfig, TunPacketIo};
 use qlink_proto::PathKind;
 use qlinkd::data_plane::{
-    packet_core_from_parts, DataPlaneError, DataPlaneRuntime, MeshFrameTransport,
+    packet_core_from_parts, DataPlaneError, DataPlaneRuntime, InboundTransportFrame,
+    MeshFrameTransport,
 };
 
 #[derive(Debug)]
@@ -88,8 +89,18 @@ impl MeshFrameTransport for SessionAwareTransport {
         Ok(())
     }
 
-    fn try_receive_frame(&mut self) -> Option<Vec<u8>> {
-        self.frames.pop_front()
+    fn try_receive_frame(&mut self) -> Option<InboundTransportFrame> {
+        self.frames.pop_front().map(|frame| InboundTransportFrame {
+            frame,
+            peer_session: InstalledPeerSession {
+                peer_id: "session-aware-peer".to_string(),
+                direction: PeerSessionDirection::Inbound,
+                generation: 1,
+                transcript_binding: [0; 32],
+                expires_at_unix: u64::MAX,
+                rekey_after_bytes: 0,
+            },
+        })
     }
 
     fn last_transport_error(&self) -> Option<&str> {

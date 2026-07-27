@@ -2,17 +2,17 @@
 
 QuantumLink on SteamOS is a Linux daemon deployment inside the Steam silo. The runtime shape is `qlinkd` under systemd, with `qlinkctl` as the local control and diagnostics surface.
 
-Status: Pre-production daemon scaffold. Production readiness is tracked in
+Status: Pre-production daemon implementation. Production readiness is tracked in
 `steam/steamos/docs/production-readiness.md`. SteamOS remains pre-production
-until live transport, signed release, Steam-safe routing, and Deck validation
-gates pass.
+until live public-edge/Dytallix proof, production signing, Steam-safe routing,
+and Deck validation gates pass.
 The SteamOS security test plan lives at
 `steam/steamos/docs/security-test-plan.md`.
 
-2026-06-30 closeout status: local Rust, shell, installer, and dev-package
-verification gates pass, but production publication is a No-Go until production
-signing, active rendezvous/relay evidence, public Dytallix registry evidence,
-and real Steam Deck validation are linked from the readiness ledger.
+Local Rust, shell, installer, evidence-bridge, and signed-RC verification gates
+pass. Production publication remains a No-Go until production signing, complete
+active rendezvous/relay and public Dytallix evidence, and real Steam Deck
+validation are linked from the readiness ledger.
 
 ## Components
 
@@ -92,7 +92,24 @@ transport ready: no
 packet counters: observed=0 queued=0 dropped=0 emitted=0 accepted=0 rejected=0 transportErrors=0
 ```
 
-The resident daemon builds a live mesh transport and drives the bidirectional packet pump, so with the local-echo development transport (no rendezvous configured) the data plane reaches `ready`. On a real `MeshTransportHandle`, `data-plane state: starting` with `transport ready: no` is expected until an authenticated peer session is installed into packet-frame encryption on the live transport — the shared cross-platform gap the macOS and Windows silos also carry. It means the local TUN packet I/O runtime and transport are wired, not that protected traffic is already flowing to remote peers.
+The resident daemon builds a live mesh transport and drives the bidirectional
+packet pump. For a configured mesh it selects exactly one current, non-revoked
+peer from the trusted invite store, applies an exact inbound ACL, and installs
+the shared transport's authenticated directional packet-session leases into the
+packet core. Rekey, expiry, disconnect, and clear events are generation-aware.
+The daemon drops the complete transport if the selected peer is removed,
+revoked, expired, or replaced on disk.
+
+Select the protected packet target explicitly when more than one peer is
+eligible:
+
+```sh
+sudo qlinkctl peer select <peer-id>
+```
+
+Public-edge authentication tokens are loaded only from absolute owner-only
+files such as `/etc/quantumlink/secrets/rendezvous.token`; token values do not
+belong in `config.json`.
 
 ## Runtime Modes
 
@@ -137,7 +154,7 @@ SteamOS may remount the root filesystem read-only after system updates. Re-run t
 - Linux creates a dedicated TUN interface, currently documented as `qlink0`.
 - Protected game/party routes use the overlay range `100.64.0.0/10`.
 - `qlinkd` owns route setup, nftables fail-closed policy, peer state, profile application, and the local packet-pump boundary; the packaged service plans network changes until explicitly started with `--activate-network`, then records ownership for `--deactivate-network` cleanup.
-- The packet pump uses shared `qlink-core` packet framing and replay protection, and the resident daemon drives it against a live `DaemonMeshTransport` (shared `qlink-core` mesh transport, or a local-echo development transport when no rendezvous is configured). Peer-session-key installation over the real transport and full Deck runtime validation remain separate gates.
+- The packet pump uses shared `qlink-core` packet framing and replay protection, and the resident daemon drives it against a live `DaemonMeshTransport` with authenticated directional packet-session leases. Full Deck runtime validation remains a separate gate.
 - Rendezvous services publish and look up short-lived signed peer records.
 - Peers attempt direct QUIC paths first, with optional ICE/STUN helpers as the traversal layer matures.
 - Relay services are fallback paths for hostile NAT or intentionally hidden paths.
