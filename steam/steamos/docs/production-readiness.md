@@ -185,6 +185,27 @@ orphaned crate.
   chain register/readback/update/suspend/reactivate/revoke plus negative-policy
   evidence is linked.
 
+## 2026-07-27 Offline Dytallix Provisioning
+
+- Added daemon-independent `qlinkctl dytallix` status, register, update,
+  suspend, reactivate, and terminal revoke commands backed by shared-core v2
+  transaction and readback logic.
+- Mutations require an explicit owner-only regular keystore file. Device-bound
+  operations load only the existing owner-only SteamOS device seed; emergency
+  suspend/revoke can use an explicit peer ID without device-key access.
+- Configuration supplies the HTTPS endpoint, RPC allowlist, chain ID, network
+  ID, and deployed contract pin. Public operations require
+  `bindingVersion=stableIdentityV2` and cannot silently select v1.
+- Lifecycle checks reject duplicate registration, update preserves suspended
+  state, reactivate requires suspension, and revoke requires exact peer-ID
+  confirmation.
+- JSON receipts distinguish confirmed transaction plus exact readback from
+  finalized-chain proof. The pinned SDK does not yet expose trustworthy
+  finalized-block metadata, so production readiness remains No-Go.
+- Next blocker: upgrade the production-evidence schema, collector, verifier,
+  and bridge to require live-chain v2 lifecycle and negative-policy evidence,
+  including independently verified finality and sidecar digests.
+
 ## Go / No-Go Rule
 
 Do not label SteamOS production-ready until every blocking gate is `Passed`

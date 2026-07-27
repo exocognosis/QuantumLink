@@ -197,6 +197,22 @@ pub enum RegistryIdentityOperationV2 {
     Update,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RegistryIdentityStatusOperationV2 {
+    Suspend,
+    Revoke,
+}
+
+impl RegistryIdentityStatusOperationV2 {
+    fn contract_method(self) -> &'static str {
+        match self {
+            Self::Suspend => "suspend_identity",
+            Self::Revoke => "revoke_identity",
+        }
+    }
+}
+
 impl RegistryIdentityOperationV2 {
     fn contract_method(self) -> &'static str {
         match self {
@@ -253,6 +269,26 @@ impl WalletAuthorizationV2 {
             ));
         }
         Ok(())
+    }
+
+    pub fn sign_status(
+        operation: RegistryIdentityStatusOperationV2,
+        peer_id: &str,
+        identity_revision: u64,
+        owner_daddr: &str,
+        keypair: &DytallixKeypair,
+    ) -> StableIdentityV2Result<Self> {
+        require_wallet_address(owner_daddr, keypair.public_key())?;
+        let payload = canonical_status_payload_bytes(operation, peer_id, identity_revision)?;
+        let signature = keypair.sign(&payload).map_err(|err| {
+            StableIdentityV2Error::WalletAuthorization(format!(
+                "Dytallix wallet signing failed: {err}"
+            ))
+        })?;
+        Ok(Self {
+            actor_public_key_hex: hex::encode(keypair.public_key()),
+            actor_signature_hex: hex::encode(signature),
+        })
     }
 }
 
@@ -361,6 +397,15 @@ struct CanonicalDevicePayload<'a> {
     binding: &'a RegistryIdentityRecordV2,
 }
 
+#[derive(Serialize)]
+struct CanonicalStatusPayload<'a> {
+    contract: &'static str,
+    schema_version: u8,
+    operation: &'static str,
+    peer_id: &'a str,
+    identity_revision: u64,
+}
+
 pub fn canonical_wallet_payload_bytes(
     operation: RegistryIdentityOperationV2,
     record: &RegistryIdentityRecordV2,
@@ -393,6 +438,35 @@ pub fn canonical_device_payload_bytes(
     .map_err(|err| {
         StableIdentityV2Error::InvalidRecord(format!(
             "device authorization payload serialization failed: {err}"
+        ))
+    })
+}
+
+pub fn canonical_status_payload_bytes(
+    operation: RegistryIdentityStatusOperationV2,
+    peer_id: &str,
+    identity_revision: u64,
+) -> StableIdentityV2Result<Vec<u8>> {
+    if peer_id.trim().is_empty() {
+        return Err(StableIdentityV2Error::InvalidRecord(
+            "peer_id must not be empty".into(),
+        ));
+    }
+    if identity_revision == 0 {
+        return Err(StableIdentityV2Error::InvalidRecord(
+            "identity_revision must be greater than zero".into(),
+        ));
+    }
+    serde_json::to_vec(&CanonicalStatusPayload {
+        contract: CONTRACT_DOMAIN,
+        schema_version: STABLE_IDENTITY_SCHEMA_VERSION,
+        operation: operation.contract_method(),
+        peer_id,
+        identity_revision,
+    })
+    .map_err(|err| {
+        StableIdentityV2Error::InvalidRecord(format!(
+            "status authorization payload serialization failed: {err}"
         ))
     })
 }
@@ -591,6 +665,20 @@ fn require_wallet_owner(
         ))
     })?;
     if owner.as_str() != record.owner_daddr {
+        return Err(StableIdentityV2Error::WalletAuthorization(
+            "wallet public key does not match owner_daddr".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn require_wallet_address(owner_daddr: &str, public_key: &[u8]) -> StableIdentityV2Result<()> {
+    let owner = DAddr::from_public_key(public_key).map_err(|err| {
+        StableIdentityV2Error::WalletAuthorization(format!(
+            "wallet public key cannot derive a Dytallix owner address: {err}"
+        ))
+    })?;
+    if owner.as_str() != owner_daddr {
         return Err(StableIdentityV2Error::WalletAuthorization(
             "wallet public key does not match owner_daddr".into(),
         ));
@@ -1081,6 +1169,22 @@ mod tests {
             record.validate().unwrap_err(),
             StableIdentityV2Error::InvalidRecord(_)
         ));
+    }
+
+    #[test]
+    fn status_authorization_payloads_match_the_registry_contract() {
+        let peer_id = "qlink_contract_compatibility";
+
+        assert_eq!(
+            canonical_status_payload_bytes(RegistryIdentityStatusOperationV2::Suspend, peer_id, 2,)
+                .unwrap(),
+            quantumlink_node_registry_v2::canonical_suspend_payload(peer_id, 2).unwrap()
+        );
+        assert_eq!(
+            canonical_status_payload_bytes(RegistryIdentityStatusOperationV2::Revoke, peer_id, 3,)
+                .unwrap(),
+            quantumlink_node_registry_v2::canonical_revoke_payload(peer_id, 3).unwrap()
+        );
     }
 
     #[test]

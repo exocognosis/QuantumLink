@@ -35,12 +35,30 @@ Before activating a packaged resident daemon, review
 `advertiseAddress`, and pinned `dytallixIdentity` values for the deployment.
 Public deployments must set `bindingVersion` to `stableIdentityV2` and pin the
 HTTPS RPC endpoint, network ID, chain ID, and deployed v2 contract identifier.
+Lifecycle mutations require the deployed 20-byte hexadecimal contract address;
+the symbolic contract name is lookup-only.
 The local stable identity must be registered and read back as active before
 network activation. Register, update, suspend, and revoke transactions are
 offline operator actions and require finalized-chain readback evidence.
 The daemon creates owner-only publication sequence and current-record files
 under `/var/lib/quantumlink`; it must never receive a Dytallix wallet seed or
 wallet signing credential.
+
+Run daemon-independent lifecycle operations through `qlinkctl dytallix`. The
+command reads public chain pins from the daemon config and requires an explicit
+keystore path for every mutation:
+
+```sh
+sudo qlinkctl dytallix status
+sudo qlinkctl dytallix register --keystore /secure/path/wallet.json --wallet main
+sudo qlinkctl dytallix suspend --keystore /secure/path/wallet.json --peer-id <peer-id>
+sudo qlinkctl dytallix revoke --keystore /secure/path/wallet.json \
+  --peer-id <peer-id> --confirm-peer-id <peer-id>
+```
+
+Archive the JSON receipt, then independently capture finalized-block and
+contract readback evidence. The command currently proves confirmed transaction
+status and exact readback convergence, not finalized-chain inclusion.
 
 To package prebuilt binaries:
 

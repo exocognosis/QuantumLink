@@ -6,6 +6,8 @@ use qlink_proto::{
     PublicationStatus, RouteMode, StoredPeer,
 };
 
+pub mod dytallix;
+
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -32,6 +34,56 @@ pub enum ControlError {
 }
 
 pub const DEFAULT_STATE_DIR: &str = "/var/lib/quantumlink";
+pub const DEVICE_IDENTITY_SEED_FILE: &str = "device-identity.seed";
+
+pub fn load_provisioning_device_keypair(
+    state_dir: &Path,
+) -> Result<qlink_core::crypto::DeviceKeypair, std::io::Error> {
+    let path = state_dir.join(DEVICE_IDENTITY_SEED_FILE);
+    let metadata = std::fs::symlink_metadata(&path)?;
+    if !metadata.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "device identity seed {} is not a regular file",
+                path.display()
+            ),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "device identity seed {} must not be group- or world-accessible",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    let bytes = std::fs::read(&path)?;
+    let seed: [u8; 32] = bytes.try_into().map_err(|bytes: Vec<u8>| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "device identity seed {} must be exactly 32 bytes; got {}",
+                path.display(),
+                bytes.len()
+            ),
+        )
+    })?;
+    qlink_core::crypto::DeviceKeypair::from_seed(seed).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "device identity seed {} is invalid: {error}",
+                path.display()
+            ),
+        )
+    })
+}
 
 pub fn format_guide() -> String {
     [
@@ -59,7 +111,9 @@ pub fn format_guide() -> String {
         "- qlinkctl peer select <peer-id> selects the single protected packet target.",
         "- qlinkctl peer trust <peer-id> explains trust source, mesh mode, and Dytallix requirements.",
         "- qlinkctl peer revoke <peer-id> marks a peer revoked; qlinkctl peer remove <peer-id> deletes it.",
-        "- qlinkd never owns wallet seeds or wallet signing keys. Provision Dytallix identity with an external wallet workflow, then configure qlinkd with public identity references only.",
+        "- qlinkctl dytallix status reads stable-identity-v2 state without contacting qlinkd or loading a wallet.",
+        "- qlinkctl dytallix register|update|suspend|reactivate|revoke performs one-shot wallet-authorized lifecycle operations while qlinkd remains wallet-free.",
+        "- Dytallix mutation commands require an explicit owner-only keystore path; wallet seeds and private keys must never be passed through command arguments.",
         "",
         "Diagnostics and support",
         "- qlinkctl support-bundle --output <path> exports redacted daemon status and doctor output.",
@@ -1420,6 +1474,67 @@ mod tests {
                 .expect("system clock after epoch")
                 .as_nanos()
         ))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provisioning_device_loader_requires_owner_only_regular_seed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let state_dir = unique_temp_dir("qlinkctl-provisioning-seed");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let seed_path = state_dir.join(DEVICE_IDENTITY_SEED_FILE);
+        std::fs::write(&seed_path, [7_u8; 32]).unwrap();
+        std::fs::set_permissions(&seed_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let loaded = load_provisioning_device_keypair(&state_dir).unwrap();
+        assert_eq!(
+            loaded.public_key().peer_id(),
+            qlink_core::crypto::DeviceKeypair::from_seed([7_u8; 32])
+                .unwrap()
+                .public_key()
+                .peer_id()
+        );
+
+        std::fs::set_permissions(&seed_path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        assert_eq!(
+            load_provisioning_device_keypair(&state_dir)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provisioning_device_loader_rejects_symlink_and_wrong_length() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let state_dir = unique_temp_dir("qlinkctl-provisioning-seed-invalid");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let outside = state_dir.with_extension("outside");
+        std::fs::write(&outside, [9_u8; 32]).unwrap();
+        let seed_path = state_dir.join(DEVICE_IDENTITY_SEED_FILE);
+        symlink(&outside, &seed_path).unwrap();
+        assert_eq!(
+            load_provisioning_device_keypair(&state_dir)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+
+        std::fs::remove_file(&seed_path).unwrap();
+        std::fs::write(&seed_path, b"short").unwrap();
+        std::fs::set_permissions(&seed_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            load_provisioning_device_keypair(&state_dir)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        let _ = std::fs::remove_file(outside);
+        let _ = std::fs::remove_dir_all(state_dir);
     }
 
     fn peer_fixture() -> StoredPeer {

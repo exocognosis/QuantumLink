@@ -1,4 +1,5 @@
 use qlink_proto::InviteCode;
+use qlinkctl::dytallix::{parse_dytallix_args, run_dytallix};
 #[cfg(unix)]
 use qlinkctl::{
     current_unix_seconds, format_doctor, format_peer_list, format_peer_trust, format_status,
@@ -17,6 +18,20 @@ fn main() {
         Some("onboarding") => onboarding_command(),
         Some("status") => status_command(),
         Some("doctor") => doctor_command(),
+        Some("dytallix") => match parse_dytallix_args(args) {
+            Ok(options) => match run_dytallix(options) {
+                Ok(output) => println!("{output}"),
+                Err(error) => {
+                    eprintln!("{error}");
+                    std::process::exit(1);
+                }
+            },
+            Err(error) => {
+                eprintln!("{error}");
+                eprintln!("{}", dytallix_usage());
+                std::process::exit(2);
+            }
+        },
         Some("support-bundle") => {
             let Some(flag) = args.next() else {
                 eprintln!("usage: qlinkctl support-bundle --output <path>");
@@ -98,11 +113,18 @@ fn main() {
         },
         _ => {
             eprintln!(
-                "usage: qlinkctl <guide|onboarding|status|doctor|support-bundle --output|invite|peer>"
+                "usage: qlinkctl <guide|onboarding|status|doctor|dytallix|support-bundle --output|invite|peer>"
             );
             std::process::exit(2);
         }
     }
+}
+
+fn dytallix_usage() -> &'static str {
+    "usage: qlinkctl dytallix <status|register|update|suspend|reactivate|revoke> \
+     [--config <path>] [--state-dir <path>] [--keystore <path>] [--wallet <name>] \
+     [--peer-id <id>] [--confirm-peer-id <id>] [--authorization-expires-at <unix>] \
+     [--max-peer-ttl <seconds>] [--mesh-scope <scope>] [--metadata-commitment <sha256-hex>]"
 }
 
 #[cfg(unix)]

@@ -133,6 +133,26 @@ enrollment, update, suspension, and revocation remain offline provisioning
 actions. Public mode requires `bindingVersion: "stableIdentityV2"`; the daemon
 performs lookup-only validation and will not silently downgrade to v1.
 
+Provisioning is daemon-independent, not network-disconnected. It reads the
+pinned Dytallix settings from `/etc/quantumlink/config.json`, requires an
+explicit owner-only wallet keystore for mutations, and emits JSON receipts:
+
+```sh
+sudo qlinkctl dytallix status
+sudo qlinkctl dytallix register --keystore /secure/path/wallet.json --wallet main
+sudo qlinkctl dytallix update --keystore /secure/path/wallet.json --wallet main
+sudo qlinkctl dytallix suspend --keystore /secure/path/wallet.json --peer-id <peer-id>
+sudo qlinkctl dytallix reactivate --keystore /secure/path/wallet.json --wallet main
+sudo qlinkctl dytallix revoke --keystore /secure/path/wallet.json \
+  --peer-id <peer-id> --confirm-peer-id <peer-id>
+```
+
+Register, update, and reactivate load the existing device seed from
+`/var/lib/quantumlink`; they never generate a replacement identity. Suspend and
+revoke can operate by explicit peer ID without device-key access. A successful
+receipt proves transaction confirmation and exact registry readback, but does
+not claim finalized-chain inclusion; that remains a separate production gate.
+
 ## Runtime Modes
 
 - `qlinkd` starts the resident daemon in dry-run planning mode and does not mutate networking.

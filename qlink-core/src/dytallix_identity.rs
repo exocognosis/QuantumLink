@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 use std::{fmt, path::PathBuf};
 
 const REGISTRY_CONTRACT_NAME: &str = "quantumlink-node-registry";
+const STABLE_IDENTITY_REGISTRY_CONTRACT_NAME: &str = "quantumlink-node-registry-v2";
 const REGISTRY_CONTRACT_VERSION: u8 = 1;
 const CONTRACT_CALL_GAS_LIMIT: u64 = 1_000_000;
 
@@ -593,6 +594,11 @@ impl DytallixRegistryLookupConfig {
         Ok(self)
     }
 
+    pub fn with_binding_version(mut self, binding_version: DytallixRegistryBindingVersion) -> Self {
+        self.binding_version = binding_version;
+        self
+    }
+
     fn validate_endpoint_allowlist(&self) -> Result<()> {
         if self.allowed_rpc_endpoints.is_empty() {
             return Ok(());
@@ -1152,8 +1158,11 @@ fn normalize_contract_address(raw: &str) -> Result<String> {
 
 fn normalize_lookup_contract_identifier(raw: &str) -> Result<String> {
     let trimmed = raw.trim();
-    if trimmed == REGISTRY_CONTRACT_NAME {
-        return Ok(REGISTRY_CONTRACT_NAME.to_string());
+    if matches!(
+        trimmed,
+        REGISTRY_CONTRACT_NAME | STABLE_IDENTITY_REGISTRY_CONTRACT_NAME
+    ) {
+        return Ok(trimmed.to_string());
     }
     normalize_contract_address(trimmed)
 }
@@ -1538,6 +1547,25 @@ mod tests {
         .unwrap();
 
         assert_eq!(config.contract_address, "quantumlink-node-registry");
+    }
+
+    #[test]
+    fn registry_lookup_config_accepts_named_stable_identity_contract() {
+        let config: DytallixRegistryLookupConfig = serde_json::from_value(json!({
+            "endpoint": "https://dytallix.com",
+            "contractAddress": "quantumlink-node-registry-v2",
+            "networkId": "dytallix-mainnet",
+            "chainId": "dytallix-mainnet-1",
+            "bindingVersion": "stableIdentityV2",
+            "allowedRpcEndpoints": ["https://dytallix.com"]
+        }))
+        .unwrap();
+
+        assert_eq!(config.contract_address, "quantumlink-node-registry-v2");
+        assert_eq!(
+            config.binding_version,
+            DytallixRegistryBindingVersion::StableIdentityV2
+        );
     }
 
     #[test]
