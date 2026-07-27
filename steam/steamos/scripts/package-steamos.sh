@@ -137,9 +137,10 @@ cat > "$PAYLOAD_ROOT/config/config.example.json" <<'JSON'
   "advertiseAddress": null,
   "dytallixIdentity": {
     "endpoint": "https://rpc.example.dytallix.invalid",
-    "contractAddress": "quantumlink-node-registry",
+    "contractAddress": "quantumlink-node-registry-v2",
     "networkId": "dytallix-mainnet",
     "chainId": "dytallix-1",
+    "bindingVersion": "stableIdentityV2",
     "allowedRpcEndpoints": [
       "https://rpc.example.dytallix.invalid"
     ]

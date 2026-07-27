@@ -50,7 +50,17 @@ pub struct DytallixIdentityLookupConfig {
     pub network_id: String,
     pub chain_id: String,
     #[serde(default)]
+    pub binding_version: DytallixBindingVersion,
+    #[serde(default)]
     pub allowed_rpc_endpoints: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DytallixBindingVersion {
+    #[default]
+    ExactPeerRecordV1,
+    StableIdentityV2,
 }
 
 impl DaemonConfig {
@@ -520,6 +530,40 @@ pub struct DytallixTrustStatus {
     pub health: DytallixTrustHealth,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LocalRegistryBindingState {
+    #[default]
+    NotConfigured,
+    Pending,
+    Active,
+    Missing,
+    Revoked,
+    Suspended,
+    Mismatched,
+    Expired,
+    Unavailable,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalRegistryBindingStatus {
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default)]
+    pub version: Option<DytallixBindingVersion>,
+    #[serde(default)]
+    pub state: LocalRegistryBindingState,
+    #[serde(default)]
+    pub identity_revision: Option<u64>,
+    #[serde(default)]
+    pub checked_at_unix: Option<u64>,
+    #[serde(default)]
+    pub last_error: Option<PublicationErrorStatus>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PublicationStatus {
@@ -535,8 +579,14 @@ pub struct PublicationStatus {
     pub last_attempt_at_unix: Option<u64>,
     #[serde(default)]
     pub last_error: Option<PublicationErrorStatus>,
+    /// Legacy alias for selected remote-peer trust. New clients should use
+    /// `remotePeerTrust`; it remains serialized for compatibility.
     #[serde(default)]
     pub dytallix: DytallixTrustStatus,
+    #[serde(default)]
+    pub remote_peer_trust: DytallixTrustStatus,
+    #[serde(default)]
+    pub local_registry_binding: LocalRegistryBindingStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -884,9 +934,10 @@ mod tests {
             "relayAuthTokenFile": "/etc/quantumlink/secrets/relay.token",
             "dytallixIdentity": {
                 "endpoint": "https://registry.example",
-                "contractAddress": "quantumlink-node-registry",
+                "contractAddress": "quantumlink-node-registry-v2",
                 "networkId": "dytallix-mainnet",
                 "chainId": "dytallix-1",
+                "bindingVersion": "stableIdentityV2",
                 "allowedRpcEndpoints": ["https://rpc.example"]
             },
             "publicationTtlSeconds": 300,
@@ -902,6 +953,10 @@ mod tests {
         assert_eq!(
             config.dytallix_identity.as_ref().unwrap().network_id,
             "dytallix-mainnet"
+        );
+        assert_eq!(
+            config.dytallix_identity.as_ref().unwrap().binding_version,
+            DytallixBindingVersion::StableIdentityV2
         );
         assert_eq!(config.publication_ttl_seconds, 300);
         assert_eq!(
@@ -1164,6 +1219,19 @@ mod tests {
                 decision: DytallixTrustDecision::Accepted,
                 health: DytallixTrustHealth::Healthy,
             },
+            remote_peer_trust: DytallixTrustStatus {
+                required: true,
+                decision: DytallixTrustDecision::Accepted,
+                health: DytallixTrustHealth::Healthy,
+            },
+            local_registry_binding: LocalRegistryBindingStatus {
+                required: true,
+                version: Some(DytallixBindingVersion::StableIdentityV2),
+                state: LocalRegistryBindingState::Active,
+                identity_revision: Some(3),
+                checked_at_unix: Some(1_767_139_200),
+                last_error: None,
+            },
         };
 
         let value = serde_json::to_value(&status).unwrap();
@@ -1209,6 +1277,10 @@ mod tests {
         assert_eq!(
             publication.dytallix.decision,
             DytallixTrustDecision::NotChecked
+        );
+        assert_eq!(
+            publication.local_registry_binding.state,
+            LocalRegistryBindingState::NotConfigured
         );
         assert_eq!(publication.dytallix.health, DytallixTrustHealth::Unknown);
         assert!(!publication.dytallix.required);

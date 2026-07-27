@@ -8,8 +8,12 @@
 
 use qlink_core::crypto::DeviceKeypair;
 use qlink_core::discovery::PeerRecord;
+use qlink_core::dytallix_identity::DytallixRegistryBindingVersion;
+use qlink_core::mesh_connection::{LocalRegistryBindingError, LocalRegistryBindingFailureKind};
 use qlink_core::mesh_transport::MeshTransportHandle;
-use qlink_proto::{DytallixTrustDecision, DytallixTrustHealth};
+use qlink_proto::{
+    DytallixBindingVersion, DytallixTrustDecision, DytallixTrustHealth, LocalRegistryBindingState,
+};
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::{self, ErrorKind, Write};
@@ -47,6 +51,11 @@ pub struct PublicationSnapshot {
     pub dytallix_required: bool,
     pub dytallix_decision: DytallixTrustDecision,
     pub dytallix_health: DytallixTrustHealth,
+    pub local_binding_version: Option<DytallixBindingVersion>,
+    pub local_binding_state: LocalRegistryBindingState,
+    pub local_identity_revision: Option<u64>,
+    pub local_binding_checked_at_unix: Option<u64>,
+    pub local_binding_error: Option<String>,
 }
 
 impl PublicationSnapshot {
@@ -61,6 +70,11 @@ impl PublicationSnapshot {
             dytallix_required: false,
             dytallix_decision: DytallixTrustDecision::NotChecked,
             dytallix_health: DytallixTrustHealth::Unknown,
+            local_binding_version: None,
+            local_binding_state: LocalRegistryBindingState::NotConfigured,
+            local_identity_revision: None,
+            local_binding_checked_at_unix: None,
+            local_binding_error: None,
         }
     }
 
@@ -83,8 +97,8 @@ impl PublicationSnapshot {
                 PublicationPhase::Published | PublicationPhase::Degraded
             )
             && (!self.dytallix_required
-                || (self.dytallix_decision == DytallixTrustDecision::Accepted
-                    && self.dytallix_health == DytallixTrustHealth::Healthy))
+                || (self.local_binding_version == Some(DytallixBindingVersion::StableIdentityV2)
+                    && self.local_binding_state == LocalRegistryBindingState::Active))
     }
 }
 
@@ -129,6 +143,11 @@ impl PublicationController {
         let machine = PublicationStateMachine::load(state_path, record_path, config.ttl_seconds)?;
         let mut machine = machine;
         machine.snapshot.dytallix_required = config.public_dytallix_required;
+        machine.snapshot.local_binding_state = if config.public_dytallix_required {
+            LocalRegistryBindingState::Pending
+        } else {
+            LocalRegistryBindingState::NotConfigured
+        };
         let snapshot = Arc::new(Mutex::new(machine.snapshot.clone()));
         let worker_snapshot = snapshot.clone();
         let (command_tx, command_rx) = mpsc::channel();
@@ -236,19 +255,62 @@ fn run_publication_worker(
             Vec::new(),
             config.overlay_routes.clone(),
         );
-        let result = match runtime
+        let published_record = match runtime
             .block_on(async { tokio::time::timeout(PUBLICATION_TIMEOUT, publish).await })
         {
-            Ok(Ok(record)) => machine.accept_record(sequence, now_unix(), record),
-            Ok(Err(error)) => Err(error.to_string()),
-            Err(_) => Err(format!(
-                "signed peer record publication timed out after {} seconds",
-                PUBLICATION_TIMEOUT.as_secs()
-            )),
+            Ok(Ok(record)) => match machine.accept_record(sequence, now_unix(), record.clone()) {
+                Ok(()) => Some(record),
+                Err(error) => {
+                    machine.record_failure(now_unix(), error);
+                    None
+                }
+            },
+            Ok(Err(error)) => {
+                machine.record_failure(now_unix(), error.to_string());
+                None
+            }
+            Err(_) => {
+                machine.record_failure(
+                    now_unix(),
+                    format!(
+                        "signed peer record publication timed out after {} seconds",
+                        PUBLICATION_TIMEOUT.as_secs()
+                    ),
+                );
+                None
+            }
         };
-        if let Err(error) = result {
-            machine.record_failure(now_unix(), error);
-        } else if config.public_dytallix_required {
+        if let Some(record) = published_record.filter(|_| config.public_dytallix_required) {
+            let local_validation = handle.validate_local_registry_binding(&record);
+            match runtime.block_on(async {
+                tokio::time::timeout(PUBLICATION_TIMEOUT, local_validation).await
+            }) {
+                Ok(Ok(proof)) => machine.record_local_binding_accepted(
+                    now_unix(),
+                    match proof.binding_version {
+                        DytallixRegistryBindingVersion::ExactPeerRecordV1 => {
+                            DytallixBindingVersion::ExactPeerRecordV1
+                        }
+                        DytallixRegistryBindingVersion::StableIdentityV2 => {
+                            DytallixBindingVersion::StableIdentityV2
+                        }
+                    },
+                    proof.identity_revision,
+                ),
+                Ok(Err(error)) => machine.record_local_binding_failure(now_unix(), error),
+                Err(_) => machine.record_local_binding_failure(
+                    now_unix(),
+                    LocalRegistryBindingError {
+                        binding_version: Some(DytallixRegistryBindingVersion::StableIdentityV2),
+                        kind: LocalRegistryBindingFailureKind::Unavailable,
+                        message: format!(
+                            "local Dytallix binding validation timed out after {} seconds",
+                            PUBLICATION_TIMEOUT.as_secs()
+                        ),
+                    },
+                ),
+            }
+
             let validation = handle.revalidate_peer_trust(&config.selected_peer_id);
             match runtime
                 .block_on(async { tokio::time::timeout(PUBLICATION_TIMEOUT, validation).await })
@@ -393,7 +455,7 @@ impl PublicationStateMachine {
         self.snapshot.dytallix_health = DytallixTrustHealth::Healthy;
     }
 
-    fn record_trust_failure(&mut self, now_unix: u64, error: String) {
+    fn record_trust_failure(&mut self, _now_unix: u64, error: String) {
         let lower = error.to_ascii_lowercase();
         self.snapshot.dytallix_decision = if lower.contains("revoked") {
             DytallixTrustDecision::Revoked
@@ -412,9 +474,43 @@ impl PublicationStateMachine {
             } else {
                 DytallixTrustHealth::Degraded
             };
+    }
+
+    fn record_local_binding_accepted(
+        &mut self,
+        checked_at_unix: u64,
+        version: DytallixBindingVersion,
+        identity_revision: Option<u64>,
+    ) {
+        self.snapshot.local_binding_version = Some(version);
+        self.snapshot.local_binding_state = LocalRegistryBindingState::Active;
+        self.snapshot.local_identity_revision = identity_revision;
+        self.snapshot.local_binding_checked_at_unix = Some(checked_at_unix);
+        self.snapshot.local_binding_error = None;
+    }
+
+    fn record_local_binding_failure(&mut self, now_unix: u64, error: LocalRegistryBindingError) {
+        self.snapshot.local_binding_version = error.binding_version.map(|version| match version {
+            DytallixRegistryBindingVersion::ExactPeerRecordV1 => {
+                DytallixBindingVersion::ExactPeerRecordV1
+            }
+            DytallixRegistryBindingVersion::StableIdentityV2 => {
+                DytallixBindingVersion::StableIdentityV2
+            }
+        });
+        self.snapshot.local_binding_state = match error.kind {
+            LocalRegistryBindingFailureKind::Missing => LocalRegistryBindingState::Missing,
+            LocalRegistryBindingFailureKind::Revoked => LocalRegistryBindingState::Revoked,
+            LocalRegistryBindingFailureKind::Suspended => LocalRegistryBindingState::Suspended,
+            LocalRegistryBindingFailureKind::Expired => LocalRegistryBindingState::Expired,
+            LocalRegistryBindingFailureKind::Mismatched => LocalRegistryBindingState::Mismatched,
+            LocalRegistryBindingFailureKind::Unavailable => LocalRegistryBindingState::Unavailable,
+        };
+        self.snapshot.local_binding_checked_at_unix = Some(now_unix);
+        self.snapshot.local_binding_error = Some(sanitize_error(error.message.clone()));
         self.record_failure(
             now_unix,
-            format!("Dytallix trust revalidation failed: {error}"),
+            format!("local Dytallix registry binding failed: {}", error.message),
         );
     }
 
@@ -605,6 +701,59 @@ mod tests {
     }
 
     #[test]
+    fn public_current_state_requires_local_v2_binding_independent_of_remote_trust() {
+        let mut snapshot = PublicationSnapshot {
+            phase: PublicationPhase::Published,
+            expires_at_unix: Some(2_000),
+            dytallix_required: true,
+            dytallix_decision: DytallixTrustDecision::Accepted,
+            dytallix_health: DytallixTrustHealth::Healthy,
+            ..PublicationSnapshot::not_started()
+        };
+
+        assert!(!snapshot.is_current(1_000));
+        snapshot.local_binding_version = Some(DytallixBindingVersion::ExactPeerRecordV1);
+        snapshot.local_binding_state = LocalRegistryBindingState::Active;
+        assert!(!snapshot.is_current(1_000));
+        snapshot.local_binding_version = Some(DytallixBindingVersion::StableIdentityV2);
+        snapshot.local_identity_revision = Some(4);
+        assert!(snapshot.is_current(1_000));
+
+        snapshot.dytallix_health = DytallixTrustHealth::Unavailable;
+        assert!(snapshot.is_current(1_000));
+    }
+
+    #[test]
+    fn local_binding_failure_is_reported_independently_from_remote_trust() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut machine = machine(&temp, 120);
+        machine.snapshot.dytallix_decision = DytallixTrustDecision::Accepted;
+        machine.snapshot.dytallix_health = DytallixTrustHealth::Healthy;
+
+        machine.record_local_binding_failure(
+            1_000,
+            LocalRegistryBindingError {
+                binding_version: Some(DytallixRegistryBindingVersion::StableIdentityV2),
+                kind: LocalRegistryBindingFailureKind::Revoked,
+                message: "stable identity is revoked".to_string(),
+            },
+        );
+
+        assert_eq!(
+            machine.snapshot.local_binding_state,
+            LocalRegistryBindingState::Revoked
+        );
+        assert_eq!(
+            machine.snapshot.dytallix_decision,
+            DytallixTrustDecision::Accepted
+        );
+        assert_eq!(
+            machine.snapshot.dytallix_health,
+            DytallixTrustHealth::Healthy
+        );
+    }
+
+    #[test]
     fn state_and_record_outbox_are_owner_only() {
         let temp = tempfile::tempdir().unwrap();
         let keypair = DeviceKeypair::generate().unwrap();
@@ -628,7 +777,7 @@ mod tests {
     }
 
     #[test]
-    fn required_dytallix_failure_makes_current_record_unusable() {
+    fn remote_trust_failure_does_not_relabel_local_publication_or_enrollment() {
         let temp = tempfile::tempdir().unwrap();
         let keypair = DeviceKeypair::generate().unwrap();
         let mut machine = machine(&temp, 120);
@@ -642,13 +791,18 @@ mod tests {
                 signed_record(&keypair, 120, sequence, started_at),
             )
             .unwrap();
+        machine.record_local_binding_accepted(
+            started_at,
+            DytallixBindingVersion::StableIdentityV2,
+            Some(1),
+        );
 
         machine.record_trust_failure(
             started_at,
             "registry lookup failed: service unavailable".to_string(),
         );
 
-        assert_eq!(machine.snapshot.phase, PublicationPhase::Degraded);
+        assert_eq!(machine.snapshot.phase, PublicationPhase::Published);
         assert_eq!(
             machine.snapshot.dytallix_decision,
             DytallixTrustDecision::NotChecked
@@ -657,7 +811,7 @@ mod tests {
             machine.snapshot.dytallix_health,
             DytallixTrustHealth::Unavailable
         );
-        assert!(!machine.snapshot.is_current(started_at + 1));
+        assert!(machine.snapshot.is_current(started_at + 1));
     }
 
     #[test]

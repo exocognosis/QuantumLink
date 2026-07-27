@@ -9,8 +9,12 @@ use crate::{
     crypto::{DeviceKeypair, SessionKeys},
     discovery::{CandidateEndpoint, CandidateType},
     dytallix_identity::{
-        verify_registry_binding, DytallixIdentityRegistry, MeshTrustPolicy, RegistryDecision,
-        RegistryNodeRecord,
+        verify_inbound_registry_assertion, verify_registry_binding, DytallixIdentityRegistry,
+        DytallixRegistryBindingVersion, MeshTrustPolicy, RegistryDecision,
+        RegistryIdentityLookupRecord,
+    },
+    dytallix_identity_v2::{
+        verify_stable_inbound_registry_binding, verify_stable_registry_binding,
     },
     error::{QlinkError, Result},
     ice::{perform_ice_check, IceCheckRequest, IceCredentials},
@@ -52,18 +56,162 @@ pub fn native_udp_carrier_binding(
 }
 
 pub trait IdentityRegistryLookup: Send + Sync {
+    fn binding_version(&self) -> DytallixRegistryBindingVersion {
+        DytallixRegistryBindingVersion::ExactPeerRecordV1
+    }
+
     fn lookup<'a>(
         &'a self,
         peer_id: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<RegistryNodeRecord>>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<Option<RegistryIdentityLookupRecord>>> + Send + 'a>>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalRegistryBindingProof {
+    pub binding_version: DytallixRegistryBindingVersion,
+    pub identity_revision: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalRegistryBindingFailureKind {
+    Missing,
+    Revoked,
+    Suspended,
+    Expired,
+    Mismatched,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{message}")]
+pub struct LocalRegistryBindingError {
+    pub binding_version: Option<DytallixRegistryBindingVersion>,
+    pub kind: LocalRegistryBindingFailureKind,
+    pub message: String,
 }
 
 impl IdentityRegistryLookup for DytallixIdentityRegistry {
+    fn binding_version(&self) -> DytallixRegistryBindingVersion {
+        self.binding_version()
+    }
+
     fn lookup<'a>(
         &'a self,
         peer_id: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<RegistryNodeRecord>>> + Send + 'a>> {
-        Box::pin(async move { DytallixIdentityRegistry::lookup(self, peer_id).await })
+    ) -> Pin<Box<dyn Future<Output = Result<Option<RegistryIdentityLookupRecord>>> + Send + 'a>>
+    {
+        Box::pin(async move { DytallixIdentityRegistry::lookup_identity(self, peer_id).await })
+    }
+}
+
+pub fn verify_registry_lookup_binding(
+    peer_record: &crate::discovery::PeerRecord,
+    registry_record: Option<&RegistryIdentityLookupRecord>,
+    binding_version: DytallixRegistryBindingVersion,
+    policy: MeshTrustPolicy,
+) -> Result<RegistryDecision> {
+    match binding_version {
+        DytallixRegistryBindingVersion::ExactPeerRecordV1 => {
+            let record = match registry_record {
+                Some(RegistryIdentityLookupRecord::ExactPeerRecordV1(record)) => Some(record),
+                Some(RegistryIdentityLookupRecord::StableIdentityV2(_)) => {
+                    return Err(QlinkError::Protocol(
+                        "Dytallix registry returned stable identity v2 for an exact v1 lookup"
+                            .into(),
+                    ));
+                }
+                None => None,
+            };
+            verify_registry_binding(peer_record, record, policy)
+        }
+        DytallixRegistryBindingVersion::StableIdentityV2 => {
+            let record = match registry_record {
+                Some(RegistryIdentityLookupRecord::StableIdentityV2(record)) => Some(record),
+                Some(RegistryIdentityLookupRecord::ExactPeerRecordV1(_)) => {
+                    return Err(QlinkError::Protocol(
+                        "Dytallix registry returned exact v1 identity for a stable v2 lookup"
+                            .into(),
+                    ));
+                }
+                None => None,
+            };
+            match verify_stable_registry_binding(peer_record, record) {
+                Ok(_) => Ok(RegistryDecision::Accepted),
+                Err(_error) if policy != MeshTrustPolicy::PublicRequired && record.is_none() => {
+                    Ok(match policy {
+                        MeshTrustPolicy::PrivatePreferred => {
+                            RegistryDecision::AcceptedWithoutRegistryPrivate
+                        }
+                        MeshTrustPolicy::DevelopmentOptional => {
+                            RegistryDecision::AcceptedWithoutRegistryDevelopment
+                        }
+                        MeshTrustPolicy::PublicRequired => unreachable!(),
+                    })
+                }
+                Err(error) => Err(QlinkError::Protocol(format!(
+                    "Dytallix stable identity v2 verification failed: {error}"
+                ))),
+            }
+        }
+    }
+}
+
+pub fn verify_inbound_registry_lookup_binding(
+    assertion: &crate::inbound_identity::InboundIdentityAssertion,
+    registry_record: Option<&RegistryIdentityLookupRecord>,
+    binding_version: DytallixRegistryBindingVersion,
+    policy: MeshTrustPolicy,
+    expected_mesh_id: &str,
+    max_age_seconds: u64,
+) -> Result<RegistryDecision> {
+    match binding_version {
+        DytallixRegistryBindingVersion::ExactPeerRecordV1 => {
+            let record = match registry_record {
+                Some(RegistryIdentityLookupRecord::ExactPeerRecordV1(record)) => Some(record),
+                Some(RegistryIdentityLookupRecord::StableIdentityV2(_)) => {
+                    return Err(QlinkError::Protocol(
+                        "Dytallix registry returned stable identity v2 for an exact v1 lookup"
+                            .into(),
+                    ));
+                }
+                None => None,
+            };
+            verify_inbound_registry_assertion(assertion, record, policy)
+        }
+        DytallixRegistryBindingVersion::StableIdentityV2 => {
+            let record = match registry_record {
+                Some(RegistryIdentityLookupRecord::StableIdentityV2(record)) => Some(record),
+                Some(RegistryIdentityLookupRecord::ExactPeerRecordV1(_)) => {
+                    return Err(QlinkError::Protocol(
+                        "Dytallix registry returned exact v1 identity for a stable v2 lookup"
+                            .into(),
+                    ));
+                }
+                None => None,
+            };
+            match verify_stable_inbound_registry_binding(
+                assertion,
+                record,
+                expected_mesh_id,
+                max_age_seconds,
+            ) {
+                Ok(_) => Ok(RegistryDecision::Accepted),
+                Err(_error) if policy != MeshTrustPolicy::PublicRequired && record.is_none() => {
+                    Ok(match policy {
+                        MeshTrustPolicy::PrivatePreferred => {
+                            RegistryDecision::AcceptedWithoutRegistryPrivate
+                        }
+                        MeshTrustPolicy::DevelopmentOptional => {
+                            RegistryDecision::AcceptedWithoutRegistryDevelopment
+                        }
+                        MeshTrustPolicy::PublicRequired => unreachable!(),
+                    })
+                }
+                Err(error) => Err(QlinkError::Protocol(format!(
+                    "Dytallix stable identity v2 inbound verification failed: {error}"
+                ))),
+            }
+        }
     }
 }
 
@@ -774,11 +922,101 @@ impl MeshConnector {
             },
             None => None,
         };
-        verify_registry_binding(
+        let binding_version = self
+            .config
+            .identity_registry_lookup
+            .as_ref()
+            .map(|lookup| lookup.binding_version())
+            .unwrap_or_default();
+        verify_registry_lookup_binding(
             &record,
             registry_record.as_ref(),
+            binding_version,
             self.config.mesh_trust_policy,
         )
+    }
+
+    pub async fn validate_local_registry_binding(
+        &self,
+        peer_record: &crate::discovery::PeerRecord,
+    ) -> std::result::Result<LocalRegistryBindingProof, LocalRegistryBindingError> {
+        peer_record
+            .verify(&self.config.mesh_id)
+            .map_err(|error| LocalRegistryBindingError {
+                binding_version: None,
+                kind: LocalRegistryBindingFailureKind::Mismatched,
+                message: format!("local signed peer record is invalid: {error}"),
+            })?;
+        let registry = self
+            .config
+            .identity_registry_lookup
+            .as_ref()
+            .ok_or_else(|| LocalRegistryBindingError {
+                binding_version: None,
+                kind: LocalRegistryBindingFailureKind::Unavailable,
+                message: "local Dytallix registry lookup is not configured".into(),
+            })?;
+        let binding_version = registry.binding_version();
+        let registry_record =
+            registry
+                .lookup(&peer_record.body.peer_id)
+                .await
+                .map_err(|error| LocalRegistryBindingError {
+                    binding_version: Some(binding_version),
+                    kind: LocalRegistryBindingFailureKind::Unavailable,
+                    message: format!("local Dytallix registry binding lookup failed: {error}"),
+                })?;
+        let registry_record = registry_record.ok_or_else(|| LocalRegistryBindingError {
+            binding_version: Some(binding_version),
+            kind: LocalRegistryBindingFailureKind::Missing,
+            message: "local Dytallix registry binding is missing".into(),
+        })?;
+        verify_registry_lookup_binding(
+            peer_record,
+            Some(&registry_record),
+            binding_version,
+            MeshTrustPolicy::PublicRequired,
+        )
+        .map_err(|error| {
+            let kind = match &registry_record {
+                RegistryIdentityLookupRecord::StableIdentityV2(record) => match record.status {
+                    crate::dytallix_identity_v2::RegistryIdentityStatusV2::Revoked => {
+                        LocalRegistryBindingFailureKind::Revoked
+                    }
+                    crate::dytallix_identity_v2::RegistryIdentityStatusV2::Suspended => {
+                        LocalRegistryBindingFailureKind::Suspended
+                    }
+                    crate::dytallix_identity_v2::RegistryIdentityStatusV2::Active
+                        if record.authorization_expires_at.is_some_and(|expires_at| {
+                            expires_at <= crate::discovery::now_unix()
+                        }) =>
+                    {
+                        LocalRegistryBindingFailureKind::Expired
+                    }
+                    crate::dytallix_identity_v2::RegistryIdentityStatusV2::Active => {
+                        LocalRegistryBindingFailureKind::Mismatched
+                    }
+                },
+                RegistryIdentityLookupRecord::ExactPeerRecordV1(_) => {
+                    LocalRegistryBindingFailureKind::Mismatched
+                }
+            };
+            LocalRegistryBindingError {
+                binding_version: Some(binding_version),
+                kind,
+                message: error.to_string(),
+            }
+        })?;
+        let identity_revision = match registry_record {
+            RegistryIdentityLookupRecord::StableIdentityV2(record) => {
+                Some(record.identity_revision)
+            }
+            RegistryIdentityLookupRecord::ExactPeerRecordV1(_) => None,
+        };
+        Ok(LocalRegistryBindingProof {
+            binding_version,
+            identity_revision,
+        })
     }
 
     #[cfg(not(feature = "dev-quic-carrier"))]
@@ -853,9 +1091,16 @@ impl MeshConnector {
             },
             None => None,
         };
-        let registry_decision = verify_registry_binding(
+        let binding_version = self
+            .config
+            .identity_registry_lookup
+            .as_ref()
+            .map(|lookup| lookup.binding_version())
+            .unwrap_or_default();
+        let registry_decision = verify_registry_lookup_binding(
             &record,
             registry_record.as_ref(),
+            binding_version,
             self.config.mesh_trust_policy,
         )?;
 
@@ -1188,9 +1433,16 @@ impl MeshConnector {
             },
             None => None,
         };
-        let registry_decision = verify_registry_binding(
+        let binding_version = self
+            .config
+            .identity_registry_lookup
+            .as_ref()
+            .map(|lookup| lookup.binding_version())
+            .unwrap_or_default();
+        let registry_decision = verify_registry_lookup_binding(
             &record,
             registry_record.as_ref(),
+            binding_version,
             self.config.mesh_trust_policy,
         )?;
 

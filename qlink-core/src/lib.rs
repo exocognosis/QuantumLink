@@ -4,6 +4,7 @@ pub mod control_transport;
 pub mod crypto;
 pub mod discovery;
 pub mod dytallix_identity;
+pub mod dytallix_identity_v2;
 pub mod error;
 pub mod ffi;
 pub mod ice;

@@ -45,8 +45,9 @@ This is the intended activated packet flow. The packaged systemd service does no
 - publishes the responder certificate, candidates, and overlay routes in an
   ML-DSA-signed peer record;
 - refreshes at TTL/2 and retains a valid prior record during bounded retries;
-- writes the current public record to an owner-only outbox for an external
-  Dytallix synchronizer;
+- writes the current public record to an owner-only diagnostics/evidence
+  outbox; stable v2 enrollment does not require a wallet transaction per TTL
+  refresh;
 - reacts to Linux netlink route, link, and address changes by reconnecting the
   shared transport and requesting immediate republication; and
 - fails the protected packet path before initial publication and after expiry.
@@ -57,15 +58,19 @@ pump or local control socket.
 ## Dytallix Boundary
 
 `qlinkd` receives lookup-only Dytallix configuration and periodically
-revalidates required public-peer trust. Wallet keys remain outside the daemon.
-The current registry schema also binds `latest_peer_record_hash`,
-`pqc_binding_hash`, and the generated transport-certificate hash. Because those
-values change on each TTL refresh, production public mode still requires either
-an isolated continuous registry synchronizer consuming
-`publication-record.json` or a versioned registry contract that binds stable
-owner/device identity while leaving ephemeral reachability under the signed
-peer record. This is a release blocker, not a reason to move wallet secrets
-into the tunnel daemon.
+validates the local device enrollment and separately revalidates required
+public-peer trust. Wallet keys remain outside the daemon. Public SteamOS mode
+requires the explicit `stableIdentityV2` binding and refuses the legacy v1
+default. The v2 contract binds wallet ownership, device identity, node signing
+identity, authorization lifetime, optional mesh scope, and maximum signed
+peer-record TTL. Ephemeral endpoints, ICE credentials, routes, transport
+certificate, sequence, and expiry remain in the ML-DSA-signed peer record.
+
+Enrollment, update, emergency suspension, and terminal revocation are offline
+operator actions. Runtime publication does not require wallet access or an
+on-chain write for each refresh. Daemon status reports local registry binding
+separately from selected remote-peer trust so one cannot be mistaken for proof
+of the other.
 
 ## Evidence Boundary
 

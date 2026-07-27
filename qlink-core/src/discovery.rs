@@ -36,6 +36,11 @@ pub struct UnsignedPeerRecord {
     pub device_public_key: DevicePublicKey,
     pub endpoints: Vec<CandidateEndpoint>,
     pub routes: Vec<String>,
+    /// Unix timestamp at which this signed record was issued. Legacy records
+    /// deserialize this as zero and omit it when reserialized so their
+    /// pre-field signatures remain verifiable.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub issued_at_unix: u64,
     pub expires_at_unix: u64,
     pub sequence: u64,
     /// Short-term ICE credentials (RFC 8445 §5.3) used to authenticate
@@ -105,6 +110,7 @@ impl UnsignedPeerRecord {
     ) -> Self {
         let peer_id = device_public_key.peer_id();
         let alias = privacy_preserving_alias(&peer_id, sequence);
+        let issued_at_unix = now_unix();
         Self {
             mesh_id: mesh_id.into(),
             peer_id,
@@ -112,7 +118,8 @@ impl UnsignedPeerRecord {
             device_public_key,
             endpoints,
             routes,
-            expires_at_unix: now_unix() + ttl_seconds,
+            issued_at_unix,
+            expires_at_unix: issued_at_unix.saturating_add(ttl_seconds),
             sequence,
             ice_credentials,
             device_certificate_der: Vec::new(),
@@ -163,6 +170,16 @@ impl UnsignedPeerRecord {
         &self.ice_credentials
     }
 
+    /// Returns the TTL committed by the signature. Legacy records predate
+    /// issuance timestamps, so their signed TTL is intentionally unknown.
+    pub fn signed_ttl_seconds(&self) -> Option<u64> {
+        if self.issued_at_unix == 0 || self.expires_at_unix <= self.issued_at_unix {
+            None
+        } else {
+            Some(self.expires_at_unix - self.issued_at_unix)
+        }
+    }
+
     pub fn canonical_bytes(&self) -> Result<Vec<u8>> {
         serde_json::to_vec(self).map_err(Into::into)
     }
@@ -178,6 +195,11 @@ impl PeerRecord {
         if self.body.mesh_id != expected_mesh_id {
             return Err(QlinkError::Protocol("peer record mesh id mismatch".into()));
         }
+        if self.body.issued_at_unix != 0 && self.body.expires_at_unix <= self.body.issued_at_unix {
+            return Err(QlinkError::Protocol(
+                "peer record expiration must be after issuance".into(),
+            ));
+        }
         if self.body.expires_at_unix <= now_unix() {
             return Err(QlinkError::RecordExpired);
         }
@@ -189,6 +211,10 @@ impl PeerRecord {
         self.body
             .device_public_key
             .verify(&self.body.canonical_bytes()?, &self.signature)
+    }
+
+    pub fn signed_ttl_seconds(&self) -> Option<u64> {
+        self.body.signed_ttl_seconds()
     }
 
     pub fn record_hash(&self) -> Result<[u8; 32]> {
@@ -205,6 +231,10 @@ pub fn now_unix() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 fn privacy_preserving_alias(peer_id: &str, sequence: u64) -> String {
@@ -247,6 +277,75 @@ mod tests {
 
         record.body.alias = "changed".to_string();
         assert!(record.verify("devmesh").is_err());
+    }
+
+    #[test]
+    fn constructors_sign_issuance_time_and_ttl() {
+        let keypair = DeviceKeypair::generate().unwrap();
+        let before = now_unix();
+        let body = UnsignedPeerRecord::new(
+            "devmesh",
+            "mac",
+            keypair.public_key(),
+            vec![],
+            vec![],
+            60,
+            1,
+        );
+        let after = now_unix();
+
+        assert!((before..=after).contains(&body.issued_at_unix));
+        assert_eq!(body.signed_ttl_seconds(), Some(60));
+
+        let record = PeerRecord::signed(body, &keypair).unwrap();
+        assert_eq!(record.signed_ttl_seconds(), Some(60));
+        record.verify("devmesh").unwrap();
+    }
+
+    #[test]
+    fn verification_rejects_invalid_issued_expiry_chronology() {
+        let keypair = DeviceKeypair::generate().unwrap();
+        let mut body = UnsignedPeerRecord::new(
+            "devmesh",
+            "mac",
+            keypair.public_key(),
+            vec![],
+            vec![],
+            60,
+            1,
+        );
+        body.expires_at_unix = body.issued_at_unix;
+        let record = PeerRecord::signed(body, &keypair).unwrap();
+
+        let error = record.verify("devmesh").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("expiration must be after issuance"));
+        assert_eq!(record.signed_ttl_seconds(), None);
+    }
+
+    #[test]
+    fn legacy_record_without_issuance_time_remains_verifiable() {
+        let keypair = DeviceKeypair::generate().unwrap();
+        let mut body = UnsignedPeerRecord::new(
+            "devmesh",
+            "mac",
+            keypair.public_key(),
+            vec![],
+            vec![],
+            60,
+            1,
+        );
+        body.issued_at_unix = 0;
+        let legacy_canonical = body.canonical_bytes().unwrap();
+        assert!(!String::from_utf8_lossy(&legacy_canonical).contains("issued_at_unix"));
+        let signature = keypair.sign(&legacy_canonical);
+        let encoded = serde_json::to_vec(&PeerRecord { body, signature }).unwrap();
+
+        let decoded: PeerRecord = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.body.issued_at_unix, 0);
+        assert_eq!(decoded.signed_ttl_seconds(), None);
+        decoded.verify("devmesh").unwrap();
     }
 
     #[test]

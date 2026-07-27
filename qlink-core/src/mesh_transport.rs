@@ -35,8 +35,7 @@ use crate::{
     crypto::{shake256_xof, DeviceKeypair},
     discovery::{now_unix, CandidateEndpoint, CandidateType, PeerRecord, UnsignedPeerRecord},
     dytallix_identity::{
-        verify_inbound_registry_assertion, DytallixIdentityRegistry, DytallixRegistryLookupConfig,
-        MeshTrustPolicy, RegistryDecision,
+        DytallixIdentityRegistry, DytallixRegistryLookupConfig, MeshTrustPolicy, RegistryDecision,
     },
     error::{QlinkError, Result},
     ice::IceCredentials,
@@ -44,7 +43,8 @@ use crate::{
         receive_and_evaluate_inbound, InboundDecision, DEFAULT_INBOUND_ASSERTION_MAX_AGE_SECONDS,
     },
     mesh_connection::{
-        IdentityRegistryLookup, MeshConnector, MeshConnectorConfig, NetworkEvent,
+        verify_inbound_registry_lookup_binding, IdentityRegistryLookup, LocalRegistryBindingError,
+        LocalRegistryBindingProof, MeshConnector, MeshConnectorConfig, NetworkEvent,
         NetworkEventResponse, PathKind, PeerRecordSource,
     },
     metrics_endpoint::{spawn_metrics_endpoint, MetricsEndpoint, MetricsSnapshot},
@@ -1827,6 +1827,15 @@ impl MeshTransportHandle {
         self.connector.revalidate_peer_trust(remote_peer_id).await
     }
 
+    pub async fn validate_local_registry_binding(
+        &self,
+        peer_record: &PeerRecord,
+    ) -> std::result::Result<LocalRegistryBindingProof, LocalRegistryBindingError> {
+        self.connector
+            .validate_local_registry_binding(peer_record)
+            .await
+    }
+
     pub fn peer_metrics(&self, remote_peer_id: &str) -> Option<MeshTransportRawMetrics> {
         let peers = self.peers.lock().ok()?;
         let session = peers.get(remote_peer_id)?;
@@ -2076,10 +2085,17 @@ async fn run_native_udp_responder_loop(
                         },
                         None => None,
                     };
-                    if let Err(error) = verify_inbound_registry_assertion(
+                    let binding_version = identity_registry_lookup
+                        .as_ref()
+                        .map(|lookup| lookup.binding_version())
+                        .unwrap_or_default();
+                    if let Err(error) = verify_inbound_registry_lookup_binding(
                         &assertion,
                         registry_record.as_ref(),
+                        binding_version,
                         mesh_trust_policy,
+                        &mesh_id,
+                        DEFAULT_INBOUND_ASSERTION_MAX_AGE_SECONDS,
                     ) {
                         tracing::warn!(
                             peer_id = %assertion.peer_id,
@@ -2299,10 +2315,17 @@ async fn handle_inbound_session(
                 },
                 None => None,
             };
-            if let Err(error) = verify_inbound_registry_assertion(
+            let binding_version = identity_registry_lookup
+                .as_ref()
+                .map(|lookup| lookup.binding_version())
+                .unwrap_or_default();
+            if let Err(error) = verify_inbound_registry_lookup_binding(
                 &assertion,
                 registry_record.as_ref(),
+                binding_version,
                 mesh_trust_policy,
+                &mesh_id,
+                DEFAULT_INBOUND_ASSERTION_MAX_AGE_SECONDS,
             ) {
                 tracing::warn!(
                     peer_id = %assertion.peer_id,

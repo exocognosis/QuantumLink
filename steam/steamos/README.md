@@ -129,8 +129,9 @@ belong in `config.json`.
 `publicationTtlSeconds` defaults to `120`. `advertiseAddress` can override the
 responder bind address when a stable public NAT/proxy endpoint is required.
 Wallet seeds and signing credentials never enter `qlinkd`; public Dytallix
-enrollment and record synchronization remain an external provisioning
-boundary.
+enrollment, update, suspension, and revocation remain offline provisioning
+actions. Public mode requires `bindingVersion: "stableIdentityV2"`; the daemon
+performs lookup-only validation and will not silently downgrade to v1.
 
 ## Runtime Modes
 

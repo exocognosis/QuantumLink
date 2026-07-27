@@ -33,6 +33,11 @@ The archive payload includes:
 Before activating a packaged resident daemon, review
 `config/config.example.json` and set `publicationTtlSeconds`,
 `advertiseAddress`, and pinned `dytallixIdentity` values for the deployment.
+Public deployments must set `bindingVersion` to `stableIdentityV2` and pin the
+HTTPS RPC endpoint, network ID, chain ID, and deployed v2 contract identifier.
+The local stable identity must be registered and read back as active before
+network activation. Register, update, suspend, and revoke transactions are
+offline operator actions and require finalized-chain readback evidence.
 The daemon creates owner-only publication sequence and current-record files
 under `/var/lib/quantumlink`; it must never receive a Dytallix wallet seed or
 wallet signing credential.

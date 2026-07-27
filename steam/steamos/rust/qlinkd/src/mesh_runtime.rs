@@ -28,7 +28,9 @@ use crate::identity::DeviceIdentity;
 use crate::publication::{PublicationController, PublicationSnapshot, PublicationWorkerConfig};
 use base64::Engine as _;
 use qlink_core::crypto::DeviceKeypair;
-use qlink_core::dytallix_identity::{DytallixRegistryLookupConfig, MeshTrustPolicy};
+use qlink_core::dytallix_identity::{
+    DytallixRegistryBindingVersion, DytallixRegistryLookupConfig, MeshTrustPolicy,
+};
 use qlink_core::mesh_connection::NetworkEvent;
 use qlink_core::mesh_transport::{
     MeshTransportConfig, MeshTransportHandle, PacketSessionDirection, PacketSessionEvent,
@@ -37,8 +39,8 @@ use qlink_core::mesh_transport::{
 use qlink_core::packet_core::{InstalledPeerSession, PeerSessionDirection};
 use qlink_core::peer_acl::PeerAcl;
 use qlink_proto::{
-    load_peer_store_at, peer_store_path_from_state_dir, DaemonConfig, MeshTrustMode, PathKind,
-    StoredPeer,
+    load_peer_store_at, peer_store_path_from_state_dir, DaemonConfig, DytallixBindingVersion,
+    MeshTrustMode, PathKind, StoredPeer,
 };
 use std::collections::VecDeque;
 use std::io::Read;
@@ -356,6 +358,16 @@ pub fn daemon_mesh_transport_config(
             "public Dytallix peer requires pinned dytallixIdentity configuration".to_string(),
         ));
     }
+    if peer.trust_mode == MeshTrustMode::PublicDytallixRequired
+        && config.dytallix_identity.as_ref().is_some_and(|settings| {
+            settings.binding_version != DytallixBindingVersion::StableIdentityV2
+        })
+    {
+        return Err(DataPlaneError::Transport(
+            "public Dytallix peer requires bindingVersion=stableIdentityV2; legacy v1 downgrade is refused"
+                .to_string(),
+        ));
+    }
     let peer_store_path = state_dir.join(MESH_PEER_RECORD_STORE_FILE);
     let rendezvous_url = config
         .rendezvous_servers
@@ -374,6 +386,14 @@ pub fn daemon_mesh_transport_config(
             .map(|settings| DytallixRegistryLookupConfig {
                 endpoint: settings.endpoint.clone(),
                 contract_address: settings.contract_address.clone(),
+                binding_version: match settings.binding_version {
+                    DytallixBindingVersion::ExactPeerRecordV1 => {
+                        DytallixRegistryBindingVersion::ExactPeerRecordV1
+                    }
+                    DytallixBindingVersion::StableIdentityV2 => {
+                        DytallixRegistryBindingVersion::StableIdentityV2
+                    }
+                },
                 network_id: Some(settings.network_id.clone()),
                 chain_id: Some(settings.chain_id.clone()),
                 allowed_rpc_endpoints: settings.allowed_rpc_endpoints.clone(),
@@ -716,6 +736,30 @@ mod tests {
             .as_deref()
             .unwrap()
             .ends_with(MESH_PEER_RECORD_STORE_FILE));
+    }
+
+    #[test]
+    fn public_mesh_refuses_legacy_v1_registry_downgrade() {
+        let (temp, identity) = identity();
+        let mut selected_peer = peer("peer-a", "mesh-a");
+        selected_peer.trust_mode = MeshTrustMode::PublicDytallixRequired;
+        let config = DaemonConfig {
+            dytallix_identity: Some(qlink_proto::DytallixIdentityLookupConfig {
+                endpoint: "https://rpc.example".to_string(),
+                contract_address: "quantumlink-node-registry".to_string(),
+                network_id: "production".to_string(),
+                chain_id: "dytallix-1".to_string(),
+                binding_version: DytallixBindingVersion::ExactPeerRecordV1,
+                allowed_rpc_endpoints: vec!["https://rpc.example".to_string()],
+            }),
+            ..DaemonConfig::default()
+        };
+
+        let error = daemon_mesh_transport_config(&config, &identity, temp.path(), &selected_peer)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("bindingVersion=stableIdentityV2"));
     }
 
     #[test]

@@ -1356,6 +1356,11 @@ fn publication_status(snapshot: publication::PublicationSnapshot) -> Publication
             ),
         }
     });
+    let remote_peer_trust = DytallixTrustStatus {
+        required: snapshot.dytallix_required,
+        decision: snapshot.dytallix_decision,
+        health: snapshot.dytallix_health,
+    };
     PublicationStatus {
         state,
         sequence: snapshot.sequence,
@@ -1363,10 +1368,27 @@ fn publication_status(snapshot: publication::PublicationSnapshot) -> Publication
         last_success_at_unix: snapshot.last_success_at_unix,
         last_attempt_at_unix: snapshot.last_attempt_at_unix,
         last_error,
-        dytallix: DytallixTrustStatus {
+        dytallix: remote_peer_trust.clone(),
+        remote_peer_trust,
+        local_registry_binding: qlink_proto::LocalRegistryBindingStatus {
             required: snapshot.dytallix_required,
-            decision: snapshot.dytallix_decision,
-            health: snapshot.dytallix_health,
+            version: snapshot.local_binding_version,
+            state: snapshot.local_binding_state,
+            identity_revision: snapshot.local_identity_revision,
+            checked_at_unix: snapshot.local_binding_checked_at_unix,
+            last_error: snapshot.local_binding_error.as_ref().map(|_| {
+                let retryable = matches!(
+                    snapshot.local_binding_state,
+                    qlink_proto::LocalRegistryBindingState::Pending
+                        | qlink_proto::LocalRegistryBindingState::Missing
+                        | qlink_proto::LocalRegistryBindingState::Unavailable
+                        | qlink_proto::LocalRegistryBindingState::Unknown
+                );
+                PublicationErrorStatus {
+                    code: PublicationErrorCode::TrustUnavailable,
+                    retryable,
+                }
+            }),
         },
     }
 }
@@ -1579,6 +1601,7 @@ mod tests {
             dytallix_required: true,
             dytallix_decision: qlink_proto::DytallixTrustDecision::NotChecked,
             dytallix_health: qlink_proto::DytallixTrustHealth::Unavailable,
+            ..publication::PublicationSnapshot::not_started()
         });
 
         assert_eq!(status.state, PublicationState::Degraded);
@@ -1608,6 +1631,7 @@ mod tests {
             dytallix_required: false,
             dytallix_decision: qlink_proto::DytallixTrustDecision::NotChecked,
             dytallix_health: qlink_proto::DytallixTrustHealth::Unknown,
+            ..publication::PublicationSnapshot::not_started()
         });
 
         assert_eq!(status.state, PublicationState::Expired);

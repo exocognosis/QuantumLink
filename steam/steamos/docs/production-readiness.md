@@ -18,7 +18,7 @@
 | Steam-safe bypass | Blocked | The `qlink-game` policy is no longer orphaned: `qlinkd` loads it into `SteamBypassSummary` at startup, validates the protected overlay CIDR against the policy, and logs the posture; `qlinkctl`'s operator guide derives its Steam-safe disclosure from the same policy so enforcement and disclosure share one source. Verified 2026-07-12 (`cargo test -p qlinkd game::`, `cargo test -p qlinkctl steam_safe_disclosure`). Local profile tests still pass (`cargo test -p qlink-game steam_bypass`). Real Deck route-leak evidence for Steam account/store/wallet/update/login categories is still required |
 | nftables rollback | Passed | Codex local automation on 2026-06-30: `cargo test -p qlink-linux network_lifecycle -- --nocapture`; fake-executor rollback and owned-record retry paths passed |
 | Private invite peer lifecycle | Passed | Invite import, explicit `peer select`, revoke, expiry, exact inbound ACL, owner-only peer storage, unambiguous targeting, and bounded resident revalidation are covered; removing, revoking, expiring, or replacing the selected peer drops the full transport |
-| Public Dytallix policy | Blocked | `qlinkd` now exposes fail-closed Dytallix status and revalidates required public-peer trust on the publication cadence without owning wallet secrets. The current registry contract binds ephemeral peer-record and transport hashes, so continuous external synchronization or a versioned stable-binding contract plus live accept/reject evidence is still required |
+| Public Dytallix policy | Blocked | Stable identity v2 contract and shared verifier code now bind wallet/device identity independently from ephemeral signed reachability; public SteamOS refuses v1 downgrade and reports local enrollment separately from remote trust. Live deployed-chain finality/readback and accept/reject evidence are still required |
 | Rendezvous/relay production profile | Blocked | Fixture-tested bridge logic can translate verified TLS, auth, limits, revocation, relay denial, and an explicit ML-DSA signed-record publication/expiry/refresh verifier report. No off-host public-edge run is linked; abuse-log samples, deployed retention, key rotation, endpoint rotation, and incident shutdown also remain blocked |
 | Non-root local control | Passed | Codex local automation on 2026-06-30: `cargo test -p qlinkd local_control_acl -- --nocapture`, `cargo test -p qlinkctl support_bundle -- --nocapture`, and `bash steam/steamos/tests/install-steamos-test.sh` |
 | Signed release artifacts | Blocked | Compatible Linux CI implements the ephemeral Ed25519 signed-RC positive path and asserts `productionReady=false`; no protected production-key signature evidence or linked passing production release run exists |
@@ -156,10 +156,34 @@ orphaned crate.
   onboarding output for publication and Dytallix trust health.
 - Added bounded shared-core peer trust revalidation for public identities.
 - Local tests prove a live initial publication and higher-sequence TTL refresh.
-- Decision: private-mesh discovery lifecycle code is closed locally. Public
-  production remains blocked on the Dytallix stable-binding/synchronizer
-  decision, live public-edge evidence, protected production signing, and Deck
-  validation.
+- Decision at this stage: private-mesh discovery lifecycle code was closed
+  locally. Public production still required a stable Dytallix binding design,
+  live public-edge evidence, protected production signing, and Deck validation.
+
+## 2026-07-27 Stable Dytallix Identity V2
+
+- Host class: local macOS development host with native Rust tests and a
+  `wasm32-unknown-unknown` contract build; no live Dytallix deployment, public
+  endpoint, production signing key, or Steam Deck hardware is claimed.
+- Added the versioned `quantumlink-node-registry-v2` contract with wallet and
+  device authorization, exact identity revisions, owner-only emergency
+  suspension, terminal revocation, stable device binding, authorization
+  expiry, optional mesh scope, and peer-record TTL policy.
+- Added the shared `qlink-core` v2 verifier and explicit versioned lookup
+  dispatch for outbound, inbound, relay, and trust-revalidation paths.
+- Signed peer records now carry issuance time, and rendezvous/peer-store
+  replacement rejects equal or lower live sequence numbers while permitting a
+  new sequence epoch after expiry.
+- Public SteamOS mode requires `bindingVersion=stableIdentityV2` and refuses
+  silent v1 downgrade. `qlinkd` validates local enrollment separately from
+  selected remote-peer trust and exposes typed, redacted status for both.
+- Passed locally: v2 contract native tests, v2 WASM release build, all 257
+  `qlink-core` tests, all 78 `qlinkd` tests, all 32 `qlinkctl` tests, and all 31
+  SteamOS protocol tests.
+- Decision: Public Dytallix remains No-Go until the evidence schema and
+  collector require v2, offline provisioning is shipped, and finalized live
+  chain register/readback/update/suspend/reactivate/revoke plus negative-policy
+  evidence is linked.
 
 ## Go / No-Go Rule
 
