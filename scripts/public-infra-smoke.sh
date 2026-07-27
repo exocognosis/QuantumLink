@@ -34,9 +34,21 @@ TURN_REALM="${QLINK_TURN_REALM:-}"
 TURN_PERMIT_PEER_IP="${QLINK_TURN_PERMIT_PEER_IP:-}"
 RENDEZVOUS_AUTH_TOKEN="${QLINK_RENDEZVOUS_AUTH_TOKEN:-}"
 RELAY_AUTH_TOKEN="${QLINK_RELAY_AUTH_TOKEN:-}"
+RENDEZVOUS_REVOKED_AUTH_TOKEN_DIGEST_FILE="${QLINK_RENDEZVOUS_REVOKED_AUTH_TOKEN_DIGEST_FILE:-${QLINK_REVOKED_SERVICE_TOKEN_DIGESTS:-}}"
+RELAY_REVOKED_AUTH_TOKEN_DIGEST_FILE="${QLINK_RELAY_REVOKED_AUTH_TOKEN_DIGEST_FILE:-${QLINK_REVOKED_SERVICE_TOKEN_DIGESTS:-}}"
 RENDEZVOUS_RATE_LIMIT_PER_WINDOW="${QLINK_RENDEZVOUS_RATE_LIMIT_PER_WINDOW:-0}"
 RELAY_RATE_LIMIT_PER_WINDOW="${QLINK_RELAY_RATE_LIMIT_PER_WINDOW:-0}"
 ADMISSION_RATE_LIMIT_WINDOW_SECONDS="${QLINK_ADMISSION_RATE_LIMIT_WINDOW_SECONDS:-60}"
+RENDEZVOUS_METRICS_ADDR="${QLINK_RENDEZVOUS_METRICS_ADDR:-}"
+RELAY_METRICS_ADDR="${QLINK_RELAY_METRICS_ADDR:-}"
+MAX_REQUEST_LINE_BYTES="${QLINK_MAX_REQUEST_LINE_BYTES:-131072}"
+MAX_CONCURRENT_CONNECTIONS="${QLINK_MAX_CONCURRENT_CONNECTIONS:-1024}"
+IDLE_TIMEOUT_SECONDS="${QLINK_IDLE_TIMEOUT_SECONDS:-300}"
+RELAY_MAX_PAYLOAD_BYTES="${QLINK_RELAY_MAX_PAYLOAD_BYTES:-65536}"
+RELAY_MAX_PEER_ID_BYTES="${QLINK_RELAY_MAX_PEER_ID_BYTES:-256}"
+RELAY_MAX_REGISTERED_PEERS="${QLINK_RELAY_MAX_REGISTERED_PEERS:-2048}"
+RELAY_MAX_PEER_DATAGRAMS_PER_WINDOW="${QLINK_RELAY_MAX_PEER_DATAGRAMS_PER_WINDOW:-120}"
+RELAY_PEER_DATAGRAM_WINDOW_SECONDS="${QLINK_RELAY_PEER_DATAGRAM_WINDOW_SECONDS:-60}"
 CONTROL_TLS="${QLINK_CONTROL_TLS:-0}"
 CONTROL_TLS_CA="${QLINK_CONTROL_TLS_CA:-}"
 CONTROL_TLS_CERT="${QLINK_CONTROL_TLS_CERT:-}"
@@ -53,6 +65,13 @@ DIRECT_PROBE_TIMEOUT_MS="${QLINK_PUBLIC_INFRA_DIRECT_PROBE_TIMEOUT_MS:-300}"
 COUNT="${QLINK_PUBLIC_INFRA_COUNT:-3}"
 INTERVAL_MS="${QLINK_PUBLIC_INFRA_INTERVAL_MS:-10}"
 RUN_DIR="${QLINK_PUBLIC_INFRA_RUN_DIR:-}"
+INCIDENT_ROLLBACK_VERIFIED="${QLINK_INCIDENT_ROLLBACK_VERIFIED:-false}"
+INCIDENT_ID="${QLINK_INCIDENT_ID:-}"
+ROLLBACK_FROM_RELEASE_ID="${QLINK_ROLLBACK_FROM_RELEASE_ID:-}"
+ROLLBACK_TO_RELEASE_ID="${QLINK_ROLLBACK_TO_RELEASE_ID:-}"
+ROLLBACK_MANIFEST_SHA256="${QLINK_ROLLBACK_MANIFEST_SHA256:-}"
+ROLLBACK_DURATION_SECONDS="${QLINK_ROLLBACK_DURATION_SECONDS:-0}"
+POST_ROLLBACK_PUBLIC_INFRA_READY="${QLINK_POST_ROLLBACK_PUBLIC_INFRA_READY:-false}"
 
 usage() {
   grep '^#' "$0" | sed 's/^# \{0,1\}//'
@@ -72,6 +91,8 @@ while [[ $# -gt 0 ]]; do
     --turn-permit-peer-ip) TURN_PERMIT_PEER_IP="$2"; shift 2 ;;
     --rendezvous-auth-token) RENDEZVOUS_AUTH_TOKEN="$2"; shift 2 ;;
     --relay-auth-token) RELAY_AUTH_TOKEN="$2"; shift 2 ;;
+    --rendezvous-revoked-auth-token-digest-file) RENDEZVOUS_REVOKED_AUTH_TOKEN_DIGEST_FILE="$2"; shift 2 ;;
+    --relay-revoked-auth-token-digest-file) RELAY_REVOKED_AUTH_TOKEN_DIGEST_FILE="$2"; shift 2 ;;
     --admission-token)
       RENDEZVOUS_AUTH_TOKEN="$2"
       RELAY_AUTH_TOKEN="$2"
@@ -80,6 +101,16 @@ while [[ $# -gt 0 ]]; do
     --rendezvous-rate-limit-per-window) RENDEZVOUS_RATE_LIMIT_PER_WINDOW="$2"; shift 2 ;;
     --relay-rate-limit-per-window) RELAY_RATE_LIMIT_PER_WINDOW="$2"; shift 2 ;;
     --admission-rate-limit-window-seconds) ADMISSION_RATE_LIMIT_WINDOW_SECONDS="$2"; shift 2 ;;
+    --rendezvous-metrics-addr) RENDEZVOUS_METRICS_ADDR="$2"; shift 2 ;;
+    --relay-metrics-addr) RELAY_METRICS_ADDR="$2"; shift 2 ;;
+    --max-request-line-bytes) MAX_REQUEST_LINE_BYTES="$2"; shift 2 ;;
+    --max-concurrent-connections) MAX_CONCURRENT_CONNECTIONS="$2"; shift 2 ;;
+    --idle-timeout-seconds) IDLE_TIMEOUT_SECONDS="$2"; shift 2 ;;
+    --relay-max-payload-bytes) RELAY_MAX_PAYLOAD_BYTES="$2"; shift 2 ;;
+    --relay-max-peer-id-bytes) RELAY_MAX_PEER_ID_BYTES="$2"; shift 2 ;;
+    --relay-max-registered-peers) RELAY_MAX_REGISTERED_PEERS="$2"; shift 2 ;;
+    --relay-max-peer-datagrams-per-window) RELAY_MAX_PEER_DATAGRAMS_PER_WINDOW="$2"; shift 2 ;;
+    --relay-peer-datagram-window-seconds) RELAY_PEER_DATAGRAM_WINDOW_SECONDS="$2"; shift 2 ;;
     --control-tls) CONTROL_TLS=1; shift ;;
     --control-tls-ca) CONTROL_TLS_CA="$2"; shift 2 ;;
     --control-tls-cert) CONTROL_TLS_CERT="$2"; shift 2 ;;
@@ -237,6 +268,88 @@ bool_for_nonempty() {
   fi
 }
 
+bool_json() {
+  case "$1" in
+    true|false) echo "$1" ;;
+    *) die "boolean evidence value must be true or false: $1" ;;
+  esac
+}
+
+file_sha256() {
+  local path="$1"
+  if [[ -z "$path" || ! -f "$path" ]]; then
+    echo ""
+    return 0
+  fi
+  shasum -a 256 "$path" | awk '{print $1}'
+}
+
+service_token_digest_for_file() {
+  local path="$1"
+  "$BIN" service-token-digest --auth-token-file "$path" \
+    | sed -n 's/^service_token_digest=//p' \
+    | tail -1
+}
+
+scrape_metrics() {
+  local addr="$1"
+  local out="$2"
+  ruby -rsocket -rtimeout -e '
+    Timeout.timeout(2) do
+      addr = ARGV.fetch(0)
+      out = ARGV.fetch(1)
+      host, port = addr.rpartition(":").values_at(0, 2)
+      socket = TCPSocket.new(host, Integer(port))
+      socket.write("GET /metrics HTTP/1.1\r\nHost: quantumlink-metrics\r\nConnection: close\r\n\r\n")
+      response = socket.read
+      body = response.to_s.split("\r\n\r\n", 2).last.to_s
+      File.write(out, body)
+    end
+  ' "$addr" "$out"
+}
+
+metric_value() {
+  local file="$1"
+  local name="$2"
+  awk -v name="$name" '$1 == name {print int($2); found=1; exit} END {if (!found) print 0}' "$file" 2>/dev/null
+}
+
+probe_oversized_line() {
+  local endpoint="$1"
+  local max_bytes="$2"
+  local args=(control-oversize-smoke --server "$endpoint" --max-request-line-bytes "$max_bytes")
+  if [[ -n "$CONTROL_TLS_CA" ]]; then
+    args+=(--control-tls-ca "$CONTROL_TLS_CA")
+  fi
+  "$BIN" "${args[@]}" > "$RUN_DIR/control-oversize-$(basename "$endpoint" | tr -c 'A-Za-z0-9' '_').log" 2>&1
+}
+
+probe_relay_payload_limit() {
+  local endpoint="$1"
+  local max_payload_bytes="$2"
+  local args=(relay-quota-smoke --server "$endpoint" --peer-id qlink-quota-probe --max-payload-bytes "$max_payload_bytes")
+  if [[ -n "$RELAY_AUTH_TOKEN" ]]; then
+    args+=(--auth-token "$RELAY_AUTH_TOKEN")
+  fi
+  if [[ -n "$CONTROL_TLS_CA" ]]; then
+    args+=(--control-tls-ca "$CONTROL_TLS_CA")
+  fi
+  "$BIN" "${args[@]}" > "$RUN_DIR/relay-quota-smoke.log" 2>&1
+}
+
+probe_relay_saturation_limit() {
+  local endpoint="$1"
+  local max_datagrams_per_window="$2"
+  local args=(relay-saturation-smoke --server "$endpoint" --peer-id qlink-saturation-probe --max-datagrams-per-window "$max_datagrams_per_window")
+  if [[ -n "$RELAY_AUTH_TOKEN" ]]; then
+    args+=(--auth-token "$RELAY_AUTH_TOKEN")
+  fi
+  if [[ -n "$CONTROL_TLS_CA" ]]; then
+    args+=(--control-tls-ca "$CONTROL_TLS_CA")
+  fi
+  "$BIN" "${args[@]}" > "$RUN_DIR/relay-saturation-smoke.log" 2>&1
+}
+
 if [[ "$BUILD" -eq 1 ]]; then
   features="dev-quic-carrier"
   if [[ "$PROVE_TURN_RELAY" -eq 1 ]]; then
@@ -264,6 +377,8 @@ if [[ "$MODE" == "local" ]]; then
     RELAY="${RELAY:-$LOCAL_HOST:$((BASE_PORT + 1))}"
   fi
   STUN="${STUN:-$LOCAL_HOST:$((BASE_PORT + 2))}"
+  RENDEZVOUS_METRICS_ADDR="${RENDEZVOUS_METRICS_ADDR:-127.0.0.1:$((BASE_PORT + 4))}"
+  RELAY_METRICS_ADDR="${RELAY_METRICS_ADDR:-127.0.0.1:$((BASE_PORT + 5))}"
   if [[ "$PROVE_TURN_RELAY" -eq 1 ]]; then
     TURN="${TURN:-$LOCAL_HOST:$((BASE_PORT + 3))}"
     TURN_PERMIT_PEER_IP="${TURN_PERMIT_PEER_IP:-$LOCAL_HOST}"
@@ -272,11 +387,25 @@ if [[ "$MODE" == "local" ]]; then
   log "starting local rendezvous at $RENDEZVOUS"
   rendezvous_listen="$(control_host_port "$RENDEZVOUS")"
   relay_listen="$(control_host_port "$RELAY")"
-  rendezvous_args=(rendezvous --listen "$rendezvous_listen")
+  rendezvous_args=(
+    rendezvous
+    --listen "$rendezvous_listen"
+    --max-request-line-bytes "$MAX_REQUEST_LINE_BYTES"
+    --max-concurrent-connections "$MAX_CONCURRENT_CONNECTIONS"
+    --idle-timeout-seconds "$IDLE_TIMEOUT_SECONDS"
+  )
   if [[ -n "$RENDEZVOUS_AUTH_TOKEN" ]]; then
     rendezvous_auth_token_file="$RUN_DIR/rendezvous-auth-token"
     write_secret_file "$rendezvous_auth_token_file" "$RENDEZVOUS_AUTH_TOKEN"
     rendezvous_args+=(--auth-token-file "$rendezvous_auth_token_file")
+    if [[ -z "$RENDEZVOUS_REVOKED_AUTH_TOKEN_DIGEST_FILE" ]]; then
+      RENDEZVOUS_REVOKED_AUTH_TOKEN_DIGEST_FILE="$RUN_DIR/rendezvous-revoked-auth-token-digests"
+    fi
+    : > "$RENDEZVOUS_REVOKED_AUTH_TOKEN_DIGEST_FILE"
+    chmod 600 "$RENDEZVOUS_REVOKED_AUTH_TOKEN_DIGEST_FILE"
+  fi
+  if [[ -n "$RENDEZVOUS_REVOKED_AUTH_TOKEN_DIGEST_FILE" ]]; then
+    rendezvous_args+=(--revoked-auth-token-digest-file "$RENDEZVOUS_REVOKED_AUTH_TOKEN_DIGEST_FILE")
   fi
   if endpoint_is_tls "$RENDEZVOUS"; then
     [[ -n "$CONTROL_TLS_CERT" && -n "$CONTROL_TLS_KEY" ]] \
@@ -289,14 +418,36 @@ if [[ "$MODE" == "local" ]]; then
       --rate-limit-window-seconds "$ADMISSION_RATE_LIMIT_WINDOW_SECONDS"
     )
   fi
+  if [[ -n "$RENDEZVOUS_METRICS_ADDR" ]]; then
+    rendezvous_args+=(--metrics-addr "$RENDEZVOUS_METRICS_ADDR")
+  fi
   "$BIN" "${rendezvous_args[@]}" > "$RUN_DIR/rendezvous.log" 2>&1 &
   PIDS+=("$!")
   log "starting local relay at $RELAY"
-  relay_args=(relay --listen "$relay_listen")
+  relay_args=(
+    relay
+    --listen "$relay_listen"
+    --max-request-line-bytes "$MAX_REQUEST_LINE_BYTES"
+    --max-concurrent-connections "$MAX_CONCURRENT_CONNECTIONS"
+    --idle-timeout-seconds "$IDLE_TIMEOUT_SECONDS"
+    --max-relay-payload-bytes "$RELAY_MAX_PAYLOAD_BYTES"
+    --max-relay-peer-id-bytes "$RELAY_MAX_PEER_ID_BYTES"
+    --max-relay-registered-peers "$RELAY_MAX_REGISTERED_PEERS"
+    --max-relay-peer-datagrams-per-window "$RELAY_MAX_PEER_DATAGRAMS_PER_WINDOW"
+    --relay-peer-datagram-window-seconds "$RELAY_PEER_DATAGRAM_WINDOW_SECONDS"
+  )
   if [[ -n "$RELAY_AUTH_TOKEN" ]]; then
     relay_auth_token_file="$RUN_DIR/relay-auth-token"
     write_secret_file "$relay_auth_token_file" "$RELAY_AUTH_TOKEN"
     relay_args+=(--auth-token-file "$relay_auth_token_file")
+    if [[ -z "$RELAY_REVOKED_AUTH_TOKEN_DIGEST_FILE" ]]; then
+      RELAY_REVOKED_AUTH_TOKEN_DIGEST_FILE="$RUN_DIR/relay-revoked-auth-token-digests"
+    fi
+    : > "$RELAY_REVOKED_AUTH_TOKEN_DIGEST_FILE"
+    chmod 600 "$RELAY_REVOKED_AUTH_TOKEN_DIGEST_FILE"
+  fi
+  if [[ -n "$RELAY_REVOKED_AUTH_TOKEN_DIGEST_FILE" ]]; then
+    relay_args+=(--revoked-auth-token-digest-file "$RELAY_REVOKED_AUTH_TOKEN_DIGEST_FILE")
   fi
   if endpoint_is_tls "$RELAY"; then
     [[ -n "$CONTROL_TLS_CERT" && -n "$CONTROL_TLS_KEY" ]] \
@@ -308,6 +459,9 @@ if [[ "$MODE" == "local" ]]; then
       --rate-limit-per-window "$RELAY_RATE_LIMIT_PER_WINDOW"
       --rate-limit-window-seconds "$ADMISSION_RATE_LIMIT_WINDOW_SECONDS"
     )
+  fi
+  if [[ -n "$RELAY_METRICS_ADDR" ]]; then
+    relay_args+=(--metrics-addr "$RELAY_METRICS_ADDR")
   fi
   "$BIN" "${relay_args[@]}" > "$RUN_DIR/relay.log" 2>&1 &
   PIDS+=("$!")
@@ -382,6 +536,94 @@ if [[ -n "$RELAY_AUTH_TOKEN" ]]; then
     || die "relay authenticated admission probe did not register"
   relay_auth_verified=true
 fi
+
+revoked_token_digest_file_configured=false
+service_token_revocation_verified="${QLINK_SERVICE_TOKEN_REVOCATION_VERIFIED:-false}"
+rendezvous_revoked_token_rejected="${QLINK_RENDEZVOUS_REVOKED_TOKEN_REJECTED:-false}"
+relay_revoked_token_rejected="${QLINK_RELAY_REVOKED_TOKEN_REJECTED:-false}"
+rendezvous_replacement_token_accepted="${QLINK_RENDEZVOUS_REPLACEMENT_TOKEN_ACCEPTED:-false}"
+relay_replacement_token_accepted="${QLINK_RELAY_REPLACEMENT_TOKEN_ACCEPTED:-false}"
+if [[ -n "$RENDEZVOUS_REVOKED_AUTH_TOKEN_DIGEST_FILE" && -n "$RELAY_REVOKED_AUTH_TOKEN_DIGEST_FILE" ]]; then
+  revoked_token_digest_file_configured=true
+fi
+if [[ "$MODE" == "local" && -n "$RENDEZVOUS_AUTH_TOKEN" && -n "$RELAY_AUTH_TOKEN" \
+  && -n "${rendezvous_auth_token_file:-}" && -n "${relay_auth_token_file:-}" \
+  && -n "$RENDEZVOUS_REVOKED_AUTH_TOKEN_DIGEST_FILE" && -n "$RELAY_REVOKED_AUTH_TOKEN_DIGEST_FILE" ]]; then
+  log "proving service-token revocation and rollback rotation"
+
+  old_rendezvous_token="$RENDEZVOUS_AUTH_TOKEN"
+  old_relay_token="$RELAY_AUTH_TOKEN"
+  rendezvous_digest="$(service_token_digest_for_file "$rendezvous_auth_token_file")"
+  relay_digest="$(service_token_digest_for_file "$relay_auth_token_file")"
+  printf '%s # local revocation drill\n' "$rendezvous_digest" >> "$RENDEZVOUS_REVOKED_AUTH_TOKEN_DIGEST_FILE"
+  printf '%s # local revocation drill\n' "$relay_digest" >> "$RELAY_REVOKED_AUTH_TOKEN_DIGEST_FILE"
+
+  revoked_rendezvous_args=(rendezvous-smoke --server "$RENDEZVOUS" --auth-token "$old_rendezvous_token")
+  if [[ -n "$CONTROL_TLS_CA" ]]; then
+    revoked_rendezvous_args+=(--control-tls-ca "$CONTROL_TLS_CA")
+  fi
+  if "$BIN" "${revoked_rendezvous_args[@]}" > "$RUN_DIR/rendezvous-revoked-auth.log" 2>&1; then
+    die "rendezvous accepted a revoked service token"
+  fi
+  grep -qi 'authentication failed' "$RUN_DIR/rendezvous-revoked-auth.log" \
+    || die "rendezvous revoked-token probe failed for an unexpected reason"
+  rendezvous_revoked_token_rejected=true
+
+  revoked_relay_args=(relay-admission-smoke --server "$RELAY" --peer-id qlink-revoked-probe --auth-token "$old_relay_token")
+  if [[ -n "$CONTROL_TLS_CA" ]]; then
+    revoked_relay_args+=(--control-tls-ca "$CONTROL_TLS_CA")
+  fi
+  if "$BIN" "${revoked_relay_args[@]}" > "$RUN_DIR/relay-revoked-auth.log" 2>&1; then
+    die "relay accepted a revoked service token"
+  fi
+  grep -qi 'authentication failed' "$RUN_DIR/relay-revoked-auth.log" \
+    || die "relay revoked-token probe failed for an unexpected reason"
+  relay_revoked_token_rejected=true
+
+  RENDEZVOUS_AUTH_TOKEN="rotated-rendezvous-service-token"
+  RELAY_AUTH_TOKEN="rotated-relay-service-token"
+  write_secret_file "$rendezvous_auth_token_file" "$RENDEZVOUS_AUTH_TOKEN"
+  write_secret_file "$relay_auth_token_file" "$RELAY_AUTH_TOKEN"
+
+  rotated_rendezvous_args=(rendezvous-smoke --server "$RENDEZVOUS" --auth-token "$RENDEZVOUS_AUTH_TOKEN")
+  if [[ -n "$CONTROL_TLS_CA" ]]; then
+    rotated_rendezvous_args+=(--control-tls-ca "$CONTROL_TLS_CA")
+  fi
+  "$BIN" "${rotated_rendezvous_args[@]}" > "$RUN_DIR/rendezvous-rotated-auth.log" 2>&1
+  grep -q '^record_verified=true$' "$RUN_DIR/rendezvous-rotated-auth.log" \
+    || die "rendezvous replacement-token probe did not verify the published record"
+  rendezvous_replacement_token_accepted=true
+
+  rotated_relay_args=(relay-admission-smoke --server "$RELAY" --peer-id qlink-rotated-probe --auth-token "$RELAY_AUTH_TOKEN")
+  if [[ -n "$CONTROL_TLS_CA" ]]; then
+    rotated_relay_args+=(--control-tls-ca "$CONTROL_TLS_CA")
+  fi
+  "$BIN" "${rotated_relay_args[@]}" > "$RUN_DIR/relay-rotated-auth.log" 2>&1
+  grep -q '^relay_registration_accepted=true$' "$RUN_DIR/relay-rotated-auth.log" \
+    || die "relay replacement-token probe did not register"
+  relay_replacement_token_accepted=true
+  service_token_revocation_verified=true
+fi
+
+bounds_verified=false
+relay_payload_limit_verified=false
+relay_saturation_limit_verified=false
+log "proving rendezvous and relay request-line bounds"
+probe_oversized_line "$RENDEZVOUS" "$MAX_REQUEST_LINE_BYTES" \
+  || die "rendezvous oversized-line probe failed"
+probe_oversized_line "$RELAY" "$MAX_REQUEST_LINE_BYTES" \
+  || die "relay oversized-line probe failed"
+bounds_verified=true
+
+log "proving relay payload-size quota"
+probe_relay_payload_limit "$RELAY" "$RELAY_MAX_PAYLOAD_BYTES" \
+  || die "relay payload quota probe failed"
+relay_payload_limit_verified=true
+
+log "proving relay per-peer saturation quota"
+probe_relay_saturation_limit "$RELAY" "$RELAY_MAX_PEER_DATAGRAMS_PER_WINDOW" \
+  || die "relay saturation quota probe failed"
+relay_saturation_limit_verified=true
 
 log "proving STUN reflexive candidate"
 "$BIN" stun-gather --server "$STUN" --bind-addr 0.0.0.0:0 \
@@ -537,6 +779,69 @@ self_publish_turn_failures="$(sed -n 's/^turn_failure_count=//p' "$RESPONDER_LOG
 turn_responder_addr="$(sed -n 's/^turn_relayed_address=//p' "$RESPONDER_LOG" | tail -1)"
 turn_responder_port="$(sed -n 's/^turn_relayed_port=//p' "$RESPONDER_LOG" | tail -1)"
 
+rendezvous_metrics_scraped=false
+relay_metrics_scraped=false
+rendezvous_auth_failures_total=0
+relay_auth_failures_total=0
+rendezvous_auth_revocations_total=0
+relay_auth_revocations_total=0
+rendezvous_requests_succeeded_total=0
+relay_forwarded_datagrams_total=0
+relay_unknown_destination_drops_total=0
+rendezvous_request_too_large_total=0
+relay_request_too_large_total=0
+relay_payload_too_large_total=0
+relay_peer_rate_limited_total=0
+relay_duplicate_registration_rejections_total=0
+if [[ -n "$RENDEZVOUS_METRICS_ADDR" ]]; then
+  log "scraping rendezvous metrics at $RENDEZVOUS_METRICS_ADDR"
+  scrape_metrics "$RENDEZVOUS_METRICS_ADDR" "$RUN_DIR/rendezvous.metrics" \
+    || die "failed to scrape rendezvous metrics at $RENDEZVOUS_METRICS_ADDR"
+  rendezvous_metrics_scraped=true
+  rendezvous_auth_failures_total="$(metric_value "$RUN_DIR/rendezvous.metrics" quantumlink_rendezvous_auth_failures_total)"
+  rendezvous_auth_revocations_total="$(metric_value "$RUN_DIR/rendezvous.metrics" quantumlink_rendezvous_auth_revocations_total)"
+  rendezvous_requests_succeeded_total="$(metric_value "$RUN_DIR/rendezvous.metrics" quantumlink_rendezvous_requests_succeeded_total)"
+  rendezvous_request_too_large_total="$(metric_value "$RUN_DIR/rendezvous.metrics" quantumlink_rendezvous_request_too_large_total)"
+  if [[ -n "$RENDEZVOUS_AUTH_TOKEN" && "$rendezvous_auth_failures_total" -lt 1 ]]; then
+    die "rendezvous metrics did not record the negative auth probe"
+  fi
+  if [[ "$rendezvous_request_too_large_total" -lt 1 ]]; then
+    die "rendezvous metrics did not record the oversized-line probe"
+  fi
+fi
+if [[ -n "$RELAY_METRICS_ADDR" ]]; then
+  log "scraping relay metrics at $RELAY_METRICS_ADDR"
+  scrape_metrics "$RELAY_METRICS_ADDR" "$RUN_DIR/relay.metrics" \
+    || die "failed to scrape relay metrics at $RELAY_METRICS_ADDR"
+  relay_metrics_scraped=true
+  relay_auth_failures_total="$(metric_value "$RUN_DIR/relay.metrics" quantumlink_relay_auth_failures_total)"
+  relay_auth_revocations_total="$(metric_value "$RUN_DIR/relay.metrics" quantumlink_relay_auth_revocations_total)"
+  relay_forwarded_datagrams_total="$(metric_value "$RUN_DIR/relay.metrics" quantumlink_relay_forwarded_datagrams_total)"
+  relay_unknown_destination_drops_total="$(metric_value "$RUN_DIR/relay.metrics" quantumlink_relay_unknown_destination_drops_total)"
+  relay_request_too_large_total="$(metric_value "$RUN_DIR/relay.metrics" quantumlink_relay_request_too_large_total)"
+  relay_payload_too_large_total="$(metric_value "$RUN_DIR/relay.metrics" quantumlink_relay_payload_too_large_total)"
+  relay_peer_rate_limited_total="$(metric_value "$RUN_DIR/relay.metrics" quantumlink_relay_peer_rate_limited_total)"
+  relay_duplicate_registration_rejections_total="$(metric_value "$RUN_DIR/relay.metrics" quantumlink_relay_duplicate_registration_rejections_total)"
+  if [[ -n "$RELAY_AUTH_TOKEN" && "$relay_auth_failures_total" -lt 1 ]]; then
+    die "relay metrics did not record the negative auth probe"
+  fi
+  if [[ "$relay_request_too_large_total" -lt 1 ]]; then
+    die "relay metrics did not record the oversized-line probe"
+  fi
+  if [[ "$relay_payload_too_large_total" -lt 1 ]]; then
+    die "relay metrics did not record the payload quota probe"
+  fi
+  if [[ "$relay_peer_rate_limited_total" -lt 1 ]]; then
+    die "relay metrics did not record the peer saturation probe"
+  fi
+  if [[ "$expected_path" == "relay" && "$relay_forwarded_datagrams_total" -lt "$COUNT" ]]; then
+    die "relay metrics forwarded_datagrams_total=$relay_forwarded_datagrams_total; expected at least $COUNT"
+  fi
+fi
+
+rendezvous_revocation_list_sha256="$(file_sha256 "$RENDEZVOUS_REVOKED_AUTH_TOKEN_DIGEST_FILE")"
+relay_revocation_list_sha256="$(file_sha256 "$RELAY_REVOKED_AUTH_TOKEN_DIGEST_FILE")"
+revocation_list_sha256="${rendezvous_revocation_list_sha256}:${relay_revocation_list_sha256}"
 git_sha="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
 EVIDENCE="$RUN_DIR/evidence.json"
 cat > "$EVIDENCE" <<EOF
@@ -556,9 +861,45 @@ cat > "$EVIDENCE" <<EOF
   "relay_auth_required": $(bool_for_nonempty "$RELAY_AUTH_TOKEN"),
   "rendezvous_auth_verified": $rendezvous_auth_verified,
   "relay_auth_verified": $relay_auth_verified,
+  "revoked_token_digest_file_configured": $revoked_token_digest_file_configured,
+  "service_token_revocation_verified": $(bool_json "$service_token_revocation_verified"),
+  "rendezvous_revoked_token_rejected": $(bool_json "$rendezvous_revoked_token_rejected"),
+  "relay_revoked_token_rejected": $(bool_json "$relay_revoked_token_rejected"),
+  "rendezvous_replacement_token_accepted": $(bool_json "$rendezvous_replacement_token_accepted"),
+  "relay_replacement_token_accepted": $(bool_json "$relay_replacement_token_accepted"),
+  "rendezvous_revocation_list_sha256": "$rendezvous_revocation_list_sha256",
+  "relay_revocation_list_sha256": "$relay_revocation_list_sha256",
+  "revocation_list_sha256": "$revocation_list_sha256",
   "rendezvous_rate_limit_per_window": $RENDEZVOUS_RATE_LIMIT_PER_WINDOW,
   "relay_rate_limit_per_window": $RELAY_RATE_LIMIT_PER_WINDOW,
   "admission_rate_limit_window_seconds": $ADMISSION_RATE_LIMIT_WINDOW_SECONDS,
+  "rendezvous_metrics_addr": "$RENDEZVOUS_METRICS_ADDR",
+  "relay_metrics_addr": "$RELAY_METRICS_ADDR",
+  "rendezvous_metrics_scraped": $rendezvous_metrics_scraped,
+  "relay_metrics_scraped": $relay_metrics_scraped,
+  "bounds_verified": $bounds_verified,
+  "relay_payload_limit_verified": $relay_payload_limit_verified,
+  "relay_saturation_limit_verified": $relay_saturation_limit_verified,
+  "max_request_line_bytes": $MAX_REQUEST_LINE_BYTES,
+  "max_concurrent_connections": $MAX_CONCURRENT_CONNECTIONS,
+  "idle_timeout_seconds": $IDLE_TIMEOUT_SECONDS,
+  "relay_max_payload_bytes": $RELAY_MAX_PAYLOAD_BYTES,
+  "relay_max_peer_id_bytes": $RELAY_MAX_PEER_ID_BYTES,
+  "relay_max_registered_peers": $RELAY_MAX_REGISTERED_PEERS,
+  "relay_max_peer_datagrams_per_window": $RELAY_MAX_PEER_DATAGRAMS_PER_WINDOW,
+  "relay_peer_datagram_window_seconds": $RELAY_PEER_DATAGRAM_WINDOW_SECONDS,
+  "rendezvous_auth_failures_total": $rendezvous_auth_failures_total,
+  "relay_auth_failures_total": $relay_auth_failures_total,
+  "rendezvous_auth_revocations_total": $rendezvous_auth_revocations_total,
+  "relay_auth_revocations_total": $relay_auth_revocations_total,
+  "rendezvous_requests_succeeded_total": $rendezvous_requests_succeeded_total,
+  "relay_forwarded_datagrams_total": $relay_forwarded_datagrams_total,
+  "relay_unknown_destination_drops_total": $relay_unknown_destination_drops_total,
+  "rendezvous_request_too_large_total": $rendezvous_request_too_large_total,
+  "relay_request_too_large_total": $relay_request_too_large_total,
+  "relay_payload_too_large_total": $relay_payload_too_large_total,
+  "relay_peer_rate_limited_total": $relay_peer_rate_limited_total,
+  "relay_duplicate_registration_rejections_total": $relay_duplicate_registration_rejections_total,
   "prove_turn_relay": $([[ "$PROVE_TURN_RELAY" -eq 1 ]] && echo true || echo false),
   "remote_peer_id": "$REMOTE_PEER",
   "advertise_addr": "$ADVERTISE_ADDR",
@@ -573,7 +914,14 @@ cat > "$EVIDENCE" <<EOF
   "self_publish_turn_failures": ${self_publish_turn_failures:-0},
   "selected_path": "$selected_path",
   "frames_sent": $frames_sent,
-  "total_elapsed_ms": ${total_elapsed_ms:-0}
+  "total_elapsed_ms": ${total_elapsed_ms:-0},
+  "incident_rollback_verified": $(bool_json "$INCIDENT_ROLLBACK_VERIFIED"),
+  "incident_id": "$INCIDENT_ID",
+  "rollback_from_release_id": "$ROLLBACK_FROM_RELEASE_ID",
+  "rollback_to_release_id": "$ROLLBACK_TO_RELEASE_ID",
+  "rollback_manifest_sha256": "$ROLLBACK_MANIFEST_SHA256",
+  "rollback_duration_seconds": $ROLLBACK_DURATION_SECONDS,
+  "post_rollback_public_infra_ready": $(bool_json "$POST_ROLLBACK_PUBLIC_INFRA_READY")
 }
 EOF
 

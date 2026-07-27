@@ -24,6 +24,7 @@ pub mod relay;
 pub mod rendezvous;
 pub mod replay;
 pub mod routing;
+pub mod service_metrics;
 pub mod session_crypto;
 pub mod stun;
 pub mod synthetic_wan;

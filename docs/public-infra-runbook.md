@@ -13,10 +13,13 @@ admission with `scripts/public-infra-smoke.sh`.
 Do not treat the in-repo rendezvous and QuantumLink relay binaries as broadly
 open internet production services yet. They now support TLS for their control
 protocols behind the explicit `public-edge-tls` feature, bearer-token admission
-from credential files, per-client IP rate limits, and smoke proof that
-unauthenticated clients are rejected. Keep those two ports source-limited for
-named testers until connection quotas, abuse telemetry, retention policy, and
-off-host deployed evidence are in place.
+from hot credential files, digest-file service-token revocation, per-client IP
+rate limits, loopback OpenMetrics service counters, bounded request lines,
+connection ceilings, idle timeouts, relay payload/peer caps, per-peer relay
+datagram saturation quotas, and smoke proof that unauthenticated, revoked,
+oversized, and saturated clients are rejected and counted. Keep those two ports
+source-limited for named testers until fresh live revocation, rollback, alert,
+and retention evidence exists.
 
 STUN and coturn TURN may be internet-facing. Published TURN relay candidates
 are consumed by the mesh connector when the responder keeps a live allocation.
@@ -39,6 +42,11 @@ Use the templates under `infra/public-edge/`:
 - `systemd/quantumlink-stun-secondary.service`: second auxiliary STUN port for NAT mapping checks.
 - `coturn/turnserver.conf.template`: authenticated coturn allocation service.
 - `ufw.rules.example`: source allowlisting and public UDP/TURN firewall shape.
+- `prometheus/quantumlink-public-edge-alerts.yml`: starter alert rules for
+  auth failures, revoked-token use, missing metrics, relay saturation, payload
+  rejections, and connection-limit exhaustion.
+- `journald/quantumlink-retention.conf.example`: bounded journald retention for
+  the `quantumlink` log namespace.
 
 Expected default ports:
 
@@ -50,6 +58,8 @@ Expected default ports:
 | QuantumLink STUN auxiliary | UDP 3479-3480 | public |
 | TURN TLS | TCP 5349 | public when configured with a real certificate |
 | TURN relay allocation range | UDP 49160-49200 | public |
+| Rendezvous metrics | TCP 9571 | loopback only |
+| Relay metrics | TCP 9572 | loopback only |
 
 ## Deploy
 
@@ -67,21 +77,52 @@ sudo install -m 0755 target/release/qlinkctl /opt/quantumlink/bin/qlinkctl
 
 sudo install -d -m 0755 /etc/quantumlink /etc/quantumlink/tls
 sudo install -d -m 0750 /etc/quantumlink/secrets
+sudo chown root:quantumlink /etc/quantumlink/secrets
 sudo install -m 0640 infra/public-edge/public-edge.env.example /etc/quantumlink/public-edge.env
 sudo install -m 0644 infra/public-edge/systemd/*.service /etc/systemd/system/
+sudo install -m 0644 infra/public-edge/journald/quantumlink-retention.conf.example /etc/systemd/journald@quantumlink.conf
 sudo systemctl daemon-reload
 ```
 
 Edit `/etc/quantumlink/public-edge.env` before starting services. Set the real
 public IP, realm, TLS cert/key paths, rate-limit windows, and high-entropy TURN
-password. Write rendezvous and relay service tokens into root-owned credential
-files instead of `ExecStart` arguments:
+password. Keep `QLINK_RENDEZVOUS_METRICS_ADDR` and
+`QLINK_RELAY_METRICS_ADDR` bound to loopback unless a local collector owns a
+different private bind. Write rendezvous and relay service tokens into
+root-owned credential files instead of `ExecStart` arguments:
 
 ```sh
 openssl rand -base64 32 | sudo tee /etc/quantumlink/secrets/rendezvous-auth-token >/dev/null
 openssl rand -base64 32 | sudo tee /etc/quantumlink/secrets/relay-auth-token >/dev/null
-sudo chown root:root /etc/quantumlink/secrets/*-auth-token
-sudo chmod 0400 /etc/quantumlink/secrets/*-auth-token
+sudo touch /etc/quantumlink/secrets/rendezvous-revoked-auth-token-digests
+sudo touch /etc/quantumlink/secrets/relay-revoked-auth-token-digests
+sudo chown root:quantumlink /etc/quantumlink/secrets/*-auth-token \
+  /etc/quantumlink/secrets/*-revoked-auth-token-digests
+sudo chmod 0640 /etc/quantumlink/secrets/*-auth-token \
+  /etc/quantumlink/secrets/*-revoked-auth-token-digests
+```
+
+The services reread the token file and revoked-digest file on each admission
+check. To revoke a leaked service token without writing the raw token to
+evidence, compute its digest and append that digest to the matching revocation
+file:
+
+```sh
+/opt/quantumlink/bin/qlinkctl service-token-digest \
+  --auth-token-file /path/to/leaked-token-copy
+sudoedit /etc/quantumlink/secrets/rendezvous-revoked-auth-token-digests
+sudoedit /etc/quantumlink/secrets/relay-revoked-auth-token-digests
+```
+
+Then write replacement tokens atomically:
+
+```sh
+openssl rand -base64 32 | sudo tee /etc/quantumlink/secrets/rendezvous-auth-token.next >/dev/null
+openssl rand -base64 32 | sudo tee /etc/quantumlink/secrets/relay-auth-token.next >/dev/null
+sudo chown root:quantumlink /etc/quantumlink/secrets/*-auth-token.next
+sudo chmod 0640 /etc/quantumlink/secrets/*-auth-token.next
+sudo mv /etc/quantumlink/secrets/rendezvous-auth-token.next /etc/quantumlink/secrets/rendezvous-auth-token
+sudo mv /etc/quantumlink/secrets/relay-auth-token.next /etc/quantumlink/secrets/relay-auth-token
 ```
 
 Install a real edge certificate and key at the paths configured by
@@ -140,10 +181,34 @@ QLINK_PUBLIC_EDGE_HOST=EDGE_HOST
 QLINK_CONTROL_TLS_CA=/path/to/control-ca-or-public-chain.pem
 QLINK_RENDEZVOUS_AUTH_TOKEN_FILE=/path/to/rendezvous-auth-token
 QLINK_RELAY_AUTH_TOKEN_FILE=/path/to/relay-auth-token
+QLINK_RENDEZVOUS_REVOKED_AUTH_TOKEN_DIGEST_FILE=/path/to/rendezvous-revoked-auth-token-digests
+QLINK_RELAY_REVOKED_AUTH_TOKEN_DIGEST_FILE=/path/to/relay-revoked-auth-token-digests
 QLINK_TURN_USERNAME=qlink-turn
 QLINK_TURN_PASSWORD_FILE=/path/to/turn-password
 QLINK_TURN_REALM=turn.quantumlink.example
 QLINK_TURN_PERMIT_PEER_IP=TESTER_PUBLIC_IP
+QLINK_RENDEZVOUS_METRICS_ADDR=127.0.0.1:9571
+QLINK_RELAY_METRICS_ADDR=127.0.0.1:9572
+QLINK_MAX_REQUEST_LINE_BYTES=131072
+QLINK_MAX_CONCURRENT_CONNECTIONS=1024
+QLINK_IDLE_TIMEOUT_SECONDS=300
+QLINK_RELAY_MAX_PAYLOAD_BYTES=65536
+QLINK_RELAY_MAX_PEER_ID_BYTES=256
+QLINK_RELAY_MAX_REGISTERED_PEERS=2048
+QLINK_RELAY_MAX_PEER_DATAGRAMS_PER_WINDOW=120
+QLINK_RELAY_PEER_DATAGRAM_WINDOW_SECONDS=60
+QLINK_SERVICE_TOKEN_REVOCATION_VERIFIED=true
+QLINK_RENDEZVOUS_REVOKED_TOKEN_REJECTED=true
+QLINK_RELAY_REVOKED_TOKEN_REJECTED=true
+QLINK_RENDEZVOUS_REPLACEMENT_TOKEN_ACCEPTED=true
+QLINK_RELAY_REPLACEMENT_TOKEN_ACCEPTED=true
+QLINK_INCIDENT_ROLLBACK_VERIFIED=true
+QLINK_INCIDENT_ID=public-edge-drill-YYYYMMDD
+QLINK_ROLLBACK_FROM_RELEASE_ID=current-release-id
+QLINK_ROLLBACK_TO_RELEASE_ID=previous-release-id
+QLINK_ROLLBACK_MANIFEST_SHA256=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+QLINK_ROLLBACK_DURATION_SECONDS=42
+QLINK_POST_ROLLBACK_PUBLIC_INFRA_READY=true
 ```
 
 Then run:
@@ -152,11 +217,19 @@ Then run:
 scripts/public-edge-live-evidence.sh --env-file ./edge-public.env --build
 ```
 
-If those values are already exported in the shell, omit `--env-file`.
+If those values are already exported in the shell, omit `--env-file`. For an
+off-host tester, forward the edge loopback metrics ports first, for example
+`ssh -N -L 9571:127.0.0.1:9571 -L 9572:127.0.0.1:9572 EDGE_HOST`.
 
 The orchestrator deliberately uses environment variables or token files for
 secrets instead of passing service tokens as command-line arguments. It records
 only credential-source metadata such as `file` or `environment` in the manifest.
+
+The `QLINK_SERVICE_TOKEN_REVOCATION_*` and `QLINK_INCIDENT_ROLLBACK_*` fields
+are operator assertions from the live revocation and rollback drills. They do
+not bypass metrics checks: `--require-public` still requires positive
+`auth_revocations_total` counters from the public services and a non-empty
+revocation-list digest in the evidence.
 
 If you need to debug one proof at a time, run the underlying smoke command
 directly. This default command proves TLS rendezvous/relay admission, STUN,
@@ -175,6 +248,18 @@ scripts/public-infra-smoke.sh \
   --turn-username "$QLINK_TURN_USERNAME" \
   --turn-password "$QLINK_TURN_PASSWORD" \
   --turn-realm "$QLINK_TURN_REALM" \
+  --rendezvous-metrics-addr "$QLINK_RENDEZVOUS_METRICS_ADDR" \
+  --relay-metrics-addr "$QLINK_RELAY_METRICS_ADDR" \
+  --rendezvous-revoked-auth-token-digest-file "$QLINK_RENDEZVOUS_REVOKED_AUTH_TOKEN_DIGEST_FILE" \
+  --relay-revoked-auth-token-digest-file "$QLINK_RELAY_REVOKED_AUTH_TOKEN_DIGEST_FILE" \
+  --max-request-line-bytes "$QLINK_MAX_REQUEST_LINE_BYTES" \
+  --max-concurrent-connections "$QLINK_MAX_CONCURRENT_CONNECTIONS" \
+  --idle-timeout-seconds "$QLINK_IDLE_TIMEOUT_SECONDS" \
+  --relay-max-payload-bytes "$QLINK_RELAY_MAX_PAYLOAD_BYTES" \
+  --relay-max-peer-id-bytes "$QLINK_RELAY_MAX_PEER_ID_BYTES" \
+  --relay-max-registered-peers "$QLINK_RELAY_MAX_REGISTERED_PEERS" \
+  --relay-max-peer-datagrams-per-window "$QLINK_RELAY_MAX_PEER_DATAGRAMS_PER_WINDOW" \
+  --relay-peer-datagram-window-seconds "$QLINK_RELAY_PEER_DATAGRAM_WINDOW_SECONDS" \
   --build
 ```
 
@@ -195,6 +280,18 @@ scripts/public-infra-smoke.sh \
   --turn-password "$QLINK_TURN_PASSWORD" \
   --turn-realm "$QLINK_TURN_REALM" \
   --turn-permit-peer-ip "$TESTER_PUBLIC_IP" \
+  --rendezvous-metrics-addr "$QLINK_RENDEZVOUS_METRICS_ADDR" \
+  --relay-metrics-addr "$QLINK_RELAY_METRICS_ADDR" \
+  --rendezvous-revoked-auth-token-digest-file "$QLINK_RENDEZVOUS_REVOKED_AUTH_TOKEN_DIGEST_FILE" \
+  --relay-revoked-auth-token-digest-file "$QLINK_RELAY_REVOKED_AUTH_TOKEN_DIGEST_FILE" \
+  --max-request-line-bytes "$QLINK_MAX_REQUEST_LINE_BYTES" \
+  --max-concurrent-connections "$QLINK_MAX_CONCURRENT_CONNECTIONS" \
+  --idle-timeout-seconds "$QLINK_IDLE_TIMEOUT_SECONDS" \
+  --relay-max-payload-bytes "$QLINK_RELAY_MAX_PAYLOAD_BYTES" \
+  --relay-max-peer-id-bytes "$QLINK_RELAY_MAX_PEER_ID_BYTES" \
+  --relay-max-registered-peers "$QLINK_RELAY_MAX_REGISTERED_PEERS" \
+  --relay-max-peer-datagrams-per-window "$QLINK_RELAY_MAX_PEER_DATAGRAMS_PER_WINDOW" \
+  --relay-peer-datagram-window-seconds "$QLINK_RELAY_PEER_DATAGRAM_WINDOW_SECONDS" \
   --prove-turn-relay \
   --build
 ```
@@ -216,11 +313,31 @@ passing evidence file must show:
 - `rendezvous_auth_required`, `relay_auth_required`,
   `rendezvous_auth_verified`, and `relay_auth_verified` are `true` for public
   edge runs;
+- `rendezvous_metrics_scraped` and `relay_metrics_scraped` are `true`, with
+  auth failure counters greater than zero;
+- `revoked_token_digest_file_configured`,
+  `service_token_revocation_verified`,
+  `rendezvous_revoked_token_rejected`, `relay_revoked_token_rejected`,
+  `rendezvous_replacement_token_accepted`, and
+  `relay_replacement_token_accepted` are `true` for public edge runs;
+- `rendezvous_auth_revocations_total` and `relay_auth_revocations_total` are
+  greater than zero for public edge runs;
+- `incident_rollback_verified` and `post_rollback_public_infra_ready` are
+  `true` for public edge runs, with incident/release IDs and a rollback
+  manifest digest recorded;
+- `bounds_verified`, `relay_payload_limit_verified`, and
+  `relay_saturation_limit_verified` are `true`;
+- `rendezvous_request_too_large_total`, `relay_request_too_large_total`, and
+  `relay_payload_too_large_total` are greater than zero;
+- `relay_peer_rate_limited_total` is greater than zero;
+- request-line, connection, idle-timeout, relay-payload, peer-ID, and
+  registered-peer limits plus relay peer datagram window limits are positive;
 - `turn_relayed` is non-empty when `--turn` was supplied;
 - `published_candidate_types` includes `ServerReflexive`;
 - `published_candidate_types` includes `QuantumLinkRelay`;
 - `published_candidate_types` includes `Relay` when `--turn` was supplied;
 - `selected_path` is `relay`;
+- `relay_forwarded_datagrams_total` is greater than or equal to `frames_sent`;
 - `frames_sent` matches the requested count.
 
 For `--prove-turn-relay`, the passing evidence changes to:
@@ -250,7 +367,8 @@ ruby scripts/verify-public-infra-evidence.rb \
 
 For TURN data-plane evidence, add `--require-turn-relay`. The verifier blocks
 loopback/private/documentation endpoints, missing TLS/auth/rate-limit proof,
-missing TURN proof, stale evidence, and obvious secret placeholders.
+missing metrics scrape proof, missing revocation/rollback proof, missing TURN
+proof, stale evidence, and obvious secret placeholders.
 
 ## Hardening Checks
 
@@ -258,8 +376,14 @@ Before widening tester access:
 
 - Confirm cloud firewall and host firewall expose only the listed ports.
 - Confirm rendezvous and QuantumLink relay require non-placeholder admission
-  token files, present TLS certificates, enforce appropriate rate limits, and
-  remain source-limited during beta.
+  token files, present TLS certificates, digest-file service-token revocation,
+  appropriate rate limits, and only loopback service metrics while enforcing
+  request, connection, idle-timeout, and relay quota bounds during
+  source-limited beta.
+- Confirm `infra/public-edge/prometheus/quantumlink-public-edge-alerts.yml` is
+  loaded by the operator's alert manager or equivalent monitoring path.
+- Confirm `journald@quantumlink` retention is active if the systemd units use
+  `LogNamespace=quantumlink`.
 - Confirm coturn uses long-term credentials and a constrained relay port range.
 - Confirm coturn has readable TLS cert/key paths before exposing TCP/UDP 5349.
 - Confirm `journalctl -u quantumlink-*` contains control-plane metadata only.

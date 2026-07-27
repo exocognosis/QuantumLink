@@ -11,6 +11,8 @@ class PublicInfraEvidenceTest < Minitest::Test
   REPO_ROOT = File.expand_path("..", __dir__)
   VERIFIER = File.join(REPO_ROOT, "scripts/verify-public-infra-evidence.rb")
   ORCHESTRATOR = File.join(REPO_ROOT, "scripts/public-edge-live-evidence.sh")
+  ALERTS = File.join(REPO_ROOT, "infra/public-edge/prometheus/quantumlink-public-edge-alerts.yml")
+  RETENTION = File.join(REPO_ROOT, "infra/public-edge/journald/quantumlink-retention.conf.example")
   COMMIT_SHA = "a" * 40
 
   def setup
@@ -84,8 +86,33 @@ class PublicInfraEvidenceTest < Minitest::Test
         "turn" => "203.0.113.10:3478",
         "rendezvous_auth_verified" => false,
         "relay_auth_verified" => false,
+        "revoked_token_digest_file_configured" => false,
+        "service_token_revocation_verified" => false,
+        "rendezvous_revoked_token_rejected" => false,
+        "relay_revoked_token_rejected" => false,
+        "rendezvous_replacement_token_accepted" => false,
+        "relay_replacement_token_accepted" => false,
         "rendezvous_rate_limit_per_window" => 0,
-        "relay_rate_limit_per_window" => 0
+        "relay_rate_limit_per_window" => 0,
+        "rendezvous_metrics_scraped" => false,
+        "relay_metrics_scraped" => false,
+        "bounds_verified" => false,
+        "relay_payload_limit_verified" => false,
+        "relay_saturation_limit_verified" => false,
+        "max_concurrent_connections" => 0,
+        "relay_max_peer_datagrams_per_window" => 0,
+        "rendezvous_auth_failures_total" => 0,
+        "relay_auth_failures_total" => 0,
+        "rendezvous_auth_revocations_total" => 0,
+        "relay_auth_revocations_total" => 0,
+        "rendezvous_requests_succeeded_total" => 0,
+        "relay_forwarded_datagrams_total" => 0,
+        "rendezvous_request_too_large_total" => 0,
+        "relay_request_too_large_total" => 0,
+        "relay_payload_too_large_total" => 0,
+        "relay_peer_rate_limited_total" => 0,
+        "incident_rollback_verified" => false,
+        "post_rollback_public_infra_ready" => false
       )
     )
     stdout, _stderr, status = run_verifier("--require-public", "--expected-sha", COMMIT_SHA, path)
@@ -95,7 +122,18 @@ class PublicInfraEvidenceTest < Minitest::Test
     assert_includes report.fetch("blockers"), "rendezvous must be a public tls://host:port endpoint"
     assert_includes report.fetch("blockers"), "stun must be a public host:port endpoint"
     assert_includes report.fetch("blockers"), "rendezvous negative auth proof must pass"
+    assert_includes report.fetch("blockers"), "service-token revocation proof must pass"
+    assert_includes report.fetch("blockers"), "rendezvous revoked-token rejections must be visible in metrics"
     assert_includes report.fetch("blockers"), "relay rate limit must be enabled"
+    assert_includes report.fetch("blockers"), "rendezvous metrics scrape must pass"
+    assert_includes report.fetch("blockers"), "relay auth failures must be visible in metrics"
+    assert_includes report.fetch("blockers"), "relay forwarded datagrams must be visible in metrics"
+    assert_includes report.fetch("blockers"), "request bounds proof must pass"
+    assert_includes report.fetch("blockers"), "connection limit must be configured"
+    assert_includes report.fetch("blockers"), "relay payload quota rejections must be visible in metrics"
+    assert_includes report.fetch("blockers"), "relay saturation limit proof must pass"
+    assert_includes report.fetch("blockers"), "relay saturation rejections must be visible in metrics"
+    assert_includes report.fetch("blockers"), "incident rollback proof must pass"
   end
 
   def test_forbidden_secret_markers_fail_the_evidence
@@ -118,9 +156,39 @@ class PublicInfraEvidenceTest < Minitest::Test
     assert_includes script, "quantumLinkPublicEdgeLiveEvidence"
     assert_includes script, "QLINK_RENDEZVOUS_AUTH_TOKEN_FILE"
     assert_includes script, "QLINK_RELAY_AUTH_TOKEN_FILE"
+    assert_includes script, "QLINK_RENDEZVOUS_REVOKED_AUTH_TOKEN_DIGEST_FILE"
+    assert_includes script, "QLINK_RELAY_REVOKED_AUTH_TOKEN_DIGEST_FILE"
+    assert_includes script, "QLINK_RENDEZVOUS_METRICS_ADDR"
+    assert_includes script, "QLINK_RELAY_METRICS_ADDR"
+    assert_includes script, "QLINK_MAX_REQUEST_LINE_BYTES"
+    assert_includes script, "QLINK_RELAY_MAX_PAYLOAD_BYTES"
+    assert_includes script, "QLINK_RELAY_MAX_PEER_DATAGRAMS_PER_WINDOW"
+    assert_includes script, "rendezvousMetricsScraped"
+    assert_includes script, "relayMetricsScraped"
+    assert_includes script, "boundsVerified"
+    assert_includes script, "relayPayloadLimitVerified"
+    assert_includes script, "relaySaturationLimitVerified"
+    assert_includes script, "serviceTokenRevocation"
+    assert_includes script, "incidentRollback"
     refute_match(/--rendezvous-auth-token(?:\s|$)/, script)
     refute_match(/--relay-auth-token(?:\s|$)/, script)
     refute_match(/--turn-password(?:\s|$)/, script)
+  end
+
+  def test_operator_alert_and_retention_artifacts_cover_public_edge_metrics
+    alerts = File.read(ALERTS)
+    retention = File.read(RETENTION)
+
+    assert alerts.ascii_only?
+    assert_includes alerts, "quantumlink_relay_peer_rate_limited_total"
+    assert_includes alerts, "quantumlink_relay_auth_revocations_total"
+    assert_includes alerts, "quantumlink_rendezvous_auth_revocations_total"
+    assert_includes alerts, "quantumlink_relay_payload_too_large_total"
+    assert_includes alerts, "quantumlink_relay_connection_limit_rejections_total"
+    assert_includes alerts, "quantumlink_rendezvous_connection_limit_rejections_total"
+    assert retention.ascii_only?
+    assert_includes retention, "MaxRetentionSec=14day"
+    assert_includes retention, "ForwardToSyslog=no"
   end
 
   private
@@ -152,9 +220,45 @@ class PublicInfraEvidenceTest < Minitest::Test
       "relay_auth_required" => true,
       "rendezvous_auth_verified" => true,
       "relay_auth_verified" => true,
+      "revoked_token_digest_file_configured" => true,
+      "service_token_revocation_verified" => true,
+      "rendezvous_revoked_token_rejected" => true,
+      "relay_revoked_token_rejected" => true,
+      "rendezvous_replacement_token_accepted" => true,
+      "relay_replacement_token_accepted" => true,
+      "rendezvous_revocation_list_sha256" => "b" * 64,
+      "relay_revocation_list_sha256" => "c" * 64,
+      "revocation_list_sha256" => "#{"b" * 64}:#{"c" * 64}",
       "rendezvous_rate_limit_per_window" => 120,
       "relay_rate_limit_per_window" => 240,
       "admission_rate_limit_window_seconds" => 60,
+      "rendezvous_metrics_addr" => "127.0.0.1:9571",
+      "relay_metrics_addr" => "127.0.0.1:9572",
+      "rendezvous_metrics_scraped" => true,
+      "relay_metrics_scraped" => true,
+      "bounds_verified" => true,
+      "relay_payload_limit_verified" => true,
+      "relay_saturation_limit_verified" => true,
+      "max_request_line_bytes" => 131_072,
+      "max_concurrent_connections" => 1_024,
+      "idle_timeout_seconds" => 300,
+      "relay_max_payload_bytes" => 65_536,
+      "relay_max_peer_id_bytes" => 256,
+      "relay_max_registered_peers" => 2_048,
+      "relay_max_peer_datagrams_per_window" => 120,
+      "relay_peer_datagram_window_seconds" => 60,
+      "rendezvous_auth_failures_total" => 1,
+      "relay_auth_failures_total" => 1,
+      "rendezvous_auth_revocations_total" => 1,
+      "relay_auth_revocations_total" => 1,
+      "rendezvous_requests_succeeded_total" => 3,
+      "relay_forwarded_datagrams_total" => 3,
+      "relay_unknown_destination_drops_total" => 0,
+      "rendezvous_request_too_large_total" => 1,
+      "relay_request_too_large_total" => 1,
+      "relay_payload_too_large_total" => 1,
+      "relay_peer_rate_limited_total" => 1,
+      "relay_duplicate_registration_rejections_total" => 0,
       "prove_turn_relay" => false,
       "remote_peer_id" => "qlink_test",
       "advertise_addr" => "127.0.0.1:1",
@@ -169,7 +273,14 @@ class PublicInfraEvidenceTest < Minitest::Test
       "self_publish_turn_failures" => 0,
       "selected_path" => "relay",
       "frames_sent" => 3,
-      "total_elapsed_ms" => 402
+      "total_elapsed_ms" => 402,
+      "incident_rollback_verified" => true,
+      "incident_id" => "qlink-public-edge-drill-20260727",
+      "rollback_from_release_id" => "public-edge-current",
+      "rollback_to_release_id" => "public-edge-previous",
+      "rollback_manifest_sha256" => "d" * 64,
+      "rollback_duration_seconds" => 42,
+      "post_rollback_public_infra_ready" => true
     }
   end
 end

@@ -30,10 +30,11 @@ This feature list is synchronized with the current repository implementation. It
 ## Mesh and Transport
 
 - Development rendezvous server and client, with optional bearer-token admission
-  and per-client IP rate limiting for public-edge rehearsal.
+  hot token-file loading, digest-file token revocation, and per-client IP rate
+  limiting for public-edge rehearsal.
 - Development relay server and client, with optional bearer-token registration,
-  per-client IP rate limiting, and registered-source validation for relayed
-  datagrams.
+  hot token-file loading, digest-file token revocation, per-client IP rate
+  limiting, and registered-source validation for relayed datagrams.
 - Native UDP carrier is the default mesh data-plane carrier; Quinn/rustls is feature-gated for legacy development.
 - Mesh connector state machine for rendezvous lookup, native direct candidate probes, PQC relay fallback, published QuantumLink relay-candidate fallback, last-good path caching, and reconnect handling.
 - Optional ICE/STUN helper paths for connectivity checks, plus feature-gated TURN relay-candidate gathering. Published TURN relay candidates are consumed as UDP-relayed carrier targets when live, and the `turn-relay` proof path keeps a resident allocation with CreatePermission plus Send/Data indication handling distinct from the QuantumLink app-relay carrier.
@@ -52,9 +53,10 @@ This feature list is synchronized with the current repository implementation. It
 ## Not Production-Complete
 
 - Public rendezvous/relay TLS is implemented behind `public-edge-tls`, but
-  durable revocation, abuse monitoring, retention controls, connection quotas,
-  and actual off-host deployed hardening evidence remain open. The repository
-  now has an off-host evidence orchestrator and verifier to gate that proof.
+  actual off-host deployed hardening evidence remains open. The repository now
+  has hot service-token rotation, digest-file token revocation, an off-host
+  evidence orchestrator, verifier, service quotas, starter alert rules, and
+  retention templates to gate that proof.
 - RFC-complete public ICE nomination behavior and TURN relay-candidate data-plane proof against deployed public infrastructure.
 - Notarized Developer ID app and tunnel extension bundle.
 - Real-hardware validation of signed/provisioned Network Extension builds, including peer-session readiness under live packet flow.

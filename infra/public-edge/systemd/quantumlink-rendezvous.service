@@ -5,9 +5,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+LogNamespace=quantumlink
 EnvironmentFile=/etc/quantumlink/public-edge.env
-LoadCredential=rendezvous-auth-token:/etc/quantumlink/secrets/rendezvous-auth-token
-ExecStart=/opt/quantumlink/bin/qlinkctl rendezvous --listen ${QLINK_RENDEZVOUS_LISTEN} --auth-token-file ${CREDENTIALS_DIRECTORY}/rendezvous-auth-token --tls-cert ${QLINK_RENDEZVOUS_TLS_CERT} --tls-key ${QLINK_RENDEZVOUS_TLS_KEY} --rate-limit-per-window ${QLINK_RENDEZVOUS_RATE_LIMIT_PER_WINDOW} --rate-limit-window-seconds ${QLINK_ADMISSION_RATE_LIMIT_WINDOW_SECONDS}
+ExecStart=/opt/quantumlink/bin/qlinkctl rendezvous --listen ${QLINK_RENDEZVOUS_LISTEN} --auth-token-file ${QLINK_RENDEZVOUS_AUTH_TOKEN_FILE} --revoked-auth-token-digest-file ${QLINK_RENDEZVOUS_REVOKED_AUTH_TOKEN_DIGEST_FILE} --tls-cert ${QLINK_RENDEZVOUS_TLS_CERT} --tls-key ${QLINK_RENDEZVOUS_TLS_KEY} --rate-limit-per-window ${QLINK_RENDEZVOUS_RATE_LIMIT_PER_WINDOW} --rate-limit-window-seconds ${QLINK_ADMISSION_RATE_LIMIT_WINDOW_SECONDS} --metrics-addr ${QLINK_RENDEZVOUS_METRICS_ADDR} --max-request-line-bytes ${QLINK_MAX_REQUEST_LINE_BYTES} --max-concurrent-connections ${QLINK_MAX_CONCURRENT_CONNECTIONS} --idle-timeout-seconds ${QLINK_IDLE_TIMEOUT_SECONDS}
 Restart=always
 RestartSec=3
 User=quantumlink

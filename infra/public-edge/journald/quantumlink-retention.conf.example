@@ -1,0 +1,18 @@
+# Install as /etc/systemd/journald@quantumlink.conf when the public-edge
+# services use LogNamespace=quantumlink, then restart systemd-journald@quantumlink.
+#
+# This bounds operational log retention for the public-edge namespace. It does
+# not export logs, and it should not replace off-host alerting from loopback-only
+# metrics.
+
+[Journal]
+Storage=persistent
+Seal=yes
+SplitMode=uid
+SystemMaxUse=1G
+SystemKeepFree=1G
+MaxRetentionSec=14day
+ForwardToSyslog=no
+ForwardToKMsg=no
+ForwardToConsole=no
+ForwardToWall=no

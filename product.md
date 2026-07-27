@@ -84,8 +84,13 @@ The control plane is layered:
 The development rendezvous and relay services in this repository include
 bearer-token admission and per-client IP rate limits for public-edge rehearsal,
 but they are not hardened public infrastructure by themselves. A production
-deployment still needs TLS, abuse monitoring, durable revocation, retention
-controls, and operational runbooks.
+deployment now has TLS, basic service-level abuse counters, bounded control
+requests, connection ceilings, idle timeouts, and relay payload/registration
+caps plus per-peer relay datagram saturation quotas behind explicit public-edge
+configuration. Hot service-token file rotation and digest-file service-token
+revocation are implemented and locally provable; actual deployed operator
+revocation, rollback, alerting, and retention proof remain open until a live
+host supplies fresh evidence.
 
 ### On-chain identity verification
 
@@ -204,11 +209,11 @@ Production gaps include:
 - Deployed public TURN data-plane proof and RFC-complete ICE nomination behavior
   against deployed public infrastructure.
 - Public rendezvous and relay TLS plus credential-file service admission now
-  exist behind the explicit public-edge TLS feature, but durable credential
-  revocation, abuse monitoring, retention controls, connection quotas, and
-  actual deployed hardening evidence remain open. The repo now includes an
-  off-host public-edge evidence orchestrator and verifier so live proof can be
-  gated before a release ledger link.
+  exist behind the explicit public-edge TLS feature, with loopback service
+  metrics and off-host evidence gates for auth, bounds, and relay quota
+  counters, including per-peer relay saturation. Hot credential rotation and
+  digest-file credential revocation now exist; actual deployed revocation,
+  rollback, alerting, and retention evidence still need live-host proof.
 - Signed Sparkle/platform update pipeline paired with a post-quantum release
   manifest layer.
 - Production Dytallix mainnet or hardened registry trust root for public

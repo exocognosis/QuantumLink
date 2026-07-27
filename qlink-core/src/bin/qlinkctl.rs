@@ -1,9 +1,8 @@
-#[cfg(feature = "dev-quic-carrier")]
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use clap::{Parser, Subcommand};
 #[cfg(feature = "public-edge-tls")]
 use qlink_core::control_transport::ControlTlsServerConfig;
-#[cfg(feature = "dev-quic-carrier")]
+use qlink_core::control_transport::{connect_control_stream, split_control_stream};
 use qlink_core::relay::RelayMessage;
 #[cfg(feature = "turn-relay")]
 use qlink_core::traversal::gather_ice_candidates;
@@ -12,7 +11,10 @@ use qlink_core::turn::TurnClient;
 #[cfg(feature = "turn-relay")]
 use qlink_core::turn::{gather_relay_candidate, run_dev_turn, TurnCredentials, TurnServer};
 use qlink_core::{
-    admission::ServiceAdmissionConfig,
+    admission::{
+        service_token_revocation_digest, trim_secret_file, validate_service_auth_token,
+        ServiceAdmissionConfig, ServiceLimitsConfig,
+    },
     crypto::{answer_handshake, start_handshake, DeviceKeypair},
     discovery::{CandidateEndpoint, CandidateType, PeerRecord, UnsignedPeerRecord},
     dytallix_identity::MeshTrustPolicy,
@@ -21,8 +23,10 @@ use qlink_core::{
         ConnectionOutcome, MeshConnector, MeshConnectorConfig, PathKind, ProbeOutcome,
     },
     mesh_transport::{MeshTransportConfig, MeshTransportHandle},
-    relay::{probe_relay_registration, run_relay_with_config},
-    rendezvous::{run_rendezvous_with_config, RendezvousClient},
+    metrics_endpoint::{spawn_metrics_endpoint, MetricsEndpoint, MetricsSnapshotProvider},
+    relay::probe_relay_registration,
+    rendezvous::RendezvousClient,
+    service_metrics::ServiceMetrics,
     stun::{gather_server_reflexive_candidate, run_stun, spawn_dev_stun},
     traversal::gather_local_candidates,
 };
@@ -51,10 +55,12 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::net::UdpSocket;
-#[cfg(feature = "dev-quic-carrier")]
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    net::UdpSocket,
+};
+#[cfg(feature = "dev-quic-carrier")]
+use tokio::{
     net::{tcp::OwnedWriteHalf, TcpListener, TcpStream},
     sync::Mutex as TokioMutex,
 };
@@ -86,6 +92,8 @@ enum Command {
         #[arg(long)]
         auth_token_file: Option<String>,
         #[arg(long)]
+        revoked_auth_token_digest_file: Option<String>,
+        #[arg(long)]
         tls_cert: Option<String>,
         #[arg(long)]
         tls_key: Option<String>,
@@ -93,6 +101,14 @@ enum Command {
         rate_limit_per_window: u32,
         #[arg(long, default_value_t = 60)]
         rate_limit_window_seconds: u64,
+        #[arg(long)]
+        metrics_addr: Option<String>,
+        #[arg(long, default_value_t = 128 * 1024)]
+        max_request_line_bytes: usize,
+        #[arg(long, default_value_t = 1024)]
+        max_concurrent_connections: u32,
+        #[arg(long, default_value_t = 300)]
+        idle_timeout_seconds: u64,
     },
     Relay {
         #[arg(long, default_value = "127.0.0.1:9472")]
@@ -102,6 +118,8 @@ enum Command {
         #[arg(long)]
         auth_token_file: Option<String>,
         #[arg(long)]
+        revoked_auth_token_digest_file: Option<String>,
+        #[arg(long)]
         tls_cert: Option<String>,
         #[arg(long)]
         tls_key: Option<String>,
@@ -109,6 +127,62 @@ enum Command {
         rate_limit_per_window: u32,
         #[arg(long, default_value_t = 60)]
         rate_limit_window_seconds: u64,
+        #[arg(long)]
+        metrics_addr: Option<String>,
+        #[arg(long, default_value_t = 128 * 1024)]
+        max_request_line_bytes: usize,
+        #[arg(long, default_value_t = 1024)]
+        max_concurrent_connections: u32,
+        #[arg(long, default_value_t = 300)]
+        idle_timeout_seconds: u64,
+        #[arg(long, default_value_t = 64 * 1024)]
+        max_relay_payload_bytes: usize,
+        #[arg(long, default_value_t = 256)]
+        max_relay_peer_id_bytes: usize,
+        #[arg(long, default_value_t = 2048)]
+        max_relay_registered_peers: usize,
+        #[arg(long, default_value_t = 120)]
+        max_relay_peer_datagrams_per_window: u32,
+        #[arg(long, default_value_t = 60)]
+        relay_peer_datagram_window_seconds: u64,
+    },
+    ServiceTokenDigest {
+        #[arg(long)]
+        auth_token: Option<String>,
+        #[arg(long)]
+        auth_token_file: Option<String>,
+    },
+    ControlOversizeSmoke {
+        #[arg(long)]
+        server: String,
+        #[arg(long)]
+        max_request_line_bytes: usize,
+        #[arg(long)]
+        control_tls_ca: Option<String>,
+    },
+    RelayQuotaSmoke {
+        #[arg(long)]
+        server: String,
+        #[arg(long, default_value = "qlink-quota-probe")]
+        peer_id: String,
+        #[arg(long)]
+        max_payload_bytes: usize,
+        #[arg(long)]
+        auth_token: Option<String>,
+        #[arg(long)]
+        control_tls_ca: Option<String>,
+    },
+    RelaySaturationSmoke {
+        #[arg(long)]
+        server: String,
+        #[arg(long, default_value = "qlink-saturation-probe")]
+        peer_id: String,
+        #[arg(long)]
+        max_datagrams_per_window: u32,
+        #[arg(long)]
+        auth_token: Option<String>,
+        #[arg(long)]
+        control_tls_ca: Option<String>,
     },
     /// Run a STUN binding server (reflects the client's public-facing
     /// address as XOR-MAPPED-ADDRESS). Stand this up on a public host so
@@ -409,17 +483,42 @@ async fn main() -> qlink_core::Result<()> {
             listen,
             auth_token,
             auth_token_file,
+            revoked_auth_token_digest_file,
             tls_cert,
             tls_key,
             rate_limit_per_window,
             rate_limit_window_seconds,
+            metrics_addr,
+            max_request_line_bytes,
+            max_concurrent_connections,
+            idle_timeout_seconds,
         } => {
             let admission = service_admission_config(
                 auth_token.as_deref(),
                 auth_token_file.as_deref(),
+                revoked_auth_token_digest_file.as_deref(),
                 rate_limit_per_window,
                 rate_limit_window_seconds,
             )?;
+            let limits = service_limits_config(
+                max_request_line_bytes,
+                max_concurrent_connections,
+                idle_timeout_seconds,
+                ServiceLimitsConfig::default().relay_max_payload_bytes,
+                ServiceLimitsConfig::default().relay_max_peer_id_bytes,
+                ServiceLimitsConfig::default().relay_max_registered_peers,
+                ServiceLimitsConfig::default().relay_max_peer_datagrams_per_window,
+                ServiceLimitsConfig::default()
+                    .relay_peer_datagram_window
+                    .as_secs(),
+            )?;
+            let service_metrics = ServiceMetrics::default();
+            let _metrics_endpoint = start_service_metrics_endpoint(
+                "rendezvous",
+                metrics_addr.as_deref(),
+                service_metrics.clone(),
+            )
+            .await?;
             println!("rendezvous_listen={listen}");
             println!(
                 "rendezvous_tls_enabled={}",
@@ -429,6 +528,10 @@ async fn main() -> qlink_core::Result<()> {
                 "rendezvous_auth_required={}",
                 admission.auth_token_configured()
             );
+            println!(
+                "rendezvous_revoked_auth_token_digest_file_configured={}",
+                admission.revoked_token_digest_file_configured()
+            );
             if let Some(rate_limit) = admission.rate_limit() {
                 println!("rendezvous_rate_limit_per_window={}", rate_limit.max_events);
                 println!(
@@ -436,30 +539,81 @@ async fn main() -> qlink_core::Result<()> {
                     rate_limit.window.as_secs()
                 );
             }
-            run_rendezvous_service(&listen, admission, tls_cert.as_deref(), tls_key.as_deref())
-                .await?;
+            println!(
+                "rendezvous_max_request_line_bytes={}",
+                limits.max_request_line_bytes
+            );
+            println!(
+                "rendezvous_max_concurrent_connections={}",
+                limits.max_concurrent_connections
+            );
+            println!(
+                "rendezvous_idle_timeout_seconds={}",
+                limits.idle_timeout.as_secs()
+            );
+            run_rendezvous_service(
+                &listen,
+                admission,
+                tls_cert.as_deref(),
+                tls_key.as_deref(),
+                service_metrics,
+                limits,
+            )
+            .await?;
         }
         Command::Relay {
             listen,
             auth_token,
             auth_token_file,
+            revoked_auth_token_digest_file,
             tls_cert,
             tls_key,
             rate_limit_per_window,
             rate_limit_window_seconds,
+            metrics_addr,
+            max_request_line_bytes,
+            max_concurrent_connections,
+            idle_timeout_seconds,
+            max_relay_payload_bytes,
+            max_relay_peer_id_bytes,
+            max_relay_registered_peers,
+            max_relay_peer_datagrams_per_window,
+            relay_peer_datagram_window_seconds,
         } => {
             let admission = service_admission_config(
                 auth_token.as_deref(),
                 auth_token_file.as_deref(),
+                revoked_auth_token_digest_file.as_deref(),
                 rate_limit_per_window,
                 rate_limit_window_seconds,
             )?;
+            let limits = service_limits_config(
+                max_request_line_bytes,
+                max_concurrent_connections,
+                idle_timeout_seconds,
+                max_relay_payload_bytes,
+                max_relay_peer_id_bytes,
+                max_relay_registered_peers,
+                max_relay_peer_datagrams_per_window,
+                relay_peer_datagram_window_seconds,
+            )?;
+            let service_metrics = ServiceMetrics::default();
+            let _metrics_endpoint = start_service_metrics_endpoint(
+                "relay",
+                metrics_addr.as_deref(),
+                service_metrics.clone(),
+            )
+            .await?;
             println!("relay_listen={listen}");
             println!(
                 "relay_tls_enabled={}",
                 tls_cert.is_some() && tls_key.is_some()
             );
             println!("relay_auth_required={}", admission.auth_token_configured());
+            println!(
+                "relay_revoked_auth_token_digest_file_configured={}",
+                admission.revoked_token_digest_file_configured()
+            );
             if let Some(rate_limit) = admission.rate_limit() {
                 println!("relay_rate_limit_per_window={}", rate_limit.max_events);
                 println!(
@@ -467,7 +621,91 @@ async fn main() -> qlink_core::Result<()> {
                     rate_limit.window.as_secs()
                 );
             }
-            run_relay_service(&listen, admission, tls_cert.as_deref(), tls_key.as_deref()).await?;
+            println!(
+                "relay_max_request_line_bytes={}",
+                limits.max_request_line_bytes
+            );
+            println!(
+                "relay_max_concurrent_connections={}",
+                limits.max_concurrent_connections
+            );
+            println!(
+                "relay_idle_timeout_seconds={}",
+                limits.idle_timeout.as_secs()
+            );
+            println!("relay_max_payload_bytes={}", limits.relay_max_payload_bytes);
+            println!("relay_max_peer_id_bytes={}", limits.relay_max_peer_id_bytes);
+            println!(
+                "relay_max_registered_peers={}",
+                limits.relay_max_registered_peers
+            );
+            println!(
+                "relay_max_peer_datagrams_per_window={}",
+                limits.relay_max_peer_datagrams_per_window
+            );
+            println!(
+                "relay_peer_datagram_window_seconds={}",
+                limits.relay_peer_datagram_window.as_secs()
+            );
+            run_relay_service(
+                &listen,
+                admission,
+                tls_cert.as_deref(),
+                tls_key.as_deref(),
+                service_metrics,
+                limits,
+            )
+            .await?;
+        }
+        Command::ServiceTokenDigest {
+            auth_token,
+            auth_token_file,
+        } => {
+            let token = read_service_auth_token(auth_token.as_deref(), auth_token_file.as_deref())?
+                .ok_or_else(|| {
+                    qlink_core::QlinkError::Protocol(
+                        "service-token-digest requires --auth-token or --auth-token-file".into(),
+                    )
+                })?;
+            println!(
+                "service_token_digest={}",
+                service_token_revocation_digest(&token)
+            );
+        }
+        Command::ControlOversizeSmoke {
+            server,
+            max_request_line_bytes,
+            control_tls_ca,
+        } => {
+            install_control_tls_ca(control_tls_ca.as_deref())?;
+            run_control_oversize_smoke(&server, max_request_line_bytes).await?;
+        }
+        Command::RelayQuotaSmoke {
+            server,
+            peer_id,
+            max_payload_bytes,
+            auth_token,
+            control_tls_ca,
+        } => {
+            install_control_tls_ca(control_tls_ca.as_deref())?;
+            run_relay_quota_smoke(&server, &peer_id, max_payload_bytes, auth_token.as_deref())
+                .await?;
+        }
+        Command::RelaySaturationSmoke {
+            server,
+            peer_id,
+            max_datagrams_per_window,
+            auth_token,
+            control_tls_ca,
+        } => {
+            install_control_tls_ca(control_tls_ca.as_deref())?;
+            run_relay_saturation_smoke(
+                &server,
+                &peer_id,
+                max_datagrams_per_window,
+                auth_token.as_deref(),
+            )
+            .await?;
         }
         Command::Stun { listen } => {
             println!("stun_listen={listen}");
@@ -834,12 +1072,35 @@ fn selected_path_label(outcome: &ConnectionOutcome) -> &'static str {
 fn service_admission_config(
     auth_token: Option<&str>,
     auth_token_file: Option<&str>,
+    revoked_auth_token_digest_file: Option<&str>,
     rate_limit_per_window: u32,
     rate_limit_window_seconds: u64,
 ) -> qlink_core::Result<ServiceAdmissionConfig> {
     let mut admission = ServiceAdmissionConfig::open();
-    if let Some(token) = read_service_auth_token(auth_token, auth_token_file)? {
-        admission = admission.with_auth_token(token);
+    match (auth_token, auth_token_file) {
+        (Some(_), Some(_)) => {
+            return Err(qlink_core::QlinkError::Protocol(
+                "use either --auth-token or --auth-token-file, not both".into(),
+            ))
+        }
+        (Some(token), None) => {
+            validate_service_auth_token(token)?;
+            admission = admission.with_auth_token(token.to_string());
+        }
+        (None, Some(path)) => {
+            let token = std::fs::read_to_string(path).map_err(|err| {
+                qlink_core::QlinkError::Protocol(format!(
+                    "failed to read service auth token file {path}: {err}"
+                ))
+            })?;
+            validate_service_auth_token(trim_secret_file(&token))?;
+            admission = admission.with_auth_token_file(path);
+        }
+        (None, None) => {}
+    }
+    if let Some(path) = revoked_auth_token_digest_file {
+        validate_revoked_token_digest_file(path)?;
+        admission = admission.with_revoked_token_digest_file(path);
     }
     if rate_limit_per_window > 0 {
         if rate_limit_window_seconds == 0 {
@@ -863,36 +1124,47 @@ fn read_service_auth_token(
         (Some(_), Some(_)) => Err(qlink_core::QlinkError::Protocol(
             "use either --auth-token or --auth-token-file, not both".into(),
         )),
-        (Some(token), None) => validate_service_auth_token(token),
+        (Some(token), None) => {
+            validate_service_auth_token(token)?;
+            Ok(Some(token.trim().to_string()))
+        }
         (None, Some(path)) => {
             let token = std::fs::read_to_string(path).map_err(|err| {
                 qlink_core::QlinkError::Protocol(format!(
                     "failed to read service auth token file {path}: {err}"
                 ))
             })?;
-            validate_service_auth_token(trim_secret_file(&token))
+            let token = trim_secret_file(&token);
+            validate_service_auth_token(token)?;
+            Ok(Some(token.to_string()))
         }
         (None, None) => Ok(None),
     }
 }
 
-fn trim_secret_file(secret: &str) -> &str {
-    secret.trim_matches(|ch| ch == '\n' || ch == '\r')
-}
-
-fn validate_service_auth_token(token: &str) -> qlink_core::Result<Option<String>> {
-    let token = token.trim();
-    if token.is_empty() {
-        return Err(qlink_core::QlinkError::Protocol(
-            "service auth token must not be empty".into(),
-        ));
+fn validate_revoked_token_digest_file(path: &str) -> qlink_core::Result<()> {
+    let body = std::fs::read_to_string(path).map_err(|err| {
+        qlink_core::QlinkError::Protocol(format!(
+            "failed to read revoked service auth token digest file {path}: {err}"
+        ))
+    })?;
+    for (index, line) in body.lines().enumerate() {
+        let digest = line.split('#').next().unwrap_or("").trim();
+        if digest.is_empty() {
+            continue;
+        }
+        let valid = digest
+            .strip_prefix("shake256:")
+            .map(|hex| hex.len() == 64 && hex.chars().all(|ch| ch.is_ascii_hexdigit()))
+            .unwrap_or(false);
+        if !valid {
+            return Err(qlink_core::QlinkError::Protocol(format!(
+                "revoked service auth token digest file {path} line {} must contain a shake256 digest",
+                index + 1
+            )));
+        }
     }
-    if token.starts_with("replace-with-") {
-        return Err(qlink_core::QlinkError::Protocol(
-            "service auth token still contains a public-edge template placeholder".into(),
-        ));
-    }
-    Ok(Some(token.to_string()))
+    Ok(())
 }
 
 fn install_control_tls_ca(path: Option<&str>) -> qlink_core::Result<()> {
@@ -913,15 +1185,19 @@ async fn run_rendezvous_service(
     admission: ServiceAdmissionConfig,
     tls_cert: Option<&str>,
     tls_key: Option<&str>,
+    metrics: ServiceMetrics,
+    limits: ServiceLimitsConfig,
 ) -> qlink_core::Result<()> {
     match (tls_cert, tls_key) {
         (Some(cert), Some(key)) => {
             #[cfg(feature = "public-edge-tls")]
             {
-                return qlink_core::rendezvous::run_rendezvous_with_optional_tls(
+                return qlink_core::rendezvous::run_rendezvous_with_optional_tls_metrics_and_limits(
                     listen,
                     admission,
                     Some(ControlTlsServerConfig::new(cert, key)),
+                    metrics,
+                    limits,
                 )
                 .await;
             }
@@ -933,7 +1209,12 @@ async fn run_rendezvous_service(
                 ));
             }
         }
-        (None, None) => run_rendezvous_with_config(listen, admission).await,
+        (None, None) => {
+            qlink_core::rendezvous::run_rendezvous_with_metrics_and_limits(
+                listen, admission, metrics, limits,
+            )
+            .await
+        }
         _ => Err(qlink_core::QlinkError::Protocol(
             "rendezvous TLS requires both --tls-cert and --tls-key".into(),
         )),
@@ -945,15 +1226,19 @@ async fn run_relay_service(
     admission: ServiceAdmissionConfig,
     tls_cert: Option<&str>,
     tls_key: Option<&str>,
+    metrics: ServiceMetrics,
+    limits: ServiceLimitsConfig,
 ) -> qlink_core::Result<()> {
     match (tls_cert, tls_key) {
         (Some(cert), Some(key)) => {
             #[cfg(feature = "public-edge-tls")]
             {
-                return qlink_core::relay::run_relay_with_optional_tls(
+                return qlink_core::relay::run_relay_with_optional_tls_metrics_and_limits(
                     listen,
                     admission,
                     Some(ControlTlsServerConfig::new(cert, key)),
+                    metrics,
+                    limits,
                 )
                 .await;
             }
@@ -965,11 +1250,219 @@ async fn run_relay_service(
                 ));
             }
         }
-        (None, None) => run_relay_with_config(listen, admission).await,
+        (None, None) => {
+            qlink_core::relay::run_relay_with_metrics_and_limits(listen, admission, metrics, limits)
+                .await
+        }
         _ => Err(qlink_core::QlinkError::Protocol(
             "relay TLS requires both --tls-cert and --tls-key".into(),
         )),
     }
+}
+
+fn service_limits_config(
+    max_request_line_bytes: usize,
+    max_concurrent_connections: u32,
+    idle_timeout_seconds: u64,
+    max_relay_payload_bytes: usize,
+    max_relay_peer_id_bytes: usize,
+    max_relay_registered_peers: usize,
+    max_relay_peer_datagrams_per_window: u32,
+    relay_peer_datagram_window_seconds: u64,
+) -> qlink_core::Result<ServiceLimitsConfig> {
+    if max_request_line_bytes == 0 {
+        return Err(qlink_core::QlinkError::Protocol(
+            "--max-request-line-bytes must be positive".into(),
+        ));
+    }
+    if max_relay_payload_bytes == 0 {
+        return Err(qlink_core::QlinkError::Protocol(
+            "--max-relay-payload-bytes must be positive".into(),
+        ));
+    }
+    if max_relay_peer_id_bytes == 0 {
+        return Err(qlink_core::QlinkError::Protocol(
+            "--max-relay-peer-id-bytes must be positive".into(),
+        ));
+    }
+    if max_relay_registered_peers == 0 {
+        return Err(qlink_core::QlinkError::Protocol(
+            "--max-relay-registered-peers must be positive".into(),
+        ));
+    }
+    if max_relay_peer_datagrams_per_window > 0 && relay_peer_datagram_window_seconds == 0 {
+        return Err(qlink_core::QlinkError::Protocol(
+            "--relay-peer-datagram-window-seconds must be positive when peer datagram quotas are enabled".into(),
+        ));
+    }
+
+    Ok(ServiceLimitsConfig {
+        max_request_line_bytes,
+        max_concurrent_connections,
+        idle_timeout: Duration::from_secs(idle_timeout_seconds),
+        relay_max_payload_bytes: max_relay_payload_bytes,
+        relay_max_peer_id_bytes: max_relay_peer_id_bytes,
+        relay_max_registered_peers: max_relay_registered_peers,
+        relay_max_peer_datagrams_per_window: max_relay_peer_datagrams_per_window,
+        relay_peer_datagram_window: Duration::from_secs(relay_peer_datagram_window_seconds),
+    })
+}
+
+async fn start_service_metrics_endpoint(
+    service_name: &'static str,
+    metrics_addr: Option<&str>,
+    metrics: ServiceMetrics,
+) -> qlink_core::Result<Option<MetricsEndpoint>> {
+    let Some(metrics_addr) = metrics_addr else {
+        return Ok(None);
+    };
+    let bind: SocketAddr = metrics_addr.parse().map_err(|err| {
+        qlink_core::QlinkError::Protocol(format!("invalid {service_name} --metrics-addr: {err}"))
+    })?;
+    if !bind.ip().is_loopback() {
+        return Err(qlink_core::QlinkError::Protocol(format!(
+            "{service_name} metrics endpoint must bind to a loopback address"
+        )));
+    }
+
+    let provider: MetricsSnapshotProvider = Arc::new(move || metrics.snapshot(service_name));
+    let endpoint = spawn_metrics_endpoint(bind, provider).await?;
+    println!("{service_name}_metrics_addr={}", endpoint.local_addr());
+    Ok(Some(endpoint))
+}
+
+async fn run_control_oversize_smoke(
+    server: &str,
+    max_request_line_bytes: usize,
+) -> qlink_core::Result<()> {
+    if max_request_line_bytes == 0 {
+        return Err(qlink_core::QlinkError::Protocol(
+            "--max-request-line-bytes must be positive".into(),
+        ));
+    }
+    let stream = connect_control_stream(server, None).await?;
+    let (_reader, mut writer) = split_control_stream(stream);
+    let mut line = vec![b'x'; max_request_line_bytes.saturating_add(1)];
+    line.push(b'\n');
+    writer.write_all(&line).await?;
+    writer.flush().await?;
+    println!("control_oversized_request_sent=true");
+    println!(
+        "control_oversized_request_bytes={}",
+        max_request_line_bytes + 1
+    );
+    Ok(())
+}
+
+async fn run_relay_quota_smoke(
+    server: &str,
+    peer_id: &str,
+    max_payload_bytes: usize,
+    auth_token: Option<&str>,
+) -> qlink_core::Result<()> {
+    if max_payload_bytes == 0 {
+        return Err(qlink_core::QlinkError::Protocol(
+            "--max-payload-bytes must be positive".into(),
+        ));
+    }
+    let stream = connect_control_stream(server, None).await?;
+    let (reader, mut writer) = split_control_stream(stream);
+    let mut reader = BufReader::new(reader);
+    let register = RelayMessage::Register {
+        peer_id: peer_id.to_string(),
+        auth_token: auth_token.map(|token| token.to_string()),
+    };
+    writer
+        .write_all(serde_json::to_string(&register)?.as_bytes())
+        .await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await?;
+
+    let mut line = String::new();
+    reader.read_line(&mut line).await?;
+    match serde_json::from_str::<RelayMessage>(line.trim_end())? {
+        RelayMessage::Registered { peer_id: confirmed } if confirmed == peer_id => {}
+        RelayMessage::Error { message } => return Err(qlink_core::QlinkError::Protocol(message)),
+        other => {
+            return Err(qlink_core::QlinkError::Protocol(format!(
+                "unexpected relay quota probe response: {other:?}"
+            )))
+        }
+    }
+
+    let payload = STANDARD.encode(vec![0_u8; max_payload_bytes.saturating_add(1)]);
+    let datagram = RelayMessage::Datagram {
+        source: peer_id.to_string(),
+        destination: "qlink-quota-missing".to_string(),
+        payload_base64: payload,
+    };
+    writer
+        .write_all(serde_json::to_string(&datagram)?.as_bytes())
+        .await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await?;
+    let mut response = String::new();
+    let _ = tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut response)).await;
+    println!("relay_payload_quota_probe_sent=true");
+    println!("relay_payload_quota_probe_bytes={}", max_payload_bytes + 1);
+    Ok(())
+}
+
+async fn run_relay_saturation_smoke(
+    server: &str,
+    peer_id: &str,
+    max_datagrams_per_window: u32,
+    auth_token: Option<&str>,
+) -> qlink_core::Result<()> {
+    if max_datagrams_per_window == 0 {
+        return Err(qlink_core::QlinkError::Protocol(
+            "--max-datagrams-per-window must be positive".into(),
+        ));
+    }
+    let stream = connect_control_stream(server, None).await?;
+    let (reader, mut writer) = split_control_stream(stream);
+    let mut reader = BufReader::new(reader);
+    let register = RelayMessage::Register {
+        peer_id: peer_id.to_string(),
+        auth_token: auth_token.map(|token| token.to_string()),
+    };
+    writer
+        .write_all(serde_json::to_string(&register)?.as_bytes())
+        .await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await?;
+
+    let mut line = String::new();
+    reader.read_line(&mut line).await?;
+    match serde_json::from_str::<RelayMessage>(line.trim_end())? {
+        RelayMessage::Registered { peer_id: confirmed } if confirmed == peer_id => {}
+        RelayMessage::Error { message } => return Err(qlink_core::QlinkError::Protocol(message)),
+        other => {
+            return Err(qlink_core::QlinkError::Protocol(format!(
+                "unexpected relay saturation probe response: {other:?}"
+            )))
+        }
+    }
+
+    let datagram = RelayMessage::Datagram {
+        source: peer_id.to_string(),
+        destination: "qlink-saturation-missing".to_string(),
+        payload_base64: STANDARD.encode(b"quota-probe"),
+    };
+    let line = serde_json::to_string(&datagram)?;
+    for _ in 0..=max_datagrams_per_window {
+        writer.write_all(line.as_bytes()).await?;
+        writer.write_all(b"\n").await?;
+    }
+    writer.flush().await?;
+    let mut response = String::new();
+    let _ = tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut response)).await;
+    println!("relay_saturation_probe_sent=true");
+    println!(
+        "relay_saturation_probe_datagrams={}",
+        max_datagrams_per_window + 1
+    );
+    Ok(())
 }
 
 #[cfg(not(feature = "dev-quic-carrier"))]
