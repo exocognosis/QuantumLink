@@ -177,8 +177,8 @@ orphaned crate.
 - Public SteamOS mode requires `bindingVersion=stableIdentityV2` and refuses
   silent v1 downgrade. `qlinkd` validates local enrollment separately from
   selected remote-peer trust and exposes typed, redacted status for both.
-- Passed locally: v2 contract native tests, v2 WASM release build, all 257
-  `qlink-core` tests, all 78 `qlinkd` tests, all 32 `qlinkctl` tests, and all 31
+- Passed locally: v2 contract native tests, v2 WASM release build, 258
+  `qlink-core` tests, 79 `qlinkd` tests, all 32 `qlinkctl` tests, and all 31
   SteamOS protocol tests.
 - Decision: Public Dytallix remains No-Go until the evidence schema and
   collector require v2, offline provisioning is shipped, and finalized live
