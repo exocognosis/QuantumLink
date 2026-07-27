@@ -35,6 +35,53 @@ This is the intended activated packet flow. The packaged systemd service does no
 4. Peers resolve each other through rendezvous, validate signatures and expiration, then attempt direct connectivity.
 5. Status reports expose phase, active party, path type, RTT, jitter, loss, NAT type, and relay privacy.
 
+## Resident Publication
+
+`qlinkd` owns a dedicated publication worker around the shared
+`MeshTransportHandle` publication API. The worker:
+
+- reserves each sequence number to an owner-only state file before attempting
+  network I/O, preventing sequence reuse after crashes;
+- publishes the responder certificate, candidates, and overlay routes in an
+  ML-DSA-signed peer record;
+- refreshes at TTL/2 and retains a valid prior record during bounded retries;
+- writes the current public record to an owner-only outbox for an external
+  Dytallix synchronizer;
+- reacts to Linux netlink route, link, and address changes by reconnecting the
+  shared transport and requesting immediate republication; and
+- fails the protected packet path before initial publication and after expiry.
+
+The publication worker has its own Tokio runtime and never blocks the packet
+pump or local control socket.
+
+## Dytallix Boundary
+
+`qlinkd` receives lookup-only Dytallix configuration and periodically
+revalidates required public-peer trust. Wallet keys remain outside the daemon.
+The current registry schema also binds `latest_peer_record_hash`,
+`pqc_binding_hash`, and the generated transport-certificate hash. Because those
+values change on each TTL refresh, production public mode still requires either
+an isolated continuous registry synchronizer consuming
+`publication-record.json` or a versioned registry contract that binds stable
+owner/device identity while leaving ephemeral reachability under the signed
+peer record. This is a release blocker, not a reason to move wallet secrets
+into the tunnel daemon.
+
+## Evidence Boundary
+
+The SteamOS evidence bridge consumes redacted reports; it does not consume or
+publish raw peer records, private keys, ICE credentials, or endpoint
+addresses. A `signed_expiring_records` pass requires a source report from the
+repository-owned `qlink-core` verifier that binds the same ML-DSA identity and
+source revision across publication, post-expiry lookup, and a
+higher-sequence pre-expiry refresh. The bridge validates hashes, decisions,
+sequence ordering, and time ordering, then emits only a whitelisted summary
+plus the source report digest.
+
+This is an evidence contract, not live endpoint evidence. Fixture coverage
+proves the bridge behavior; an off-host public-edge run still has to produce
+and link the report before the rendezvous/relay production gate can pass.
+
 ## SteamOS Defaults
 
 - Use split tunneling by default; do not replace the SteamOS default route.

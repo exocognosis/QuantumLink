@@ -25,9 +25,11 @@ use crate::data_plane::{
     DataPlaneError, InboundTransportFrame, MeshFrameTransport, PeerSessionUpdate,
 };
 use crate::identity::DeviceIdentity;
+use crate::publication::{PublicationController, PublicationSnapshot, PublicationWorkerConfig};
 use base64::Engine as _;
 use qlink_core::crypto::DeviceKeypair;
 use qlink_core::dytallix_identity::{DytallixRegistryLookupConfig, MeshTrustPolicy};
+use qlink_core::mesh_connection::NetworkEvent;
 use qlink_core::mesh_transport::{
     MeshTransportConfig, MeshTransportHandle, PacketSessionDirection, PacketSessionEvent,
     PacketSessionLease,
@@ -66,6 +68,7 @@ pub enum DaemonMeshTransport {
         handle: Arc<MeshTransportHandle>,
         selected_peer_id: String,
         trusted_peer_store_path: PathBuf,
+        publication: PublicationController,
     },
     /// Development/local-smoke: frames are queued back for inbound acceptance.
     LocalEcho(VecDeque<Vec<u8>>),
@@ -118,6 +121,20 @@ impl DaemonMeshTransport {
         }
     }
 
+    pub fn publication_snapshot(&self, at_unix: u64) -> Option<PublicationSnapshot> {
+        match self {
+            Self::Mesh { publication, .. } => Some(publication.snapshot(at_unix)),
+            Self::LocalEcho(_) => None,
+        }
+    }
+
+    fn publication_current(&self) -> bool {
+        match self {
+            Self::Mesh { publication, .. } => publication.is_current(now_unix()),
+            Self::LocalEcho(_) => true,
+        }
+    }
+
     pub fn validate_selected_peer(&self, at_unix: u64) -> Result<(), DataPlaneError> {
         let Self::Mesh {
             selected_peer_id,
@@ -128,6 +145,18 @@ impl DaemonMeshTransport {
             return Ok(());
         };
         selected_peer_is_authorized(trusted_peer_store_path, selected_peer_id, at_unix)
+    }
+
+    pub fn handle_network_change(&self) {
+        if let Self::Mesh {
+            handle,
+            publication,
+            ..
+        } = self
+        {
+            handle.handle_network_event(NetworkEvent::PathChanged);
+            publication.request_refresh();
+        }
     }
 }
 
@@ -163,7 +192,8 @@ impl MeshFrameTransport for DaemonMeshTransport {
     fn is_ready(&self) -> bool {
         match self {
             Self::Mesh { handle, .. } => {
-                handle.state_code() == MESH_STATE_READY
+                self.publication_current()
+                    && handle.state_code() == MESH_STATE_READY
                     && matches!(handle.default_packet_session(), Ok(Some(_)))
             }
             Self::LocalEcho(_) => true,
@@ -180,7 +210,7 @@ impl MeshFrameTransport for DaemonMeshTransport {
     fn peer_session_ready(&self) -> bool {
         match self {
             Self::Mesh { handle, .. } => {
-                matches!(handle.default_packet_session(), Ok(Some(_)))
+                self.publication_current() && matches!(handle.default_packet_session(), Ok(Some(_)))
             }
             Self::LocalEcho(_) => true,
         }
@@ -188,11 +218,12 @@ impl MeshFrameTransport for DaemonMeshTransport {
 
     fn installed_peer_session(&self) -> Option<InstalledPeerSession> {
         match self {
-            Self::Mesh { handle, .. } => handle
+            Self::Mesh { handle, .. } if self.publication_current() => handle
                 .default_packet_session()
                 .ok()
                 .flatten()
                 .map(installed_peer_session),
+            Self::Mesh { .. } => None,
             Self::LocalEcho(_) => Some(InstalledPeerSession {
                 peer_id: LOCAL_ECHO_PEER_ID.to_string(),
                 direction: PeerSessionDirection::Outbound,
@@ -229,6 +260,11 @@ impl MeshFrameTransport for DaemonMeshTransport {
     }
 
     fn send_frame(&mut self, frame: Vec<u8>) -> Result<(), DataPlaneError> {
+        if !self.publication_current() {
+            return Err(DataPlaneError::Transport(
+                "signed local peer record is not current".to_string(),
+            ));
+        }
         match self {
             Self::Mesh { handle, .. } => handle
                 .send_frame(frame)
@@ -241,6 +277,9 @@ impl MeshFrameTransport for DaemonMeshTransport {
     }
 
     fn try_receive_frame(&mut self) -> Option<InboundTransportFrame> {
+        if !self.publication_current() {
+            return None;
+        }
         match self {
             Self::Mesh { handle, .. } => {
                 handle
@@ -507,12 +546,43 @@ pub fn build_daemon_mesh_transport(
                 .map_err(|error| DataPlaneError::Transport(error.to_string()))
         })?;
 
-    let handle = MeshTransportHandle::new_with_keypair(mesh_config, Some(Arc::new(owned_keypair)))
-        .map_err(|error| DataPlaneError::Transport(error.to_string()))?;
+    let owned_keypair = Arc::new(owned_keypair);
+    let handle = Arc::new(
+        MeshTransportHandle::new_with_keypair(mesh_config, Some(owned_keypair.clone()))
+            .map_err(|error| DataPlaneError::Transport(error.to_string()))?,
+    );
+    if let Some(advertise_address) = config.advertise_address.as_deref() {
+        let address = advertise_address.parse().map_err(|error| {
+            DataPlaneError::Transport(format!(
+                "invalid advertiseAddress {advertise_address}: {error}"
+            ))
+        })?;
+        handle.set_advertise_addr(address);
+    }
+    let publication = PublicationController::start(
+        handle.clone(),
+        owned_keypair,
+        PublicationWorkerConfig {
+            rendezvous_url: config.rendezvous_servers[0].clone(),
+            rendezvous_auth_token: load_optional_auth_token(
+                config.rendezvous_auth_token_file.as_deref(),
+                "rendezvous",
+            )?,
+            ttl_seconds: config.publication_ttl_seconds,
+            overlay_routes: vec![config.overlay_cidr.clone()],
+            state_dir: state_dir.to_path_buf(),
+            selected_peer_id: peer.peer_id.clone(),
+            public_dytallix_required: peer.trust_mode == MeshTrustMode::PublicDytallixRequired,
+        },
+    )
+    .map_err(|error| {
+        DataPlaneError::Transport(format!("signed publication worker initialization: {error}"))
+    })?;
     Ok(DaemonMeshTransport::Mesh {
-        handle: Arc::new(handle),
+        handle,
         selected_peer_id: peer.peer_id,
         trusted_peer_store_path: peer_store_path_from_state_dir(state_dir),
+        publication,
     })
 }
 

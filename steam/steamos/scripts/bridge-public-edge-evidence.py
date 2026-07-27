@@ -97,7 +97,10 @@ CONTROL_FIELDS: dict[str, tuple[str, ...]] = {
 }
 
 UNSUPPORTED_PROOFS = {
-    "signed_expiring_records": "shared live evidence does not attest signed record expiry",
+    "signed_expiring_records": (
+        "shared live evidence does not include complete signed publication, "
+        "expiry-rejection, and refresh proof"
+    ),
     "abuse_logs": "shared live evidence exposes counters, not redacted abuse-log samples",
     "retention": "shared live evidence does not attest deployed log retention",
     "key_rotation": "service-token replacement is not cryptographic key-rotation proof",
@@ -174,11 +177,31 @@ def parse_timestamp(value: object, max_age_seconds: int) -> None:
     require((now - generated).total_seconds() <= max_age_seconds, "public-edge generatedAt is stale")
 
 
+def timestamp(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value.endswith("Z"):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
 def resolve_source_path(reference: object, run_root: Path, label: str) -> Path:
     require(isinstance(reference, str) and bool(reference.strip()), f"{label} path is required")
     rel = Path(reference)
     candidates = [rel] if rel.is_absolute() else [run_root / rel, REPO_ROOT / rel]
     for candidate in candidates:
+        if candidate.is_symlink():
+            raise BridgeError(f"{label} must not be a symbolic link")
+        try:
+            lexical_relative = candidate.absolute().relative_to(run_root)
+        except ValueError:
+            lexical_relative = None
+        if lexical_relative is not None:
+            cursor = run_root
+            if any((cursor := cursor / part).is_symlink() for part in lexical_relative.parts):
+                raise BridgeError(f"{label} must not traverse symbolic links")
         resolved = candidate.resolve()
         try:
             resolved.relative_to(run_root)
@@ -263,9 +286,358 @@ def control_status(control: str, app: dict[str, Any], turn: dict[str, Any]) -> s
     return "blocked"
 
 
+def signed_record_lifecycle_proof(
+    proofs: dict[str, Any],
+    run_root: Path,
+    manifest: dict[str, Any],
+) -> tuple[str, str | None, dict[str, Any], str | None]:
+    reference = proofs.get("signedExpiringRecords")
+    if not isinstance(reference, dict) or not reference.get("evidence"):
+        return (
+            "blocked",
+            UNSUPPORTED_PROOFS["signed_expiring_records"],
+            {},
+            None,
+        )
+
+    proof_path = resolve_source_path(
+        reference.get("evidence"),
+        run_root,
+        "signed expiring record lifecycle evidence",
+    )
+    proof, proof_raw = load_json(proof_path, "signed expiring record lifecycle evidence")
+    proof_sha = sha256(proof_raw)
+    expected_sha = reference.get("sha256")
+    require(
+        isinstance(expected_sha, str)
+        and re.fullmatch(r"[0-9a-f]{64}", expected_sha) is not None,
+        "signed expiring record lifecycle evidence reference requires sha256",
+    )
+    require(
+        expected_sha == proof_sha,
+        "signed expiring record lifecycle evidence sha256 does not match",
+    )
+    publication = proof.get("publication")
+    expiry = proof.get("expiryProbe")
+    refresh = proof.get("refresh")
+    verifier = proof.get("verifier")
+    redaction = proof.get("redaction")
+
+    assertions = {
+        "schemaVersion": proof.get("schemaVersion"),
+        "evidenceKind": proof.get("evidenceKind"),
+        "status": proof.get("status"),
+        "generatedAt": proof.get("generatedAt"),
+        "gitSha": proof.get("gitSha"),
+        "rendezvousEndpointSha256": proof.get("rendezvousEndpointSha256"),
+        "verifier": {
+            field: verifier.get(field)
+            for field in ("kind", "gitSha", "cryptographicVerificationPerformed")
+        }
+        if isinstance(verifier, dict)
+        else {},
+        "publication": {
+            field: publication.get(field)
+            for field in (
+                "recordSha256",
+                "peerIdSha256",
+                "meshIdSha256",
+                "keyFingerprintSha256",
+                "signatureSha256",
+                "signatureAlgorithm",
+                "signatureValid",
+                "peerIdBindingValid",
+                "meshIdBindingValid",
+                "sequence",
+                "publishedAtUnix",
+                "expiresAtUnix",
+                "lookupAtUnix",
+                "lookupRecordSha256",
+            )
+        }
+        if isinstance(publication, dict)
+        else {},
+        "expiryProbe": {
+            field: expiry.get(field)
+            for field in (
+                "recordSha256",
+                "peerIdSha256",
+                "meshIdSha256",
+                "keyFingerprintSha256",
+                "signatureSha256",
+                "signatureAlgorithm",
+                "signatureValidBeforeExpiry",
+                "sequence",
+                "expiresAtUnix",
+                "lookupAtUnix",
+                "lookupResult",
+            )
+        }
+        if isinstance(expiry, dict)
+        else {},
+        "refresh": {
+            field: refresh.get(field)
+            for field in (
+                "recordSha256",
+                "peerIdSha256",
+                "meshIdSha256",
+                "keyFingerprintSha256",
+                "signatureSha256",
+                "signatureAlgorithm",
+                "signatureValid",
+                "peerIdBindingValid",
+                "meshIdBindingValid",
+                "sequence",
+                "publishedAtUnix",
+                "expiresAtUnix",
+                "lookupAtUnix",
+                "lookupRecordSha256",
+            )
+        }
+        if isinstance(refresh, dict)
+        else {},
+        "redaction": {
+            field: redaction.get(field)
+            for field in (
+                "rawRecordsCommitted",
+                "privateKeysCommitted",
+                "iceCredentialsCommitted",
+                "endpointAddressesCommitted",
+            )
+        }
+        if isinstance(redaction, dict)
+        else {},
+    }
+
+    if not all(
+        isinstance(section, dict)
+        for section in (publication, expiry, refresh, verifier, redaction)
+    ):
+        return (
+            "blocked",
+            "signed record lifecycle proof requires verifier, publication, expiryProbe, refresh, and redaction sections",
+            assertions,
+            proof_sha,
+        )
+
+    digest_fields = (
+        publication.get("recordSha256"),
+        publication.get("peerIdSha256"),
+        publication.get("meshIdSha256"),
+        publication.get("keyFingerprintSha256"),
+        publication.get("signatureSha256"),
+        expiry.get("recordSha256"),
+        expiry.get("peerIdSha256"),
+        expiry.get("meshIdSha256"),
+        expiry.get("keyFingerprintSha256"),
+        expiry.get("signatureSha256"),
+        refresh.get("recordSha256"),
+        refresh.get("peerIdSha256"),
+        refresh.get("meshIdSha256"),
+        refresh.get("keyFingerprintSha256"),
+        refresh.get("signatureSha256"),
+        publication.get("lookupRecordSha256"),
+        refresh.get("lookupRecordSha256"),
+        proof.get("rendezvousEndpointSha256"),
+    )
+    digests_valid = all(
+        isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+        for value in digest_fields
+    )
+    sequence_values = (
+        expiry.get("sequence"),
+        publication.get("sequence"),
+        refresh.get("sequence"),
+    )
+    sequences_valid = all(
+        isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        for value in sequence_values
+    )
+    if sequences_valid:
+        sequences_valid = (
+            expiry["sequence"] < publication["sequence"]
+            and refresh["sequence"] > publication["sequence"]
+        )
+
+    identity_stable = (
+        publication.get("peerIdSha256")
+        == expiry.get("peerIdSha256")
+        == refresh.get("peerIdSha256")
+        and publication.get("meshIdSha256")
+        == expiry.get("meshIdSha256")
+        == refresh.get("meshIdSha256")
+        and publication.get("keyFingerprintSha256")
+        == expiry.get("keyFingerprintSha256")
+        == refresh.get("keyFingerprintSha256")
+    )
+    algorithms_valid = all(
+        section.get("signatureAlgorithm") == "ML-DSA-65"
+        for section in (publication, expiry, refresh)
+    )
+    signature_results_valid = (
+        publication.get("signatureValid") is True
+        and expiry.get("signatureValidBeforeExpiry") is True
+        and refresh.get("signatureValid") is True
+    )
+    bindings_valid = all(
+        section.get("peerIdBindingValid") is True
+        and section.get("meshIdBindingValid") is True
+        for section in (publication, refresh)
+    )
+    lookup_results_valid = (
+        publication.get("lookupRecordSha256") == publication.get("recordSha256")
+        and refresh.get("lookupRecordSha256") == refresh.get("recordSha256")
+        and expiry.get("lookupResult") == "not_found"
+    )
+    records_distinct = (
+        refresh.get("recordSha256") != publication.get("recordSha256")
+        and expiry.get("recordSha256") != publication.get("recordSha256")
+    )
+    unix_fields = (
+        publication.get("publishedAtUnix"),
+        publication.get("expiresAtUnix"),
+        publication.get("lookupAtUnix"),
+        expiry.get("expiresAtUnix"),
+        expiry.get("lookupAtUnix"),
+        refresh.get("publishedAtUnix"),
+        refresh.get("expiresAtUnix"),
+        refresh.get("lookupAtUnix"),
+    )
+    timestamps_valid = all(
+        isinstance(value, int) and not isinstance(value, bool) and value > 0
+        for value in unix_fields
+    )
+    generated_at = timestamp(proof.get("generatedAt"))
+    if timestamps_valid and generated_at is not None:
+        generated_unix = int(generated_at.timestamp())
+        timestamps_valid = (
+            publication["publishedAtUnix"]
+            <= publication["lookupAtUnix"]
+            <= generated_unix
+            and publication["publishedAtUnix"]
+            < refresh["publishedAtUnix"]
+            < publication["expiresAtUnix"]
+            and refresh["publishedAtUnix"]
+            <= refresh["lookupAtUnix"]
+            <= generated_unix
+            and refresh["expiresAtUnix"] > publication["expiresAtUnix"]
+            and expiry["expiresAtUnix"] < expiry["lookupAtUnix"] <= generated_unix
+        )
+    else:
+        timestamps_valid = False
+    verifier_valid = (
+        verifier.get("kind") == "qlink-core-peer-record-verifier"
+        and verifier.get("gitSha") == manifest.get("gitSha")
+        and verifier.get("cryptographicVerificationPerformed") is True
+    )
+    redaction_valid = all(
+        redaction.get(field) is False
+        for field in (
+            "rawRecordsCommitted",
+            "privateKeysCommitted",
+            "iceCredentialsCommitted",
+            "endpointAddressesCommitted",
+        )
+    )
+    expected_keys = {
+        "schemaVersion",
+        "evidenceKind",
+        "status",
+        "generatedAt",
+        "gitSha",
+        "rendezvousEndpointSha256",
+        "verifier",
+        "publication",
+        "expiryProbe",
+        "refresh",
+        "redaction",
+    }
+    publication_keys = {
+        "recordSha256",
+        "peerIdSha256",
+        "meshIdSha256",
+        "keyFingerprintSha256",
+        "signatureSha256",
+        "signatureAlgorithm",
+        "signatureValid",
+        "peerIdBindingValid",
+        "meshIdBindingValid",
+        "sequence",
+        "publishedAtUnix",
+        "expiresAtUnix",
+        "lookupAtUnix",
+        "lookupRecordSha256",
+    }
+    expiry_keys = {
+        "recordSha256",
+        "peerIdSha256",
+        "meshIdSha256",
+        "keyFingerprintSha256",
+        "signatureSha256",
+        "signatureAlgorithm",
+        "signatureValidBeforeExpiry",
+        "sequence",
+        "expiresAtUnix",
+        "lookupAtUnix",
+        "lookupResult",
+    }
+    verifier_keys = {"kind", "gitSha", "cryptographicVerificationPerformed"}
+    redaction_keys = {
+        "rawRecordsCommitted",
+        "privateKeysCommitted",
+        "iceCredentialsCommitted",
+        "endpointAddressesCommitted",
+    }
+    unexpected_fields_valid = (
+        set(proof) == expected_keys
+        and set(verifier) == verifier_keys
+        and set(publication) == publication_keys
+        and set(expiry) == expiry_keys
+        and set(refresh) == publication_keys
+        and set(redaction) == redaction_keys
+    )
+    envelope_valid = (
+        proof.get("schemaVersion") == 1
+        and proof.get("evidenceKind") == "quantumLinkSignedRecordLifecycleVerification"
+        and proof.get("status") == "pass"
+        and proof.get("generatedAt") == manifest.get("generatedAt")
+        and proof.get("gitSha") == manifest.get("gitSha")
+        and proof.get("rendezvousEndpointSha256")
+        == sha256(manifest["endpoints"]["rendezvous"].encode("utf-8"))
+    )
+
+    valid = all(
+        (
+            envelope_valid,
+            verifier_valid,
+            redaction_valid,
+            unexpected_fields_valid,
+            digests_valid,
+            sequences_valid,
+            identity_stable,
+            algorithms_valid,
+            signature_results_valid,
+            bindings_valid,
+            lookup_results_valid,
+            records_distinct,
+            timestamps_valid,
+        )
+    )
+    if valid:
+        return "pass", None, assertions, proof_sha
+    return (
+        "blocked",
+        "signed record lifecycle proof is incomplete or internally inconsistent",
+        assertions,
+        proof_sha,
+    )
+
+
 def public_control_documents(
     manifest: dict[str, Any],
     manifest_raw: bytes,
+    proofs: dict[str, Any],
+    run_root: Path,
     app: dict[str, Any],
     app_raw: bytes,
     turn: dict[str, Any],
@@ -279,8 +651,17 @@ def public_control_documents(
         "appRelayEvidenceSha256": sha256(app_raw),
         "turnRelayEvidenceSha256": sha256(turn_raw),
     }
+    signed_status, signed_reason, signed_assertions, signed_source_sha = (
+        signed_record_lifecycle_proof(proofs, run_root, manifest)
+    )
+    if signed_source_sha is not None:
+        source["signedExpiringRecordsEvidenceSha256"] = signed_source_sha
     for control in REQUIRED_CONTROLS:
-        status = control_status(control, app, turn)
+        status = (
+            signed_status
+            if control == "signed_expiring_records"
+            else control_status(control, app, turn)
+        )
         fields = CONTROL_FIELDS.get(control, ())
         document: dict[str, Any] = {
             "schemaVersion": 1,
@@ -299,8 +680,14 @@ def public_control_documents(
                 "rawGamePayloadsCommitted": False,
             },
         }
+        if control == "signed_expiring_records":
+            document["assertions"] = signed_assertions
         if status != "pass":
-            document["blockedReason"] = UNSUPPORTED_PROOFS.get(control, "required shared proof did not pass")
+            document["blockedReason"] = (
+                signed_reason
+                if control == "signed_expiring_records"
+                else UNSUPPORTED_PROOFS.get(control, "required shared proof did not pass")
+            )
         relative = f"rendezvous-relay/{control}.json"
         controls[control] = {"status": status, "evidence": relative}
         documents[control] = document
@@ -458,7 +845,16 @@ def main() -> int:
         require(app.get(field) == endpoints.get(field), f"public-edge endpoint {field} does not match app-relay evidence")
         require(turn.get(field) == endpoints.get(field), f"public-edge endpoint {field} does not match TURN-relay evidence")
 
-    controls, control_documents = public_control_documents(manifest, manifest_raw, app, app_raw, turn, turn_raw)
+    controls, control_documents = public_control_documents(
+        manifest,
+        manifest_raw,
+        proofs,
+        run_root,
+        app,
+        app_raw,
+        turn,
+        turn_raw,
+    )
     if args.dytallix_evidence_root:
         dytallix, dytallix_documents = load_dytallix(args.dytallix_evidence_root)
     else:

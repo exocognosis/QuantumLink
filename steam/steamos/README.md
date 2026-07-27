@@ -14,6 +14,12 @@ pass. Production publication remains a No-Go until production signing, complete
 active rendezvous/relay and public Dytallix evidence, and real Steam Deck
 validation are linked from the readiness ledger.
 
+The evidence bridge has fixture coverage for an optional signed-record
+lifecycle report. It marks `signed_expiring_records` passed only when a
+redacted `qlink-core` verifier report proves ML-DSA publication lookup,
+post-expiry rejection, and higher-sequence refresh before expiry. No live
+public-edge proof is claimed by this repository state.
+
 ## Components
 
 - `steam/steamos/rust/qlinkd`: SteamOS/Linux daemon scaffold for config loading, local status, mesh state, profile lifecycle, explicit network activation, and the local TUN packet-pump boundary.
@@ -100,6 +106,15 @@ packet core. Rekey, expiry, disconnect, and clear events are generation-aware.
 The daemon drops the complete transport if the selected peer is removed,
 revoked, expired, or replaced on disk.
 
+For a configured rendezvous service, `qlinkd` also runs a dedicated signed
+peer-record publication worker. It reserves monotonic sequence numbers in
+`/var/lib/quantumlink/publication-state.json`, writes the current public record
+to an owner-only `publication-record.json` outbox, refreshes at TTL/2, and
+retries without blocking packet or control processing. Linux netlink
+route/link/address changes trigger an immediate reconnect and republish. The
+packet path remains fail-closed before the first successful publication and
+after record expiry.
+
 Select the protected packet target explicitly when more than one peer is
 eligible:
 
@@ -110,6 +125,12 @@ sudo qlinkctl peer select <peer-id>
 Public-edge authentication tokens are loaded only from absolute owner-only
 files such as `/etc/quantumlink/secrets/rendezvous.token`; token values do not
 belong in `config.json`.
+
+`publicationTtlSeconds` defaults to `120`. `advertiseAddress` can override the
+responder bind address when a stable public NAT/proxy endpoint is required.
+Wallet seeds and signing credentials never enter `qlinkd`; public Dytallix
+enrollment and record synchronization remain an external provisioning
+boundary.
 
 ## Runtime Modes
 

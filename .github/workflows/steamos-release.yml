@@ -60,12 +60,15 @@ jobs:
       - name: SteamOS install/package smoke test
         run: |
           bash steam/steamos/tests/collect-production-evidence-test.sh
-          python3 -m py_compile steam/steamos/scripts/bridge-public-edge-evidence.py
-          bash steam/steamos/tests/bridge-public-edge-evidence-test.sh
           bash steam/steamos/tests/deck-validation-test.sh
           bash steam/steamos/tests/production-evidence-test.sh
           bash steam/steamos/tests/verify-steamos-release-test.sh
           bash steam/steamos/tests/install-steamos-test.sh
+
+      - name: Public-edge evidence bridge contract
+        run: |
+          python3 -m py_compile steam/steamos/scripts/bridge-public-edge-evidence.py
+          bash steam/steamos/tests/bridge-public-edge-evidence-test.sh
 
       - name: Compatible-Linux signed RC proof
         env:

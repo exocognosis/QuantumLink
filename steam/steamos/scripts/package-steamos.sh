@@ -133,6 +133,17 @@ cat > "$PAYLOAD_ROOT/config/config.example.json" <<'JSON'
   ],
   "rendezvousAuthTokenFile": "/etc/quantumlink/secrets/rendezvous.token",
   "relayAuthTokenFile": "/etc/quantumlink/secrets/relay.token",
+  "publicationTtlSeconds": 120,
+  "advertiseAddress": null,
+  "dytallixIdentity": {
+    "endpoint": "https://rpc.example.dytallix.invalid",
+    "contractAddress": "quantumlink-node-registry",
+    "networkId": "dytallix-mainnet",
+    "chainId": "dytallix-1",
+    "allowedRpcEndpoints": [
+      "https://rpc.example.dytallix.invalid"
+    ]
+  },
   "killSwitch": true,
   "lowLatency": true,
   "voiceChatSafe": true

@@ -68,8 +68,8 @@ rejects missing files, parent-directory traversal, private-key markers, wallet
 seed markers, entitlement-token markers, raw packet captures, and raw support
 bundle archives.
 
-When the shared public-edge live-evidence run already exists, bridge it into
-the SteamOS contract instead of copying its claims manually:
+When a shared public-edge live-evidence run already exists, bridge it into the
+SteamOS contract instead of copying its claims manually:
 
 ```sh
 python3 steam/steamos/scripts/bridge-public-edge-evidence.py \
@@ -78,14 +78,49 @@ python3 steam/steamos/scripts/bridge-public-edge-evidence.py \
   --output-root steam/steamos/validation/non-hardware/<timestamp>
 ```
 
-The bridge first runs the shared public-edge verifier, confines referenced
-files to their evidence roots, rejects secret-like content, and records source
-hashes. It can pass only the controls proven by that source: TLS,
-authentication, rate limits, revocation propagation, and relay denial.
-Signed-record expiry, abuse-log samples, retention, key rotation, endpoint
-rotation, and incident shutdown remain blocked until their own live evidence is
-provided. Omit the Dytallix root or add `--allow-blocked` only when intentionally
-creating a valid but incomplete evidence bundle.
+This command documents an operator capability; it does not establish that a
+live run exists. The bridge first runs the shared public-edge verifier,
+confines referenced files to their evidence roots, rejects secret-like content,
+and records source hashes. It can pass TLS, authentication, rate limits,
+revocation propagation, and relay denial from the verified relay runs.
+
+The bridge can additionally pass `signed_expiring_records` only when the
+public-edge manifest references
+`proofs.signedExpiringRecords.evidence`. That versioned, redacted verifier
+report must attest ML-DSA-65 verification with the same source revision and
+identity, contain record/signature/key hashes rather than raw records, prove a
+published record was returned by lookup, prove an older record was absent after
+expiry, and prove a higher-sequence replacement was published and returned
+before the prior record expired. Missing, malformed, inconsistent, stale, or
+privacy-unsafe proof leaves the control blocked or rejects the bridge.
+
+The other controls, including abuse-log samples, retention, key rotation,
+endpoint rotation, and incident shutdown, remain blocked until their own live
+evidence is provided. Omit the Dytallix root or add `--allow-blocked` only when
+intentionally creating a valid but incomplete evidence bundle.
+`--allow-blocked` is for gap analysis and must not feed production packaging.
+
+Minimum signed-record lifecycle reference:
+
+```json
+{
+  "proofs": {
+    "signedExpiringRecords": {
+      "evidence": "signed-records/lifecycle-verification.json",
+      "sha256": "<lowercase SHA-256 of the verifier report>"
+    }
+  }
+}
+```
+
+The referenced schema-v1 report uses
+`evidenceKind=quantumLinkSignedRecordLifecycleVerification`. It includes a
+`qlink-core-peer-record-verifier` section, `publication`, `expiryProbe`, and
+`refresh` observations, plus explicit booleans confirming that raw records,
+private keys, ICE credentials, and endpoint addresses were not committed.
+Every referenced path must remain inside the public-edge run root and must not
+traverse a symlink. The bridged sidecar contains only whitelisted assertions
+and the source report SHA-256.
 
 Minimum `metadata.json` shape:
 
@@ -183,9 +218,11 @@ bash steam/steamos/scripts/steamos-rc-dry-run.sh \
   --evidence-root steam/steamos/validation/non-hardware/<timestamp>
 ```
 
-The dry run must produce a valid signed package with
+With complete evidence, the dry run must produce a valid signed package with
 `nonHardwareProductionReady=true` while still leaving `productionReady=false`
-until Steam Deck evidence is linked.
+until Steam Deck evidence is linked. A fixture or incomplete bridged bundle
+instead remains structurally valid with `productionEvidenceReady=false` and
+`nonHardwareProductionReady=false`.
 
 CI runs the same positive path on compatible Linux with ephemeral Ed25519 keys
 through `steam/steamos/tests/compatible-linux-signed-rc-proof-test.sh`. That

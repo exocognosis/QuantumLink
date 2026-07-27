@@ -718,6 +718,69 @@ impl MeshConnector {
         }
     }
 
+    /// Re-runs signed peer-record and identity-registry validation without
+    /// replacing the active carrier session. Platform resident loops use this
+    /// to bound how long a revoked, suspended, stale, mismatched, or
+    /// unavailable public identity can retain packet access.
+    pub async fn revalidate_peer_trust(&self, remote_peer_id: &str) -> Result<RegistryDecision> {
+        if let Some(acl) = self.config.peer_acl.as_ref() {
+            let decision = acl.evaluate(remote_peer_id);
+            if !decision.is_allowed() {
+                return Err(QlinkError::Protocol(format!(
+                    "peer {remote_peer_id} rejected by ACL: {}",
+                    decision.reason()
+                )));
+            }
+        }
+
+        let record = match self
+            .rendezvous
+            .lookup(&self.config.mesh_id, remote_peer_id)
+            .await
+        {
+            Ok(Some(fresh)) => {
+                fresh.verify(&self.config.mesh_id)?;
+                self.peer_store.store(&self.config.mesh_id, &fresh);
+                fresh
+            }
+            Ok(None) => self
+                .peer_store
+                .load(&self.config.mesh_id, remote_peer_id)
+                .ok_or_else(|| {
+                    QlinkError::Protocol(format!(
+                        "peer {remote_peer_id} not found during trust revalidation"
+                    ))
+                })?,
+            Err(error) => match self.peer_store.load(&self.config.mesh_id, remote_peer_id) {
+                Some(cached) => cached,
+                None => return Err(error),
+            },
+        };
+        record.verify(&self.config.mesh_id)?;
+
+        let registry_record = match self.config.identity_registry_lookup.as_ref() {
+            Some(registry) => match registry.lookup(remote_peer_id).await {
+                Ok(record) => record,
+                Err(error) => match self.config.mesh_trust_policy {
+                    MeshTrustPolicy::PublicRequired => {
+                        return Err(QlinkError::Protocol(format!(
+                            "identity registry lookup failed: {error}"
+                        )));
+                    }
+                    MeshTrustPolicy::PrivatePreferred | MeshTrustPolicy::DevelopmentOptional => {
+                        None
+                    }
+                },
+            },
+            None => None,
+        };
+        verify_registry_binding(
+            &record,
+            registry_record.as_ref(),
+            self.config.mesh_trust_policy,
+        )
+    }
+
     #[cfg(not(feature = "dev-quic-carrier"))]
     pub async fn connect(&self, remote_peer_id: &str) -> Result<(MeshLink, ConnectionOutcome)> {
         let started = Instant::now();

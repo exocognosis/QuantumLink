@@ -1820,6 +1820,13 @@ impl MeshTransportHandle {
             .map(|session| session.shared.peer_trust_status())
     }
 
+    /// Revalidates the selected peer's signed rendezvous record and Dytallix
+    /// binding without replacing its active carrier. Resident platform loops
+    /// should call this on a bounded cadence for public meshes.
+    pub async fn revalidate_peer_trust(&self, remote_peer_id: &str) -> Result<RegistryDecision> {
+        self.connector.revalidate_peer_trust(remote_peer_id).await
+    }
+
     pub fn peer_metrics(&self, remote_peer_id: &str) -> Option<MeshTransportRawMetrics> {
         let peers = self.peers.lock().ok()?;
         let session = peers.get(remote_peer_id)?;

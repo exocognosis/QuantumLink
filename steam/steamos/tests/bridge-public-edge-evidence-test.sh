@@ -25,6 +25,7 @@ assert_contains() {
 
 python3 - "$TMP_ROOT" <<'PY'
 import copy
+import hashlib
 import json
 import sys
 from datetime import datetime, timezone
@@ -119,7 +120,80 @@ def write_json(path, value):
     path.write_text(json.dumps(value, separators=(",", ":"), sort_keys=True) + "\n", encoding="utf-8")
 
 
-def write_run(path, secret=False, escape=False):
+def lifecycle_proof(valid=True, raw_field=False):
+    now_unix = int(datetime.now(timezone.utc).timestamp())
+    proof = {
+        "schemaVersion": 1,
+        "evidenceKind": "quantumLinkSignedRecordLifecycleVerification",
+        "status": "pass",
+        "generatedAt": generated_at,
+        "gitSha": git_sha,
+        "rendezvousEndpointSha256": hashlib.sha256(
+            base["rendezvous"].encode("utf-8")
+        ).hexdigest(),
+        "verifier": {
+            "kind": "qlink-core-peer-record-verifier",
+            "gitSha": git_sha,
+            "cryptographicVerificationPerformed": True,
+        },
+        "publication": {
+            "recordSha256": "1" * 64,
+            "peerIdSha256": "2" * 64,
+            "meshIdSha256": "3" * 64,
+            "keyFingerprintSha256": "4" * 64,
+            "signatureSha256": "5" * 64,
+            "signatureAlgorithm": "ML-DSA-65",
+            "signatureValid": valid,
+            "peerIdBindingValid": True,
+            "meshIdBindingValid": True,
+            "sequence": 41,
+            "publishedAtUnix": now_unix - 60,
+            "expiresAtUnix": now_unix + 240,
+            "lookupAtUnix": now_unix - 59,
+            "lookupRecordSha256": "1" * 64,
+        },
+        "expiryProbe": {
+            "recordSha256": "6" * 64,
+            "peerIdSha256": "2" * 64,
+            "meshIdSha256": "3" * 64,
+            "keyFingerprintSha256": "4" * 64,
+            "signatureSha256": "7" * 64,
+            "signatureAlgorithm": "ML-DSA-65",
+            "signatureValidBeforeExpiry": True,
+            "sequence": 40,
+            "expiresAtUnix": now_unix - 180,
+            "lookupAtUnix": now_unix - 120,
+            "lookupResult": "not_found",
+        },
+        "refresh": {
+            "recordSha256": "8" * 64,
+            "peerIdSha256": "2" * 64,
+            "meshIdSha256": "3" * 64,
+            "keyFingerprintSha256": "4" * 64,
+            "signatureSha256": "9" * 64,
+            "signatureAlgorithm": "ML-DSA-65",
+            "signatureValid": True,
+            "peerIdBindingValid": True,
+            "meshIdBindingValid": True,
+            "sequence": 42,
+            "publishedAtUnix": now_unix - 10,
+            "expiresAtUnix": now_unix + 540,
+            "lookupAtUnix": now_unix - 9,
+            "lookupRecordSha256": "8" * 64,
+        },
+        "redaction": {
+            "rawRecordsCommitted": False,
+            "privateKeysCommitted": False,
+            "iceCredentialsCommitted": False,
+            "endpointAddressesCommitted": False,
+        },
+    }
+    if raw_field:
+        proof["publication"]["iceCredentials"] = {"username": "raw-user"}
+    return proof
+
+
+def write_run(path, secret=False, escape=False, lifecycle=None):
     app = copy.deepcopy(base)
     turn = copy.deepcopy(base)
     turn.update(
@@ -158,12 +232,37 @@ def write_run(path, secret=False, escape=False):
             "turnRelay": {"evidence": str(turn_path)},
         },
     }
+    if lifecycle is not None:
+        proof_path = path / "signed-records" / "lifecycle.json"
+        proof = lifecycle_proof(valid=lifecycle != "invalid", raw_field=lifecycle == "raw")
+        if lifecycle == "secret":
+            proof["operatorNotes"] = "WALLET_SEED"
+        write_json(proof_path, proof)
+        source_sha = hashlib.sha256(proof_path.read_bytes()).hexdigest()
+        evidence_path = proof_path
+        if lifecycle == "symlink":
+            evidence_path = path / "signed-records" / "lifecycle-link.json"
+            evidence_path.symlink_to(proof_path.name)
+        manifest["proofs"]["signedExpiringRecords"] = {
+            "evidence": str(evidence_path),
+            "sha256": source_sha,
+        }
     write_json(path / "manifest.json", manifest)
 
 
 write_run(root / "public")
 write_run(root / "secret", secret=True)
 write_run(root / "escape", escape=True)
+write_run(root / "signed", lifecycle="valid")
+write_run(root / "incomplete-lifecycle", lifecycle="invalid")
+write_run(root / "raw-lifecycle", lifecycle="raw")
+write_run(root / "secret-lifecycle", lifecycle="secret")
+write_run(root / "symlink-lifecycle", lifecycle="symlink")
+write_run(root / "tampered-lifecycle", lifecycle="valid")
+tampered_path = root / "tampered-lifecycle" / "signed-records" / "lifecycle.json"
+tampered = json.loads(tampered_path.read_text(encoding="utf-8"))
+tampered["publication"]["lookupAtUnix"] += 1
+write_json(tampered_path, tampered)
 
 dytallix_root = root / "dytallix"
 dytallix_cases = {}
@@ -238,6 +337,65 @@ PY
 
 bash "$VERIFIER" "$TMP_ROOT/bridged/production-evidence.json" > "$TMP_ROOT/verifier.out"
 
+python3 "$BRIDGE" \
+    --public-edge-manifest "$TMP_ROOT/signed/manifest.json" \
+    --output-root "$TMP_ROOT/signed-output" \
+    --allow-blocked > "$TMP_ROOT/signed.out"
+
+python3 - "$TMP_ROOT/signed.out" "$TMP_ROOT/signed-output/metadata.json" \
+    "$TMP_ROOT/signed-output/rendezvous-relay/signed_expiring_records.json" <<'PY'
+import json
+import sys
+
+report_path, metadata_path, control_path = sys.argv[1:]
+with open(report_path, "r", encoding="utf-8") as handle:
+    report = json.load(handle)
+assert report["valid"] is True
+assert report["productionEvidenceReady"] is False
+
+with open(metadata_path, "r", encoding="utf-8") as handle:
+    metadata = json.load(handle)
+assert metadata["rendezvousRelay"]["controls"]["signed_expiring_records"]["status"] == "pass"
+assert metadata["rendezvousRelay"]["status"] == "blocked"
+
+with open(control_path, "r", encoding="utf-8") as handle:
+    control = json.load(handle)
+assert control["status"] == "pass"
+assert len(control["source"]["signedExpiringRecordsEvidenceSha256"]) == 64
+assert control["assertions"]["verifier"]["cryptographicVerificationPerformed"] is True
+assert control["assertions"]["refresh"]["sequence"] == 42
+assert "iceCredentials" not in control["assertions"]["publication"]
+PY
+
+python3 "$BRIDGE" \
+    --public-edge-manifest "$TMP_ROOT/incomplete-lifecycle/manifest.json" \
+    --output-root "$TMP_ROOT/incomplete-lifecycle-output" \
+    --allow-blocked > "$TMP_ROOT/incomplete-lifecycle.out"
+
+python3 - "$TMP_ROOT/incomplete-lifecycle-output/metadata.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    metadata = json.load(handle)
+control = metadata["rendezvousRelay"]["controls"]["signed_expiring_records"]
+assert control["status"] == "blocked"
+PY
+
+python3 "$BRIDGE" \
+    --public-edge-manifest "$TMP_ROOT/raw-lifecycle/manifest.json" \
+    --output-root "$TMP_ROOT/raw-lifecycle-output" \
+    --allow-blocked > "$TMP_ROOT/raw-lifecycle.out"
+
+python3 - "$TMP_ROOT/raw-lifecycle-output/metadata.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    metadata = json.load(handle)
+assert metadata["rendezvousRelay"]["controls"]["signed_expiring_records"]["status"] == "blocked"
+PY
+
 if python3 "$BRIDGE" \
     --public-edge-manifest "$TMP_ROOT/public/manifest.json" \
     --output-root "$TMP_ROOT/default-blocked" > "$TMP_ROOT/default-blocked.out" 2> "$TMP_ROOT/default-blocked.err"; then
@@ -278,6 +436,30 @@ if python3 "$BRIDGE" \
     fail "expected public evidence path escape to fail"
 fi
 assert_contains "$TMP_ROOT/escape.err" "inside the public-edge run root"
+
+if python3 "$BRIDGE" \
+    --public-edge-manifest "$TMP_ROOT/secret-lifecycle/manifest.json" \
+    --output-root "$TMP_ROOT/secret-lifecycle-output" \
+    --allow-blocked > "$TMP_ROOT/secret-lifecycle.out" 2> "$TMP_ROOT/secret-lifecycle.err"; then
+    fail "expected secret-bearing signed record proof to fail"
+fi
+assert_contains "$TMP_ROOT/secret-lifecycle.err" "forbidden secret or raw-artifact marker"
+
+if python3 "$BRIDGE" \
+    --public-edge-manifest "$TMP_ROOT/symlink-lifecycle/manifest.json" \
+    --output-root "$TMP_ROOT/symlink-lifecycle-output" \
+    --allow-blocked > "$TMP_ROOT/symlink-lifecycle.out" 2> "$TMP_ROOT/symlink-lifecycle.err"; then
+    fail "expected symlinked signed record proof to fail"
+fi
+assert_contains "$TMP_ROOT/symlink-lifecycle.err" "must not be a symbolic link"
+
+if python3 "$BRIDGE" \
+    --public-edge-manifest "$TMP_ROOT/tampered-lifecycle/manifest.json" \
+    --output-root "$TMP_ROOT/tampered-lifecycle-output" \
+    --allow-blocked > "$TMP_ROOT/tampered-lifecycle.out" 2> "$TMP_ROOT/tampered-lifecycle.err"; then
+    fail "expected tampered signed record proof to fail"
+fi
+assert_contains "$TMP_ROOT/tampered-lifecycle.err" "sha256 does not match"
 
 if grep -R -n -i -E 'PRIVATE KEY|WALLET_SEED|AUTH_TOKEN|TURN_PASSWORD|\.pcap' "$TMP_ROOT/bridged"; then
     fail "bridged bundle contains a forbidden secret or raw-artifact marker"

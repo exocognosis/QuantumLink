@@ -18,10 +18,10 @@
 | Steam-safe bypass | Blocked | The `qlink-game` policy is no longer orphaned: `qlinkd` loads it into `SteamBypassSummary` at startup, validates the protected overlay CIDR against the policy, and logs the posture; `qlinkctl`'s operator guide derives its Steam-safe disclosure from the same policy so enforcement and disclosure share one source. Verified 2026-07-12 (`cargo test -p qlinkd game::`, `cargo test -p qlinkctl steam_safe_disclosure`). Local profile tests still pass (`cargo test -p qlink-game steam_bypass`). Real Deck route-leak evidence for Steam account/store/wallet/update/login categories is still required |
 | nftables rollback | Passed | Codex local automation on 2026-06-30: `cargo test -p qlink-linux network_lifecycle -- --nocapture`; fake-executor rollback and owned-record retry paths passed |
 | Private invite peer lifecycle | Passed | Invite import, explicit `peer select`, revoke, expiry, exact inbound ACL, owner-only peer storage, unambiguous targeting, and bounded resident revalidation are covered; removing, revoking, expiring, or replacing the selected peer drops the full transport |
-| Public Dytallix policy | Blocked | Shared-core status policy tests pass locally, but live public registry accept/reject evidence for missing, revoked, suspended, mismatched, stale, unavailable, and active records is not linked; sidecar schema/verifier: [`production-evidence.md`](production-evidence.md), [`../scripts/verify-production-evidence.sh`](../scripts/verify-production-evidence.sh) |
-| Rendezvous/relay production profile | Blocked | The shared public-edge manifest can now be bridged into the SteamOS sidecar with verified TLS, auth, limits, revocation, and relay-denial controls. Signed-record expiry, abuse-log samples, deployed retention, key rotation, endpoint rotation, and incident shutdown remain blocked until live evidence is supplied |
+| Public Dytallix policy | Blocked | `qlinkd` now exposes fail-closed Dytallix status and revalidates required public-peer trust on the publication cadence without owning wallet secrets. The current registry contract binds ephemeral peer-record and transport hashes, so continuous external synchronization or a versioned stable-binding contract plus live accept/reject evidence is still required |
+| Rendezvous/relay production profile | Blocked | Fixture-tested bridge logic can translate verified TLS, auth, limits, revocation, relay denial, and an explicit ML-DSA signed-record publication/expiry/refresh verifier report. No off-host public-edge run is linked; abuse-log samples, deployed retention, key rotation, endpoint rotation, and incident shutdown also remain blocked |
 | Non-root local control | Passed | Codex local automation on 2026-06-30: `cargo test -p qlinkd local_control_acl -- --nocapture`, `cargo test -p qlinkctl support_bundle -- --nocapture`, and `bash steam/steamos/tests/install-steamos-test.sh` |
-| Signed release artifacts | Blocked | Compatible Linux CI must complete the ephemeral Ed25519 signed-RC positive path and assert `productionReady=false`; production signing key/signature evidence is still absent |
+| Signed release artifacts | Blocked | Compatible Linux CI implements the ephemeral Ed25519 signed-RC positive path and asserts `productionReady=false`; no protected production-key signature evidence or linked passing production release run exists |
 | Deck validation | Blocked | Hardware runbook: [`deck-validation.md`](deck-validation.md), harness: [`../tests/deck-validation.sh`](../tests/deck-validation.sh), evidence verifier: [`../tests/verify-deck-evidence.sh`](../tests/verify-deck-evidence.sh); no real two-Deck evidence directory is linked |
 | Game compatibility | Blocked | Matrix placeholder: [`deck-validation.md`](deck-validation.md), profiles: `../config/games/factorio.toml`, `../config/games/minecraft.toml`, `../config/games/steam-remote-play.toml`; no real game-session evidence is linked |
 | Diagnostics redaction | Passed | Codex local automation on 2026-06-30: [`support-bundle-redaction.md`](support-bundle-redaction.md) plus `cargo test -p qlinkctl support_bundle -- --nocapture`; no raw bundle evidence committed |
@@ -110,15 +110,56 @@ orphaned crate.
 - Added owner-only credential-file loading for rendezvous and relay
   authentication plus pinned Dytallix lookup configuration in the SteamOS
   daemon contract.
-- Added `bridge-public-edge-evidence.py` to verify shared live public-edge
-  evidence before translating supported controls into the SteamOS evidence
-  sidecar. Unsupported controls remain explicitly blocked rather than inferred.
+- Added `bridge-public-edge-evidence.py` to verify a supplied shared public-edge
+  manifest before translating supported controls into the SteamOS evidence
+  sidecar. Only fixtures were exercised; no off-host live proof is claimed.
 - Added a compatible-Linux CI proof that creates ephemeral Ed25519 keys, builds
   and verifies a signed RC with fixture non-hardware evidence, and asserts that
   the result does not claim full production readiness.
 - Decision: No-Go remains. Production still requires complete live Dytallix and
   public-edge evidence, a protected production signing key, two-Deck packet and
   route-leak evidence, and the game compatibility matrix.
+
+## 2026-07-27 Signed Record Evidence Contract
+
+- Host class: local development host with synthetic, redacted evidence
+  fixtures; no live rendezvous endpoint or Steam Deck hardware is claimed.
+- Extended the public-edge bridge with an optional, confined
+  `signedExpiringRecords` verifier report.
+- The control passes only when the report identifies the repository-owned
+  `qlink-core` verifier, matches the public-edge revision and rendezvous
+  endpoint hash, records valid ML-DSA-65 signatures and identity bindings, and
+  proves lookup after publication, rejection after expiry, and a
+  higher-sequence pre-expiry refresh.
+- Missing or inconsistent lifecycle proof remains blocked. Secret markers,
+  escaped paths, and symlinked evidence are rejected; the generated sidecar
+  contains only whitelisted hashes, times, decisions, and verifier outcomes.
+- Focused fixture tests and workflow wiring validate the contract mechanics.
+  They do not satisfy the live rendezvous/relay gate.
+- Decision: No-Go remains unchanged.
+
+## 2026-07-27 Resident Discovery Lifecycle
+
+- Host class: local macOS development host plus an in-process shared
+  rendezvous server; the Linux netlink module was cross-checked for
+  `x86_64-unknown-linux-gnu`. No public endpoint or Deck hardware is claimed.
+- Added a non-blocking resident publication worker using the shared
+  `qlink-core` signing and rendezvous APIs.
+- Added owner-only, atomic sequence reservation and current-record outbox
+  files, TTL/2 refresh, bounded retry, initial/expired fail-closure, and
+  systemd-restart behavior after expiry.
+- Added monotonic sequence enforcement to the shared rendezvous store so equal
+  and lower live replacements are rejected across every platform.
+- Added Linux route/link/address monitoring that triggers shared transport
+  reconnection and immediate republication.
+- Added backward-compatible daemon status plus `qlinkctl` status, doctor, and
+  onboarding output for publication and Dytallix trust health.
+- Added bounded shared-core peer trust revalidation for public identities.
+- Local tests prove a live initial publication and higher-sequence TTL refresh.
+- Decision: private-mesh discovery lifecycle code is closed locally. Public
+  production remains blocked on the Dytallix stable-binding/synchronizer
+  decision, live public-edge evidence, protected production signing, and Deck
+  validation.
 
 ## Go / No-Go Rule
 

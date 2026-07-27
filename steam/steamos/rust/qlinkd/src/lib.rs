@@ -2,6 +2,7 @@ pub mod data_plane;
 pub mod game;
 pub mod identity;
 pub mod mesh_runtime;
+pub mod publication;
 
 use data_plane::{packet_core_from_parts, BoxedTunDevice, DataPlaneError, DataPlaneRuntime};
 use game::SteamBypassSummary;
@@ -10,14 +11,15 @@ use qlink_core::dytallix_identity::{
 };
 use qlink_core::packet_core::{FfiRouteMode, PacketTunnelCore};
 use qlink_linux::{
-    LinuxNetworkPlan, LinuxRuntimePlan, NetworkApplyError, NetworkExecutor, NetworkOperation,
-    NetworkPlanError, NftablesExecutor, NftablesOperation, NftablesPlan, TunDeviceConfig,
-    TunPacketIo,
+    LinuxNetworkPlan, LinuxRuntimePlan, NetworkApplyError, NetworkChangeMonitor, NetworkExecutor,
+    NetworkOperation, NetworkPlanError, NftablesExecutor, NftablesOperation, NftablesPlan,
+    TunDeviceConfig, TunPacketIo,
 };
 use qlink_proto::{
     load_peer_store_at, peer_store_path_from_state_dir, store_peer_store_at, ConnectionPhase,
-    DaemonConfig, DaemonStatus, DataPlaneState, DataPlaneStatus, InviteCode, MeshTrustMode,
-    NetworkPlanState, NetworkStatus, PeerStatus, PeerStore, RouteMode, StoredPeer,
+    DaemonConfig, DaemonStatus, DataPlaneState, DataPlaneStatus, DytallixTrustStatus, InviteCode,
+    MeshTrustMode, NetworkPlanState, NetworkStatus, PeerStatus, PeerStore, PublicationErrorCode,
+    PublicationErrorStatus, PublicationState, PublicationStatus, RouteMode, StoredPeer,
 };
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
@@ -40,6 +42,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use identity::load_or_generate_device_identity;
 #[cfg(unix)]
 use mesh_runtime::{build_daemon_mesh_transport, DaemonMeshTransport};
+#[cfg(unix)]
+use publication::PublicationPhase;
 
 #[cfg(unix)]
 const MAX_CONTROL_REQUEST_BYTES: usize = 1024;
@@ -513,6 +517,7 @@ pub struct DaemonRuntimeState {
     pub kill_switch: bool,
     pub network: NetworkRuntimeState,
     pub data_plane: DataPlaneStatus,
+    pub publication: PublicationStatus,
 }
 
 impl DaemonRuntimeState {
@@ -524,6 +529,7 @@ impl DaemonRuntimeState {
             kill_switch,
             network: NetworkRuntimeState::NotStarted,
             data_plane: DataPlaneStatus::not_started(),
+            publication: PublicationStatus::default(),
         }
     }
 
@@ -535,6 +541,7 @@ impl DaemonRuntimeState {
             kill_switch: self.kill_switch,
             network: self.network.status(ownership_record_present),
             data_plane: self.data_plane.clone(),
+            publication: self.publication.clone(),
         }
     }
 }
@@ -570,6 +577,7 @@ impl DaemonEngine {
             kill_switch: config.kill_switch,
             network: NetworkRuntimeState::planned(&config, &plan),
             data_plane: DataPlaneStatus::not_started(),
+            publication: PublicationStatus::default(),
         };
         let steam_bypass = SteamBypassSummary::load(&paths.config_dir(), &config);
         Ok(Self {
@@ -613,6 +621,11 @@ impl DaemonEngine {
     /// `true` once packet I/O has been started (network activated + TUN open).
     pub fn data_plane_active(&self) -> bool {
         self.data_plane.is_some()
+    }
+
+    #[cfg(unix)]
+    fn set_publication_snapshot(&mut self, snapshot: publication::PublicationSnapshot) {
+        self.runtime.publication = publication_status(snapshot);
     }
 
     pub fn mark_preparing(&mut self) {
@@ -1238,7 +1251,46 @@ pub fn serve_resident_loop(
     let mut buffer = vec![0_u8; DATA_PLANE_MTU];
     let mut result = Ok(());
     let mut next_peer_check = Instant::now() + TRUSTED_PEER_RECHECK_INTERVAL;
+    let mut network_monitor = NetworkChangeMonitor::open().ok();
     while !shutdown.load(Ordering::SeqCst) {
+        let network_changed = match network_monitor.as_mut() {
+            Some(monitor) => match monitor.poll_changed() {
+                Ok(changed) => changed,
+                Err(error) => {
+                    eprintln!("qlinkd network change monitor disabled after error: {error}");
+                    network_monitor = None;
+                    false
+                }
+            },
+            None => false,
+        };
+        if network_changed {
+            if let Some(transport) = transport.as_ref() {
+                transport.handle_network_change();
+            }
+        }
+        if let Some(snapshot) = transport
+            .as_ref()
+            .and_then(|transport| transport.publication_snapshot(current_unix_seconds()))
+        {
+            engine.set_publication_snapshot(snapshot);
+        }
+        let publication_terminal = transport.as_ref().is_some_and(|transport| {
+            transport
+                .publication_snapshot(current_unix_seconds())
+                .is_some_and(|snapshot| {
+                    matches!(
+                        snapshot.phase,
+                        PublicationPhase::Expired | PublicationPhase::Stopped
+                    )
+                })
+        });
+        if publication_terminal {
+            result = Err(std::io::Error::other(
+                "signed peer-record publication stopped or expired; restarting resident transport",
+            ));
+            break;
+        }
         if Instant::now() >= next_peer_check {
             let peer_error = transport.as_ref().and_then(|transport| {
                 transport
@@ -1267,6 +1319,56 @@ pub fn serve_resident_loop(
         transport.shutdown();
     }
     result
+}
+
+#[cfg(unix)]
+fn publication_status(snapshot: publication::PublicationSnapshot) -> PublicationStatus {
+    let state = match snapshot.phase {
+        PublicationPhase::NotStarted => PublicationState::NotStarted,
+        PublicationPhase::Published => PublicationState::Active,
+        PublicationPhase::Degraded => PublicationState::Degraded,
+        PublicationPhase::Expired => PublicationState::Expired,
+        PublicationPhase::Stopped => PublicationState::Failed,
+    };
+    let last_error = snapshot.last_error.as_deref().map(|error| {
+        let lower = error.to_ascii_lowercase();
+        let code = if state == PublicationState::Expired {
+            PublicationErrorCode::Expired
+        } else if lower.contains("authentication") {
+            PublicationErrorCode::AuthenticationFailed
+        } else if lower.contains("dytallix") || lower.contains("registry") {
+            PublicationErrorCode::TrustUnavailable
+        } else if lower.contains("verification") || lower.contains("sequence") {
+            PublicationErrorCode::InvalidResponse
+        } else if lower.contains("rendezvous")
+            || lower.contains("transport")
+            || lower.contains("timed out")
+        {
+            PublicationErrorCode::Transport
+        } else {
+            PublicationErrorCode::Internal
+        };
+        PublicationErrorStatus {
+            code,
+            retryable: !matches!(
+                code,
+                PublicationErrorCode::InvalidResponse | PublicationErrorCode::Expired
+            ),
+        }
+    });
+    PublicationStatus {
+        state,
+        sequence: snapshot.sequence,
+        expires_at_unix: snapshot.expires_at_unix,
+        last_success_at_unix: snapshot.last_success_at_unix,
+        last_attempt_at_unix: snapshot.last_attempt_at_unix,
+        last_error,
+        dytallix: DytallixTrustStatus {
+            required: snapshot.dytallix_required,
+            decision: snapshot.dytallix_decision,
+            health: snapshot.dytallix_health,
+        },
+    }
 }
 
 /// Builds the live mesh transport for the resident data plane. Returns `None`
@@ -1459,6 +1561,63 @@ mod tests {
         assert_eq!(runtime.phase, ConnectionPhase::Idle);
         assert_eq!(runtime.network, NetworkRuntimeState::NotStarted);
         assert!(runtime.peers.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publication_status_is_structured_and_redacted() {
+        let status = publication_status(publication::PublicationSnapshot {
+            phase: PublicationPhase::Degraded,
+            sequence: Some(7),
+            expires_at_unix: Some(2_000),
+            last_attempt_at_unix: Some(1_100),
+            last_success_at_unix: Some(1_000),
+            last_error: Some(
+                "Dytallix registry lookup failed for https://secret.invalid?token=sensitive"
+                    .to_string(),
+            ),
+            dytallix_required: true,
+            dytallix_decision: qlink_proto::DytallixTrustDecision::NotChecked,
+            dytallix_health: qlink_proto::DytallixTrustHealth::Unavailable,
+        });
+
+        assert_eq!(status.state, PublicationState::Degraded);
+        assert_eq!(status.sequence, Some(7));
+        assert_eq!(
+            status.last_error,
+            Some(PublicationErrorStatus {
+                code: PublicationErrorCode::TrustUnavailable,
+                retryable: true,
+            })
+        );
+        let encoded = serde_json::to_string(&status).unwrap();
+        assert!(!encoded.contains("secret.invalid"));
+        assert!(!encoded.contains("sensitive"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expired_publication_status_is_non_retryable() {
+        let status = publication_status(publication::PublicationSnapshot {
+            phase: PublicationPhase::Expired,
+            sequence: Some(8),
+            expires_at_unix: Some(2_000),
+            last_attempt_at_unix: Some(2_001),
+            last_success_at_unix: Some(1_900),
+            last_error: Some("rendezvous timed out".to_string()),
+            dytallix_required: false,
+            dytallix_decision: qlink_proto::DytallixTrustDecision::NotChecked,
+            dytallix_health: qlink_proto::DytallixTrustHealth::Unknown,
+        });
+
+        assert_eq!(status.state, PublicationState::Expired);
+        assert_eq!(
+            status.last_error,
+            Some(PublicationErrorStatus {
+                code: PublicationErrorCode::Expired,
+                retryable: false,
+            })
+        );
     }
 
     #[test]

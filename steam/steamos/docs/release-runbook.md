@@ -30,6 +30,13 @@ The archive payload includes:
 - `config/games/*.toml`
 - SteamOS readiness and release docs when present
 
+Before activating a packaged resident daemon, review
+`config/config.example.json` and set `publicationTtlSeconds`,
+`advertiseAddress`, and pinned `dytallixIdentity` values for the deployment.
+The daemon creates owner-only publication sequence and current-record files
+under `/var/lib/quantumlink`; it must never receive a Dytallix wallet seed or
+wallet signing credential.
+
 To package prebuilt binaries:
 
 ```sh
@@ -75,8 +82,14 @@ python3 steam/steamos/scripts/bridge-public-edge-evidence.py \
   --output-root steam/steamos/validation/non-hardware/<timestamp>
 ```
 
-The bridge fails closed unless the resulting evidence is ready. Use
-`--allow-blocked` only to retain an incomplete bundle for gap analysis.
+The bridge fails closed unless the resulting evidence is ready. A
+`signed_expiring_records` pass additionally requires the public-edge manifest
+to reference a redacted `qlink-core` lifecycle-verifier report proving signed
+publication lookup, rejection after expiry, and higher-sequence refresh before
+expiry. Missing or incomplete proof remains blocked. Use `--allow-blocked`
+only to retain an incomplete bundle for gap analysis; never use that output as
+production packaging input. The command is a capability, not evidence that a
+live run has occurred.
 
 The verifier validates production signatures with:
 
@@ -101,9 +114,12 @@ bash steam/steamos/scripts/steamos-rc-dry-run.sh \
   --evidence-root steam/steamos/validation/non-hardware/<timestamp>
 ```
 
-Expected RC dry-run result: `valid=true`, `signatureValidated=true`,
+With complete live non-hardware evidence, the expected RC dry-run result is
+`valid=true`, `signatureValidated=true`,
 `nonHardwareProductionEvidenceValidated=true`,
-`nonHardwareProductionReady=true`, and `productionReady=false`.
+`nonHardwareProductionReady=true`, and `productionReady=false`. Fixture or
+incomplete bridged evidence must instead leave
+`nonHardwareProductionReady=false`.
 
 The release workflow exercises this path on compatible Linux with ephemeral
 Ed25519 keys. It proves the positive signing and verification path while
