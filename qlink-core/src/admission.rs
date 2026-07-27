@@ -1,8 +1,10 @@
 use crate::{error::QlinkError, Result};
+use shake::{ExtendableOutput, Shake256, Update, XofReader};
 use std::{
     collections::HashMap,
     fmt,
     net::{IpAddr, SocketAddr},
+    path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
@@ -19,7 +21,8 @@ pub const DEFAULT_RELAY_PEER_DATAGRAM_WINDOW_SECONDS: u64 = 60;
 
 #[derive(Clone)]
 pub struct ServiceAdmissionConfig {
-    auth_token: Option<String>,
+    auth_token: Option<ServiceAuthToken>,
+    revoked_token_digest_file: Option<PathBuf>,
     rate_limit: Option<RateLimitConfig>,
 }
 
@@ -27,12 +30,23 @@ impl ServiceAdmissionConfig {
     pub fn open() -> Self {
         Self {
             auth_token: None,
+            revoked_token_digest_file: None,
             rate_limit: None,
         }
     }
 
     pub fn with_auth_token(mut self, token: impl Into<String>) -> Self {
-        self.auth_token = Some(token.into());
+        self.auth_token = Some(ServiceAuthToken::Static(token.into()));
+        self
+    }
+
+    pub fn with_auth_token_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.auth_token = Some(ServiceAuthToken::File(path.into()));
+        self
+    }
+
+    pub fn with_revoked_token_digest_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.revoked_token_digest_file = Some(path.into());
         self
     }
 
@@ -47,19 +61,67 @@ impl ServiceAdmissionConfig {
         self.auth_token.is_some()
     }
 
+    pub fn revoked_token_digest_file_configured(&self) -> bool {
+        self.revoked_token_digest_file.is_some()
+    }
+
     pub fn rate_limit(&self) -> Option<RateLimitConfig> {
         self.rate_limit
     }
 
     pub fn require_token(&self, provided: Option<&str>, service: &str) -> Result<()> {
-        let Some(expected) = self.auth_token.as_deref() else {
+        let Some(expected) = self.expected_token()? else {
             return Ok(());
         };
         match provided {
-            Some(token) if token_matches(expected, token) => Ok(()),
+            Some(token) if token_matches(&expected, token) => Ok(()),
             _ => Err(QlinkError::Protocol(format!(
                 "{service} authentication failed"
             ))),
+        }
+    }
+
+    pub fn token_is_revoked(&self, provided: Option<&str>) -> Result<bool> {
+        let Some(token) = provided else {
+            return Ok(false);
+        };
+        self.token_digest_is_revoked(Some(&service_token_revocation_digest(token)))
+    }
+
+    pub fn token_digest_is_revoked(&self, digest: Option<&str>) -> Result<bool> {
+        let Some(digest) = digest else {
+            return Ok(false);
+        };
+        let Some(path) = &self.revoked_token_digest_file else {
+            return Ok(false);
+        };
+        let revoked = std::fs::read_to_string(path).map_err(|err| {
+            QlinkError::Protocol(format!(
+                "service token revocation list is unavailable: {}",
+                redact_path(path, err)
+            ))
+        })?;
+        Ok(revoked.lines().any(|line| {
+            let line = line.split('#').next().unwrap_or("").trim();
+            !line.is_empty() && token_matches(line, digest)
+        }))
+    }
+
+    fn expected_token(&self) -> Result<Option<String>> {
+        match &self.auth_token {
+            Some(ServiceAuthToken::Static(token)) => Ok(Some(token.clone())),
+            Some(ServiceAuthToken::File(path)) => {
+                let token = std::fs::read_to_string(path).map_err(|err| {
+                    QlinkError::Protocol(format!(
+                        "service auth token file is unavailable: {}",
+                        redact_path(path, err)
+                    ))
+                })?;
+                let token = trim_secret_file(&token);
+                validate_service_auth_token(token)?;
+                Ok(Some(token.to_string()))
+            }
+            None => Ok(None),
         }
     }
 }
@@ -74,9 +136,19 @@ impl fmt::Debug for ServiceAdmissionConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ServiceAdmissionConfig")
             .field("auth_token_configured", &self.auth_token_configured())
+            .field(
+                "revoked_token_digest_file_configured",
+                &self.revoked_token_digest_file_configured(),
+            )
             .field("rate_limit", &self.rate_limit)
             .finish()
     }
+}
+
+#[derive(Clone)]
+enum ServiceAuthToken {
+    Static(String),
+    File(PathBuf),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -269,6 +341,44 @@ fn token_matches(expected: &str, provided: &str) -> bool {
     diff == 0
 }
 
+pub fn validate_service_auth_token(token: &str) -> Result<()> {
+    let token = token.trim();
+    if token.is_empty() {
+        return Err(QlinkError::Protocol(
+            "service auth token must not be empty".into(),
+        ));
+    }
+    if token.starts_with("replace-with-") {
+        return Err(QlinkError::Protocol(
+            "service auth token still contains a public-edge template placeholder".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub fn trim_secret_file(secret: &str) -> &str {
+    secret.trim_matches(|ch| ch == '\n' || ch == '\r')
+}
+
+pub fn service_token_revocation_digest(token: &str) -> String {
+    let mut hasher = Shake256::default();
+    hasher.update(b"QuantumLink service token revocation digest v1");
+    hasher.update(&(token.len() as u64).to_be_bytes());
+    hasher.update(token.as_bytes());
+    let mut reader = hasher.finalize_xof();
+    let mut digest = [0_u8; 32];
+    reader.read(&mut digest);
+    format!("shake256:{}", hex::encode(digest))
+}
+
+fn redact_path(path: &Path, err: std::io::Error) -> String {
+    let display = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("<token-file>");
+    format!("{display}: {err}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,10 +390,14 @@ mod tests {
 
     #[test]
     fn admission_config_redacts_token_in_debug() {
-        let config = ServiceAdmissionConfig::open().with_auth_token("secret-token");
+        let config = ServiceAdmissionConfig::open()
+            .with_auth_token("secret-token")
+            .with_revoked_token_digest_file("/tmp/revoked-token-digests");
         let debug = format!("{config:?}");
         assert!(debug.contains("auth_token_configured"));
+        assert!(debug.contains("revoked_token_digest_file_configured"));
         assert!(!debug.contains("secret-token"));
+        assert!(!debug.contains("/tmp/revoked-token-digests"));
     }
 
     #[test]
@@ -292,6 +406,28 @@ mod tests {
         assert!(config.require_token(Some("shared"), "rendezvous").is_ok());
         assert!(config.require_token(Some("wrong"), "rendezvous").is_err());
         assert!(config.require_token(None, "rendezvous").is_err());
+    }
+
+    #[test]
+    fn token_file_auth_reloads_and_rejects_revoked_digests() {
+        let dir = tempfile::tempdir().unwrap();
+        let token_path = dir.path().join("service-token");
+        let revoked_path = dir.path().join("revoked-service-token-digests");
+        std::fs::write(&token_path, "first-token\n").unwrap();
+        std::fs::write(&revoked_path, "").unwrap();
+        let config = ServiceAdmissionConfig::open()
+            .with_auth_token_file(&token_path)
+            .with_revoked_token_digest_file(&revoked_path);
+
+        assert!(config.require_token(Some("first-token"), "relay").is_ok());
+        std::fs::write(&token_path, "second-token\n").unwrap();
+        assert!(config.require_token(Some("first-token"), "relay").is_err());
+        assert!(config.require_token(Some("second-token"), "relay").is_ok());
+
+        let digest = service_token_revocation_digest("second-token");
+        std::fs::write(&revoked_path, format!("# old token\n{digest}\n")).unwrap();
+        assert!(config.token_is_revoked(Some("second-token")).unwrap());
+        assert!(!config.token_is_revoked(Some("first-token")).unwrap());
     }
 
     #[tokio::test]

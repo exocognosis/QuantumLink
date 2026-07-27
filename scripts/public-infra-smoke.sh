@@ -34,6 +34,8 @@ TURN_REALM="${QLINK_TURN_REALM:-}"
 TURN_PERMIT_PEER_IP="${QLINK_TURN_PERMIT_PEER_IP:-}"
 RENDEZVOUS_AUTH_TOKEN="${QLINK_RENDEZVOUS_AUTH_TOKEN:-}"
 RELAY_AUTH_TOKEN="${QLINK_RELAY_AUTH_TOKEN:-}"
+RENDEZVOUS_REVOKED_AUTH_TOKEN_DIGEST_FILE="${QLINK_RENDEZVOUS_REVOKED_AUTH_TOKEN_DIGEST_FILE:-${QLINK_REVOKED_SERVICE_TOKEN_DIGESTS:-}}"
+RELAY_REVOKED_AUTH_TOKEN_DIGEST_FILE="${QLINK_RELAY_REVOKED_AUTH_TOKEN_DIGEST_FILE:-${QLINK_REVOKED_SERVICE_TOKEN_DIGESTS:-}}"
 RENDEZVOUS_RATE_LIMIT_PER_WINDOW="${QLINK_RENDEZVOUS_RATE_LIMIT_PER_WINDOW:-0}"
 RELAY_RATE_LIMIT_PER_WINDOW="${QLINK_RELAY_RATE_LIMIT_PER_WINDOW:-0}"
 ADMISSION_RATE_LIMIT_WINDOW_SECONDS="${QLINK_ADMISSION_RATE_LIMIT_WINDOW_SECONDS:-60}"
@@ -63,6 +65,13 @@ DIRECT_PROBE_TIMEOUT_MS="${QLINK_PUBLIC_INFRA_DIRECT_PROBE_TIMEOUT_MS:-300}"
 COUNT="${QLINK_PUBLIC_INFRA_COUNT:-3}"
 INTERVAL_MS="${QLINK_PUBLIC_INFRA_INTERVAL_MS:-10}"
 RUN_DIR="${QLINK_PUBLIC_INFRA_RUN_DIR:-}"
+INCIDENT_ROLLBACK_VERIFIED="${QLINK_INCIDENT_ROLLBACK_VERIFIED:-false}"
+INCIDENT_ID="${QLINK_INCIDENT_ID:-}"
+ROLLBACK_FROM_RELEASE_ID="${QLINK_ROLLBACK_FROM_RELEASE_ID:-}"
+ROLLBACK_TO_RELEASE_ID="${QLINK_ROLLBACK_TO_RELEASE_ID:-}"
+ROLLBACK_MANIFEST_SHA256="${QLINK_ROLLBACK_MANIFEST_SHA256:-}"
+ROLLBACK_DURATION_SECONDS="${QLINK_ROLLBACK_DURATION_SECONDS:-0}"
+POST_ROLLBACK_PUBLIC_INFRA_READY="${QLINK_POST_ROLLBACK_PUBLIC_INFRA_READY:-false}"
 
 usage() {
   grep '^#' "$0" | sed 's/^# \{0,1\}//'
@@ -82,6 +91,8 @@ while [[ $# -gt 0 ]]; do
     --turn-permit-peer-ip) TURN_PERMIT_PEER_IP="$2"; shift 2 ;;
     --rendezvous-auth-token) RENDEZVOUS_AUTH_TOKEN="$2"; shift 2 ;;
     --relay-auth-token) RELAY_AUTH_TOKEN="$2"; shift 2 ;;
+    --rendezvous-revoked-auth-token-digest-file) RENDEZVOUS_REVOKED_AUTH_TOKEN_DIGEST_FILE="$2"; shift 2 ;;
+    --relay-revoked-auth-token-digest-file) RELAY_REVOKED_AUTH_TOKEN_DIGEST_FILE="$2"; shift 2 ;;
     --admission-token)
       RENDEZVOUS_AUTH_TOKEN="$2"
       RELAY_AUTH_TOKEN="$2"
@@ -257,6 +268,29 @@ bool_for_nonempty() {
   fi
 }
 
+bool_json() {
+  case "$1" in
+    true|false) echo "$1" ;;
+    *) die "boolean evidence value must be true or false: $1" ;;
+  esac
+}
+
+file_sha256() {
+  local path="$1"
+  if [[ -z "$path" || ! -f "$path" ]]; then
+    echo ""
+    return 0
+  fi
+  shasum -a 256 "$path" | awk '{print $1}'
+}
+
+service_token_digest_for_file() {
+  local path="$1"
+  "$BIN" service-token-digest --auth-token-file "$path" \
+    | sed -n 's/^service_token_digest=//p' \
+    | tail -1
+}
+
 scrape_metrics() {
   local addr="$1"
   local out="$2"
@@ -364,6 +398,14 @@ if [[ "$MODE" == "local" ]]; then
     rendezvous_auth_token_file="$RUN_DIR/rendezvous-auth-token"
     write_secret_file "$rendezvous_auth_token_file" "$RENDEZVOUS_AUTH_TOKEN"
     rendezvous_args+=(--auth-token-file "$rendezvous_auth_token_file")
+    if [[ -z "$RENDEZVOUS_REVOKED_AUTH_TOKEN_DIGEST_FILE" ]]; then
+      RENDEZVOUS_REVOKED_AUTH_TOKEN_DIGEST_FILE="$RUN_DIR/rendezvous-revoked-auth-token-digests"
+    fi
+    : > "$RENDEZVOUS_REVOKED_AUTH_TOKEN_DIGEST_FILE"
+    chmod 600 "$RENDEZVOUS_REVOKED_AUTH_TOKEN_DIGEST_FILE"
+  fi
+  if [[ -n "$RENDEZVOUS_REVOKED_AUTH_TOKEN_DIGEST_FILE" ]]; then
+    rendezvous_args+=(--revoked-auth-token-digest-file "$RENDEZVOUS_REVOKED_AUTH_TOKEN_DIGEST_FILE")
   fi
   if endpoint_is_tls "$RENDEZVOUS"; then
     [[ -n "$CONTROL_TLS_CERT" && -n "$CONTROL_TLS_KEY" ]] \
@@ -398,6 +440,14 @@ if [[ "$MODE" == "local" ]]; then
     relay_auth_token_file="$RUN_DIR/relay-auth-token"
     write_secret_file "$relay_auth_token_file" "$RELAY_AUTH_TOKEN"
     relay_args+=(--auth-token-file "$relay_auth_token_file")
+    if [[ -z "$RELAY_REVOKED_AUTH_TOKEN_DIGEST_FILE" ]]; then
+      RELAY_REVOKED_AUTH_TOKEN_DIGEST_FILE="$RUN_DIR/relay-revoked-auth-token-digests"
+    fi
+    : > "$RELAY_REVOKED_AUTH_TOKEN_DIGEST_FILE"
+    chmod 600 "$RELAY_REVOKED_AUTH_TOKEN_DIGEST_FILE"
+  fi
+  if [[ -n "$RELAY_REVOKED_AUTH_TOKEN_DIGEST_FILE" ]]; then
+    relay_args+=(--revoked-auth-token-digest-file "$RELAY_REVOKED_AUTH_TOKEN_DIGEST_FILE")
   fi
   if endpoint_is_tls "$RELAY"; then
     [[ -n "$CONTROL_TLS_CERT" && -n "$CONTROL_TLS_KEY" ]] \
@@ -485,6 +535,74 @@ if [[ -n "$RELAY_AUTH_TOKEN" ]]; then
   grep -q '^relay_registration_accepted=true$' "$RUN_DIR/relay-admission.log" \
     || die "relay authenticated admission probe did not register"
   relay_auth_verified=true
+fi
+
+revoked_token_digest_file_configured=false
+service_token_revocation_verified="${QLINK_SERVICE_TOKEN_REVOCATION_VERIFIED:-false}"
+rendezvous_revoked_token_rejected="${QLINK_RENDEZVOUS_REVOKED_TOKEN_REJECTED:-false}"
+relay_revoked_token_rejected="${QLINK_RELAY_REVOKED_TOKEN_REJECTED:-false}"
+rendezvous_replacement_token_accepted="${QLINK_RENDEZVOUS_REPLACEMENT_TOKEN_ACCEPTED:-false}"
+relay_replacement_token_accepted="${QLINK_RELAY_REPLACEMENT_TOKEN_ACCEPTED:-false}"
+if [[ -n "$RENDEZVOUS_REVOKED_AUTH_TOKEN_DIGEST_FILE" && -n "$RELAY_REVOKED_AUTH_TOKEN_DIGEST_FILE" ]]; then
+  revoked_token_digest_file_configured=true
+fi
+if [[ "$MODE" == "local" && -n "$RENDEZVOUS_AUTH_TOKEN" && -n "$RELAY_AUTH_TOKEN" \
+  && -n "${rendezvous_auth_token_file:-}" && -n "${relay_auth_token_file:-}" \
+  && -n "$RENDEZVOUS_REVOKED_AUTH_TOKEN_DIGEST_FILE" && -n "$RELAY_REVOKED_AUTH_TOKEN_DIGEST_FILE" ]]; then
+  log "proving service-token revocation and rollback rotation"
+
+  old_rendezvous_token="$RENDEZVOUS_AUTH_TOKEN"
+  old_relay_token="$RELAY_AUTH_TOKEN"
+  rendezvous_digest="$(service_token_digest_for_file "$rendezvous_auth_token_file")"
+  relay_digest="$(service_token_digest_for_file "$relay_auth_token_file")"
+  printf '%s # local revocation drill\n' "$rendezvous_digest" >> "$RENDEZVOUS_REVOKED_AUTH_TOKEN_DIGEST_FILE"
+  printf '%s # local revocation drill\n' "$relay_digest" >> "$RELAY_REVOKED_AUTH_TOKEN_DIGEST_FILE"
+
+  revoked_rendezvous_args=(rendezvous-smoke --server "$RENDEZVOUS" --auth-token "$old_rendezvous_token")
+  if [[ -n "$CONTROL_TLS_CA" ]]; then
+    revoked_rendezvous_args+=(--control-tls-ca "$CONTROL_TLS_CA")
+  fi
+  if "$BIN" "${revoked_rendezvous_args[@]}" > "$RUN_DIR/rendezvous-revoked-auth.log" 2>&1; then
+    die "rendezvous accepted a revoked service token"
+  fi
+  grep -qi 'authentication failed' "$RUN_DIR/rendezvous-revoked-auth.log" \
+    || die "rendezvous revoked-token probe failed for an unexpected reason"
+  rendezvous_revoked_token_rejected=true
+
+  revoked_relay_args=(relay-admission-smoke --server "$RELAY" --peer-id qlink-revoked-probe --auth-token "$old_relay_token")
+  if [[ -n "$CONTROL_TLS_CA" ]]; then
+    revoked_relay_args+=(--control-tls-ca "$CONTROL_TLS_CA")
+  fi
+  if "$BIN" "${revoked_relay_args[@]}" > "$RUN_DIR/relay-revoked-auth.log" 2>&1; then
+    die "relay accepted a revoked service token"
+  fi
+  grep -qi 'authentication failed' "$RUN_DIR/relay-revoked-auth.log" \
+    || die "relay revoked-token probe failed for an unexpected reason"
+  relay_revoked_token_rejected=true
+
+  RENDEZVOUS_AUTH_TOKEN="rotated-rendezvous-service-token"
+  RELAY_AUTH_TOKEN="rotated-relay-service-token"
+  write_secret_file "$rendezvous_auth_token_file" "$RENDEZVOUS_AUTH_TOKEN"
+  write_secret_file "$relay_auth_token_file" "$RELAY_AUTH_TOKEN"
+
+  rotated_rendezvous_args=(rendezvous-smoke --server "$RENDEZVOUS" --auth-token "$RENDEZVOUS_AUTH_TOKEN")
+  if [[ -n "$CONTROL_TLS_CA" ]]; then
+    rotated_rendezvous_args+=(--control-tls-ca "$CONTROL_TLS_CA")
+  fi
+  "$BIN" "${rotated_rendezvous_args[@]}" > "$RUN_DIR/rendezvous-rotated-auth.log" 2>&1
+  grep -q '^record_verified=true$' "$RUN_DIR/rendezvous-rotated-auth.log" \
+    || die "rendezvous replacement-token probe did not verify the published record"
+  rendezvous_replacement_token_accepted=true
+
+  rotated_relay_args=(relay-admission-smoke --server "$RELAY" --peer-id qlink-rotated-probe --auth-token "$RELAY_AUTH_TOKEN")
+  if [[ -n "$CONTROL_TLS_CA" ]]; then
+    rotated_relay_args+=(--control-tls-ca "$CONTROL_TLS_CA")
+  fi
+  "$BIN" "${rotated_relay_args[@]}" > "$RUN_DIR/relay-rotated-auth.log" 2>&1
+  grep -q '^relay_registration_accepted=true$' "$RUN_DIR/relay-rotated-auth.log" \
+    || die "relay replacement-token probe did not register"
+  relay_replacement_token_accepted=true
+  service_token_revocation_verified=true
 fi
 
 bounds_verified=false
@@ -665,6 +783,8 @@ rendezvous_metrics_scraped=false
 relay_metrics_scraped=false
 rendezvous_auth_failures_total=0
 relay_auth_failures_total=0
+rendezvous_auth_revocations_total=0
+relay_auth_revocations_total=0
 rendezvous_requests_succeeded_total=0
 relay_forwarded_datagrams_total=0
 relay_unknown_destination_drops_total=0
@@ -679,6 +799,7 @@ if [[ -n "$RENDEZVOUS_METRICS_ADDR" ]]; then
     || die "failed to scrape rendezvous metrics at $RENDEZVOUS_METRICS_ADDR"
   rendezvous_metrics_scraped=true
   rendezvous_auth_failures_total="$(metric_value "$RUN_DIR/rendezvous.metrics" quantumlink_rendezvous_auth_failures_total)"
+  rendezvous_auth_revocations_total="$(metric_value "$RUN_DIR/rendezvous.metrics" quantumlink_rendezvous_auth_revocations_total)"
   rendezvous_requests_succeeded_total="$(metric_value "$RUN_DIR/rendezvous.metrics" quantumlink_rendezvous_requests_succeeded_total)"
   rendezvous_request_too_large_total="$(metric_value "$RUN_DIR/rendezvous.metrics" quantumlink_rendezvous_request_too_large_total)"
   if [[ -n "$RENDEZVOUS_AUTH_TOKEN" && "$rendezvous_auth_failures_total" -lt 1 ]]; then
@@ -694,6 +815,7 @@ if [[ -n "$RELAY_METRICS_ADDR" ]]; then
     || die "failed to scrape relay metrics at $RELAY_METRICS_ADDR"
   relay_metrics_scraped=true
   relay_auth_failures_total="$(metric_value "$RUN_DIR/relay.metrics" quantumlink_relay_auth_failures_total)"
+  relay_auth_revocations_total="$(metric_value "$RUN_DIR/relay.metrics" quantumlink_relay_auth_revocations_total)"
   relay_forwarded_datagrams_total="$(metric_value "$RUN_DIR/relay.metrics" quantumlink_relay_forwarded_datagrams_total)"
   relay_unknown_destination_drops_total="$(metric_value "$RUN_DIR/relay.metrics" quantumlink_relay_unknown_destination_drops_total)"
   relay_request_too_large_total="$(metric_value "$RUN_DIR/relay.metrics" quantumlink_relay_request_too_large_total)"
@@ -717,6 +839,9 @@ if [[ -n "$RELAY_METRICS_ADDR" ]]; then
   fi
 fi
 
+rendezvous_revocation_list_sha256="$(file_sha256 "$RENDEZVOUS_REVOKED_AUTH_TOKEN_DIGEST_FILE")"
+relay_revocation_list_sha256="$(file_sha256 "$RELAY_REVOKED_AUTH_TOKEN_DIGEST_FILE")"
+revocation_list_sha256="${rendezvous_revocation_list_sha256}:${relay_revocation_list_sha256}"
 git_sha="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
 EVIDENCE="$RUN_DIR/evidence.json"
 cat > "$EVIDENCE" <<EOF
@@ -736,6 +861,15 @@ cat > "$EVIDENCE" <<EOF
   "relay_auth_required": $(bool_for_nonempty "$RELAY_AUTH_TOKEN"),
   "rendezvous_auth_verified": $rendezvous_auth_verified,
   "relay_auth_verified": $relay_auth_verified,
+  "revoked_token_digest_file_configured": $revoked_token_digest_file_configured,
+  "service_token_revocation_verified": $(bool_json "$service_token_revocation_verified"),
+  "rendezvous_revoked_token_rejected": $(bool_json "$rendezvous_revoked_token_rejected"),
+  "relay_revoked_token_rejected": $(bool_json "$relay_revoked_token_rejected"),
+  "rendezvous_replacement_token_accepted": $(bool_json "$rendezvous_replacement_token_accepted"),
+  "relay_replacement_token_accepted": $(bool_json "$relay_replacement_token_accepted"),
+  "rendezvous_revocation_list_sha256": "$rendezvous_revocation_list_sha256",
+  "relay_revocation_list_sha256": "$relay_revocation_list_sha256",
+  "revocation_list_sha256": "$revocation_list_sha256",
   "rendezvous_rate_limit_per_window": $RENDEZVOUS_RATE_LIMIT_PER_WINDOW,
   "relay_rate_limit_per_window": $RELAY_RATE_LIMIT_PER_WINDOW,
   "admission_rate_limit_window_seconds": $ADMISSION_RATE_LIMIT_WINDOW_SECONDS,
@@ -756,6 +890,8 @@ cat > "$EVIDENCE" <<EOF
   "relay_peer_datagram_window_seconds": $RELAY_PEER_DATAGRAM_WINDOW_SECONDS,
   "rendezvous_auth_failures_total": $rendezvous_auth_failures_total,
   "relay_auth_failures_total": $relay_auth_failures_total,
+  "rendezvous_auth_revocations_total": $rendezvous_auth_revocations_total,
+  "relay_auth_revocations_total": $relay_auth_revocations_total,
   "rendezvous_requests_succeeded_total": $rendezvous_requests_succeeded_total,
   "relay_forwarded_datagrams_total": $relay_forwarded_datagrams_total,
   "relay_unknown_destination_drops_total": $relay_unknown_destination_drops_total,
@@ -778,7 +914,14 @@ cat > "$EVIDENCE" <<EOF
   "self_publish_turn_failures": ${self_publish_turn_failures:-0},
   "selected_path": "$selected_path",
   "frames_sent": $frames_sent,
-  "total_elapsed_ms": ${total_elapsed_ms:-0}
+  "total_elapsed_ms": ${total_elapsed_ms:-0},
+  "incident_rollback_verified": $(bool_json "$INCIDENT_ROLLBACK_VERIFIED"),
+  "incident_id": "$INCIDENT_ID",
+  "rollback_from_release_id": "$ROLLBACK_FROM_RELEASE_ID",
+  "rollback_to_release_id": "$ROLLBACK_TO_RELEASE_ID",
+  "rollback_manifest_sha256": "$ROLLBACK_MANIFEST_SHA256",
+  "rollback_duration_seconds": $ROLLBACK_DURATION_SECONDS,
+  "post_rollback_public_infra_ready": $(bool_json "$POST_ROLLBACK_PUBLIC_INFRA_READY")
 }
 EOF
 

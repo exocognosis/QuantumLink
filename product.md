@@ -87,9 +87,10 @@ but they are not hardened public infrastructure by themselves. A production
 deployment now has TLS, basic service-level abuse counters, bounded control
 requests, connection ceilings, idle timeouts, and relay payload/registration
 caps plus per-peer relay datagram saturation quotas behind explicit public-edge
-configuration. Durable revocation and actual deployed operator workflow proof
-remain open; starter alert rules, retention templates, and operational runbooks
-exist but still need live-host installation evidence.
+configuration. Hot service-token file rotation and digest-file service-token
+revocation are implemented and locally provable; actual deployed operator
+revocation, rollback, alerting, and retention proof remain open until a live
+host supplies fresh evidence.
 
 ### On-chain identity verification
 
@@ -210,9 +211,9 @@ Production gaps include:
 - Public rendezvous and relay TLS plus credential-file service admission now
   exist behind the explicit public-edge TLS feature, with loopback service
   metrics and off-host evidence gates for auth, bounds, and relay quota
-  counters, including per-peer relay saturation. Durable credential revocation
-  and actual deployed hardening evidence remain open; alerting and retention
-  templates still need live-host installation proof.
+  counters, including per-peer relay saturation. Hot credential rotation and
+  digest-file credential revocation now exist; actual deployed revocation,
+  rollback, alerting, and retention evidence still need live-host proof.
 - Signed Sparkle/platform update pipeline paired with a post-quantum release
   manifest layer.
 - Production Dytallix mainnet or hardened registry trust root for public

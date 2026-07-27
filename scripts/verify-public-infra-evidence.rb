@@ -118,6 +118,10 @@ def boolean_true?(value)
   value == true
 end
 
+def boolean?(value)
+  value == true || value == false
+end
+
 def positive_integer?(value)
   value.is_a?(Integer) && value.positive?
 end
@@ -230,6 +234,22 @@ if require_public
   block_unless(boolean_true?(evidence["relay_auth_required"]), "relay auth must be required", blockers)
   block_unless(boolean_true?(evidence["rendezvous_auth_verified"]), "rendezvous negative auth proof must pass", blockers)
   block_unless(boolean_true?(evidence["relay_auth_verified"]), "relay negative auth proof must pass", blockers)
+  block_unless(boolean_true?(evidence["revoked_token_digest_file_configured"]), "revoked service-token digest files must be configured", blockers)
+  block_unless(boolean_true?(evidence["service_token_revocation_verified"]), "service-token revocation proof must pass", blockers)
+  block_unless(boolean_true?(evidence["rendezvous_revoked_token_rejected"]), "rendezvous revoked-token proof must reject the old token", blockers)
+  block_unless(boolean_true?(evidence["relay_revoked_token_rejected"]), "relay revoked-token proof must reject the old token", blockers)
+  block_unless(boolean_true?(evidence["rendezvous_replacement_token_accepted"]), "rendezvous replacement-token proof must pass", blockers)
+  block_unless(boolean_true?(evidence["relay_replacement_token_accepted"]), "relay replacement-token proof must pass", blockers)
+  block_unless(nonempty_string?(evidence["revocation_list_sha256"]) && evidence["revocation_list_sha256"] != ":", "revocation list digest must be recorded", blockers)
+  block_unless(positive_integer?(evidence["rendezvous_auth_revocations_total"]), "rendezvous revoked-token rejections must be visible in metrics", blockers)
+  block_unless(positive_integer?(evidence["relay_auth_revocations_total"]), "relay revoked-token rejections must be visible in metrics", blockers)
+  block_unless(boolean_true?(evidence["incident_rollback_verified"]), "incident rollback proof must pass", blockers)
+  block_unless(nonempty_string?(evidence["incident_id"]), "incident rollback evidence must include an incident id", blockers)
+  block_unless(nonempty_string?(evidence["rollback_from_release_id"]), "incident rollback evidence must include the source release id", blockers)
+  block_unless(nonempty_string?(evidence["rollback_to_release_id"]), "incident rollback evidence must include the rollback release id", blockers)
+  block_unless(nonempty_string?(evidence["rollback_manifest_sha256"]), "incident rollback evidence must include a rollback manifest digest", blockers)
+  block_unless(positive_integer?(evidence["rollback_duration_seconds"]), "incident rollback duration must be positive", blockers)
+  block_unless(boolean_true?(evidence["post_rollback_public_infra_ready"]), "post-rollback public infra evidence must pass", blockers)
   block_unless(positive_integer?(evidence["rendezvous_rate_limit_per_window"]), "rendezvous rate limit must be enabled", blockers)
   block_unless(positive_integer?(evidence["relay_rate_limit_per_window"]), "relay rate limit must be enabled", blockers)
   block_unless(positive_integer?(evidence["admission_rate_limit_window_seconds"]), "admission rate-limit window must be positive", blockers)
@@ -264,6 +284,8 @@ require_field(positive_integer?(evidence["direct_probe_timeout_ms"]), "direct_pr
 %w[
   rendezvous_auth_failures_total
   relay_auth_failures_total
+  rendezvous_auth_revocations_total
+  relay_auth_revocations_total
   rendezvous_requests_succeeded_total
   relay_forwarded_datagrams_total
   relay_unknown_destination_drops_total
@@ -275,6 +297,34 @@ require_field(positive_integer?(evidence["direct_probe_timeout_ms"]), "direct_pr
 ].each do |field|
   require_field(nonnegative_integer?(evidence[field]), "#{field} must be a non-negative integer", failures)
 end
+%w[
+  revoked_token_digest_file_configured
+  service_token_revocation_verified
+  rendezvous_revoked_token_rejected
+  relay_revoked_token_rejected
+  rendezvous_replacement_token_accepted
+  relay_replacement_token_accepted
+  incident_rollback_verified
+  post_rollback_public_infra_ready
+].each do |field|
+  require_field(boolean?(evidence[field]), "#{field} must be true or false", failures)
+end
+%w[
+  rendezvous_revocation_list_sha256
+  relay_revocation_list_sha256
+  revocation_list_sha256
+].each do |field|
+  require_field(evidence[field].is_a?(String), "#{field} must be a string", failures)
+end
+%w[
+  incident_id
+  rollback_from_release_id
+  rollback_to_release_id
+  rollback_manifest_sha256
+].each do |field|
+  require_field(evidence[field].is_a?(String), "#{field} must be a string", failures)
+end
+require_field(nonnegative_integer?(evidence["rollback_duration_seconds"]), "rollback_duration_seconds must be a non-negative integer", failures)
 %w[
   max_request_line_bytes
   max_concurrent_connections

@@ -479,7 +479,14 @@ async fn handle_connection(
         }
         let response = match serde_json::from_slice::<RendezvousRequest>(trim_line(&line)) {
             Ok(request) => {
-                if let Err(error) = admission.require_token(request.auth_token(), "rendezvous") {
+                if admission.token_is_revoked(request.auth_token())? {
+                    metrics.auth_revocation();
+                    RendezvousResponse::Error {
+                        message: "rendezvous authentication failed".into(),
+                    }
+                } else if let Err(error) =
+                    admission.require_token(request.auth_token(), "rendezvous")
+                {
                     metrics.auth_failure();
                     RendezvousResponse::Error {
                         message: error.to_string(),
@@ -589,6 +596,7 @@ fn trim_line(line: &[u8]) -> &[u8] {
 mod tests {
     use super::*;
     use crate::{
+        admission::service_token_revocation_digest,
         crypto::DeviceKeypair,
         discovery::{CandidateEndpoint, CandidateType, UnsignedPeerRecord},
     };
@@ -727,6 +735,46 @@ mod tests {
         assert!(rendered.contains("quantumlink_rendezvous_lookups_total 2"));
         assert!(rendered.contains("quantumlink_rendezvous_lookup_not_found_total 1"));
         assert!(rendered.contains("quantumlink_rendezvous_requests_succeeded_total 3"));
+    }
+
+    #[tokio::test]
+    async fn rendezvous_rejects_revoked_auth_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let revoked_path = dir.path().join("revoked-service-token-digests");
+        std::fs::write(
+            &revoked_path,
+            service_token_revocation_digest("edge-secret"),
+        )
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let store = RendezvousStore::default();
+        let metrics = ServiceMetrics::default();
+        let metrics_for_server = metrics.clone();
+        let admission = ServiceAdmissionConfig::open()
+            .with_auth_token("edge-secret")
+            .with_revoked_token_digest_file(&revoked_path);
+        let _task = tokio::spawn(async move {
+            let _ = serve_rendezvous_with_config_and_metrics(
+                listener,
+                store,
+                admission,
+                metrics_for_server,
+            )
+            .await;
+        });
+
+        let (_peer_id, record) = signed_record();
+        let error = RendezvousClient::new(addr.to_string())
+            .with_auth_token("edge-secret")
+            .publish("devmesh", record)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("authentication failed"));
+
+        let rendered = metrics.snapshot("rendezvous").render_open_metrics();
+        assert!(rendered.contains("quantumlink_rendezvous_auth_revocations_total 1"));
+        assert!(rendered.contains("quantumlink_rendezvous_auth_failures_total 1"));
     }
 
     #[tokio::test]

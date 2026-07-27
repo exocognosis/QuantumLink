@@ -1,7 +1,10 @@
 #[cfg(feature = "public-edge-tls")]
 use crate::control_transport::{load_tls_acceptor, ControlTlsServerConfig};
 use crate::{
-    admission::{AdmissionLimiter, ServiceAdmissionConfig, ServiceLimits, ServiceLimitsConfig},
+    admission::{
+        service_token_revocation_digest, AdmissionLimiter, ServiceAdmissionConfig, ServiceLimits,
+        ServiceLimitsConfig,
+    },
     control_transport::{
         connect_control_stream, split_control_stream, BoxedControlReader, BoxedControlWriter,
     },
@@ -46,6 +49,7 @@ pub enum RelayMessage {
 #[derive(Default, Clone)]
 pub struct RelayRegistry {
     peers: Arc<Mutex<HashMap<String, BoxedControlWriter>>>,
+    peer_auth_token_digests: Arc<Mutex<HashMap<String, String>>>,
     peer_datagram_buckets: Arc<Mutex<HashMap<String, RelayPeerDatagramBucket>>>,
 }
 
@@ -816,6 +820,13 @@ async fn handle_connection(
                     }
                     break;
                 }
+                if admission.token_is_revoked(auth_token.as_deref())? {
+                    metrics.auth_revocation();
+                    if let Some(writer) = pending_writer.as_mut() {
+                        write_relay_error(writer, "relay authentication failed").await?;
+                    }
+                    break;
+                }
                 if let Err(error) = admission.require_token(auth_token.as_deref(), "relay") {
                     metrics.auth_failure();
                     if let Some(writer) = pending_writer.as_mut() {
@@ -851,6 +862,13 @@ async fn handle_connection(
                         .await?;
                     writer.write_all(b"\n").await?;
                     peers.insert(peer_id.clone(), writer);
+                    if let Some(auth_token) = auth_token.as_deref() {
+                        registry
+                            .peer_auth_token_digests
+                            .lock()
+                            .await
+                            .insert(peer_id.clone(), service_token_revocation_digest(auth_token));
+                    }
                     metrics.relay_registration();
                     metrics.request_succeeded();
                     registered_peer = Some(peer_id);
@@ -892,6 +910,11 @@ async fn handle_connection(
                     return Err(QlinkError::Protocol(
                         "relay datagram source does not match registered peer".into(),
                     ));
+                }
+                if registered_relay_peer_is_revoked(&registry, &admission, &source).await? {
+                    metrics.auth_revocation();
+                    end_relay_registration(&registry, &source, &metrics).await;
+                    return Err(QlinkError::Protocol("relay authentication failed".into()));
                 }
                 if let Err(error) =
                     check_peer_datagram_quota(&registry, &source, limits, &metrics).await
@@ -974,8 +997,27 @@ async fn check_peer_datagram_quota(
 
 async fn end_relay_registration(registry: &RelayRegistry, peer_id: &str, metrics: &ServiceMetrics) {
     registry.peers.lock().await.remove(peer_id);
+    registry
+        .peer_auth_token_digests
+        .lock()
+        .await
+        .remove(peer_id);
     registry.peer_datagram_buckets.lock().await.remove(peer_id);
     metrics.relay_registration_ended();
+}
+
+async fn registered_relay_peer_is_revoked(
+    registry: &RelayRegistry,
+    admission: &ServiceAdmissionConfig,
+    peer_id: &str,
+) -> Result<bool> {
+    let digest = registry
+        .peer_auth_token_digests
+        .lock()
+        .await
+        .get(peer_id)
+        .cloned();
+    admission.token_digest_is_revoked(digest.as_deref())
 }
 
 async fn read_bounded_line<R: AsyncRead + Unpin>(
@@ -1221,6 +1263,47 @@ mod tests {
         assert!(rendered.contains("quantumlink_relay_forwarded_datagrams_total 1"));
         assert!(rendered.contains("quantumlink_relay_unknown_destination_drops_total 1"));
         assert!(rendered.contains("quantumlink_relay_requests_succeeded_total 3"));
+    }
+
+    #[tokio::test]
+    async fn relay_rejects_revoked_auth_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let revoked_path = dir.path().join("revoked-service-token-digests");
+        std::fs::write(
+            &revoked_path,
+            service_token_revocation_digest("relay-secret"),
+        )
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let registry = RelayRegistry::default();
+        let metrics = ServiceMetrics::default();
+        let metrics_for_server = metrics.clone();
+        let admission = ServiceAdmissionConfig::open()
+            .with_auth_token("relay-secret")
+            .with_revoked_token_digest_file(&revoked_path);
+        let _task = tokio::spawn(async move {
+            let _ = serve_relay_with_config_and_metrics(
+                listener,
+                registry,
+                admission,
+                metrics_for_server,
+            )
+            .await;
+        });
+
+        let error =
+            match RelayClient::connect_with_auth(&addr.to_string(), "alice", Some("relay-secret"))
+                .await
+            {
+                Ok(_) => panic!("relay accepted registration with a revoked auth token"),
+                Err(error) => error,
+            };
+        assert!(error.to_string().contains("authentication failed"));
+
+        let rendered = metrics.snapshot("relay").render_open_metrics();
+        assert!(rendered.contains("quantumlink_relay_auth_revocations_total 1"));
+        assert!(rendered.contains("quantumlink_relay_auth_failures_total 1"));
     }
 
     #[tokio::test]

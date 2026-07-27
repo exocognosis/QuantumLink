@@ -12,6 +12,8 @@
 #   QLINK_CONTROL_TLS_CA
 #   QLINK_RENDEZVOUS_AUTH_TOKEN or QLINK_RENDEZVOUS_AUTH_TOKEN_FILE
 #   QLINK_RELAY_AUTH_TOKEN or QLINK_RELAY_AUTH_TOKEN_FILE
+#   QLINK_RENDEZVOUS_REVOKED_AUTH_TOKEN_DIGEST_FILE and
+#     QLINK_RELAY_REVOKED_AUTH_TOKEN_DIGEST_FILE
 #   QLINK_TURN_USERNAME
 #   QLINK_TURN_PASSWORD or QLINK_TURN_PASSWORD_FILE
 #   QLINK_TURN_REALM
@@ -40,6 +42,8 @@ RENDEZVOUS_AUTH_TOKEN="${QLINK_RENDEZVOUS_AUTH_TOKEN:-}"
 RELAY_AUTH_TOKEN="${QLINK_RELAY_AUTH_TOKEN:-}"
 RENDEZVOUS_AUTH_TOKEN_FILE="${QLINK_RENDEZVOUS_AUTH_TOKEN_FILE:-}"
 RELAY_AUTH_TOKEN_FILE="${QLINK_RELAY_AUTH_TOKEN_FILE:-}"
+RENDEZVOUS_REVOKED_AUTH_TOKEN_DIGEST_FILE="${QLINK_RENDEZVOUS_REVOKED_AUTH_TOKEN_DIGEST_FILE:-${QLINK_REVOKED_SERVICE_TOKEN_DIGESTS:-}}"
+RELAY_REVOKED_AUTH_TOKEN_DIGEST_FILE="${QLINK_RELAY_REVOKED_AUTH_TOKEN_DIGEST_FILE:-${QLINK_REVOKED_SERVICE_TOKEN_DIGESTS:-}}"
 TURN_USERNAME="${QLINK_TURN_USERNAME:-}"
 TURN_PASSWORD="${QLINK_TURN_PASSWORD:-}"
 TURN_PASSWORD_FILE="${QLINK_TURN_PASSWORD_FILE:-}"
@@ -81,6 +85,8 @@ while [[ $# -gt 0 ]]; do
     --control-tls-ca) CONTROL_TLS_CA="$2"; shift 2 ;;
     --rendezvous-auth-token-file) RENDEZVOUS_AUTH_TOKEN_FILE="$2"; shift 2 ;;
     --relay-auth-token-file) RELAY_AUTH_TOKEN_FILE="$2"; shift 2 ;;
+    --rendezvous-revoked-auth-token-digest-file) RENDEZVOUS_REVOKED_AUTH_TOKEN_DIGEST_FILE="$2"; shift 2 ;;
+    --relay-revoked-auth-token-digest-file) RELAY_REVOKED_AUTH_TOKEN_DIGEST_FILE="$2"; shift 2 ;;
     --turn-password-file) TURN_PASSWORD_FILE="$2"; shift 2 ;;
     --turn-username) TURN_USERNAME="$2"; shift 2 ;;
     --turn-realm) TURN_REALM="$2"; shift 2 ;;
@@ -124,6 +130,8 @@ if [[ -n "$ENV_FILE" ]]; then
   RELAY_AUTH_TOKEN="${QLINK_RELAY_AUTH_TOKEN:-$RELAY_AUTH_TOKEN}"
   RENDEZVOUS_AUTH_TOKEN_FILE="${QLINK_RENDEZVOUS_AUTH_TOKEN_FILE:-$RENDEZVOUS_AUTH_TOKEN_FILE}"
   RELAY_AUTH_TOKEN_FILE="${QLINK_RELAY_AUTH_TOKEN_FILE:-$RELAY_AUTH_TOKEN_FILE}"
+  RENDEZVOUS_REVOKED_AUTH_TOKEN_DIGEST_FILE="${QLINK_RENDEZVOUS_REVOKED_AUTH_TOKEN_DIGEST_FILE:-${QLINK_REVOKED_SERVICE_TOKEN_DIGESTS:-$RENDEZVOUS_REVOKED_AUTH_TOKEN_DIGEST_FILE}}"
+  RELAY_REVOKED_AUTH_TOKEN_DIGEST_FILE="${QLINK_RELAY_REVOKED_AUTH_TOKEN_DIGEST_FILE:-${QLINK_REVOKED_SERVICE_TOKEN_DIGESTS:-$RELAY_REVOKED_AUTH_TOKEN_DIGEST_FILE}}"
   TURN_USERNAME="${QLINK_TURN_USERNAME:-$TURN_USERNAME}"
   TURN_PASSWORD="${QLINK_TURN_PASSWORD:-$TURN_PASSWORD}"
   TURN_PASSWORD_FILE="${QLINK_TURN_PASSWORD_FILE:-$TURN_PASSWORD_FILE}"
@@ -178,6 +186,8 @@ fi
 [[ -f "$CONTROL_TLS_CA" ]] || die "control TLS CA file does not exist: $CONTROL_TLS_CA"
 [[ -n "$RENDEZVOUS_AUTH_TOKEN" ]] || die "missing rendezvous auth token or token file"
 [[ -n "$RELAY_AUTH_TOKEN" ]] || die "missing relay auth token or token file"
+[[ -n "$RENDEZVOUS_REVOKED_AUTH_TOKEN_DIGEST_FILE" ]] || die "missing rendezvous revoked auth token digest file path"
+[[ -n "$RELAY_REVOKED_AUTH_TOKEN_DIGEST_FILE" ]] || die "missing relay revoked auth token digest file path"
 [[ -n "$TURN_USERNAME" ]] || die "missing TURN username"
 [[ -n "$TURN_PASSWORD" ]] || die "missing TURN password"
 [[ -n "$TURN_REALM" ]] || die "missing TURN realm"
@@ -206,6 +216,8 @@ smoke_common=(
   --direct-probe-timeout-ms "$DIRECT_PROBE_TIMEOUT_MS"
   --rendezvous-rate-limit-per-window "$RENDEZVOUS_RATE_LIMIT_PER_WINDOW"
   --relay-rate-limit-per-window "$RELAY_RATE_LIMIT_PER_WINDOW"
+  --rendezvous-revoked-auth-token-digest-file "$RENDEZVOUS_REVOKED_AUTH_TOKEN_DIGEST_FILE"
+  --relay-revoked-auth-token-digest-file "$RELAY_REVOKED_AUTH_TOKEN_DIGEST_FILE"
   --admission-rate-limit-window-seconds "$ADMISSION_RATE_LIMIT_WINDOW_SECONDS"
   --rendezvous-metrics-addr "$RENDEZVOUS_METRICS_ADDR"
   --relay-metrics-addr "$RELAY_METRICS_ADDR"
@@ -291,12 +303,34 @@ ruby -rjson -rtime -e '
     },
     "credentialSources" => {
       "controlTlsCa" => "file",
-      "rendezvousAuth" => ENV.fetch("QLINK_LIVE_EVIDENCE_RENDEZVOUS_AUTH_SOURCE"),
-      "relayAuth" => ENV.fetch("QLINK_LIVE_EVIDENCE_RELAY_AUTH_SOURCE"),
-      "turnPassword" => ENV.fetch("QLINK_LIVE_EVIDENCE_TURN_PASSWORD_SOURCE")
-    },
-    "proofs" => {
-      "appRelay" => {
+        "rendezvousAuth" => ENV.fetch("QLINK_LIVE_EVIDENCE_RENDEZVOUS_AUTH_SOURCE"),
+        "relayAuth" => ENV.fetch("QLINK_LIVE_EVIDENCE_RELAY_AUTH_SOURCE"),
+        "rendezvousRevokedTokenDigests" => "path",
+        "relayRevokedTokenDigests" => "path",
+        "turnPassword" => ENV.fetch("QLINK_LIVE_EVIDENCE_TURN_PASSWORD_SOURCE")
+      },
+      "proofs" => {
+        "serviceTokenRevocation" => {
+          "appRelayVerified" => app.fetch("service_token_revocation_verified"),
+          "turnRelayVerified" => turn.fetch("service_token_revocation_verified"),
+          "rendezvousRevokedTokenRejected" => app.fetch("rendezvous_revoked_token_rejected") && turn.fetch("rendezvous_revoked_token_rejected"),
+          "relayRevokedTokenRejected" => app.fetch("relay_revoked_token_rejected") && turn.fetch("relay_revoked_token_rejected"),
+          "rendezvousReplacementTokenAccepted" => app.fetch("rendezvous_replacement_token_accepted") && turn.fetch("rendezvous_replacement_token_accepted"),
+          "relayReplacementTokenAccepted" => app.fetch("relay_replacement_token_accepted") && turn.fetch("relay_replacement_token_accepted"),
+          "rendezvousAuthRevocationsTotal" => app.fetch("rendezvous_auth_revocations_total") + turn.fetch("rendezvous_auth_revocations_total"),
+          "relayAuthRevocationsTotal" => app.fetch("relay_auth_revocations_total") + turn.fetch("relay_auth_revocations_total"),
+          "revocationListSha256" => app.fetch("revocation_list_sha256")
+        },
+        "incidentRollback" => {
+          "verified" => app.fetch("incident_rollback_verified") && turn.fetch("incident_rollback_verified"),
+          "incidentId" => app.fetch("incident_id"),
+          "rollbackFromReleaseId" => app.fetch("rollback_from_release_id"),
+          "rollbackToReleaseId" => app.fetch("rollback_to_release_id"),
+          "rollbackManifestSha256" => app.fetch("rollback_manifest_sha256"),
+          "rollbackDurationSeconds" => app.fetch("rollback_duration_seconds"),
+          "postRollbackPublicInfraReady" => app.fetch("post_rollback_public_infra_ready") && turn.fetch("post_rollback_public_infra_ready")
+        },
+        "appRelay" => {
         "evidence" => app_evidence_path,
         "verification" => app_verification_path,
         "selectedPath" => app.fetch("selected_path"),
@@ -308,6 +342,8 @@ ruby -rjson -rtime -e '
         "relaySaturationLimitVerified" => app.fetch("relay_saturation_limit_verified"),
         "rendezvousAuthFailuresTotal" => app.fetch("rendezvous_auth_failures_total"),
         "relayAuthFailuresTotal" => app.fetch("relay_auth_failures_total"),
+        "rendezvousAuthRevocationsTotal" => app.fetch("rendezvous_auth_revocations_total"),
+        "relayAuthRevocationsTotal" => app.fetch("relay_auth_revocations_total"),
         "rendezvousRequestTooLargeTotal" => app.fetch("rendezvous_request_too_large_total"),
         "relayRequestTooLargeTotal" => app.fetch("relay_request_too_large_total"),
         "relayPayloadTooLargeTotal" => app.fetch("relay_payload_too_large_total"),
@@ -327,6 +363,8 @@ ruby -rjson -rtime -e '
         "relaySaturationLimitVerified" => turn.fetch("relay_saturation_limit_verified"),
         "rendezvousAuthFailuresTotal" => turn.fetch("rendezvous_auth_failures_total"),
         "relayAuthFailuresTotal" => turn.fetch("relay_auth_failures_total"),
+        "rendezvousAuthRevocationsTotal" => turn.fetch("rendezvous_auth_revocations_total"),
+        "relayAuthRevocationsTotal" => turn.fetch("relay_auth_revocations_total"),
         "rendezvousRequestTooLargeTotal" => turn.fetch("rendezvous_request_too_large_total"),
         "relayRequestTooLargeTotal" => turn.fetch("relay_request_too_large_total"),
         "relayPayloadTooLargeTotal" => turn.fetch("relay_payload_too_large_total"),

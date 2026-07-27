@@ -15,6 +15,7 @@ struct ServiceMetricsInner {
     active_connections: AtomicU64,
     connection_limit_rejections_total: AtomicU64,
     auth_failures_total: AtomicU64,
+    auth_revocations_total: AtomicU64,
     rate_limited_total: AtomicU64,
     malformed_requests_total: AtomicU64,
     request_too_large_total: AtomicU64,
@@ -66,6 +67,13 @@ impl ServiceMetrics {
         self.inner
             .auth_failures_total
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn auth_revocation(&self) {
+        self.inner
+            .auth_revocations_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.auth_failure();
     }
 
     pub fn connection_limit_rejection(&self) {
@@ -223,6 +231,13 @@ impl ServiceMetrics {
             "auth_failures_total",
             "Requests rejected by service token admission.",
             self.inner.auth_failures_total.load(Ordering::Relaxed),
+        );
+        push_counter(
+            &mut snapshot,
+            &prefix,
+            "auth_revocations_total",
+            "Requests rejected because the supplied service token was revoked.",
+            self.inner.auth_revocations_total.load(Ordering::Relaxed),
         );
         push_counter(
             &mut snapshot,
@@ -423,13 +438,15 @@ mod tests {
         let metrics = ServiceMetrics::default();
         let _connection = metrics.connection_started();
         metrics.auth_failure();
+        metrics.auth_revocation();
         metrics.rendezvous_publish();
         metrics.request_succeeded();
 
         let rendered = metrics.snapshot("rendezvous").render_open_metrics();
         assert!(rendered.contains("quantumlink_rendezvous_connections_accepted_total 1"));
         assert!(rendered.contains("quantumlink_rendezvous_active_connections 1"));
-        assert!(rendered.contains("quantumlink_rendezvous_auth_failures_total 1"));
+        assert!(rendered.contains("quantumlink_rendezvous_auth_failures_total 2"));
+        assert!(rendered.contains("quantumlink_rendezvous_auth_revocations_total 1"));
         assert!(rendered.contains("quantumlink_rendezvous_publishes_total 1"));
         assert!(!rendered.contains('{'));
     }

@@ -42,6 +42,26 @@ groups:
           summary: QuantumLink relay auth failures increased
           description: The relay service is rejecting a burst of unauthenticated registrations.
 
+      - alert: QuantumLinkRendezvousRevokedTokenUsed
+        expr: increase(quantumlink_rendezvous_auth_revocations_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          service: rendezvous
+        annotations:
+          summary: QuantumLink rendezvous rejected revoked tokens
+          description: At least one client attempted rendezvous admission with a revoked service token.
+
+      - alert: QuantumLinkRelayRevokedTokenUsed
+        expr: increase(quantumlink_relay_auth_revocations_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          service: relay
+        annotations:
+          summary: QuantumLink relay rejected revoked tokens
+          description: At least one client attempted relay admission or traffic with a revoked service token.
+
       - alert: QuantumLinkRelayPeerSaturation
         expr: increase(quantumlink_relay_peer_rate_limited_total[5m]) > 0
         for: 0m
