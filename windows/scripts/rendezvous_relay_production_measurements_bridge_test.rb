@@ -18,7 +18,9 @@ class RendezvousRelayProductionMeasurementsBridgeTest < Minitest::Test
   PUBLIC_EDGE_ASSERTIONS = [
     ["tls", "tls_enabled"],
     ["authentication", "authorized_accepted"],
-    ["authentication", "unauthorized_rejected"]
+    ["authentication", "unauthorized_rejected"],
+    ["rate_limits", "endpoint_limit_enforced"],
+    ["relay_denial", "rate_limited_denied"]
   ].freeze
   REQUIRED_ASSERTIONS = {
     "tls" => %w[tls_enabled certificate_valid rotation_tested],
@@ -57,8 +59,8 @@ class RendezvousRelayProductionMeasurementsBridgeTest < Minitest::Test
 
     assert status.success?, stderr
     assert_equal "blocked", result.fetch("status")
-    assert_equal 3, result.fetch("passingAssertionCount")
-    assert_equal 32, result.fetch("blockedAssertionCount")
+    assert_equal 5, result.fetch("passingAssertionCount")
+    assert_equal 30, result.fetch("blockedAssertionCount")
 
     measurement = JSON.parse(File.read(File.join(@tmpdir, "windows/build/validation/rendezvous-relay-production-measurements.json")))
     assert_equal "windowsRendezvousRelayMeasuredControls", measurement.fetch("evidenceKind")
@@ -67,6 +69,16 @@ class RendezvousRelayProductionMeasurementsBridgeTest < Minitest::Test
                  measurement.fetch("publicEdgeBridge").fetch("supportedAssertions")
     assert_equal "blocked", measurement.fetch("controls").find { |entry| entry.fetch("control") == "tls" }.fetch("status")
     assert_equal "pass", measurement.fetch("controls").find { |entry| entry.fetch("control") == "authentication" }.fetch("status")
+    assert_equal "blocked",
+                 measurement.fetch("controls").find { |entry| entry.fetch("control") == "signed_expiring_records" }.fetch("status")
+    assert_assertion_status(measurement, "signed_expiring_records", "revoked_key_rejected", "blocked")
+    assert_assertion_status(measurement, "signed_expiring_records", "expired_rejected", "blocked")
+    assert_equal "blocked", measurement.fetch("controls").find { |entry| entry.fetch("control") == "rate_limits" }.fetch("status")
+    assert_assertion_status(measurement, "rate_limits", "source_limit_enforced", "blocked")
+    assert_assertion_status(measurement, "rate_limits", "endpoint_limit_enforced", "pass")
+    assert_assertion_status(measurement, "rate_limits", "identity_limit_enforced", "blocked")
+    assert_assertion_status(measurement, "relay_denial", "rate_limited_denied", "pass")
+    assert_assertion_status(measurement, "relay_denial", "entitlement_denied", "blocked")
 
     generator_stdout, generator_stderr, generator_status = invoke_generator
     generator_result = JSON.parse(generator_stdout)
@@ -243,9 +255,45 @@ class RendezvousRelayProductionMeasurementsBridgeTest < Minitest::Test
       "relay_auth_required" => true,
       "rendezvous_auth_verified" => true,
       "relay_auth_verified" => true,
+      "revoked_token_digest_file_configured" => true,
+      "service_token_revocation_verified" => true,
+      "rendezvous_revoked_token_rejected" => true,
+      "relay_revoked_token_rejected" => true,
+      "rendezvous_replacement_token_accepted" => true,
+      "relay_replacement_token_accepted" => true,
+      "rendezvous_revocation_list_sha256" => "c" * 64,
+      "relay_revocation_list_sha256" => "d" * 64,
+      "revocation_list_sha256" => "#{"c" * 64}:#{"d" * 64}",
       "rendezvous_rate_limit_per_window" => 120,
       "relay_rate_limit_per_window" => 240,
       "admission_rate_limit_window_seconds" => 60,
+      "rendezvous_metrics_addr" => "127.0.0.1:9571",
+      "relay_metrics_addr" => "127.0.0.1:9572",
+      "rendezvous_metrics_scraped" => true,
+      "relay_metrics_scraped" => true,
+      "bounds_verified" => true,
+      "relay_payload_limit_verified" => true,
+      "relay_saturation_limit_verified" => true,
+      "max_request_line_bytes" => 131_072,
+      "max_concurrent_connections" => 1_024,
+      "idle_timeout_seconds" => 300,
+      "relay_max_payload_bytes" => 65_536,
+      "relay_max_peer_id_bytes" => 256,
+      "relay_max_registered_peers" => 2_048,
+      "relay_max_peer_datagrams_per_window" => 120,
+      "relay_peer_datagram_window_seconds" => 60,
+      "rendezvous_auth_failures_total" => 1,
+      "relay_auth_failures_total" => 1,
+      "rendezvous_auth_revocations_total" => 1,
+      "relay_auth_revocations_total" => 1,
+      "rendezvous_requests_succeeded_total" => 3,
+      "relay_forwarded_datagrams_total" => 3,
+      "relay_unknown_destination_drops_total" => 0,
+      "rendezvous_request_too_large_total" => 1,
+      "relay_request_too_large_total" => 1,
+      "relay_payload_too_large_total" => 1,
+      "relay_peer_rate_limited_total" => 1,
+      "relay_duplicate_registration_rejections_total" => 0,
       "prove_turn_relay" => turn_relay,
       "published_candidate_types" => turn_relay ? "Relay" : "Host,ServerReflexive,Relay,QuantumLinkRelay",
       "selected_path" => selected_path,
@@ -300,6 +348,13 @@ class RendezvousRelayProductionMeasurementsBridgeTest < Minitest::Test
       "endpointSetSha256" => @endpoint_digest,
       "redacted" => true
     }
+  end
+
+  def assert_assertion_status(measurement, control, assertion, expected)
+    control_entry = measurement.fetch("controls").find { |entry| entry.fetch("control") == control }
+    assertion_entry = control_entry.fetch("assertions").find { |entry| entry.fetch("name") == assertion }
+
+    assert_equal expected, assertion_entry.fetch("status")
   end
 
   def write_json(relative, value)

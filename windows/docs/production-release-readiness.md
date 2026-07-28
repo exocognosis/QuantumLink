@@ -149,9 +149,11 @@ bindings; it cannot convert placeholders or contract-only data into a pass.
 `windows/scripts/collect-rendezvous-relay-production-measurements.rb` bridges
 the live public-edge smoke manifest into the generator's measurement schema,
 but it only auto-seeds the assertions that smoke actually proves. Operator
-drill source files are still required for certificate rotation,
-signed-record rejection, rate-limit denial, abuse-log redaction, revocation,
-retention, key rotation, endpoint rotation, and incident shutdown.
+drill source files are still required for certificate validation and rotation,
+valid/expired/replayed/malformed signed-record behavior, identity and
+entitlement limits, source-address limits, abuse-log redaction, revocation
+propagation timing, entitlement/policy/revoked/expired relay denial, retention,
+key rotation, endpoint rotation, and incident shutdown.
 
 ## Production Host Matrix
 
