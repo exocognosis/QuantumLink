@@ -164,7 +164,7 @@ jobs:
           ruby-version: "3.3"
 
       - name: Download exact signed release artifact
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: ${{ env.SIGNED_ARTIFACT_NAME }}
           path: ${{ runner.temp }}/quantumlink-signed-release
