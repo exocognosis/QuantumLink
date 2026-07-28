@@ -376,7 +376,13 @@ ruby -rjson -rtime -e '
   File.write(manifest_path, "#{JSON.pretty_generate(manifest)}\n")
 ' "$manifest" "$app_evidence" "$RUN_DIR/app-relay-verification.json" "$turn_evidence" "$RUN_DIR/turn-relay-verification.json"
 
+ruby scripts/verify-public-edge-live-manifest.rb \
+  --expected-sha "$git_sha" \
+  --report "$RUN_DIR/manifest-verification.json" \
+  "$manifest" > "$RUN_DIR/manifest-verification.stdout.json"
+
 log "PASS public edge live evidence"
 echo "manifest=$manifest"
+echo "manifest_verification=$RUN_DIR/manifest-verification.json"
 echo "app_relay_evidence=$app_evidence"
 echo "turn_relay_evidence=$turn_evidence"

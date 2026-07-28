@@ -125,6 +125,24 @@ sudo mv /etc/quantumlink/secrets/rendezvous-auth-token.next /etc/quantumlink/sec
 sudo mv /etc/quantumlink/secrets/relay-auth-token.next /etc/quantumlink/secrets/relay-auth-token
 ```
 
+For a live operator drill, prefer the scripted form so the old-token rejection,
+replacement-token acceptance, revocation-list digests, and
+`auth_revocations_total` counters are captured together in redacted evidence:
+
+```sh
+scripts/public-edge-service-token-revocation.sh \
+  --env-file ./edge-public.env \
+  --rendezvous-replacement-auth-token-file /path/to/rendezvous-auth-token.next \
+  --relay-replacement-auth-token-file /path/to/relay-auth-token.next \
+  --append-revocation-digests \
+  --install-replacement-tokens
+```
+
+The script prints a `service-token-revocation.env` file containing only the
+`QLINK_SERVICE_TOKEN_REVOCATION_*` booleans that the public evidence smoke
+consumes. The JSON proof records digests, counters, and endpoint names, but not
+the raw service tokens.
+
 Install a real edge certificate and key at the paths configured by
 `QLINK_RENDEZVOUS_TLS_CERT`, `QLINK_RENDEZVOUS_TLS_KEY`,
 `QLINK_RELAY_TLS_CERT`, and `QLINK_RELAY_TLS_KEY`. For shared beta testing,
@@ -225,11 +243,56 @@ The orchestrator deliberately uses environment variables or token files for
 secrets instead of passing service tokens as command-line arguments. It records
 only credential-source metadata such as `file` or `environment` in the manifest.
 
+Run the service-token revocation drill before final evidence capture and load
+the printed exports into the tester shell:
+
+```sh
+scripts/public-edge-service-token-revocation.sh \
+  --env-file ./edge-public.env \
+  --rendezvous-replacement-auth-token-file /path/to/rendezvous-auth-token.next \
+  --relay-replacement-auth-token-file /path/to/relay-auth-token.next \
+  --append-revocation-digests \
+  --install-replacement-tokens
+
+set -a
+. build/public-edge-service-token-revocation/<timestamp>/service-token-revocation.env
+set +a
+```
+
+For rollback evidence, keep a small rollback manifest with the operator,
+release IDs, changed unit/package identifiers, rollback command transcript
+path, and timing. Then run the rollback drill. By default it exports the
+rollback metadata, runs the post-rollback live evidence orchestrator, verifies
+the resulting live manifest, and emits an `incident-rollback.env` file:
+
+```sh
+scripts/public-edge-incident-rollback.sh \
+  --env-file ./edge-public.env \
+  --incident-id public-edge-drill-YYYYMMDD \
+  --from-release-id "$QLINK_PUBLIC_EDGE_RELEASE_ID" \
+  --to-release-id "$QLINK_PREVIOUS_RELEASE_ID" \
+  --rollback-manifest "$QLINK_ROLLBACK_MANIFEST" \
+  --rollback-duration-seconds 42 \
+  --build
+
+set -a
+. build/public-edge-incident-rollback/<timestamp>/incident-rollback.env
+set +a
+```
+
 The `QLINK_SERVICE_TOKEN_REVOCATION_*` and `QLINK_INCIDENT_ROLLBACK_*` fields
 are operator assertions from the live revocation and rollback drills. They do
 not bypass metrics checks: `--require-public` still requires positive
 `auth_revocations_total` counters from the public services and a non-empty
 revocation-list digest in the evidence.
+
+The final live manifest is also checkable on its own:
+
+```sh
+ruby scripts/verify-public-edge-live-manifest.rb \
+  --expected-sha "$(git rev-parse HEAD)" \
+  build/public-edge-live-evidence/<timestamp>/manifest.json
+```
 
 If you need to debug one proof at a time, run the underlying smoke command
 directly. This default command proves TLS rendezvous/relay admission, STUN,
