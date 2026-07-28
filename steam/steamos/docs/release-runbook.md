@@ -88,6 +88,15 @@ The packager copies this manifest to
 and includes it in checksums and release-manifest artifact hashes. The manifest
 schema is documented in [`production-evidence.md`](production-evidence.md).
 
+Production publication requires schema v2. Schema v1 remains parseable for
+historical inspection, but is always production-blocked and must result in
+`productionEvidenceReady=false` and `nonHardwareProductionReady=false`.
+Do not relabel or mechanically promote a schema-v1 bundle.
+
+Collector, bridge, or verifier output is production-ineligible unless the tool
+enforces the complete schema-v2 contract. Schema-v1 output may be used only for
+historical inspection, fixture testing, and gap analysis.
+
 To build the manifest from a redacted operator evidence bundle:
 
 ```sh
@@ -114,12 +123,58 @@ only to retain an incomplete bundle for gap analysis; never use that output as
 production packaging input. The command is a capability, not evidence that a
 live run has occurred.
 
+For a production-eligible schema-v2 Dytallix bundle, confirm all of the
+following before packaging:
+
+- `bindingVersion=stableIdentityV2`, `contractSchemaVersion=2`, and
+  `evidenceClass=liveChain`.
+- The HTTPS registry endpoint and exact network ID, chain ID, deployed
+  20-byte contract address, and deployed contract code hash are pinned.
+- Register, update, suspend, reactivate, and revoke have independently verified
+  finalized-chain inclusion and exact contract readback.
+- Reactivation after terminal revocation is rejected and the revoked state is
+  unchanged.
+- Reachability TTL refresh succeeds while preserving the stable identity
+  revision.
+- The required negative-policy matrix rejects legacy v1 downgrade, expired
+  authorization, device mismatch, signing-key mismatch, wrong mesh scope, TTL
+  excess, non-monotonic revision, missing/suspended/revoked identities, and
+  registry outage.
+- Every lifecycle, negative-policy, finality, readback, and rendezvous/relay
+  sidecar exists as a regular file beside the generated manifest and its
+  calculated SHA-256 matches the manifest.
+- Dytallix sidecar JSON matches the manifest's chain/contract pins,
+  transaction IDs, finalized heights, lifecycle/readback results, identity
+  revisions, and policy decisions.
+- The independently finalized checkpoint covers every lifecycle and TTL
+  refresh transaction.
+
+Treat `qlinkctl dytallix` receipts and exact readback as transaction convergence
+evidence only. They do not prove finality. The pinned SDK's receipt/readback or
+finalized-block metadata must not satisfy the finality field; use an independent
+finality verifier bound to the pinned chain and transaction.
+
+Pin that verifier's public key outside the evidence bundle:
+
+```sh
+export QLINK_DYTALLIX_FINALITY_VERIFIER_PUBLIC_KEY=/secure/path/dytallix-finality-verifier-public.pem
+```
+
+The finality report must carry a valid ECDSA P-256/SHA-256 signature from this
+key. A bundled replacement key, unsigned JSON report, or modified report fails
+closed.
+
 The verifier validates production signatures with:
 
 ```sh
 QLINK_STEAMOS_RELEASE_PUBLIC_KEY=/path/to/ed25519-public-key.pem \
 bash steam/steamos/scripts/verify-steamos-release.sh dist/steamos/quantumlink-steamos-<version>.tar.zst
 ```
+
+The packager embeds the production evidence manifest and referenced sidecars
+inside the signed application archive as `release-evidence/`. The external
+release sidecars must match those signed copies byte for byte. Detached or
+substituted evidence fails release verification.
 
 Publication gates should add:
 
@@ -137,11 +192,11 @@ bash steam/steamos/scripts/steamos-rc-dry-run.sh \
   --evidence-root steam/steamos/validation/non-hardware/<timestamp>
 ```
 
-With complete live non-hardware evidence, the expected RC dry-run result is
+With complete schema-v2 live non-hardware evidence, the expected RC dry-run result is
 `valid=true`, `signatureValidated=true`,
 `nonHardwareProductionEvidenceValidated=true`,
 `nonHardwareProductionReady=true`, and `productionReady=false`. Fixture or
-incomplete bridged evidence must instead leave
+schema-v1, synthetic, non-finalized, or incomplete bridged evidence must instead leave
 `nonHardwareProductionReady=false`.
 
 The release workflow exercises this path on compatible Linux with ephemeral
@@ -172,7 +227,8 @@ Before tagging or attaching public SteamOS artifacts:
 - Provide `QLINK_STEAMOS_SIGNATURE_FILE` or `QLINK_STEAMOS_RELEASE_PRIVATE_KEY`.
 - Verify with `QLINK_STEAMOS_RELEASE_PUBLIC_KEY`.
 - Provide or package `QLINK_STEAMOS_PRODUCTION_EVIDENCE_MANIFEST`.
-- Prefer generating the manifest through `collect-production-evidence.sh` so
-  evidence file paths and hashes are normalized before packaging.
+- Require a schema-v2 manifest with live-chain Dytallix lifecycle, negative
+  policy, independent finality, and contained sidecar digest evidence.
+- Do not use schema-v1 collector or bridge output as production evidence.
 - Set `QLINK_STEAMOS_REQUIRE_PRODUCTION_READY=1` in publication gates.
 - Link active rendezvous/relay endpoint evidence and real Steam Deck validation evidence from `production-readiness.md`.

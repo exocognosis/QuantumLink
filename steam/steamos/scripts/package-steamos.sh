@@ -157,6 +157,84 @@ for doc in README.md docs/deck-validation.md docs/production-evidence.md docs/pr
     fi
 done
 
+if [ -n "$PRODUCTION_EVIDENCE_MANIFEST_SOURCE" ]; then
+    if [ ! -f "$PRODUCTION_EVIDENCE_MANIFEST_SOURCE" ]; then
+        echo "missing production evidence manifest: $PRODUCTION_EVIDENCE_MANIFEST_SOURCE" >&2
+        exit 1
+    fi
+    EVIDENCE_REPORT="$WORK_DIR/production-evidence-report.json"
+    if ! bash "$STEAMOS_ROOT/scripts/verify-production-evidence.sh" \
+        "$PRODUCTION_EVIDENCE_MANIFEST_SOURCE" >"$EVIDENCE_REPORT"; then
+        echo "production evidence manifest or referenced sidecars are invalid" >&2
+        exit 1
+    fi
+    if [ "$SIGNING_MODE" = "production" ] && ! python3 - "$EVIDENCE_REPORT" <<'PY'
+import json
+import sys
+report = json.load(open(sys.argv[1], encoding="utf-8"))
+raise SystemExit(0 if report.get("productionEvidenceReady") is True else 1)
+PY
+    then
+        echo "production signing requires a ready schema-v2 production evidence bundle" >&2
+        exit 1
+    fi
+    install_payload_file "$PRODUCTION_EVIDENCE_MANIFEST_SOURCE" "$PRODUCTION_EVIDENCE_MANIFEST" 0644
+    install_payload_file "$PRODUCTION_EVIDENCE_MANIFEST_SOURCE" \
+        "$PAYLOAD_ROOT/release-evidence/production-evidence-manifest.json" 0644
+    PRODUCTION_EVIDENCE_SOURCE="$PRODUCTION_EVIDENCE_MANIFEST_SOURCE" \
+    PRODUCTION_EVIDENCE_SIDECAR_DESTINATION="$SIDECAR_DIR" \
+    PRODUCTION_EVIDENCE_ARCHIVE_DESTINATION="$PAYLOAD_ROOT/release-evidence" \
+    python3 - <<'PY'
+import json
+import os
+import shutil
+from pathlib import Path
+
+manifest_path = Path(os.environ["PRODUCTION_EVIDENCE_SOURCE"]).resolve()
+destinations = [
+    Path(os.environ["PRODUCTION_EVIDENCE_SIDECAR_DESTINATION"]).resolve(),
+    Path(os.environ["PRODUCTION_EVIDENCE_ARCHIVE_DESTINATION"]).resolve(),
+]
+manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+if manifest.get("schemaVersion") != 2:
+    raise SystemExit(0)
+
+references = []
+dytallix = manifest.get("dytallix", {})
+for entry in [dytallix.get("finality"), dytallix.get("ttlRefresh")]:
+    if isinstance(entry, dict):
+        references.append(entry.get("evidence"))
+verifier_signature = dytallix.get("finality", {}).get("verifierSignature", {})
+if isinstance(verifier_signature, dict):
+    references.extend([
+        verifier_signature.get("publicKey"),
+        verifier_signature.get("signature"),
+    ])
+for field in ("lifecycleMatrix", "negativePolicyMatrix"):
+    for entry in dytallix.get(field, []):
+        if isinstance(entry, dict):
+            references.append(entry.get("evidence"))
+for entry in manifest.get("rendezvousRelay", {}).get("controls", []):
+    if isinstance(entry, dict):
+        references.append(entry.get("evidence"))
+
+source_root = manifest_path.parent
+for reference in references:
+    if not isinstance(reference, str) or not reference:
+        raise SystemExit("production evidence contains an empty sidecar reference")
+    relative = Path(reference)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise SystemExit(f"production evidence sidecar path is not contained: {reference}")
+    source = (source_root / relative).resolve()
+    source.relative_to(source_root)
+    for destination in destinations:
+        target = destination / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
+        target.chmod(0o644)
+PY
+fi
+
 find "$PAYLOAD_ROOT" -exec touch -h -t 197001010000.00 {} +
 COPYFILE_DISABLE=1 tar -cf - -C "$WORK_DIR" "$PACKAGE_NAME" | zstd -q -19 -T0 -o "$ARCHIVE"
 
@@ -223,14 +301,6 @@ else
         printf 'archive=%s\n' "$(basename "$ARCHIVE")"
         printf 'sha256=%s\n' "$(sha256_file "$ARCHIVE")"
     } > "$SIDECAR_DIR/$SIG_ARTIFACT"
-fi
-
-if [ -n "$PRODUCTION_EVIDENCE_MANIFEST_SOURCE" ]; then
-    if [ ! -f "$PRODUCTION_EVIDENCE_MANIFEST_SOURCE" ]; then
-        echo "missing production evidence manifest: $PRODUCTION_EVIDENCE_MANIFEST_SOURCE" >&2
-        exit 1
-    fi
-    install_payload_file "$PRODUCTION_EVIDENCE_MANIFEST_SOURCE" "$PRODUCTION_EVIDENCE_MANIFEST" 0644
 fi
 
 ARCHIVE_PATH="$ARCHIVE" \

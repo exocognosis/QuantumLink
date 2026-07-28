@@ -58,6 +58,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -68,15 +69,27 @@ output_manifest = Path(sys.argv[2])
 metadata_path = evidence_root / "metadata.json"
 failures: list[str] = []
 
-required_dytallix_cases = {
-    "active": "accepted",
-    "missing": "rejected",
-    "revoked": "rejected",
-    "suspended": "rejected",
-    "mismatched": "rejected",
-    "stale": "rejected",
-    "unavailable": "rejected",
+required_lifecycle_cases = {
+    "register": "accepted",
+    "update": "accepted",
+    "suspend": "accepted",
+    "reactivate": "accepted",
+    "revoke": "accepted",
+    "post_revocation_reactivation": "rejected",
 }
+required_negative_cases = (
+    "legacy_v1_downgrade",
+    "expired_authorization",
+    "device_mismatch",
+    "signing_key_mismatch",
+    "wrong_mesh_scope",
+    "ttl_excess",
+    "non_monotonic_revision",
+    "missing",
+    "suspended",
+    "revoked",
+    "registry_outage",
+)
 required_controls = [
     "tls",
     "authentication",
@@ -142,6 +155,12 @@ def evidence_digest(rel_path: object, label: str) -> tuple[str, str]:
     if rel.is_absolute() or ".." in rel.parts:
         fail(f"{label} evidence path must be relative and stay inside evidence root")
         return str(rel_path), ""
+    cursor = evidence_root
+    for part in rel.parts:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            fail(f"{label} evidence must not traverse symbolic links")
+            return str(rel_path), ""
     path = (evidence_root / rel).resolve()
     try:
         path.relative_to(evidence_root)
@@ -155,7 +174,11 @@ def evidence_digest(rel_path: object, label: str) -> tuple[str, str]:
     text = raw.decode("utf-8", errors="ignore")
     if forbidden.search(str(rel)) or forbidden.search(text):
         fail(f"{label} evidence contains forbidden secret or raw-artifact marker: {rel}")
-    return str(rel).replace(os.sep, "/"), hashlib.sha256(raw).hexdigest()
+    output_rel = Path("production-evidence") / rel
+    output_path = output_manifest.parent / output_rel
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(path, output_path)
+    return str(output_rel).replace(os.sep, "/"), hashlib.sha256(raw).hexdigest()
 
 
 metadata = load_metadata()
@@ -191,35 +214,131 @@ registry_endpoint = dytallix_meta.get("registryEndpoint")
 if not is_nonempty_string(registry_endpoint) or not secure_url(str(registry_endpoint), {"https"}):
     fail("metadata.dytallix.registryEndpoint must be an https URL")
 
-for field in ("networkId", "contract"):
+if dytallix_meta.get("bindingVersion") != "stableIdentityV2":
+    fail("metadata.dytallix.bindingVersion must be stableIdentityV2")
+if dytallix_meta.get("contractSchemaVersion") != 2:
+    fail("metadata.dytallix.contractSchemaVersion must be 2")
+if dytallix_meta.get("evidenceClass") != "liveChain":
+    fail("metadata.dytallix.evidenceClass must be liveChain")
+for field in ("networkId", "chainId", "contractAddress"):
     if not is_nonempty_string(dytallix_meta.get(field)):
         fail(f"metadata.dytallix.{field} is required")
+if not isinstance(dytallix_meta.get("contractCodeHash"), str) or not re.fullmatch(
+    r"[0-9a-f]{64}", dytallix_meta.get("contractCodeHash", "")
+):
+    fail("metadata.dytallix.contractCodeHash must be a 64-character lowercase hex digest")
 
-case_meta = dytallix_meta.get("cases")
-if not isinstance(case_meta, dict):
-    fail("metadata.dytallix.cases must be an object")
-    case_meta = {}
+finality_meta = dytallix_meta.get("finality")
+if not isinstance(finality_meta, dict):
+    fail("metadata.dytallix.finality section is required")
+    finality_meta = {}
+finality_evidence, finality_digest = evidence_digest(
+    finality_meta.get("evidence", "dytallix/finality.json"),
+    "Dytallix finality",
+)
+verifier_signature_meta = finality_meta.get("verifierSignature")
+if not isinstance(verifier_signature_meta, dict):
+    fail("metadata.dytallix.finality.verifierSignature section is required")
+    verifier_signature_meta = {}
+verifier_public_key, verifier_public_key_digest = evidence_digest(
+    verifier_signature_meta.get("publicKey", "dytallix/finality-verifier-public.pem"),
+    "Dytallix finality verifier public key",
+)
+verifier_signature, verifier_signature_digest = evidence_digest(
+    verifier_signature_meta.get("signature", "dytallix/finality.sig"),
+    "Dytallix finality verifier signature",
+)
+finality = {
+    "independentlyVerified": finality_meta.get("independentlyVerified"),
+    "verificationMethod": finality_meta.get("verificationMethod"),
+    "finalizedBlockHeight": finality_meta.get("finalizedBlockHeight"),
+    "finalizedBlockHash": finality_meta.get("finalizedBlockHash"),
+    "sdkReceiptOnly": finality_meta.get("sdkReceiptOnly"),
+    "evidence": finality_evidence,
+    "sha256": finality_digest,
+    "verifierSignature": {
+        "algorithm": verifier_signature_meta.get("algorithm"),
+        "publicKey": verifier_public_key,
+        "publicKeySha256": verifier_public_key_digest,
+        "signature": verifier_signature,
+        "signatureSha256": verifier_signature_digest,
+    },
+}
 
-case_matrix = []
-for case_name, expected_decision in required_dytallix_cases.items():
-    entry = case_meta.get(case_name)
+lifecycle_meta = dytallix_meta.get("lifecycle")
+if not isinstance(lifecycle_meta, dict):
+    fail("metadata.dytallix.lifecycle must be an object")
+    lifecycle_meta = {}
+
+lifecycle_matrix = []
+for case_name, expected_outcome in required_lifecycle_cases.items():
+    entry = lifecycle_meta.get(case_name)
     if not isinstance(entry, dict):
-        fail(f"metadata.dytallix.cases.{case_name} is required")
+        fail(f"metadata.dytallix.lifecycle.{case_name} is required")
         entry = {}
-    evidence_rel, digest = evidence_digest(entry.get("evidence", f"dytallix/{case_name}.json"), f"Dytallix case {case_name}")
-    observed = entry.get("observedDecision")
+    evidence_rel, digest = evidence_digest(
+        entry.get("evidence", f"dytallix/lifecycle/{case_name}.json"),
+        f"Dytallix lifecycle case {case_name}",
+    )
+    observed = entry.get("observedOutcome")
     if not is_nonempty_string(observed):
-        fail(f"metadata.dytallix.cases.{case_name}.observedDecision is required")
+        fail(f"metadata.dytallix.lifecycle.{case_name}.observedOutcome is required")
         observed = "unknown"
-    case_matrix.append({
+    lifecycle_matrix.append({
         "case": case_name,
-        "trustMode": "publicDytallixRequired",
-        "expectedDecision": expected_decision,
-        "observedDecision": observed,
+        "expectedOutcome": expected_outcome,
+        "observedOutcome": observed,
+        "transactionId": entry.get("transactionId"),
+        "finalized": entry.get("finalized"),
+        "finalizedBlockHeight": entry.get("finalizedBlockHeight"),
+        "stableIdentityRevision": entry.get("stableIdentityRevision"),
         "evidence": evidence_rel,
         "sha256": digest,
         "redacted": entry.get("redacted", True),
     })
+
+negative_meta = dytallix_meta.get("negativePolicies")
+if not isinstance(negative_meta, dict):
+    fail("metadata.dytallix.negativePolicies must be an object")
+    negative_meta = {}
+
+negative_policy_matrix = []
+for case_name in required_negative_cases:
+    entry = negative_meta.get(case_name)
+    if not isinstance(entry, dict):
+        fail(f"metadata.dytallix.negativePolicies.{case_name} is required")
+        entry = {}
+    evidence_rel, digest = evidence_digest(
+        entry.get("evidence", f"dytallix/negative/{case_name}.json"),
+        f"Dytallix negative policy case {case_name}",
+    )
+    negative_policy_matrix.append({
+        "case": case_name,
+        "expectedDecision": "rejected",
+        "observedDecision": entry.get("observedDecision"),
+        "evidence": evidence_rel,
+        "sha256": digest,
+        "redacted": entry.get("redacted", True),
+    })
+
+ttl_meta = dytallix_meta.get("ttlRefresh")
+if not isinstance(ttl_meta, dict):
+    fail("metadata.dytallix.ttlRefresh section is required")
+    ttl_meta = {}
+ttl_evidence, ttl_digest = evidence_digest(
+    ttl_meta.get("evidence", "dytallix/ttl-refresh.json"),
+    "Dytallix TTL refresh",
+)
+ttl_refresh = {
+    "observedOutcome": ttl_meta.get("observedOutcome"),
+    "transactionId": ttl_meta.get("transactionId"),
+    "finalized": ttl_meta.get("finalized"),
+    "finalizedBlockHeight": ttl_meta.get("finalizedBlockHeight"),
+    "stableIdentityRevisionBefore": ttl_meta.get("stableIdentityRevisionBefore"),
+    "stableIdentityRevisionAfter": ttl_meta.get("stableIdentityRevisionAfter"),
+    "evidence": ttl_evidence,
+    "sha256": ttl_digest,
+}
 
 rendezvous_endpoints = rendezvous_meta.get("rendezvousEndpoints")
 if not isinstance(rendezvous_endpoints, list) or not rendezvous_endpoints:
@@ -264,7 +383,7 @@ for control_name in required_controls:
     })
 
 manifest = {
-    "schemaVersion": 1,
+    "schemaVersion": 2,
     "evidenceKind": "steamosNonHardwareProductionEvidence",
     "product": "QuantumLink SteamOS",
     "platform": "steamos",
@@ -277,12 +396,20 @@ manifest = {
     },
     "dytallix": {
         "status": dytallix_status,
+        "bindingVersion": dytallix_meta.get("bindingVersion"),
+        "contractSchemaVersion": dytallix_meta.get("contractSchemaVersion"),
+        "evidenceClass": dytallix_meta.get("evidenceClass"),
         "registryEndpoint": registry_endpoint,
         "networkId": dytallix_meta.get("networkId", ""),
-        "contract": dytallix_meta.get("contract", ""),
+        "chainId": dytallix_meta.get("chainId", ""),
+        "contractAddress": dytallix_meta.get("contractAddress", ""),
+        "contractCodeHash": dytallix_meta.get("contractCodeHash", ""),
         "walletAddressesRedacted": dytallix_meta.get("walletAddressesRedacted", True),
         "rawWalletMaterialCommitted": dytallix_meta.get("rawWalletMaterialCommitted", False),
-        "caseMatrix": case_matrix,
+        "finality": finality,
+        "lifecycleMatrix": lifecycle_matrix,
+        "negativePolicyMatrix": negative_policy_matrix,
+        "ttlRefresh": ttl_refresh,
     },
     "rendezvousRelay": {
         "status": rendezvous_status,

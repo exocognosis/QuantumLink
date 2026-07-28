@@ -27,6 +27,7 @@ python3 - "$TMP_ROOT" <<'PY'
 import copy
 import hashlib
 import json
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -265,41 +266,258 @@ tampered["publication"]["lookupAtUnix"] += 1
 write_json(tampered_path, tampered)
 
 dytallix_root = root / "dytallix"
-dytallix_cases = {}
-expected = {
-    "active": "accepted",
-    "missing": "rejected",
-    "revoked": "rejected",
-    "suspended": "rejected",
-    "mismatched": "rejected",
-    "stale": "rejected",
-    "unavailable": "rejected",
-}
-for case_name, decision in expected.items():
-    relative = f"dytallix/{case_name}.json"
-    dytallix_cases[case_name] = {
-        "observedDecision": decision,
-        "evidence": relative,
+
+
+def write_dytallix_sidecar(relative, case_name):
+    document = {
+        "schemaVersion": 2,
+        "evidenceClass": "liveChain",
+        "bindingVersion": "stableIdentityV2",
+        "contractSchemaVersion": 2,
+        "case": case_name,
         "redacted": True,
     }
-    write_json(
-        dytallix_root / relative,
-        {"case": case_name, "observedDecision": decision, "redacted": True},
+    write_json(dytallix_root / relative, document)
+    return {
+        "evidence": relative,
+        "sha256": hashlib.sha256((dytallix_root / relative).read_bytes()).hexdigest(),
+        "redacted": True,
+    }
+
+
+finality = write_dytallix_sidecar("dytallix/finality.json", "finality")
+finality.update(
+    {
+        "independentlyVerified": True,
+        "verificationMethod": "independentFinalizedBlock",
+        "finalizedBlockHeight": 1100,
+        "finalizedBlockHash": "f" * 64,
+        "sdkReceiptOnly": False,
+    }
+)
+lifecycle = {}
+lifecycle_outcomes = {
+    "register": "accepted",
+    "update": "accepted",
+    "suspend": "accepted",
+    "reactivate": "accepted",
+    "revoke": "accepted",
+    "post_revocation_reactivation": "rejected",
+}
+for revision, (case_name, outcome) in enumerate(lifecycle_outcomes.items(), start=1):
+    entry = write_dytallix_sidecar(f"dytallix/lifecycle/{case_name}.json", case_name)
+    entry.update(
+        {
+            "observedOutcome": outcome,
+            "transactionId": f"tx-{case_name}",
+            "finalized": True,
+            "finalizedBlockHeight": 1042 + revision,
+            "stableIdentityRevision": revision,
+        }
     )
+    lifecycle[case_name] = entry
+negative = {}
+for case_name in (
+    "legacy_v1_downgrade",
+    "expired_authorization",
+    "device_mismatch",
+    "signing_key_mismatch",
+    "wrong_mesh_scope",
+    "ttl_excess",
+    "non_monotonic_revision",
+    "missing",
+    "suspended",
+    "revoked",
+    "registry_outage",
+):
+    entry = write_dytallix_sidecar(f"dytallix/negative/{case_name}.json", case_name)
+    entry["observedDecision"] = "rejected"
+    negative[case_name] = entry
+ttl_refresh = write_dytallix_sidecar("dytallix/ttl-refresh.json", "ttl_refresh")
+ttl_refresh.update(
+    {
+        "observedOutcome": "accepted",
+        "transactionId": "tx-ttl-refresh",
+        "finalized": True,
+        "finalizedBlockHeight": 1050,
+        "stableIdentityRevisionBefore": 5,
+        "stableIdentityRevisionAfter": 5,
+    }
+)
+pins = {
+    "networkId": "dytallix-testnet",
+    "chainId": "dytallix-testnet-1",
+    "contractAddress": "0x1111111111111111111111111111111111111111",
+    "contractCodeHash": "e" * 64,
+}
+
+
+def rewrite_dytallix_entry(relative, entry, document):
+    write_json(dytallix_root / relative, document)
+    entry["sha256"] = hashlib.sha256((dytallix_root / relative).read_bytes()).hexdigest()
+
+
+readback_status = {
+    "register": "active", "update": "active", "suspend": "suspended",
+    "reactivate": "active", "revoke": "revoked",
+    "post_revocation_reactivation": "revoked",
+}
+finalized_transactions = []
+for index, (case_name, entry) in enumerate(lifecycle.items(), start=1):
+    finalized_transactions.append({
+        "transactionId": entry["transactionId"],
+        "finalizedBlockHeight": entry["finalizedBlockHeight"],
+        "finalizedBlockHash": f"{index:x}" * 64,
+        "case": case_name, "observedOutcome": entry["observedOutcome"],
+        "stableIdentityRevision": entry["stableIdentityRevision"],
+        "readbackStatus": readback_status[case_name],
+        "readbackDigest": hashlib.sha256(f"{case_name}-readback".encode()).hexdigest(),
+    })
+finalized_transactions.append({
+    "transactionId": ttl_refresh["transactionId"],
+    "finalizedBlockHeight": ttl_refresh["finalizedBlockHeight"],
+    "finalizedBlockHash": "f" * 64,
+    "case": "ttl_refresh", "observedOutcome": ttl_refresh["observedOutcome"],
+    "stableIdentityRevisionBefore": ttl_refresh["stableIdentityRevisionBefore"],
+    "stableIdentityRevisionAfter": ttl_refresh["stableIdentityRevisionAfter"],
+    "readbackStatus": "active",
+    "readbackDigest": hashlib.sha256(b"ttl-refresh-readback").hexdigest(),
+})
+rewrite_dytallix_entry(
+    "dytallix/finality.json",
+    finality,
+    {
+        "evidenceKind": "dytallixIndependentFinalityVerification",
+        "independentFromMutationSdk": True,
+        **pins,
+        "finalizedBlockHeight": finality["finalizedBlockHeight"],
+        "finalizedBlockHash": finality["finalizedBlockHash"],
+        "finalizedTransactions": finalized_transactions,
+    },
+)
+private_key = dytallix_root / ".finality-verifier-private.pem"
+public_key = dytallix_root / "dytallix/finality-verifier-public.pem"
+signature = dytallix_root / "dytallix/finality.sig"
+subprocess.run(
+    ["openssl", "ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", private_key],
+    check=True,
+    capture_output=True,
+)
+subprocess.run(
+    ["openssl", "ec", "-in", private_key, "-pubout", "-out", public_key],
+    check=True,
+    capture_output=True,
+)
+subprocess.run(
+    [
+        "openssl", "dgst", "-sha256", "-sign", private_key, "-out", signature,
+        dytallix_root / finality["evidence"],
+    ],
+    check=True,
+    capture_output=True,
+)
+finality["verifierSignature"] = {
+    "algorithm": "ecdsa-p256-sha256",
+    "publicKey": "dytallix/finality-verifier-public.pem",
+    "publicKeySha256": hashlib.sha256(public_key.read_bytes()).hexdigest(),
+    "signature": "dytallix/finality.sig",
+    "signatureSha256": hashlib.sha256(signature.read_bytes()).hexdigest(),
+}
+for case_name, entry in lifecycle.items():
+    rewrite_dytallix_entry(
+        f"dytallix/lifecycle/{case_name}.json",
+        entry,
+        {
+            "evidenceKind": "dytallixLifecycleObservation",
+            "case": case_name, "observedOutcome": entry["observedOutcome"],
+            "transactionId": entry["transactionId"],
+            "finalizedBlockHeight": entry["finalizedBlockHeight"],
+            "stableIdentityRevision": entry["stableIdentityRevision"],
+            "readbackStatus": readback_status[case_name],
+            "readbackDigest": hashlib.sha256(f"{case_name}-readback".encode()).hexdigest(),
+            **pins,
+        },
+    )
+for case_name, entry in negative.items():
+    rewrite_dytallix_entry(
+        f"dytallix/negative/{case_name}.json",
+        entry,
+        {
+            "evidenceKind": "dytallixNegativePolicyObservation",
+            "case": case_name, "observedDecision": entry["observedDecision"],
+            "policyInputsRedacted": True, **pins,
+        },
+    )
+rewrite_dytallix_entry(
+    "dytallix/ttl-refresh.json",
+    ttl_refresh,
+    {
+        "evidenceKind": "dytallixTtlRefreshObservation",
+        "observedOutcome": ttl_refresh["observedOutcome"],
+        "transactionId": ttl_refresh["transactionId"],
+        "finalizedBlockHeight": ttl_refresh["finalizedBlockHeight"],
+        "stableIdentityRevisionBefore": ttl_refresh["stableIdentityRevisionBefore"],
+        "stableIdentityRevisionAfter": ttl_refresh["stableIdentityRevisionAfter"],
+        "readbackStatus": "active",
+        "readbackDigest": hashlib.sha256(b"ttl-refresh-readback").hexdigest(),
+        **pins,
+    },
+)
 write_json(
     dytallix_root / "metadata.json",
     {
+        "schemaVersion": 2,
         "dytallix": {
             "status": "pass",
+            "evidenceClass": "liveChain",
+            "bindingVersion": "stableIdentityV2",
+            "contractSchemaVersion": 2,
             "registryEndpoint": "https://registry.dytallix.invalid",
-            "networkId": "dytallix-testnet",
-            "contract": "quantumlink-node-registry",
+            **pins,
             "walletAddressesRedacted": True,
             "rawWalletMaterialCommitted": False,
-            "cases": dytallix_cases,
+            "finality": finality,
+            "lifecycle": lifecycle,
+            "negativePolicies": negative,
+            "ttlRefresh": ttl_refresh,
         }
     },
 )
+
+
+def copy_dytallix_bundle(destination, omitted=None):
+    for path in dytallix_root.rglob("*"):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(dytallix_root)
+        if omitted is not None and relative.as_posix() == omitted:
+            continue
+        target = destination / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(path.read_bytes())
+
+
+downgrade = copy.deepcopy(json.loads((dytallix_root / "metadata.json").read_text()))
+copy_dytallix_bundle(root / "dytallix-v1")
+downgrade["schemaVersion"] = 1
+write_json(root / "dytallix-v1" / "metadata.json", downgrade)
+
+synthetic = copy.deepcopy(json.loads((dytallix_root / "metadata.json").read_text()))
+copy_dytallix_bundle(root / "dytallix-synthetic")
+synthetic["dytallix"]["evidenceClass"] = "synthetic"
+write_json(root / "dytallix-synthetic" / "metadata.json", synthetic)
+
+tampered = copy.deepcopy(json.loads((dytallix_root / "metadata.json").read_text()))
+copy_dytallix_bundle(root / "dytallix-tampered")
+write_json(root / "dytallix-tampered" / "metadata.json", tampered)
+tampered_case = root / "dytallix-tampered" / "dytallix" / "lifecycle" / "register.json"
+tampered_document = json.loads(tampered_case.read_text())
+tampered_document["tampered"] = True
+write_json(tampered_case, tampered_document)
+
+missing = copy.deepcopy(json.loads((dytallix_root / "metadata.json").read_text()))
+copy_dytallix_bundle(root / "dytallix-missing", "dytallix/negative/revoked.json")
+write_json(root / "dytallix-missing" / "metadata.json", missing)
 PY
 
 python3 "$BRIDGE" \
@@ -331,11 +549,10 @@ for name in ("signed_expiring_records", "abuse_logs", "retention", "key_rotation
 
 with open(manifest_path, "r", encoding="utf-8") as handle:
     manifest = json.load(handle)
+assert manifest["schemaVersion"] == 2
 assert manifest["evidenceKind"] == "steamosNonHardwareProductionEvidence"
 assert manifest["dytallix"]["status"] == "blocked"
 PY
-
-bash "$VERIFIER" "$TMP_ROOT/bridged/production-evidence.json" > "$TMP_ROOT/verifier.out"
 
 python3 "$BRIDGE" \
     --public-edge-manifest "$TMP_ROOT/signed/manifest.json" \
@@ -403,6 +620,8 @@ if python3 "$BRIDGE" \
 fi
 assert_contains "$TMP_ROOT/default-blocked.err" "valid but blocked"
 
+export QLINK_DYTALLIX_FINALITY_VERIFIER_PUBLIC_KEY="$TMP_ROOT/dytallix/dytallix/finality-verifier-public.pem"
+
 python3 "$BRIDGE" \
     --public-edge-manifest "$TMP_ROOT/public/manifest.json" \
     --dytallix-evidence-root "$TMP_ROOT/dytallix" \
@@ -420,6 +639,62 @@ assert report["dytallixReady"] is True
 assert report["rendezvousRelayReady"] is False
 assert report["productionEvidenceReady"] is False
 PY
+
+python3 - "$TMP_ROOT/with-dytallix/production-evidence.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    manifest = json.load(handle)
+assert manifest["schemaVersion"] == 2
+dytallix = manifest["dytallix"]
+assert dytallix["evidenceClass"] == "liveChain"
+assert dytallix["bindingVersion"] == "stableIdentityV2"
+assert dytallix["contractSchemaVersion"] == 2
+assert dytallix["chainId"] == "dytallix-testnet-1"
+assert dytallix["contractAddress"] == "0x1111111111111111111111111111111111111111"
+assert dytallix["contractCodeHash"] == "e" * 64
+assert len(dytallix["finality"]["sha256"]) == 64
+assert all(len(case["sha256"]) == 64 for case in dytallix["lifecycleMatrix"])
+assert all(len(case["sha256"]) == 64 for case in dytallix["negativePolicyMatrix"])
+assert len(dytallix["ttlRefresh"]["sha256"]) == 64
+PY
+
+if python3 "$BRIDGE" \
+    --public-edge-manifest "$TMP_ROOT/public/manifest.json" \
+    --dytallix-evidence-root "$TMP_ROOT/dytallix-v1" \
+    --output-root "$TMP_ROOT/dytallix-v1-output" \
+    --allow-blocked > "$TMP_ROOT/dytallix-v1.out" 2> "$TMP_ROOT/dytallix-v1.err"; then
+    fail "expected schema v1 Dytallix evidence to fail closed"
+fi
+assert_contains "$TMP_ROOT/dytallix-v1.err" "schemaVersion must be 2"
+
+if python3 "$BRIDGE" \
+    --public-edge-manifest "$TMP_ROOT/public/manifest.json" \
+    --dytallix-evidence-root "$TMP_ROOT/dytallix-synthetic" \
+    --output-root "$TMP_ROOT/dytallix-synthetic-output" \
+    --allow-blocked > "$TMP_ROOT/dytallix-synthetic.out" 2> "$TMP_ROOT/dytallix-synthetic.err"; then
+    fail "expected synthetic Dytallix evidence to fail closed"
+fi
+assert_contains "$TMP_ROOT/dytallix-synthetic.err" "evidenceClass must be liveChain"
+
+if python3 "$BRIDGE" \
+    --public-edge-manifest "$TMP_ROOT/public/manifest.json" \
+    --dytallix-evidence-root "$TMP_ROOT/dytallix-missing" \
+    --output-root "$TMP_ROOT/dytallix-missing-output" \
+    --allow-blocked > "$TMP_ROOT/dytallix-missing.out" 2> "$TMP_ROOT/dytallix-missing.err"; then
+    fail "expected missing Dytallix sidecar to fail closed"
+fi
+assert_contains "$TMP_ROOT/dytallix-missing.err" "must resolve to a regular file"
+
+if python3 "$BRIDGE" \
+    --public-edge-manifest "$TMP_ROOT/public/manifest.json" \
+    --dytallix-evidence-root "$TMP_ROOT/dytallix-tampered" \
+    --output-root "$TMP_ROOT/dytallix-tampered-output" \
+    --allow-blocked > "$TMP_ROOT/dytallix-tampered.out" 2> "$TMP_ROOT/dytallix-tampered.err"; then
+    fail "expected tampered Dytallix sidecar to fail closed"
+fi
+assert_contains "$TMP_ROOT/dytallix-tampered.err" "sha256 does not match"
 
 if python3 "$BRIDGE" \
     --public-edge-manifest "$TMP_ROOT/secret/manifest.json" \

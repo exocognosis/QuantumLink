@@ -19,14 +19,26 @@ REPO_ROOT = SCRIPT_DIR.parents[2]
 PUBLIC_VERIFIER = REPO_ROOT / "scripts" / "verify-public-infra-evidence.rb"
 STEAMOS_COLLECTOR = SCRIPT_DIR / "collect-production-evidence.sh"
 
-REQUIRED_DYTALLIX_CASES = (
-    "active",
+REQUIRED_DYTALLIX_LIFECYCLE = {
+    "register": "accepted",
+    "update": "accepted",
+    "suspend": "accepted",
+    "reactivate": "accepted",
+    "revoke": "accepted",
+    "post_revocation_reactivation": "rejected",
+}
+REQUIRED_DYTALLIX_NEGATIVE_POLICIES = (
+    "legacy_v1_downgrade",
+    "expired_authorization",
+    "device_mismatch",
+    "signing_key_mismatch",
+    "wrong_mesh_scope",
+    "ttl_excess",
+    "non_monotonic_revision",
     "missing",
-    "revoked",
     "suspended",
-    "mismatched",
-    "stale",
-    "unavailable",
+    "revoked",
+    "registry_outage",
 )
 REQUIRED_CONTROLS = (
     "tls",
@@ -50,6 +62,7 @@ FORBIDDEN = re.compile(
     re.IGNORECASE,
 )
 SHA_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
 CONTROL_FIELDS: dict[str, tuple[str, ...]] = {
     "tls": (
@@ -664,7 +677,7 @@ def public_control_documents(
         )
         fields = CONTROL_FIELDS.get(control, ())
         document: dict[str, Any] = {
-            "schemaVersion": 1,
+            "schemaVersion": 2,
             "evidenceKind": "steamosPublicEdgeControlEvidence",
             "control": control,
             "status": status,
@@ -694,101 +707,334 @@ def public_control_documents(
     return controls, documents
 
 
-def unresolved_dytallix() -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
-    cases: dict[str, dict[str, Any]] = {}
-    documents: dict[str, dict[str, Any]] = {}
-    for case_name in REQUIRED_DYTALLIX_CASES:
-        relative = f"dytallix/{case_name}.json"
-        cases[case_name] = {
-            "observedDecision": "unavailable",
-            "evidence": relative,
-            "redacted": True,
+def encoded_json(value: dict[str, Any]) -> bytes:
+    return (json.dumps(value, separators=(",", ":"), sort_keys=True) + "\n").encode("utf-8")
+
+
+def unresolved_dytallix() -> tuple[dict[str, Any], dict[str, bytes]]:
+    documents: dict[str, bytes] = {}
+
+    def blocked_reference(relative: str, case: str) -> dict[str, Any]:
+        raw = encoded_json(
+            {
+                "schemaVersion": 2,
+                "evidenceKind": "steamosDytallixDependency",
+                "case": case,
+                "status": "blocked",
+                "blockedReason": "live Dytallix evidence bundle was not supplied",
+                "redacted": True,
+            }
+        )
+        documents[relative] = raw
+        return {"evidence": relative, "sha256": sha256(raw), "redacted": True}
+
+    def replace_document(relative: str, entry: dict[str, Any], document: dict[str, Any]) -> None:
+        raw = encoded_json(document)
+        documents[relative] = raw
+        entry["sha256"] = sha256(raw)
+
+    finality = blocked_reference("dytallix/finality.json", "finality")
+    finality.update(
+        {
+            "independentlyVerified": False,
+            "verificationMethod": "unavailable",
+            "finalizedBlockHeight": 0,
+            "finalizedBlockHash": "0" * 64,
+            "sdkReceiptOnly": True,
         }
-        documents[case_name] = {
-            "schemaVersion": 1,
-            "evidenceKind": "steamosDytallixDependency",
-            "case": case_name,
-            "status": "blocked",
-            "observedDecision": "unavailable",
-            "redacted": True,
-            "blockedReason": "live Dytallix evidence bundle was not supplied",
+    )
+    verifier_public_key_raw = b"unconfigured Dytallix finality verifier public key\n"
+    verifier_signature_raw = b"unconfigured Dytallix finality verifier signature\n"
+    documents["dytallix/finality-verifier-public.pem"] = verifier_public_key_raw
+    documents["dytallix/finality.sig"] = verifier_signature_raw
+    finality["verifierSignature"] = {
+        "algorithm": "ecdsa-p256-sha256",
+        "publicKey": "dytallix/finality-verifier-public.pem",
+        "publicKeySha256": sha256(verifier_public_key_raw),
+        "signature": "dytallix/finality.sig",
+        "signatureSha256": sha256(verifier_signature_raw),
+    }
+    lifecycle: dict[str, dict[str, Any]] = {}
+    for revision, case_name in enumerate(REQUIRED_DYTALLIX_LIFECYCLE, start=1):
+        relative = f"dytallix/lifecycle/{case_name}.json"
+        lifecycle[case_name] = blocked_reference(relative, case_name)
+        lifecycle[case_name].update(
+            {
+                "observedOutcome": "unavailable",
+                "transactionId": "unavailable",
+                "finalized": False,
+                "finalizedBlockHeight": 0,
+                "stableIdentityRevision": revision,
+            }
+        )
+    negative: dict[str, dict[str, Any]] = {}
+    for case_name in REQUIRED_DYTALLIX_NEGATIVE_POLICIES:
+        relative = f"dytallix/negative/{case_name}.json"
+        negative[case_name] = blocked_reference(relative, case_name)
+        negative[case_name]["observedDecision"] = "unavailable"
+    ttl_refresh = blocked_reference("dytallix/ttl-refresh.json", "ttl_refresh")
+    ttl_refresh.update(
+        {
+            "observedOutcome": "unavailable",
+            "transactionId": "unavailable",
+            "finalized": False,
+            "finalizedBlockHeight": 0,
+            "stableIdentityRevisionBefore": 1,
+            "stableIdentityRevisionAfter": 1,
         }
+    )
     metadata = {
         "status": "blocked",
+        "evidenceClass": "liveChain",
+        "bindingVersion": "stableIdentityV2",
+        "contractSchemaVersion": 2,
         "registryEndpoint": "https://live-evidence-required.invalid",
         "networkId": "unresolved",
-        "contract": "unresolved",
+        "chainId": "unresolved",
+        "contractAddress": "unresolved",
+        "contractCodeHash": "0" * 64,
         "walletAddressesRedacted": True,
         "rawWalletMaterialCommitted": False,
-        "cases": cases,
+        "finality": finality,
+        "lifecycle": lifecycle,
+        "negativePolicies": negative,
+        "ttlRefresh": ttl_refresh,
     }
+    pins = {
+        "networkId": metadata["networkId"],
+        "chainId": metadata["chainId"],
+        "contractAddress": metadata["contractAddress"],
+        "contractCodeHash": metadata["contractCodeHash"],
+    }
+    replace_document(
+        "dytallix/finality.json",
+        finality,
+        {
+            "evidenceKind": "dytallixIndependentFinalityVerification",
+            "independentFromMutationSdk": False,
+            **pins,
+            "finalizedBlockHeight": finality["finalizedBlockHeight"],
+            "finalizedBlockHash": finality["finalizedBlockHash"],
+            "finalizedTransactions": [],
+        },
+    )
+    readback_status = {
+        "register": "active",
+        "update": "active",
+        "suspend": "suspended",
+        "reactivate": "active",
+        "revoke": "revoked",
+        "post_revocation_reactivation": "revoked",
+    }
+    for case_name, entry in lifecycle.items():
+        replace_document(
+            f"dytallix/lifecycle/{case_name}.json",
+            entry,
+            {
+                "evidenceKind": "dytallixLifecycleObservation",
+                "case": case_name,
+                "observedOutcome": entry["observedOutcome"],
+                "transactionId": entry["transactionId"],
+                "finalizedBlockHeight": entry["finalizedBlockHeight"],
+                "stableIdentityRevision": entry["stableIdentityRevision"],
+                "readbackStatus": readback_status[case_name],
+                **pins,
+            },
+        )
+    for case_name, entry in negative.items():
+        replace_document(
+            f"dytallix/negative/{case_name}.json",
+            entry,
+            {
+                "evidenceKind": "dytallixNegativePolicyObservation",
+                "case": case_name,
+                "observedDecision": entry["observedDecision"],
+                "policyInputsRedacted": True,
+                **pins,
+            },
+        )
+    replace_document(
+        "dytallix/ttl-refresh.json",
+        ttl_refresh,
+        {
+            "evidenceKind": "dytallixTtlRefreshObservation",
+            "observedOutcome": ttl_refresh["observedOutcome"],
+            "transactionId": ttl_refresh["transactionId"],
+            "finalizedBlockHeight": ttl_refresh["finalizedBlockHeight"],
+            "stableIdentityRevisionBefore": ttl_refresh["stableIdentityRevisionBefore"],
+            "stableIdentityRevisionAfter": ttl_refresh["stableIdentityRevisionAfter"],
+            **pins,
+        },
+    )
     return metadata, documents
 
 
-def load_dytallix(root: Path) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+def load_dytallix(root: Path) -> tuple[dict[str, Any], dict[str, bytes]]:
     resolved_root = root.resolve()
     metadata, _ = load_json(resolved_root / "metadata.json", "Dytallix bundle metadata")
     section = metadata.get("dytallix")
     require(isinstance(section, dict), "Dytallix bundle metadata.dytallix section is required")
+    require(
+        metadata.get("schemaVersion") == 2 or section.get("schemaVersion") == 2,
+        "Dytallix evidence schemaVersion must be 2",
+    )
+    require(
+        section.get("evidenceClass") == "liveChain",
+        "Dytallix evidenceClass must be liveChain; fixture or synthetic evidence is not production evidence",
+    )
+    require(
+        section.get("bindingVersion") == "stableIdentityV2",
+        "Dytallix bindingVersion must be stableIdentityV2",
+    )
+    require(
+        section.get("contractSchemaVersion") == 2,
+        "Dytallix contractSchemaVersion must be 2",
+    )
+    require(section.get("status") == "pass", "Dytallix live-chain evidence status must be pass")
+    for field in (
+        "registryEndpoint",
+        "networkId",
+        "chainId",
+        "contractAddress",
+    ):
+        require(
+            isinstance(section.get(field), str) and bool(section[field].strip()),
+            f"Dytallix {field} is required",
+        )
+    require(
+        isinstance(section.get("contractCodeHash"), str)
+        and SHA256_RE.fullmatch(section["contractCodeHash"]) is not None,
+        "Dytallix contractCodeHash must be a 64-character lowercase hex digest",
+    )
     require(section.get("walletAddressesRedacted") is True, "Dytallix wallet addresses must be redacted")
     require(section.get("rawWalletMaterialCommitted") is False, "Dytallix raw wallet material must not be committed")
-    cases = section.get("cases")
-    require(isinstance(cases, dict), "Dytallix bundle metadata.dytallix.cases must be an object")
+    documents: dict[str, bytes] = {}
 
-    copied_cases: dict[str, dict[str, Any]] = {}
-    documents: dict[str, dict[str, Any]] = {}
-    expected_decisions = {
-        "active": "accepted",
-        "missing": "rejected",
-        "revoked": "rejected",
-        "suspended": "rejected",
-        "mismatched": "rejected",
-        "stale": "rejected",
-        "unavailable": "rejected",
+    def checked_reference(entry: object, label: str) -> tuple[dict[str, Any], str]:
+        require(isinstance(entry, dict), f"{label} is required")
+        assert isinstance(entry, dict)
+        expected_sha = entry.get("sha256")
+        require(
+            isinstance(expected_sha, str)
+            and SHA256_RE.fullmatch(expected_sha) is not None,
+            f"{label} evidence requires sha256",
+        )
+        source = resolve_source_path(entry.get("evidence"), resolved_root, f"{label} evidence")
+        _, source_raw = load_json(source, f"{label} evidence")
+        source_sha = sha256(source_raw)
+        require(expected_sha == source_sha, f"{label} evidence sha256 does not match")
+        relative = source.relative_to(resolved_root).as_posix()
+        documents[relative] = source_raw
+        copied = dict(entry)
+        copied.update({"evidence": relative, "sha256": source_sha})
+        return copied, relative
+
+    def checked_binary_reference(
+        reference: object,
+        expected_sha: object,
+        label: str,
+    ) -> tuple[str, str]:
+        require(
+            isinstance(expected_sha, str) and SHA256_RE.fullmatch(expected_sha) is not None,
+            f"{label} requires sha256",
+        )
+        source = resolve_source_path(reference, resolved_root, label)
+        source_raw = read_checked(source, label)
+        source_sha = sha256(source_raw)
+        require(expected_sha == source_sha, f"{label} sha256 does not match")
+        relative = source.relative_to(resolved_root).as_posix()
+        documents[relative] = source_raw
+        return relative, source_sha
+
+    finality, _ = checked_reference(section.get("finality"), "Dytallix finality")
+    require(finality.get("independentlyVerified") is True, "Dytallix finality must be independently verified")
+    require(
+        finality.get("verificationMethod") == "independentFinalizedBlock",
+        "Dytallix finality verificationMethod must be independentFinalizedBlock",
+    )
+    require(finality.get("sdkReceiptOnly") is False, "Dytallix finality cannot rely on an SDK receipt")
+    verifier_signature = finality.get("verifierSignature")
+    require(isinstance(verifier_signature, dict), "Dytallix finality verifierSignature is required")
+    assert isinstance(verifier_signature, dict)
+    require(
+        verifier_signature.get("algorithm") == "ecdsa-p256-sha256",
+        "Dytallix finality verifier signature algorithm must be ecdsa-p256-sha256",
+    )
+    public_key, public_key_sha = checked_binary_reference(
+        verifier_signature.get("publicKey"),
+        verifier_signature.get("publicKeySha256"),
+        "Dytallix finality verifier public key",
+    )
+    signature, signature_sha = checked_binary_reference(
+        verifier_signature.get("signature"),
+        verifier_signature.get("signatureSha256"),
+        "Dytallix finality verifier signature",
+    )
+    finality["verifierSignature"] = {
+        "algorithm": "ecdsa-p256-sha256",
+        "publicKey": public_key,
+        "publicKeySha256": public_key_sha,
+        "signature": signature,
+        "signatureSha256": signature_sha,
     }
-    for case_name in REQUIRED_DYTALLIX_CASES:
-        entry = cases.get(case_name)
-        require(isinstance(entry, dict), f"Dytallix case {case_name} is required")
-        require(entry.get("redacted", True) is True, f"Dytallix case {case_name} must be redacted")
-        source = resolve_source_path(entry.get("evidence"), resolved_root, f"Dytallix case {case_name} evidence")
-        source_document, source_raw = load_json(source, f"Dytallix case {case_name} evidence")
-        observed = entry.get("observedDecision")
+
+    source_lifecycle = section.get("lifecycle")
+    require(isinstance(source_lifecycle, dict), "Dytallix lifecycle must be an object")
+    lifecycle: dict[str, dict[str, Any]] = {}
+    for case_name, expected_outcome in REQUIRED_DYTALLIX_LIFECYCLE.items():
+        entry, _ = checked_reference(source_lifecycle.get(case_name), f"Dytallix lifecycle case {case_name}")
         require(
-            observed == expected_decisions[case_name],
-            f"Dytallix case {case_name} observedDecision must be {expected_decisions[case_name]}",
+            entry.get("observedOutcome") == expected_outcome,
+            f"Dytallix lifecycle case {case_name} observedOutcome must be {expected_outcome}",
+        )
+        require(entry.get("finalized") is True, f"Dytallix lifecycle case {case_name} must be finalized")
+        lifecycle[case_name] = entry
+
+    source_negative = section.get("negativePolicies")
+    require(isinstance(source_negative, dict), "Dytallix negativePolicies must be an object")
+    negative: dict[str, dict[str, Any]] = {}
+    for case_name in REQUIRED_DYTALLIX_NEGATIVE_POLICIES:
+        entry, _ = checked_reference(
+            source_negative.get(case_name),
+            f"Dytallix negative policy case {case_name}",
         )
         require(
-            source_document.get("observedDecision") == observed,
-            f"Dytallix case {case_name} evidence decision does not match metadata",
+            entry.get("observedDecision") == "rejected",
+            f"Dytallix negative policy case {case_name} observedDecision must be rejected",
         )
-        require(
-            source_document.get("redacted") is True,
-            f"Dytallix case {case_name} evidence must assert redacted=true",
-        )
-        relative = f"dytallix/{case_name}.json"
-        copied_cases[case_name] = {
-            "observedDecision": observed,
-            "evidence": relative,
-            "redacted": True,
-        }
-        documents[case_name] = {
-            "schemaVersion": 1,
-            "evidenceKind": "steamosDytallixCaseEvidence",
-            "case": case_name,
-            "status": "pass",
-            "observedDecision": observed,
-            "redacted": True,
-            "sourceSha256": sha256(source_raw),
-        }
+        negative[case_name] = entry
+
+    ttl_refresh, _ = checked_reference(section.get("ttlRefresh"), "Dytallix TTL refresh")
+    require(ttl_refresh.get("observedOutcome") == "accepted", "Dytallix TTL refresh must be accepted")
+    require(ttl_refresh.get("finalized") is True, "Dytallix TTL refresh must be finalized")
+    require(
+        ttl_refresh.get("stableIdentityRevisionBefore")
+        == ttl_refresh.get("stableIdentityRevisionAfter"),
+        "Dytallix TTL refresh must preserve stable identity revision",
+    )
+
     copied_section = {
-        "status": section.get("status"),
-        "registryEndpoint": section.get("registryEndpoint"),
-        "networkId": section.get("networkId"),
-        "contract": section.get("contract"),
+        field: section[field]
+        for field in (
+            "status",
+            "evidenceClass",
+            "bindingVersion",
+            "contractSchemaVersion",
+            "registryEndpoint",
+            "networkId",
+            "chainId",
+            "contractAddress",
+            "contractCodeHash",
+        )
+    }
+    copied_section.update({
         "walletAddressesRedacted": True,
         "rawWalletMaterialCommitted": False,
-        "cases": copied_cases,
-    }
+        "finality": finality,
+        "lifecycle": lifecycle,
+        "negativePolicies": negative,
+        "ttlRefresh": ttl_refresh,
+    })
     return copied_section, documents
 
 
@@ -869,6 +1115,7 @@ def main() -> int:
     else:
         overall_status = "blocked"
     metadata = {
+        "schemaVersion": 2,
         "generatedAt": manifest["generatedAt"],
         "status": overall_status,
         "dytallix": dytallix,
@@ -885,8 +1132,10 @@ def main() -> int:
 
     output_root.mkdir(parents=True, exist_ok=True)
     write_json(output_root / "metadata.json", metadata)
-    for case_name, document in dytallix_documents.items():
-        write_json(output_root / "dytallix" / f"{case_name}.json", document)
+    for relative, raw in dytallix_documents.items():
+        destination = output_root / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(raw)
     for control, document in control_documents.items():
         write_json(output_root / "rendezvous-relay" / f"{control}.json", document)
 

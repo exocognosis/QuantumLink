@@ -18,7 +18,7 @@
 | Steam-safe bypass | Blocked | The `qlink-game` policy is no longer orphaned: `qlinkd` loads it into `SteamBypassSummary` at startup, validates the protected overlay CIDR against the policy, and logs the posture; `qlinkctl`'s operator guide derives its Steam-safe disclosure from the same policy so enforcement and disclosure share one source. Verified 2026-07-12 (`cargo test -p qlinkd game::`, `cargo test -p qlinkctl steam_safe_disclosure`). Local profile tests still pass (`cargo test -p qlink-game steam_bypass`). Real Deck route-leak evidence for Steam account/store/wallet/update/login categories is still required |
 | nftables rollback | Passed | Codex local automation on 2026-06-30: `cargo test -p qlink-linux network_lifecycle -- --nocapture`; fake-executor rollback and owned-record retry paths passed |
 | Private invite peer lifecycle | Passed | Invite import, explicit `peer select`, revoke, expiry, exact inbound ACL, owner-only peer storage, unambiguous targeting, and bounded resident revalidation are covered; removing, revoking, expiring, or replacing the selected peer drops the full transport |
-| Public Dytallix policy | Blocked | Stable identity v2 contract and shared verifier code now bind wallet/device identity independently from ephemeral signed reachability; public SteamOS refuses v1 downgrade and reports local enrollment separately from remote trust. Live deployed-chain finality/readback and accept/reject evidence are still required |
+| Public Dytallix policy | Blocked | The schema-v2 evidence contract now requires `stableIdentityV2`, contract schema 2, `liveChain` evidence, pinned network/chain/contract/code hash, independently verified finality, the complete register/update/suspend/reactivate/revoke lifecycle, rejected post-revocation reactivation, TTL refresh preserving identity revision, the negative-policy matrix, and contained SHA-256-matched sidecars. No qualifying live evidence is linked |
 | Rendezvous/relay production profile | Blocked | Fixture-tested bridge logic can translate verified TLS, auth, limits, revocation, relay denial, and an explicit ML-DSA signed-record publication/expiry/refresh verifier report. No off-host public-edge run is linked; abuse-log samples, deployed retention, key rotation, endpoint rotation, and incident shutdown also remain blocked |
 | Non-root local control | Passed | Codex local automation on 2026-06-30: `cargo test -p qlinkd local_control_acl -- --nocapture`, `cargo test -p qlinkctl support_bundle -- --nocapture`, and `bash steam/steamos/tests/install-steamos-test.sh` |
 | Signed release artifacts | Blocked | Compatible Linux CI implements the ephemeral Ed25519 signed-RC positive path and asserts `productionReady=false`; no protected production-key signature evidence or linked passing production release run exists |
@@ -202,9 +202,52 @@ orphaned crate.
 - JSON receipts distinguish confirmed transaction plus exact readback from
   finalized-chain proof. The pinned SDK does not yet expose trustworthy
   finalized-block metadata, so production readiness remains No-Go.
-- Next blocker: upgrade the production-evidence schema, collector, verifier,
-  and bridge to require live-chain v2 lifecycle and negative-policy evidence,
-  including independently verified finality and sidecar digests.
+- The production-evidence schema, collector, verifier, bridge, packager, and
+  tests now enforce live-chain v2 lifecycle and negative-policy evidence,
+  independently verified finality, content-bound sidecars, and signed-archive
+  binding.
+- Next blocker: run the live Dytallix lifecycle and policy harness against the
+  deployed chain using an independent finality source, then link the resulting
+  passing bundle. The current pinned SDK cannot supply that finality proof.
+
+## 2026-07-28 Production-Evidence Schema V2 Enforcement
+
+- Defined schema v2 as the only production-eligible non-hardware evidence
+  contract.
+- Schema v1 remains parseable for historical inspection and gap analysis, but
+  it is always production-blocked and must never set
+  `nonHardwareProductionReady=true`.
+- The Dytallix gate now requires `bindingVersion=stableIdentityV2`,
+  `contractSchemaVersion=2`, `evidenceClass=liveChain`, and pinned network,
+  chain, deployed contract address, and deployed code hash.
+- Required lifecycle proof covers finalized register, update, suspend,
+  reactivate, and revoke transactions plus rejected post-revocation
+  reactivation and TTL refresh that preserves the stable identity revision.
+- Required negative-policy proof covers v1 downgrade, expired authorization,
+  device mismatch, signing-key mismatch, wrong mesh scope, TTL excess,
+  non-monotonic revision, missing/suspended/revoked identities, and registry
+  outage fail-closure.
+- Every finality proof, readback, lifecycle case, negative case, and
+  rendezvous/relay control requires a contained regular-file sidecar with a
+  matching SHA-256 digest.
+- Dytallix sidecar JSON must match the manifest's pinned chain, contract,
+  transaction, lifecycle/readback, identity revision, and policy decision.
+  The independently finalized checkpoint must cover every claimed transaction.
+- The finality report must carry a valid ECDSA P-256/SHA-256 signature from an
+  independently configured, pinned verifier public key. Bundle-supplied trust
+  alone cannot set readiness. Its signed transaction inventory binds each
+  lifecycle operation to the observed result, identity revision, and exact
+  readback digest.
+- The packager embeds an identical evidence manifest and sidecar tree in the
+  signed application archive. Release verification rejects detached or
+  substituted external evidence.
+- SDK transaction confirmation and exact readback are explicitly not
+  finalized-chain proof. Finality must be independently verified against the
+  pinned chain and transaction.
+- The collector, verifier, bridge, packager, fixtures, and tests enforce the
+  complete v2 contract. Schema-v1 evidence is rejected for production signing.
+- Decision: No-Go remains unchanged. No schema-v2 live-chain bundle is linked,
+  independently verified, and recorded as passing evidence.
 
 ## Go / No-Go Rule
 
