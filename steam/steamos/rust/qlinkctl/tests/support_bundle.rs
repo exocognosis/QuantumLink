@@ -98,6 +98,7 @@ fn sensitive_status_fixture() -> DaemonStatus {
             error: Some("PRIVATE_KEY_MATERIAL should not leave diagnostics".to_string()),
         },
         data_plane: DataPlaneStatus::not_started(),
+        publication: Default::default(),
     }
 }
 

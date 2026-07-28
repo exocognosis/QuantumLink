@@ -103,8 +103,11 @@ pub trait PeerStore: Send + Sync + std::fmt::Debug {
     /// trusting it (`PeerRecord::verify`); the store does not.
     fn load(&self, mesh_id: &str, peer_id: &str) -> Option<PeerRecord>;
 
-    /// Stores or replaces the record. Best-effort: implementations
-    /// log on failure rather than returning errors.
+    /// Stores a record, replacing a current record for the same peer only when
+    /// the candidate has a higher sequence. Equal or lower sequences are
+    /// ignored until the current record expires, after which sequence restart
+    /// is allowed. Best-effort: implementations log on failure rather than
+    /// returning errors.
     fn store(&self, mesh_id: &str, record: &PeerRecord);
 
     /// Removes the record for the given peer. Idempotent.
@@ -153,6 +156,12 @@ impl PeerStore for InMemoryPeerStore {
             // accumulating dead records.
             let now = now_unix();
             guard.retain(|_, existing| existing.body.expires_at_unix > now);
+            if guard
+                .get(&key)
+                .is_some_and(|existing| record.body.sequence <= existing.body.sequence)
+            {
+                return;
+            }
             guard.insert(key, record.clone());
         }
     }
@@ -612,11 +621,14 @@ impl PeerStore for FilePeerStore {
                 by_peer.retain(|_, existing| existing.body.expires_at_unix > now);
                 !by_peer.is_empty()
             });
-            guard
-                .records
-                .entry(mesh_id.to_string())
-                .or_default()
-                .insert(record.body.peer_id.clone(), record.clone());
+            let by_peer = guard.records.entry(mesh_id.to_string()).or_default();
+            if by_peer
+                .get(&record.body.peer_id)
+                .is_some_and(|existing| record.body.sequence <= existing.body.sequence)
+            {
+                return;
+            }
+            by_peer.insert(record.body.peer_id.clone(), record.clone());
             guard.records.clone()
         };
         self.persist(&snapshot);
@@ -725,6 +737,16 @@ mod tests {
 
     fn fresh_signed_record(mesh_id: &str) -> (DeviceKeypair, PeerRecord) {
         let keypair = DeviceKeypair::generate().unwrap();
+        let record = signed_record_with_sequence(&keypair, mesh_id, 1, 300);
+        (keypair, record)
+    }
+
+    fn signed_record_with_sequence(
+        keypair: &DeviceKeypair,
+        mesh_id: &str,
+        sequence: u64,
+        ttl_seconds: u64,
+    ) -> PeerRecord {
         let body = UnsignedPeerRecord::new(
             mesh_id,
             "alias",
@@ -736,11 +758,10 @@ mod tests {
                 priority: 100,
             }],
             vec!["100.127.0.10/32".to_string()],
-            300,
-            1,
+            ttl_seconds,
+            sequence,
         );
-        let record = PeerRecord::signed(body, &keypair).unwrap();
-        (keypair, record)
+        PeerRecord::signed(body, keypair).unwrap()
     }
 
     #[test]
@@ -770,6 +791,44 @@ mod tests {
         store.store("devmesh", &record);
         // Same peer_id, different mesh: nothing leaked across meshes.
         assert!(store.load("other-mesh", &peer_id).is_none());
+    }
+
+    #[test]
+    fn in_memory_store_enforces_sequence_anti_rollback() {
+        let store = InMemoryPeerStore::new();
+        let keypair = DeviceKeypair::generate().unwrap();
+        let first = signed_record_with_sequence(&keypair, "devmesh", 10, 300);
+        let equal = signed_record_with_sequence(&keypair, "devmesh", 10, 600);
+        let lower = signed_record_with_sequence(&keypair, "devmesh", 9, 600);
+        let higher = signed_record_with_sequence(&keypair, "devmesh", 11, 300);
+        let peer_id = first.body.peer_id.clone();
+
+        store.store("devmesh", &first);
+        store.store("devmesh", &equal);
+        store.store("devmesh", &lower);
+        let loaded = store.load("devmesh", &peer_id).unwrap();
+        assert_eq!(loaded.signature, first.signature);
+        assert_eq!(loaded.body.sequence, 10);
+
+        store.store("devmesh", &higher);
+        assert_eq!(store.load("devmesh", &peer_id).unwrap().body.sequence, 11);
+    }
+
+    #[test]
+    fn in_memory_store_allows_sequence_restart_after_expiry() {
+        let store = InMemoryPeerStore::new();
+        let keypair = DeviceKeypair::generate().unwrap();
+        let mut expired = signed_record_with_sequence(&keypair, "devmesh", 10, 300);
+        expired.body.expires_at_unix = now_unix().saturating_sub(1);
+        let restarted = signed_record_with_sequence(&keypair, "devmesh", 1, 300);
+        let peer_id = expired.body.peer_id.clone();
+
+        store.store("devmesh", &expired);
+        store.store("devmesh", &restarted);
+
+        let loaded = store.load("devmesh", &peer_id).unwrap();
+        assert_eq!(loaded.body.sequence, 1);
+        assert_eq!(loaded.signature, restarted.signature);
     }
 
     #[test]
@@ -885,6 +944,53 @@ mod tests {
         let loaded = store.load("devmesh", &peer_id).unwrap();
         assert_eq!(loaded.body.sequence, 2);
         assert_eq!(store.len(), 1, "same peer must not duplicate");
+    }
+
+    #[test]
+    fn file_store_rejects_rollback_and_newer_record_survives_restart() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("peers.json");
+        let keypair = DeviceKeypair::generate().unwrap();
+        let newer = signed_record_with_sequence(&keypair, "devmesh", 12, 300);
+        let equal = signed_record_with_sequence(&keypair, "devmesh", 12, 600);
+        let older = signed_record_with_sequence(&keypair, "devmesh", 11, 600);
+        let peer_id = newer.body.peer_id.clone();
+
+        {
+            let store = open_file_peer_store(&path).unwrap();
+            store.store("devmesh", &newer);
+            store.store("devmesh", &equal);
+            store.store("devmesh", &older);
+            let loaded = store.load("devmesh", &peer_id).unwrap();
+            assert_eq!(loaded.body.sequence, 12);
+            assert_eq!(loaded.signature, newer.signature);
+        }
+
+        let reloaded = open_file_peer_store(&path).unwrap();
+        let loaded = reloaded.load("devmesh", &peer_id).unwrap();
+        assert_eq!(loaded.body.sequence, 12);
+        assert_eq!(loaded.signature, newer.signature);
+    }
+
+    #[test]
+    fn file_store_allows_sequence_restart_after_expiry_and_persists_it() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("peers.json");
+        let keypair = DeviceKeypair::generate().unwrap();
+        let mut expired = signed_record_with_sequence(&keypair, "devmesh", 10, 300);
+        expired.body.expires_at_unix = now_unix().saturating_sub(1);
+        let restarted = signed_record_with_sequence(&keypair, "devmesh", 1, 300);
+        let peer_id = expired.body.peer_id.clone();
+
+        {
+            let store = open_file_peer_store(&path).unwrap();
+            store.store("devmesh", &expired);
+            store.store("devmesh", &restarted);
+            assert_eq!(store.load("devmesh", &peer_id).unwrap().body.sequence, 1);
+        }
+
+        let reloaded = open_file_peer_store(&path).unwrap();
+        assert_eq!(reloaded.load("devmesh", &peer_id).unwrap().body.sequence, 1);
     }
 
     // MARK: - TTL eviction
@@ -1241,8 +1347,11 @@ mod tests {
         store.store("devmesh", &record);
         let first = fs::read_to_string(&path).unwrap();
 
-        // Second store of the same record forces a rewrite.
-        store.store("devmesh", &record);
+        // A second accepted write forces a rewrite. Use another peer because
+        // equal-sequence replacement for the same peer is intentionally
+        // ignored by the anti-rollback policy.
+        let (_, second_record) = fresh_signed_record("devmesh");
+        store.store("devmesh", &second_record);
         let second = fs::read_to_string(&path).unwrap();
 
         assert_ne!(

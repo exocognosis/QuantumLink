@@ -1,6 +1,7 @@
 use crate::{
     crypto::DevicePublicKey,
     discovery::{now_unix, PeerRecord},
+    dytallix_identity_v2::RegistryIdentityRecordV2,
     error::{QlinkError, Result},
     inbound_identity::InboundIdentityAssertion,
 };
@@ -16,6 +17,7 @@ use sha2::{Digest, Sha256};
 use std::{fmt, path::PathBuf};
 
 const REGISTRY_CONTRACT_NAME: &str = "quantumlink-node-registry";
+const STABLE_IDENTITY_REGISTRY_CONTRACT_NAME: &str = "quantumlink-node-registry-v2";
 const REGISTRY_CONTRACT_VERSION: u8 = 1;
 const CONTRACT_CALL_GAS_LIMIT: u64 = 1_000_000;
 
@@ -70,6 +72,20 @@ pub enum DytallixPolicyStatus {
     Unavailable,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum DytallixRegistryBindingVersion {
+    #[default]
+    ExactPeerRecordV1,
+    StableIdentityV2,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegistryIdentityLookupRecord {
+    ExactPeerRecordV1(RegistryNodeRecord),
+    StableIdentityV2(RegistryIdentityRecordV2),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DytallixPolicyDecision {
     pub accepted: bool,
@@ -81,6 +97,7 @@ pub struct DytallixPolicyDecision {
 pub struct DytallixRegistryLookupConfig {
     pub endpoint: String,
     pub contract_address: String,
+    pub binding_version: DytallixRegistryBindingVersion,
     pub network_id: Option<String>,
     pub chain_id: Option<String>,
     pub allowed_rpc_endpoints: Vec<String>,
@@ -557,6 +574,7 @@ impl DytallixRegistryLookupConfig {
         Ok(Self {
             endpoint: endpoint.into(),
             contract_address: normalize_lookup_contract_identifier(&contract_address.into())?,
+            binding_version: DytallixRegistryBindingVersion::ExactPeerRecordV1,
             network_id: None,
             chain_id: None,
             allowed_rpc_endpoints: Vec::new(),
@@ -574,6 +592,11 @@ impl DytallixRegistryLookupConfig {
         self.allowed_rpc_endpoints = normalize_endpoint_allowlist(allowed_rpc_endpoints);
         self.validate_endpoint_allowlist()?;
         Ok(self)
+    }
+
+    pub fn with_binding_version(mut self, binding_version: DytallixRegistryBindingVersion) -> Self {
+        self.binding_version = binding_version;
+        self
     }
 
     fn validate_endpoint_allowlist(&self) -> Result<()> {
@@ -704,6 +727,8 @@ impl<'de> Deserialize<'de> for DytallixRegistryLookupConfig {
             #[serde(default)]
             publish_wallet_address: bool,
             #[serde(default)]
+            binding_version: DytallixRegistryBindingVersion,
+            #[serde(default)]
             network_id: Option<String>,
             #[serde(default)]
             chain_id: Option<String>,
@@ -714,6 +739,10 @@ impl<'de> Deserialize<'de> for DytallixRegistryLookupConfig {
         let raw = RawLookupConfig::deserialize(deserializer)?;
         let _ = raw.publish_wallet_address;
         Self::new(raw.endpoint, raw.contract_address)
+            .map(|mut config| {
+                config.binding_version = raw.binding_version;
+                config
+            })
             .and_then(|config| {
                 config.with_network_pins(raw.network_id, raw.chain_id, raw.allowed_rpc_endpoints)
             })
@@ -728,11 +757,16 @@ pub struct DytallixIdentityRegistry {
 }
 
 impl DytallixIdentityRegistry {
+    pub fn binding_version(&self) -> DytallixRegistryBindingVersion {
+        self.lookup_config.binding_version
+    }
+
     pub fn new(mut config: DytallixRegistryConfig) -> Result<Self> {
         config.contract_address = normalize_contract_address(&config.contract_address)?;
         let lookup_config = DytallixRegistryLookupConfig {
             endpoint: config.endpoint.clone(),
             contract_address: config.contract_address.clone(),
+            binding_version: DytallixRegistryBindingVersion::ExactPeerRecordV1,
             network_id: None,
             chain_id: None,
             allowed_rpc_endpoints: Vec::new(),
@@ -774,6 +808,62 @@ impl DytallixIdentityRegistry {
         } else {
             Err(QlinkError::Protocol(format!(
                 "dytallix registry lookup failed: {}",
+                response
+                    .error
+                    .unwrap_or_else(|| "unknown contract error".into())
+            )))
+        }
+    }
+
+    pub async fn lookup_identity(
+        &self,
+        peer_id: &str,
+    ) -> Result<Option<RegistryIdentityLookupRecord>> {
+        match self.lookup_config.binding_version {
+            DytallixRegistryBindingVersion::ExactPeerRecordV1 => self
+                .lookup(peer_id)
+                .await
+                .map(|record| record.map(RegistryIdentityLookupRecord::ExactPeerRecordV1)),
+            DytallixRegistryBindingVersion::StableIdentityV2 => self
+                .lookup_stable_identity_v2(peer_id)
+                .await
+                .map(|record| record.map(RegistryIdentityLookupRecord::StableIdentityV2)),
+        }
+    }
+
+    async fn lookup_stable_identity_v2(
+        &self,
+        peer_id: &str,
+    ) -> Result<Option<RegistryIdentityRecordV2>> {
+        #[derive(Serialize)]
+        struct GetIdentityRequest<'a> {
+            peer_id: &'a str,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct StableIdentityQueryResponse {
+            ok: bool,
+            identity: Option<RegistryIdentityRecordV2>,
+            #[serde(default)]
+            events: Vec<serde_json::Value>,
+            error: Option<String>,
+        }
+
+        let args_hex = hex::encode(serde_json::to_vec(&GetIdentityRequest { peer_id })?);
+        let path = format!(
+            "/api/contracts/{}/query/get_identity?args={args_hex}",
+            self.lookup_config.contract_address
+        );
+        let value: serde_json::Value = self.get_json(&path).await?;
+        let response: StableIdentityQueryResponse =
+            decode_contract_response(value, "stable identity")?;
+        let _ = response.events;
+        if response.ok {
+            Ok(response.identity)
+        } else {
+            Err(QlinkError::Protocol(format!(
+                "dytallix stable identity lookup failed: {}",
                 response
                     .error
                     .unwrap_or_else(|| "unknown contract error".into())
@@ -1068,8 +1158,11 @@ fn normalize_contract_address(raw: &str) -> Result<String> {
 
 fn normalize_lookup_contract_identifier(raw: &str) -> Result<String> {
     let trimmed = raw.trim();
-    if trimmed == REGISTRY_CONTRACT_NAME {
-        return Ok(REGISTRY_CONTRACT_NAME.to_string());
+    if matches!(
+        trimmed,
+        REGISTRY_CONTRACT_NAME | STABLE_IDENTITY_REGISTRY_CONTRACT_NAME
+    ) {
+        return Ok(trimmed.to_string());
     }
     normalize_contract_address(trimmed)
 }
@@ -1101,20 +1194,29 @@ fn contract_call_submission_body<T: Serialize>(
 }
 
 fn decode_registry_query_response(value: serde_json::Value) -> Result<RegistryQueryResponse> {
+    decode_contract_response(value, "registry")
+}
+
+fn decode_contract_response<T: for<'de> Deserialize<'de>>(
+    value: serde_json::Value,
+    response_kind: &str,
+) -> Result<T> {
     if let Some(result_hex) = value.get("result").and_then(|raw| raw.as_str()) {
         let bytes = hex::decode(result_hex).map_err(|err| {
-            QlinkError::Protocol(format!("dytallix registry result is not valid hex: {err}"))
+            QlinkError::Protocol(format!(
+                "dytallix {response_kind} result is not valid hex: {err}"
+            ))
         })?;
         return serde_json::from_slice(&bytes).map_err(|err| {
             QlinkError::Protocol(format!(
-                "dytallix registry result is not valid contract JSON: {err}"
+                "dytallix {response_kind} result is not valid contract JSON: {err}"
             ))
         });
     }
 
     serde_json::from_value(value).map_err(|err| {
         QlinkError::Protocol(format!(
-            "dytallix registry response is not valid JSON: {err}"
+            "dytallix {response_kind} response is not valid JSON: {err}"
         ))
     })
 }
@@ -1445,6 +1547,25 @@ mod tests {
         .unwrap();
 
         assert_eq!(config.contract_address, "quantumlink-node-registry");
+    }
+
+    #[test]
+    fn registry_lookup_config_accepts_named_stable_identity_contract() {
+        let config: DytallixRegistryLookupConfig = serde_json::from_value(json!({
+            "endpoint": "https://dytallix.com",
+            "contractAddress": "quantumlink-node-registry-v2",
+            "networkId": "dytallix-mainnet",
+            "chainId": "dytallix-mainnet-1",
+            "bindingVersion": "stableIdentityV2",
+            "allowedRpcEndpoints": ["https://dytallix.com"]
+        }))
+        .unwrap();
+
+        assert_eq!(config.contract_address, "quantumlink-node-registry-v2");
+        assert_eq!(
+            config.binding_version,
+            DytallixRegistryBindingVersion::StableIdentityV2
+        );
     }
 
     #[test]

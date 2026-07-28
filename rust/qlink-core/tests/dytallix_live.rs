@@ -29,6 +29,7 @@ fn live_lookup_config() -> DytallixRegistryLookupConfig {
             .unwrap_or_else(|_| DEFAULT_ENDPOINT.to_string()),
         contract_address: std::env::var("QLINK_DYTALLIX_CONTRACT")
             .unwrap_or_else(|_| DEFAULT_CONTRACT.to_string()),
+        binding_version: Default::default(),
         network_id: None,
         chain_id: None,
         allowed_rpc_endpoints: Vec::new(),

@@ -1,10 +1,11 @@
 use qlink_proto::InviteCode;
+use qlinkctl::dytallix::{parse_dytallix_args, run_dytallix};
 #[cfg(unix)]
 use qlinkctl::{
     current_unix_seconds, format_doctor, format_peer_list, format_peer_trust, format_status,
     import_invite_to_store, load_peer_store_for_state_dir, peer_from_store, remove_peer_from_store,
-    revoke_peer_in_store, status_from_daemon, write_support_bundle, SupportBundleOptions,
-    SupportBundleReleaseInfo, DEFAULT_STATE_DIR,
+    revoke_peer_in_store, select_peer_in_store, status_from_daemon, write_support_bundle,
+    SupportBundleOptions, SupportBundleReleaseInfo, DEFAULT_STATE_DIR,
 };
 use qlinkctl::{format_guide, format_onboarding_checklist};
 #[cfg(unix)]
@@ -17,6 +18,20 @@ fn main() {
         Some("onboarding") => onboarding_command(),
         Some("status") => status_command(),
         Some("doctor") => doctor_command(),
+        Some("dytallix") => match parse_dytallix_args(args) {
+            Ok(options) => match run_dytallix(options) {
+                Ok(output) => println!("{output}"),
+                Err(error) => {
+                    eprintln!("{error}");
+                    std::process::exit(1);
+                }
+            },
+            Err(error) => {
+                eprintln!("{error}");
+                eprintln!("{}", dytallix_usage());
+                std::process::exit(2);
+            }
+        },
         Some("support-bundle") => {
             let Some(flag) = args.next() else {
                 eprintln!("usage: qlinkctl support-bundle --output <path>");
@@ -77,6 +92,13 @@ fn main() {
                 };
                 peer_revoke_command(&peer_id);
             }
+            Some("select") => {
+                let Some(peer_id) = args.next() else {
+                    eprintln!("usage: qlinkctl peer select <peer-id>");
+                    std::process::exit(2);
+                };
+                peer_select_command(&peer_id);
+            }
             Some("trust") => {
                 let Some(peer_id) = args.next() else {
                     eprintln!("usage: qlinkctl peer trust <peer-id>");
@@ -85,17 +107,24 @@ fn main() {
                 peer_trust_command(&peer_id);
             }
             _ => {
-                eprintln!("usage: qlinkctl peer <list|remove|revoke|trust> [peer-id]");
+                eprintln!("usage: qlinkctl peer <list|remove|revoke|select|trust> [peer-id]");
                 std::process::exit(2);
             }
         },
         _ => {
             eprintln!(
-                "usage: qlinkctl <guide|onboarding|status|doctor|support-bundle --output|invite|peer>"
+                "usage: qlinkctl <guide|onboarding|status|doctor|dytallix|support-bundle --output|invite|peer>"
             );
             std::process::exit(2);
         }
     }
+}
+
+fn dytallix_usage() -> &'static str {
+    "usage: qlinkctl dytallix <status|register|update|suspend|reactivate|revoke> \
+     [--config <path>] [--state-dir <path>] [--keystore <path>] [--wallet <name>] \
+     [--peer-id <id>] [--confirm-peer-id <id>] [--authorization-expires-at <unix>] \
+     [--max-peer-ttl <seconds>] [--mesh-scope <scope>] [--metadata-commitment <sha256-hex>]"
 }
 
 #[cfg(unix)]
@@ -246,6 +275,27 @@ fn peer_revoke_command(peer_id: &str) {
             std::process::exit(1);
         }
     }
+}
+
+#[cfg(unix)]
+fn peer_select_command(peer_id: &str) {
+    match select_peer_in_store(
+        Path::new(DEFAULT_STATE_DIR),
+        peer_id,
+        current_unix_seconds(),
+    ) {
+        Ok(()) => println!("{peer_id}"),
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn peer_select_command(_peer_id: &str) {
+    eprintln!("qlinkctl peer select is only supported on Unix-like SteamOS hosts");
+    std::process::exit(2);
 }
 
 #[cfg(not(unix))]

@@ -68,6 +68,7 @@ turn-relay = ["dep:hmac", "dep:md-5", "dep:sha1"]
 
 [dev-dependencies]
 criterion = { version = "0.8", default-features = false, features = ["async_tokio", "html_reports"] }
+quantumlink-node-registry-v2 = { path = "../dytallix/quantumlink-node-registry-v2" }
 tempfile = "3"
 
 [[bench]]

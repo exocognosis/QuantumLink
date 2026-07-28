@@ -304,7 +304,6 @@ impl IfReq {
 }
 
 #[cfg(unix)]
-#[cfg(unix)]
 fn set_nonblocking(fd: RawFd) -> io::Result<()> {
     let flags = unsafe { fcntl(fd, F_GETFL) };
     if flags < 0 {

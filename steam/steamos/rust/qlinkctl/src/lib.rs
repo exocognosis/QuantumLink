@@ -1,8 +1,12 @@
 use qlink_proto::{
     load_peer_store_at, peer_store_path_from_state_dir, store_peer_store_at, ConnectionPhase,
-    DaemonStatus, DataPlaneState, InviteCode, MeshTrustMode, NetworkPlanState, PathKind, PeerStore,
-    RouteMode, StoredPeer,
+    DaemonStatus, DataPlaneState, DytallixBindingVersion, DytallixTrustDecision,
+    DytallixTrustHealth, DytallixTrustStatus, InviteCode, LocalRegistryBindingState, MeshTrustMode,
+    NetworkPlanState, PathKind, PeerStore, PublicationErrorCode, PublicationState,
+    PublicationStatus, RouteMode, StoredPeer,
 };
+
+pub mod dytallix;
 
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
@@ -30,6 +34,56 @@ pub enum ControlError {
 }
 
 pub const DEFAULT_STATE_DIR: &str = "/var/lib/quantumlink";
+pub const DEVICE_IDENTITY_SEED_FILE: &str = "device-identity.seed";
+
+pub fn load_provisioning_device_keypair(
+    state_dir: &Path,
+) -> Result<qlink_core::crypto::DeviceKeypair, std::io::Error> {
+    let path = state_dir.join(DEVICE_IDENTITY_SEED_FILE);
+    let metadata = std::fs::symlink_metadata(&path)?;
+    if !metadata.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "device identity seed {} is not a regular file",
+                path.display()
+            ),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "device identity seed {} must not be group- or world-accessible",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    let bytes = std::fs::read(&path)?;
+    let seed: [u8; 32] = bytes.try_into().map_err(|bytes: Vec<u8>| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "device identity seed {} must be exactly 32 bytes; got {}",
+                path.display(),
+                bytes.len()
+            ),
+        )
+    })?;
+    qlink_core::crypto::DeviceKeypair::from_seed(seed).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "device identity seed {} is invalid: {error}",
+                path.display()
+            ),
+        )
+    })
+}
 
 pub fn format_guide() -> String {
     [
@@ -46,6 +100,7 @@ pub fn format_guide() -> String {
         "- qlinkd --activate-network is the explicit operator opt-in for live TUN, route, and nftables application.",
         "- qlinkd --deactivate-network removes only QuantumLink-owned network state from the persisted ownership record.",
         "- qlinkctl doctor reports packet I/O, data-plane health, and whether transport ready is yes or no.",
+        "- Publication and Dytallix failures are fail-closed: protected transport must remain disabled until qlinkctl doctor reports a current signed record and healthy required trust.",
         "",
         "Peer and invite commands",
         "- qlinkctl status shows daemon status as JSON.",
@@ -53,8 +108,12 @@ pub fn format_guide() -> String {
         "- qlinkctl invite import <encoded-invite> stores a private mesh peer invite.",
         "- qlinkctl invite decode <code> inspects an invite without storing it.",
         "- qlinkctl peer list lists stored peers.",
+        "- qlinkctl peer select <peer-id> selects the single protected packet target.",
         "- qlinkctl peer trust <peer-id> explains trust source, mesh mode, and Dytallix requirements.",
         "- qlinkctl peer revoke <peer-id> marks a peer revoked; qlinkctl peer remove <peer-id> deletes it.",
+        "- qlinkctl dytallix status reads stable-identity-v2 state without contacting qlinkd or loading a wallet.",
+        "- qlinkctl dytallix register|update|suspend|reactivate|revoke performs one-shot wallet-authorized lifecycle operations while qlinkd remains wallet-free.",
+        "- Dytallix mutation commands require an explicit owner-only keystore path; wallet seeds and private keys must never be passed through command arguments.",
         "",
         "Diagnostics and support",
         "- qlinkctl support-bundle --output <path> exports redacted daemon status and doctor output.",
@@ -101,6 +160,7 @@ fn format_bypass_categories(categories: &[String]) -> String {
 }
 
 pub fn format_onboarding_checklist(status: &DaemonStatus, peer_store: &PeerStore) -> String {
+    let now_unix = current_unix_seconds();
     let active_peer_count = peer_store.peers.iter().filter(|peer| !peer.revoked).count();
     let network_ready = matches!(
         (
@@ -152,19 +212,171 @@ pub fn format_onboarding_checklist(status: &DaemonStatus, peer_store: &PeerStore
             "Transport ready",
             "requires a live peer session; dry-run planning alone is not protected traffic",
         ),
+        checklist_line(
+            publication_ready(&status.publication, now_unix),
+            "Signed peer record current",
+            &publication_action(&status.publication, now_unix),
+        ),
+        checklist_line(
+            dytallix_trust_ready(&status.publication),
+            "Dytallix enrollment and peer trust ready",
+            &dytallix_action(&status.publication),
+        ),
         "".to_string(),
         "Next operator commands".to_string(),
         "- qlinkctl guide".to_string(),
         "- qlinkctl status".to_string(),
         "- qlinkctl doctor".to_string(),
         "- qlinkctl invite import <encoded-invite>".to_string(),
+        "- qlinkctl peer select <peer-id>".to_string(),
         "- qlinkctl peer trust <peer-id>".to_string(),
         "- qlinkctl support-bundle --output <path>".to_string(),
+        "".to_string(),
+        "Identity provisioning boundary".to_string(),
+        "- qlinkd accepts public identity references and trust decisions only; it never stores or uses wallet seeds, wallet private keys, or wallet signing credentials.".to_string(),
+        "- Complete wallet enrollment in the external Dytallix wallet/provisioning workflow, then restart qlinkd and confirm publication with qlinkctl doctor.".to_string(),
         "".to_string(),
         "SteamOS release boundary".to_string(),
         "- SteamOS remains pre-production until two-Deck or equivalent SteamOS/Linux validation proves real protected peer traffic, production signing, public Dytallix registry evidence, hardened rendezvous/relay evidence, and game compatibility.".to_string(),
     ]
     .join("\n")
+}
+
+fn publication_ready(publication: &PublicationStatus, now_unix: u64) -> bool {
+    publication.state == PublicationState::Active
+        && publication
+            .expires_at_unix
+            .is_some_and(|expires_at| expires_at > now_unix)
+}
+
+fn dytallix_trust_ready(publication: &PublicationStatus) -> bool {
+    let remote = remote_peer_trust(publication);
+    if !remote.required && !publication.local_registry_binding.required {
+        return true;
+    }
+    remote.required
+        && remote.decision == DytallixTrustDecision::Accepted
+        && remote.health == DytallixTrustHealth::Healthy
+        && publication.local_registry_binding.required
+        && publication.local_registry_binding.version
+            == Some(DytallixBindingVersion::StableIdentityV2)
+        && publication.local_registry_binding.state == LocalRegistryBindingState::Active
+}
+
+fn publication_action(publication: &PublicationStatus, now_unix: u64) -> String {
+    if publication.state == PublicationState::Active
+        && publication
+            .expires_at_unix
+            .is_some_and(|expires_at| expires_at > now_unix)
+    {
+        return "signed peer record is active and unexpired".to_string();
+    }
+    if publication
+        .expires_at_unix
+        .is_some_and(|expires_at| expires_at <= now_unix)
+        || publication.state == PublicationState::Expired
+    {
+        return "record expired; keep protected transport disabled and restore publication"
+            .to_string();
+    }
+    match publication.state {
+        PublicationState::Failed => format!(
+            "publication failed ({error}); keep protected transport disabled",
+            error = publication
+                .last_error
+                .as_ref()
+                .map(|error| publication_error_code_label(error.code))
+                .unwrap_or("unknown")
+        ),
+        PublicationState::Degraded => {
+            "publication degraded; restore refresh health before protected transport".to_string()
+        }
+        PublicationState::Publishing => {
+            "publication is in progress; wait for an active unexpired record".to_string()
+        }
+        PublicationState::Active => {
+            "active publication has no usable expiry; keep protected transport disabled".to_string()
+        }
+        PublicationState::NotStarted => {
+            "publication not started; configure public identity references and restart qlinkd"
+                .to_string()
+        }
+        PublicationState::Unknown => {
+            "publication state unsupported; update qlinkctl before protected transport".to_string()
+        }
+        PublicationState::Expired => unreachable!("expired state handled above"),
+    }
+}
+
+fn dytallix_action(publication: &PublicationStatus) -> String {
+    let local = &publication.local_registry_binding;
+    if local.required {
+        match local.state {
+            LocalRegistryBindingState::Active
+                if local.version == Some(DytallixBindingVersion::StableIdentityV2) => {}
+            LocalRegistryBindingState::Revoked => {
+                return "local Dytallix identity revoked; keep protected transport disabled"
+                    .to_string()
+            }
+            LocalRegistryBindingState::Suspended => {
+                return "local Dytallix identity suspended; keep protected transport disabled"
+                    .to_string()
+            }
+            LocalRegistryBindingState::Unavailable => {
+                return "local Dytallix registry unavailable; keep protected transport disabled"
+                    .to_string()
+            }
+            LocalRegistryBindingState::Active => {
+                return "local identity uses an unsupported registry binding; migrate explicitly to stableIdentityV2"
+                    .to_string()
+            }
+            _ => {
+                return "local stable Dytallix enrollment is not active; keep protected transport disabled"
+                    .to_string()
+            }
+        }
+    }
+    let remote = remote_peer_trust(publication);
+    match (remote.required, remote.decision, remote.health) {
+        (false, _, _) => "Dytallix trust is not required for this private mesh".to_string(),
+        (true, DytallixTrustDecision::Accepted, DytallixTrustHealth::Healthy) => {
+            "public identity is allowed and the trust lookup is healthy".to_string()
+        }
+        (true, DytallixTrustDecision::Denied, _) => {
+            "public identity denied; keep protected transport disabled".to_string()
+        }
+        (true, DytallixTrustDecision::Revoked, _) => {
+            "public identity revoked; keep protected transport disabled".to_string()
+        }
+        (true, DytallixTrustDecision::Suspended, _) => {
+            "public identity suspended; keep protected transport disabled".to_string()
+        }
+        (true, DytallixTrustDecision::Mismatched, _) => {
+            "public identity mismatch; keep protected transport disabled".to_string()
+        }
+        (true, _, DytallixTrustHealth::Unavailable) => {
+            "Dytallix trust unavailable; keep protected transport disabled".to_string()
+        }
+        (true, _, DytallixTrustHealth::Degraded) => {
+            "Dytallix trust degraded; restore healthy validation before protected transport"
+                .to_string()
+        }
+        (true, DytallixTrustDecision::NotChecked | DytallixTrustDecision::Unknown, _) => {
+            "required trust decision not checked; configure public identity references".to_string()
+        }
+        (true, DytallixTrustDecision::Accepted, _) => {
+            "identity allowed but trust health is not confirmed; keep protected transport disabled"
+                .to_string()
+        }
+    }
+}
+
+fn remote_peer_trust(publication: &PublicationStatus) -> &DytallixTrustStatus {
+    if publication.remote_peer_trust != DytallixTrustStatus::default() {
+        &publication.remote_peer_trust
+    } else {
+        &publication.dytallix
+    }
 }
 
 fn checklist_line(complete: bool, title: &str, detail: &str) -> String {
@@ -222,6 +434,19 @@ pub fn remove_peer_from_store(state_dir: &Path, peer_id: &str) -> Result<(), Pee
 pub fn revoke_peer_in_store(state_dir: &Path, peer_id: &str) -> Result<(), PeerCommandError> {
     let mut store = load_peer_store_for_state_dir(state_dir)?;
     if !store.revoke(peer_id) {
+        return Err(PeerCommandError::UnknownPeer(peer_id.to_string()));
+    }
+    store_peer_store_at(state_dir, &store)?;
+    Ok(())
+}
+
+pub fn select_peer_in_store(
+    state_dir: &Path,
+    peer_id: &str,
+    now_unix: u64,
+) -> Result<(), PeerCommandError> {
+    let mut store = load_peer_store_for_state_dir(state_dir)?;
+    if !store.select(peer_id, now_unix) {
         return Err(PeerCommandError::UnknownPeer(peer_id.to_string()));
     }
     store_peer_store_at(state_dir, &store)?;
@@ -371,8 +596,13 @@ pub fn format_status(status: &DaemonStatus) -> Result<String, serde_json::Error>
 }
 
 pub fn format_doctor(status: &DaemonStatus) -> String {
+    format_doctor_at(status, current_unix_seconds())
+}
+
+fn format_doctor_at(status: &DaemonStatus, now_unix: u64) -> String {
     let network = &status.network;
     let data_plane = &status.data_plane;
+    let publication = &status.publication;
     let phase = phase_label(status.phase);
     let state = network_state_label(network.state);
     let data_plane_state = data_plane_state_label(data_plane.state);
@@ -412,6 +642,11 @@ pub fn format_doctor(status: &DaemonStatus) -> String {
     };
     let data_plane_verdict =
         data_plane_health_verdict(data_plane.state, data_plane.error.as_deref());
+    let publication_verdict = publication_health_verdict(
+        publication,
+        now_unix,
+        network.state == NetworkPlanState::Applied && !network.dry_run,
+    );
     let verdict = match status.phase {
         ConnectionPhase::Failed => "FAIL - daemon phase failed".to_string(),
         _ if data_plane_verdict
@@ -421,6 +656,7 @@ pub fn format_doctor(status: &DaemonStatus) -> String {
             data_plane_verdict.unwrap()
         }
         _ if network_verdict.starts_with("FAIL") => network_verdict,
+        _ if publication_verdict.starts_with("FAIL") => publication_verdict,
         ConnectionPhase::Degraded => "WARN - daemon phase degraded".to_string(),
         _ if data_plane_verdict
             .as_deref()
@@ -428,6 +664,8 @@ pub fn format_doctor(status: &DaemonStatus) -> String {
         {
             data_plane_verdict.unwrap()
         }
+        _ if network_verdict.starts_with("WARN") => network_verdict,
+        _ if publication_verdict.starts_with("WARN") => publication_verdict,
         _ => network_verdict,
     };
 
@@ -450,7 +688,19 @@ pub fn format_doctor(status: &DaemonStatus) -> String {
          peer session: {peer_session}\n\
          last transport error: {last_transport_error}\n\
          packet counters: observed={observed_packets} queued={queued_packets} dropped={dropped_packets} emitted={emitted_packets} accepted={accepted_packets} rejected={rejected_packets} transportErrors={transport_errors}\n\
-         data-plane error: {data_plane_error}",
+         data-plane error: {data_plane_error}\n\
+         publication state: {publication_state}\n\
+         publication sequence: {publication_sequence}\n\
+         publication expiry (unix): {publication_expiry}\n\
+         publication last success (unix): {publication_last_success}\n\
+         publication last attempt (unix): {publication_last_attempt}\n\
+         publication error: {publication_error}\n\
+         local Dytallix binding: {local_registry_binding}\n\
+         local Dytallix revision: {local_registry_revision}\n\
+         remote Dytallix trust decision: {dytallix_decision}\n\
+         remote Dytallix trust health: {dytallix_health}\n\
+         action: {publication_action}\n\
+         identity boundary: qlinkd never owns wallet secrets; provision externally and configure public identity references only",
         kill_switch = if status.kill_switch {
             "enabled"
         } else {
@@ -494,6 +744,23 @@ pub fn format_doctor(status: &DaemonStatus) -> String {
         rejected_packets = data_plane.metrics.rejected_packets,
         transport_errors = data_plane.metrics.transport_errors,
         data_plane_error = data_plane.error.as_deref().unwrap_or("none"),
+        publication_state = publication_state_label(publication.state),
+        publication_sequence = optional_u64_label(publication.sequence),
+        publication_expiry = optional_u64_label(publication.expires_at_unix),
+        publication_last_success = optional_u64_label(publication.last_success_at_unix),
+        publication_last_attempt = optional_u64_label(publication.last_attempt_at_unix),
+        publication_error = publication
+            .last_error
+            .as_ref()
+            .map(|error| publication_error_code_label(error.code))
+            .unwrap_or("none"),
+        local_registry_binding =
+            local_registry_binding_state_label(publication.local_registry_binding.state),
+        local_registry_revision =
+            optional_u64_label(publication.local_registry_binding.identity_revision),
+        dytallix_decision = dytallix_decision_label(remote_peer_trust(publication).decision),
+        dytallix_health = dytallix_health_label(remote_peer_trust(publication).health),
+        publication_action = combined_publication_action(publication, now_unix),
     )
 }
 
@@ -796,6 +1063,178 @@ fn data_plane_health_verdict(state: DataPlaneState, error: Option<&str>) -> Opti
     }
 }
 
+fn publication_health_verdict(
+    publication: &PublicationStatus,
+    now_unix: u64,
+    protected_network_active: bool,
+) -> String {
+    if publication
+        .expires_at_unix
+        .is_some_and(|expires_at| expires_at <= now_unix)
+        || publication.state == PublicationState::Expired
+    {
+        return "FAIL - signed peer record expired; protected transport must remain disabled"
+            .to_string();
+    }
+    let remote = remote_peer_trust(publication);
+    if remote.required || publication.local_registry_binding.required {
+        if !publication.local_registry_binding.required {
+            return "FAIL - required local Dytallix enrollment status is unavailable".to_string();
+        }
+        if publication.local_registry_binding.version
+            != Some(DytallixBindingVersion::StableIdentityV2)
+        {
+            return "FAIL - local Dytallix enrollment is not stableIdentityV2".to_string();
+        }
+        match publication.local_registry_binding.state {
+            LocalRegistryBindingState::Active => {}
+            LocalRegistryBindingState::Revoked => {
+                return "FAIL - local Dytallix identity revoked".to_string()
+            }
+            LocalRegistryBindingState::Suspended => {
+                return "FAIL - local Dytallix identity suspended".to_string()
+            }
+            LocalRegistryBindingState::Unavailable => {
+                return "FAIL - local Dytallix registry unavailable".to_string()
+            }
+            state => {
+                return format!(
+                    "FAIL - local Dytallix enrollment is {}",
+                    local_registry_binding_state_label(state)
+                )
+            }
+        }
+        if !remote.required {
+            return "FAIL - required remote Dytallix trust status is unavailable".to_string();
+        }
+        match remote.decision {
+            DytallixTrustDecision::Denied => {
+                return "FAIL - required remote Dytallix identity denied".to_string()
+            }
+            DytallixTrustDecision::Revoked => {
+                return "FAIL - required remote Dytallix identity revoked".to_string()
+            }
+            DytallixTrustDecision::Suspended => {
+                return "FAIL - required remote Dytallix identity suspended".to_string()
+            }
+            DytallixTrustDecision::Mismatched => {
+                return "FAIL - required remote Dytallix identity mismatched".to_string()
+            }
+            DytallixTrustDecision::NotChecked | DytallixTrustDecision::Unknown => {
+                return "FAIL - required remote Dytallix trust decision is unavailable".to_string()
+            }
+            DytallixTrustDecision::Accepted => {}
+        }
+        if remote.health == DytallixTrustHealth::Unavailable {
+            return "FAIL - required remote Dytallix trust service unavailable".to_string();
+        }
+    }
+    match publication.state {
+        PublicationState::Failed => format!(
+            "FAIL - peer record publication failed: {error}",
+            error = publication
+                .last_error
+                .as_ref()
+                .map(|error| publication_error_code_label(error.code))
+                .unwrap_or("unknown")
+        ),
+        PublicationState::Degraded => "WARN - peer record publication degraded".to_string(),
+        PublicationState::Publishing => "WARN - peer record publication in progress".to_string(),
+        PublicationState::NotStarted if protected_network_active => {
+            "FAIL - protected networking active without peer record publication".to_string()
+        }
+        PublicationState::NotStarted => "WARN - peer record publication not started".to_string(),
+        PublicationState::Unknown => {
+            "FAIL - peer record publication state is unsupported".to_string()
+        }
+        PublicationState::Active if publication.expires_at_unix.is_none() => {
+            "FAIL - active peer record has no expiry".to_string()
+        }
+        PublicationState::Active
+            if remote.required && remote.health != DytallixTrustHealth::Healthy =>
+        {
+            "WARN - required Dytallix trust health degraded".to_string()
+        }
+        PublicationState::Active => "OK - signed peer record current".to_string(),
+        PublicationState::Expired => unreachable!("expired state handled above"),
+    }
+}
+
+fn local_registry_binding_state_label(state: LocalRegistryBindingState) -> &'static str {
+    match state {
+        LocalRegistryBindingState::NotConfigured => "notConfigured",
+        LocalRegistryBindingState::Pending => "pending",
+        LocalRegistryBindingState::Active => "active",
+        LocalRegistryBindingState::Missing => "missing",
+        LocalRegistryBindingState::Revoked => "revoked",
+        LocalRegistryBindingState::Suspended => "suspended",
+        LocalRegistryBindingState::Mismatched => "mismatched",
+        LocalRegistryBindingState::Expired => "expired",
+        LocalRegistryBindingState::Unavailable => "unavailable",
+        LocalRegistryBindingState::Unknown => "unknown",
+    }
+}
+
+fn combined_publication_action(publication: &PublicationStatus, now_unix: u64) -> String {
+    if !dytallix_trust_ready(publication) {
+        dytallix_action(publication)
+    } else {
+        publication_action(publication, now_unix)
+    }
+}
+
+fn optional_u64_label(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn publication_state_label(state: PublicationState) -> &'static str {
+    match state {
+        PublicationState::NotStarted => "notStarted",
+        PublicationState::Publishing => "publishing",
+        PublicationState::Active => "active",
+        PublicationState::Degraded => "degraded",
+        PublicationState::Failed => "failed",
+        PublicationState::Expired => "expired",
+        PublicationState::Unknown => "unknown",
+    }
+}
+
+fn publication_error_code_label(code: PublicationErrorCode) -> &'static str {
+    match code {
+        PublicationErrorCode::PublishRejected => "publishRejected",
+        PublicationErrorCode::AuthenticationFailed => "authenticationFailed",
+        PublicationErrorCode::TrustUnavailable => "trustUnavailable",
+        PublicationErrorCode::InvalidResponse => "invalidResponse",
+        PublicationErrorCode::Transport => "transport",
+        PublicationErrorCode::Expired => "expired",
+        PublicationErrorCode::Internal => "internal",
+        PublicationErrorCode::Unknown => "unknown",
+    }
+}
+
+fn dytallix_decision_label(decision: DytallixTrustDecision) -> &'static str {
+    match decision {
+        DytallixTrustDecision::NotChecked => "notChecked",
+        DytallixTrustDecision::Accepted => "accepted",
+        DytallixTrustDecision::Denied => "denied",
+        DytallixTrustDecision::Revoked => "revoked",
+        DytallixTrustDecision::Suspended => "suspended",
+        DytallixTrustDecision::Mismatched => "mismatched",
+        DytallixTrustDecision::Unknown => "unknown",
+    }
+}
+
+fn dytallix_health_label(health: DytallixTrustHealth) -> &'static str {
+    match health {
+        DytallixTrustHealth::Unknown => "unknown",
+        DytallixTrustHealth::Healthy => "healthy",
+        DytallixTrustHealth::Degraded => "degraded",
+        DytallixTrustHealth::Unavailable => "unavailable",
+    }
+}
+
 fn route_mode_label(route_mode: RouteMode) -> &'static str {
     match route_mode {
         RouteMode::GameOnly => "gameOnly",
@@ -830,8 +1269,9 @@ fn parse_status_response(line: &str) -> Result<DaemonStatus, ControlError> {
 mod tests {
     use super::*;
     use qlink_proto::{
-        DataPlaneState, DataPlaneStatus, InviteCode, MeshTrustMode, NetworkPlanState,
-        NetworkStatus, PacketPumpMetrics, RouteMode, StoredPeer,
+        DataPlaneState, DataPlaneStatus, DytallixTrustStatus, InviteCode, MeshTrustMode,
+        NetworkPlanState, NetworkStatus, PacketPumpMetrics, PublicationErrorStatus, RouteMode,
+        StoredPeer,
     };
     use std::path::PathBuf;
 
@@ -893,6 +1333,44 @@ mod tests {
         status
     }
 
+    fn healthy_publication(required: bool) -> PublicationStatus {
+        let remote_peer_trust = DytallixTrustStatus {
+            required,
+            decision: if required {
+                DytallixTrustDecision::Accepted
+            } else {
+                DytallixTrustDecision::NotChecked
+            },
+            health: if required {
+                DytallixTrustHealth::Healthy
+            } else {
+                DytallixTrustHealth::Unknown
+            },
+        };
+        PublicationStatus {
+            state: PublicationState::Active,
+            sequence: Some(9),
+            expires_at_unix: Some(4_102_444_800),
+            last_success_at_unix: Some(1_767_139_200),
+            last_attempt_at_unix: Some(1_767_139_200),
+            last_error: None,
+            dytallix: remote_peer_trust.clone(),
+            remote_peer_trust,
+            local_registry_binding: qlink_proto::LocalRegistryBindingStatus {
+                required,
+                version: required.then_some(qlink_proto::DytallixBindingVersion::StableIdentityV2),
+                state: if required {
+                    qlink_proto::LocalRegistryBindingState::Active
+                } else {
+                    qlink_proto::LocalRegistryBindingState::NotConfigured
+                },
+                identity_revision: required.then_some(1),
+                checked_at_unix: required.then_some(1_767_139_200),
+                last_error: None,
+            },
+        }
+    }
+
     #[test]
     fn format_guide_explains_steamos_modes_and_gates() {
         let guide = format_guide();
@@ -949,6 +1427,10 @@ mod tests {
         assert!(checklist.contains("[x] qlinkd reachable"));
         assert!(checklist.contains("[x] Dry-run planning healthy"));
         assert!(checklist.contains("[ ] Import at least one peer invite"));
+        assert!(checklist.contains("[ ] Signed peer record current"));
+        assert!(checklist.contains("[x] Dytallix enrollment and peer trust ready"));
+        assert!(checklist.contains("not required for this private mesh"));
+        assert!(checklist.contains("never stores or uses wallet seeds"));
         assert!(checklist.contains("qlinkctl invite import <encoded-invite>"));
         assert!(checklist.contains("qlinkctl peer trust <peer-id>"));
         assert!(checklist.contains("qlinkctl doctor"));
@@ -958,8 +1440,10 @@ mod tests {
 
     #[test]
     fn format_onboarding_checklist_marks_active_peer_and_live_transport_ready() {
-        let status = status_with_data_plane(DataPlaneState::Ready, true, true, None);
+        let mut status = status_with_data_plane(DataPlaneState::Ready, true, true, None);
+        status.publication = healthy_publication(true);
         let peer_store = PeerStore {
+            selected_peer_id: None,
             peers: vec![StoredPeer {
                 peer_id: "peer-a".to_string(),
                 alias: "deck two".to_string(),
@@ -976,6 +1460,8 @@ mod tests {
         assert!(checklist.contains("1 active peer"));
         assert!(checklist.contains("[x] Packet I/O available"));
         assert!(checklist.contains("[x] Transport ready"));
+        assert!(checklist.contains("[x] Signed peer record current"));
+        assert!(checklist.contains("[x] Dytallix enrollment and peer trust ready"));
         assert!(checklist.contains("two-Deck or equivalent SteamOS/Linux validation"));
     }
 
@@ -988,6 +1474,67 @@ mod tests {
                 .expect("system clock after epoch")
                 .as_nanos()
         ))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provisioning_device_loader_requires_owner_only_regular_seed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let state_dir = unique_temp_dir("qlinkctl-provisioning-seed");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let seed_path = state_dir.join(DEVICE_IDENTITY_SEED_FILE);
+        std::fs::write(&seed_path, [7_u8; 32]).unwrap();
+        std::fs::set_permissions(&seed_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let loaded = load_provisioning_device_keypair(&state_dir).unwrap();
+        assert_eq!(
+            loaded.public_key().peer_id(),
+            qlink_core::crypto::DeviceKeypair::from_seed([7_u8; 32])
+                .unwrap()
+                .public_key()
+                .peer_id()
+        );
+
+        std::fs::set_permissions(&seed_path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        assert_eq!(
+            load_provisioning_device_keypair(&state_dir)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provisioning_device_loader_rejects_symlink_and_wrong_length() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let state_dir = unique_temp_dir("qlinkctl-provisioning-seed-invalid");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let outside = state_dir.with_extension("outside");
+        std::fs::write(&outside, [9_u8; 32]).unwrap();
+        let seed_path = state_dir.join(DEVICE_IDENTITY_SEED_FILE);
+        symlink(&outside, &seed_path).unwrap();
+        assert_eq!(
+            load_provisioning_device_keypair(&state_dir)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+
+        std::fs::remove_file(&seed_path).unwrap();
+        std::fs::write(&seed_path, b"short").unwrap();
+        std::fs::set_permissions(&seed_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            load_provisioning_device_keypair(&state_dir)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        let _ = std::fs::remove_file(outside);
+        let _ = std::fs::remove_dir_all(state_dir);
     }
 
     fn peer_fixture() -> StoredPeer {
@@ -1066,6 +1613,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(state_dir);
     }
 
+    #[test]
+    fn peer_store_select_persists_only_current_non_revoked_peer() {
+        let state_dir = unique_temp_dir("qlinkctl-peer-select");
+        let mut store = PeerStore::default();
+        store.upsert(StoredPeer {
+            peer_id: "peer-a".to_string(),
+            alias: "deck".to_string(),
+            mesh_id: "mesh-a".to_string(),
+            party_id: "party-a".to_string(),
+            trust_mode: MeshTrustMode::PrivateFriends,
+            trust_source: "invite".to_string(),
+            revoked: false,
+            expires_at_unix: 100,
+        });
+        store_peer_store_at(&state_dir, &store).unwrap();
+
+        select_peer_in_store(&state_dir, "peer-a", 10).unwrap();
+        let selected = load_peer_store_for_state_dir(&state_dir).unwrap();
+        assert_eq!(selected.selected_peer_id.as_deref(), Some("peer-a"));
+
+        revoke_peer_in_store(&state_dir, "peer-a").unwrap();
+        let revoked = load_peer_store_for_state_dir(&state_dir).unwrap();
+        assert_eq!(revoked.selected_peer_id, None);
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
     #[cfg(unix)]
     #[test]
     fn status_reports_daemon_unavailable_when_socket_is_missing() {
@@ -1099,31 +1672,16 @@ mod tests {
     }
 
     #[test]
-    fn format_doctor_reports_ok_for_healthy_dry_run_plan() {
+    fn format_doctor_warns_when_publication_is_missing_in_dry_run() {
         let status = status_with_network(NetworkPlanState::Planned, true, false, None);
+        let doctor = format_doctor(&status);
 
-        assert_eq!(
-            format_doctor(&status),
-            "verdict: OK - dry-run planning healthy\n\
-             phase: idle\n\
-             kill switch: enabled\n\
-             network state: planned\n\
-             mode: dry-run\n\
-             interface: qlink0\n\
-             route mode: gameOnly\n\
-             protected CIDR: 100.64.0.0/10\n\
-             ownership record: absent\n\
-             apply error: none\n\
-             data-plane state: notStarted\n\
-             data-plane interface: unknown\n\
-             packet I/O: unavailable\n\
-             transport ready: no\n\
-             transport path: unknown\n\
-             peer session: not ready\n\
-             last transport error: none\n\
-             packet counters: observed=0 queued=0 dropped=0 emitted=0 accepted=0 rejected=0 transportErrors=0\n\
-             data-plane error: none"
-        );
+        assert!(doctor.contains("verdict: WARN - peer record publication not started"));
+        assert!(doctor.contains("network state: planned"));
+        assert!(doctor.contains("mode: dry-run"));
+        assert!(doctor.contains("publication state: notStarted"));
+        assert!(doctor.contains("action: publication not started"));
+        assert!(doctor.contains("qlinkd never owns wallet secrets"));
     }
 
     #[test]
@@ -1151,14 +1709,87 @@ mod tests {
     }
 
     #[test]
-    fn format_doctor_reports_ok_for_activated_network_with_ownership() {
+    fn format_doctor_fails_for_activated_network_without_publication() {
         let status = status_with_network(NetworkPlanState::Applied, false, true, None);
         let doctor = format_doctor(&status);
 
-        assert!(doctor.contains("verdict: OK - activated networking has teardown ownership"));
+        assert!(doctor.contains(
+            "verdict: FAIL - protected networking active without peer record publication"
+        ));
         assert!(doctor.contains("network state: applied"));
         assert!(doctor.contains("mode: activated"));
         assert!(doctor.contains("ownership record: present"));
+    }
+
+    #[test]
+    fn format_doctor_reports_current_publication_and_healthy_required_trust() {
+        let mut status = status_with_network(NetworkPlanState::Applied, false, true, None);
+        status.publication = healthy_publication(true);
+
+        let doctor = format_doctor_at(&status, 1_767_139_200);
+
+        assert!(doctor.contains("verdict: OK - activated networking has teardown ownership"));
+        assert!(doctor.contains("publication state: active"));
+        assert!(doctor.contains("publication sequence: 9"));
+        assert!(doctor.contains("local Dytallix binding: active"));
+        assert!(doctor.contains("remote Dytallix trust decision: accepted"));
+        assert!(doctor.contains("remote Dytallix trust health: healthy"));
+        assert!(doctor.contains("action: signed peer record is active and unexpired"));
+    }
+
+    #[test]
+    fn format_doctor_fails_closed_for_expired_publication() {
+        let mut status = status_with_network(NetworkPlanState::Applied, false, true, None);
+        status.publication = healthy_publication(false);
+        status.publication.expires_at_unix = Some(100);
+        status.publication.last_error = Some(PublicationErrorStatus {
+            code: PublicationErrorCode::Expired,
+            retryable: true,
+        });
+
+        let doctor = format_doctor_at(&status, 101);
+
+        assert!(doctor.contains("verdict: FAIL - signed peer record expired"));
+        assert!(doctor.contains("publication error: expired"));
+        assert!(doctor.contains("keep protected transport disabled"));
+    }
+
+    #[test]
+    fn format_doctor_fails_closed_for_required_dytallix_denial() {
+        let mut status = status_with_network(NetworkPlanState::Applied, false, true, None);
+        status.publication = healthy_publication(true);
+        status.publication.remote_peer_trust.decision = DytallixTrustDecision::Revoked;
+
+        let doctor = format_doctor_at(&status, 1_767_139_200);
+
+        assert!(doctor.contains("verdict: FAIL - required remote Dytallix identity revoked"));
+        assert!(doctor.contains("action: public identity revoked"));
+    }
+
+    #[test]
+    fn format_doctor_fails_closed_when_required_dytallix_is_unavailable() {
+        let mut status = status_with_network(NetworkPlanState::Applied, false, true, None);
+        status.publication = healthy_publication(true);
+        status.publication.remote_peer_trust.health = DytallixTrustHealth::Unavailable;
+
+        let doctor = format_doctor_at(&status, 1_767_139_200);
+
+        assert!(
+            doctor.contains("verdict: FAIL - required remote Dytallix trust service unavailable")
+        );
+        assert!(doctor.contains("action: Dytallix trust unavailable"));
+    }
+
+    #[test]
+    fn format_doctor_fails_closed_without_local_stable_enrollment() {
+        let mut status = status_with_network(NetworkPlanState::Applied, false, true, None);
+        status.publication = healthy_publication(true);
+        status.publication.local_registry_binding.state = LocalRegistryBindingState::NotConfigured;
+
+        let doctor = format_doctor_at(&status, 1_767_139_200);
+
+        assert!(doctor.contains("verdict: FAIL - local Dytallix enrollment is notConfigured"));
+        assert!(doctor.contains("action: local stable Dytallix enrollment is not active"));
     }
 
     #[test]
@@ -1235,7 +1866,7 @@ mod tests {
         let status = status_with_data_plane(DataPlaneState::Starting, true, false, None);
         let doctor = format_doctor(&status);
 
-        assert!(doctor.contains("verdict: OK - dry-run planning healthy"));
+        assert!(doctor.contains("verdict: WARN - peer record publication not started"));
         assert!(doctor.contains("data-plane state: starting"));
         assert!(doctor.contains("data-plane interface: qlink0"));
         assert!(doctor.contains("packet I/O: available"));

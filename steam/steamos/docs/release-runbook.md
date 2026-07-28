@@ -30,6 +30,36 @@ The archive payload includes:
 - `config/games/*.toml`
 - SteamOS readiness and release docs when present
 
+Before activating a packaged resident daemon, review
+`config/config.example.json` and set `publicationTtlSeconds`,
+`advertiseAddress`, and pinned `dytallixIdentity` values for the deployment.
+Public deployments must set `bindingVersion` to `stableIdentityV2` and pin the
+HTTPS RPC endpoint, network ID, chain ID, and deployed v2 contract identifier.
+Lifecycle mutations require the deployed 20-byte hexadecimal contract address;
+the symbolic contract name is lookup-only.
+The local stable identity must be registered and read back as active before
+network activation. Register, update, suspend, and revoke transactions are
+offline operator actions and require finalized-chain readback evidence.
+The daemon creates owner-only publication sequence and current-record files
+under `/var/lib/quantumlink`; it must never receive a Dytallix wallet seed or
+wallet signing credential.
+
+Run daemon-independent lifecycle operations through `qlinkctl dytallix`. The
+command reads public chain pins from the daemon config and requires an explicit
+keystore path for every mutation:
+
+```sh
+sudo qlinkctl dytallix status
+sudo qlinkctl dytallix register --keystore /secure/path/wallet.json --wallet main
+sudo qlinkctl dytallix suspend --keystore /secure/path/wallet.json --peer-id <peer-id>
+sudo qlinkctl dytallix revoke --keystore /secure/path/wallet.json \
+  --peer-id <peer-id> --confirm-peer-id <peer-id>
+```
+
+Archive the JSON receipt, then independently capture finalized-block and
+contract readback evidence. The command currently proves confirmed transaction
+status and exact readback convergence, not finalized-chain inclusion.
+
 To package prebuilt binaries:
 
 ```sh
@@ -58,6 +88,15 @@ The packager copies this manifest to
 and includes it in checksums and release-manifest artifact hashes. The manifest
 schema is documented in [`production-evidence.md`](production-evidence.md).
 
+Production publication requires schema v2. Schema v1 remains parseable for
+historical inspection, but is always production-blocked and must result in
+`productionEvidenceReady=false` and `nonHardwareProductionReady=false`.
+Do not relabel or mechanically promote a schema-v1 bundle.
+
+Collector, bridge, or verifier output is production-ineligible unless the tool
+enforces the complete schema-v2 contract. Schema-v1 output may be used only for
+historical inspection, fixture testing, and gap analysis.
+
 To build the manifest from a redacted operator evidence bundle:
 
 ```sh
@@ -66,12 +105,76 @@ bash steam/steamos/scripts/collect-production-evidence.sh \
   --output steam/steamos/validation/non-hardware/<timestamp>/production-evidence-manifest.json
 ```
 
+To translate a verified shared public-edge run into that bundle:
+
+```sh
+python3 steam/steamos/scripts/bridge-public-edge-evidence.py \
+  --public-edge-manifest validation/public-edge/<timestamp>/manifest.json \
+  --dytallix-evidence-root validation/dytallix/<timestamp> \
+  --output-root steam/steamos/validation/non-hardware/<timestamp>
+```
+
+The bridge fails closed unless the resulting evidence is ready. A
+`signed_expiring_records` pass additionally requires the public-edge manifest
+to reference a redacted `qlink-core` lifecycle-verifier report proving signed
+publication lookup, rejection after expiry, and higher-sequence refresh before
+expiry. Missing or incomplete proof remains blocked. Use `--allow-blocked`
+only to retain an incomplete bundle for gap analysis; never use that output as
+production packaging input. The command is a capability, not evidence that a
+live run has occurred.
+
+For a production-eligible schema-v2 Dytallix bundle, confirm all of the
+following before packaging:
+
+- `bindingVersion=stableIdentityV2`, `contractSchemaVersion=2`, and
+  `evidenceClass=liveChain`.
+- The HTTPS registry endpoint and exact network ID, chain ID, deployed
+  20-byte contract address, and deployed contract code hash are pinned.
+- Register, update, suspend, reactivate, and revoke have independently verified
+  finalized-chain inclusion and exact contract readback.
+- Reactivation after terminal revocation is rejected and the revoked state is
+  unchanged.
+- Reachability TTL refresh succeeds while preserving the stable identity
+  revision.
+- The required negative-policy matrix rejects legacy v1 downgrade, expired
+  authorization, device mismatch, signing-key mismatch, wrong mesh scope, TTL
+  excess, non-monotonic revision, missing/suspended/revoked identities, and
+  registry outage.
+- Every lifecycle, negative-policy, finality, readback, and rendezvous/relay
+  sidecar exists as a regular file beside the generated manifest and its
+  calculated SHA-256 matches the manifest.
+- Dytallix sidecar JSON matches the manifest's chain/contract pins,
+  transaction IDs, finalized heights, lifecycle/readback results, identity
+  revisions, and policy decisions.
+- The independently finalized checkpoint covers every lifecycle and TTL
+  refresh transaction.
+
+Treat `qlinkctl dytallix` receipts and exact readback as transaction convergence
+evidence only. They do not prove finality. The pinned SDK's receipt/readback or
+finalized-block metadata must not satisfy the finality field; use an independent
+finality verifier bound to the pinned chain and transaction.
+
+Pin that verifier's public key outside the evidence bundle:
+
+```sh
+export QLINK_DYTALLIX_FINALITY_VERIFIER_PUBLIC_KEY=/secure/path/dytallix-finality-verifier-public.pem
+```
+
+The finality report must carry a valid ECDSA P-256/SHA-256 signature from this
+key. A bundled replacement key, unsigned JSON report, or modified report fails
+closed.
+
 The verifier validates production signatures with:
 
 ```sh
 QLINK_STEAMOS_RELEASE_PUBLIC_KEY=/path/to/ed25519-public-key.pem \
 bash steam/steamos/scripts/verify-steamos-release.sh dist/steamos/quantumlink-steamos-<version>.tar.zst
 ```
+
+The packager embeds the production evidence manifest and referenced sidecars
+inside the signed application archive as `release-evidence/`. The external
+release sidecars must match those signed copies byte for byte. Detached or
+substituted evidence fails release verification.
 
 Publication gates should add:
 
@@ -89,9 +192,16 @@ bash steam/steamos/scripts/steamos-rc-dry-run.sh \
   --evidence-root steam/steamos/validation/non-hardware/<timestamp>
 ```
 
-Expected RC dry-run result: `valid=true`, `signatureValidated=true`,
+With complete schema-v2 live non-hardware evidence, the expected RC dry-run result is
+`valid=true`, `signatureValidated=true`,
 `nonHardwareProductionEvidenceValidated=true`,
-`nonHardwareProductionReady=true`, and `productionReady=false`.
+`nonHardwareProductionReady=true`, and `productionReady=false`. Fixture or
+schema-v1, synthetic, non-finalized, or incomplete bridged evidence must instead leave
+`nonHardwareProductionReady=false`.
+
+The release workflow exercises this path on compatible Linux with ephemeral
+Ed25519 keys. It proves the positive signing and verification path while
+remaining distinct from protected production-key evidence.
 
 ## Verification
 
@@ -117,7 +227,8 @@ Before tagging or attaching public SteamOS artifacts:
 - Provide `QLINK_STEAMOS_SIGNATURE_FILE` or `QLINK_STEAMOS_RELEASE_PRIVATE_KEY`.
 - Verify with `QLINK_STEAMOS_RELEASE_PUBLIC_KEY`.
 - Provide or package `QLINK_STEAMOS_PRODUCTION_EVIDENCE_MANIFEST`.
-- Prefer generating the manifest through `collect-production-evidence.sh` so
-  evidence file paths and hashes are normalized before packaging.
+- Require a schema-v2 manifest with live-chain Dytallix lifecycle, negative
+  policy, independent finality, and contained sidecar digest evidence.
+- Do not use schema-v1 collector or bridge output as production evidence.
 - Set `QLINK_STEAMOS_REQUIRE_PRODUCTION_READY=1` in publication gates.
 - Link active rendezvous/relay endpoint evidence and real Steam Deck validation evidence from `production-readiness.md`.

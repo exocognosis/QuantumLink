@@ -35,6 +35,58 @@ This is the intended activated packet flow. The packaged systemd service does no
 4. Peers resolve each other through rendezvous, validate signatures and expiration, then attempt direct connectivity.
 5. Status reports expose phase, active party, path type, RTT, jitter, loss, NAT type, and relay privacy.
 
+## Resident Publication
+
+`qlinkd` owns a dedicated publication worker around the shared
+`MeshTransportHandle` publication API. The worker:
+
+- reserves each sequence number to an owner-only state file before attempting
+  network I/O, preventing sequence reuse after crashes;
+- publishes the responder certificate, candidates, and overlay routes in an
+  ML-DSA-signed peer record;
+- refreshes at TTL/2 and retains a valid prior record during bounded retries;
+- writes the current public record to an owner-only diagnostics/evidence
+  outbox; stable v2 enrollment does not require a wallet transaction per TTL
+  refresh;
+- reacts to Linux netlink route, link, and address changes by reconnecting the
+  shared transport and requesting immediate republication; and
+- fails the protected packet path before initial publication and after expiry.
+
+The publication worker has its own Tokio runtime and never blocks the packet
+pump or local control socket.
+
+## Dytallix Boundary
+
+`qlinkd` receives lookup-only Dytallix configuration and periodically
+validates the local device enrollment and separately revalidates required
+public-peer trust. Wallet keys remain outside the daemon. Public SteamOS mode
+requires the explicit `stableIdentityV2` binding and refuses the legacy v1
+default. The v2 contract binds wallet ownership, device identity, node signing
+identity, authorization lifetime, optional mesh scope, and maximum signed
+peer-record TTL. Ephemeral endpoints, ICE credentials, routes, transport
+certificate, sequence, and expiry remain in the ML-DSA-signed peer record.
+
+Enrollment, update, emergency suspension, and terminal revocation are offline
+operator actions. Runtime publication does not require wallet access or an
+on-chain write for each refresh. Daemon status reports local registry binding
+separately from selected remote-peer trust so one cannot be mistaken for proof
+of the other.
+
+## Evidence Boundary
+
+The SteamOS evidence bridge consumes redacted reports; it does not consume or
+publish raw peer records, private keys, ICE credentials, or endpoint
+addresses. A `signed_expiring_records` pass requires a source report from the
+repository-owned `qlink-core` verifier that binds the same ML-DSA identity and
+source revision across publication, post-expiry lookup, and a
+higher-sequence pre-expiry refresh. The bridge validates hashes, decisions,
+sequence ordering, and time ordering, then emits only a whitelisted summary
+plus the source report digest.
+
+This is an evidence contract, not live endpoint evidence. Fixture coverage
+proves the bridge behavior; an off-host public-edge run still has to produce
+and link the report before the rendezvous/relay production gate can pass.
+
 ## SteamOS Defaults
 
 - Use split tunneling by default; do not replace the SteamOS default route.
@@ -56,7 +108,22 @@ The default resident daemon builds and reports a dry-run Linux network plan duri
 
 Successful activated starts persist a small ownership record under the daemon state directory with the interface, route mode, protected CIDR, fwmark, route table, nftables family/table, schema version, and activation timestamp. Deactivation reconstructs the owned Linux runtime plan from that record, tears down nftables before network objects, removes the record only after successful cleanup, and leaves it in place when cleanup fails so the operator can retry. If no record exists, deactivation is a no-op. The packaged systemd unit wires this through `ExecStop=/usr/local/bin/qlinkd --deactivate-network` and `ExecStopPost=/usr/local/bin/qlinkd --deactivate-network`; `ExecStopPost` is an idempotent crash/start-failure cleanup backstop.
 
-After successful activated network application, the daemon opens the configured TUN device (non-blocking, so the single-threaded resident pump never stalls on an idle interface), initializes a `qlink-core` packet tunnel core, builds the live `DaemonMeshTransport`, and drives the bidirectional pump in `pump_and_serve_once` alongside the control socket. `dataPlane.state` reaches `ready` and `transportReady` becomes true once the transport reports ready — proven end to end over the local-echo development transport. Over the real `MeshTransportHandle`, protected packets still fail closed until peer-session-key installation into packet-frame encryption lands; this is the shared cross-platform gap that the macOS and Windows silos also carry, and `qlinkctl doctor` reports that boundary explicitly. This confirms local packet movement and transport wiring, not two-Deck live peer reachability, which remains a hardware-validation gate.
+After successful activated network application, the daemon opens the configured
+TUN device, initializes a `qlink-core` packet tunnel core, builds the live
+`DaemonMeshTransport`, and drives the bidirectional pump alongside the control
+socket. The production mesh path carries the exact authenticated outbound lease
+and per-frame inbound lease from `MeshTransportHandle` into the packet core.
+Ready and clear events preserve peer ID, direction, generation, transcript
+binding, expiry, and byte rekey limit.
+
+The trusted invite store remains separate from the shared-core signed peer
+record cache. Exactly one current, non-revoked packet target is selected,
+automatically only when unambiguous or explicitly through
+`qlinkctl peer select`. Its peer ID and mesh ID configure the transport, and an
+exact inbound ACL rejects other peers before packet processing. The resident
+loop rechecks the selected peer on disk and drops the complete transport after
+removal, revocation, expiry, or replacement. Two-Deck live reachability remains
+a hardware-validation gate.
 
 If packet I/O startup fails after network activation, the daemon invokes record-backed deactivation before exiting. That keeps an operator from being left with active routes or nftables rules when the TUN reader/writer cannot start.
 
@@ -66,4 +133,8 @@ Full-tunnel planning currently renders `0.0.0.0/0` as the protected CIDR so the 
 
 ## Boundaries
 
-The SteamOS silo contains the daemon, CLI, Linux TUN/network helpers, systemd unit, installer assets, and game profile helpers. The shared protocol core remains in `qlink-core`. The resident packet pump is now wired to the live mesh transport. Production readiness still requires peer-session-key installation into packet-frame encryption over the real transport, Deck-host two-Deck data-plane validation, public rendezvous/relay hardening, public Dytallix registry evidence, signed release packaging, and broader game compatibility testing.
+The SteamOS silo contains the daemon, CLI, Linux TUN/network helpers, systemd
+unit, installer assets, and game profile helpers. The shared protocol core
+remains in `qlink-core`. Production readiness still requires Deck-host
+two-Deck data-plane validation, complete live rendezvous/relay and Dytallix
+evidence, production signing evidence, and broader game compatibility testing.

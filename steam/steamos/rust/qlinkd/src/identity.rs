@@ -97,10 +97,9 @@ fn load_or_generate_secret(path: &Path) -> io::Result<[u8; SECRET_LEN]> {
         None => {
             let mut secret = [0_u8; SECRET_LEN];
             getrandom::fill(&mut secret).map_err(|error| {
-                io::Error::new(
-                    ErrorKind::Other,
-                    format!("OS randomness unavailable for device secret: {error}"),
-                )
+                io::Error::other(format!(
+                    "OS randomness unavailable for device secret: {error}"
+                ))
             })?;
             write_secret_atomically(path, &secret)?;
             Ok(secret)

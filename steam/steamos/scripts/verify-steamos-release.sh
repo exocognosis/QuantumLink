@@ -408,6 +408,59 @@ if [ -n "$PRODUCTION_EVIDENCE_MANIFEST" ]; then
     else
         PRODUCTION_EVIDENCE_MANIFEST="$(cd "$(dirname "$evidence_input")" && pwd -P)/$(basename "$evidence_input")"
         PRODUCTION_EVIDENCE_MANIFEST_SHA256="$(sha256_file "$PRODUCTION_EVIDENCE_MANIFEST")"
+        archived_evidence_root="$PAYLOAD_ROOT/release-evidence"
+        archived_evidence_manifest="$archived_evidence_root/production-evidence-manifest.json"
+        if [ ! -f "$archived_evidence_manifest" ]; then
+            add_failure "signed archive is missing embedded production evidence manifest"
+        elif ! cmp -s "$PRODUCTION_EVIDENCE_MANIFEST" "$archived_evidence_manifest"; then
+            add_failure "packaged production evidence manifest does not match signed archive"
+        elif ! PRODUCTION_EVIDENCE_MANIFEST="$PRODUCTION_EVIDENCE_MANIFEST" \
+            ARCHIVED_EVIDENCE_ROOT="$archived_evidence_root" \
+            python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+manifest_path = Path(os.environ["PRODUCTION_EVIDENCE_MANIFEST"]).resolve()
+external_root = manifest_path.parent
+archived_root = Path(os.environ["ARCHIVED_EVIDENCE_ROOT"]).resolve()
+manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+if manifest.get("schemaVersion") != 2:
+    raise SystemExit("signed archive evidence must use schemaVersion 2")
+references = []
+dytallix = manifest.get("dytallix", {})
+for entry in (dytallix.get("finality"), dytallix.get("ttlRefresh")):
+    if isinstance(entry, dict):
+        references.append(entry.get("evidence"))
+verifier_signature = dytallix.get("finality", {}).get("verifierSignature", {})
+if isinstance(verifier_signature, dict):
+    references.extend([
+        verifier_signature.get("publicKey"),
+        verifier_signature.get("signature"),
+    ])
+for field in ("lifecycleMatrix", "negativePolicyMatrix"):
+    for entry in dytallix.get(field, []):
+        if isinstance(entry, dict):
+            references.append(entry.get("evidence"))
+for entry in manifest.get("rendezvousRelay", {}).get("controls", []):
+    if isinstance(entry, dict):
+        references.append(entry.get("evidence"))
+for reference in references:
+    if not isinstance(reference, str) or not reference:
+        raise SystemExit("production evidence contains an empty sidecar reference")
+    relative = Path(reference)
+    external = (external_root / relative).resolve()
+    archived = (archived_root / relative).resolve()
+    external.relative_to(external_root)
+    archived.relative_to(archived_root)
+    if not external.is_file() or not archived.is_file():
+        raise SystemExit(f"signed archive is missing production evidence sidecar: {reference}")
+    if external.read_bytes() != archived.read_bytes():
+        raise SystemExit(f"production evidence sidecar does not match signed archive: {reference}")
+PY
+        then
+            add_failure "production evidence sidecars are not bound to the signed archive"
+        fi
     fi
     if [ -f "$PRODUCTION_EVIDENCE_MANIFEST" ] && bash "$SCRIPT_DIR/verify-production-evidence.sh" "$PRODUCTION_EVIDENCE_MANIFEST" > "$evidence_report" 2> "$evidence_errors"; then
         evidence_ready="$(python3 - "$evidence_report" <<'PY'

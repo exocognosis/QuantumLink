@@ -33,7 +33,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install release tooling
-        run: sudo apt-get update && sudo apt-get install -y zstd jq
+        run: sudo apt-get update && sudo apt-get install -y zstd jq openssl
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -48,9 +48,11 @@ jobs:
           bash -n steam/steamos/scripts/verify-production-evidence.sh
           bash -n steam/steamos/scripts/verify-steamos-release.sh
           bash -n steam/steamos/tests/collect-production-evidence-test.sh
+          bash -n steam/steamos/tests/bridge-public-edge-evidence-test.sh
           bash -n steam/steamos/tests/deck-validation.sh
           bash -n steam/steamos/tests/deck-validation-test.sh
           bash -n steam/steamos/tests/production-evidence-test.sh
+          bash -n steam/steamos/tests/compatible-linux-signed-rc-proof-test.sh
           bash -n steam/steamos/tests/steamos-rc-dry-run-test.sh
           bash -n steam/steamos/tests/verify-deck-evidence.sh
           bash -n steam/steamos/tests/verify-steamos-release-test.sh
@@ -60,9 +62,20 @@ jobs:
           bash steam/steamos/tests/collect-production-evidence-test.sh
           bash steam/steamos/tests/deck-validation-test.sh
           bash steam/steamos/tests/production-evidence-test.sh
-          bash steam/steamos/tests/steamos-rc-dry-run-test.sh
           bash steam/steamos/tests/verify-steamos-release-test.sh
           bash steam/steamos/tests/install-steamos-test.sh
+
+      - name: Public-edge evidence bridge contract
+        run: |
+          python3 -m py_compile steam/steamos/scripts/bridge-public-edge-evidence.py
+          bash steam/steamos/tests/bridge-public-edge-evidence-test.sh
+
+      - name: Compatible-Linux signed RC proof
+        env:
+          QLINK_STEAMOS_RELEASE_PRIVATE_KEY: ""
+          QLINK_STEAMOS_RELEASE_PUBLIC_KEY: ""
+          QLINK_STEAMOS_SIGNATURE_FILE: ""
+        run: bash steam/steamos/tests/compatible-linux-signed-rc-proof-test.sh
 
       - name: Rust tests
         run: cargo test -p qlinkd -p qlinkctl -p qlink-linux -p qlink-proto -p qlink-game

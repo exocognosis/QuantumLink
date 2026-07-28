@@ -4,7 +4,8 @@ use qlink_core::packet_core::{FfiRouteMode, InstalledPeerSession, PeerSessionDir
 use qlink_linux::{DryRunExecutor, LoopbackTunDevice, TunDeviceConfig, TunPacketIo};
 use qlink_proto::{DaemonConfig, DataPlaneState, PathKind};
 use qlinkd::data_plane::{
-    packet_core_from_parts, DataPlaneError, DataPlaneRuntime, MeshFrameTransport,
+    packet_core_from_parts, DataPlaneError, DataPlaneRuntime, InboundTransportFrame,
+    MeshFrameTransport,
 };
 use qlinkd::{DaemonEngine, DaemonPaths};
 
@@ -74,8 +75,18 @@ impl MeshFrameTransport for FakeMeshTransport {
         Ok(())
     }
 
-    fn try_receive_frame(&mut self) -> Option<Vec<u8>> {
-        self.frames.pop_front()
+    fn try_receive_frame(&mut self) -> Option<InboundTransportFrame> {
+        self.frames.pop_front().map(|frame| InboundTransportFrame {
+            frame,
+            peer_session: InstalledPeerSession {
+                peer_id: "fake-live-peer".to_string(),
+                direction: PeerSessionDirection::Inbound,
+                generation: 1,
+                transcript_binding: [0; 32],
+                expires_at_unix: u64::MAX,
+                rekey_after_bytes: 0,
+            },
+        })
     }
 }
 
@@ -194,4 +205,26 @@ fn live_mesh_transport_inbound_transport_frame_emits_tunnel_packet() {
     let len = receiver.tun_mut().read_packet(&mut buffer).unwrap();
     assert_eq!(len, packet.len());
     assert_eq!(&buffer[16..20], &packet[16..20]);
+}
+
+#[test]
+fn live_mesh_transport_accepts_authenticated_inbound_frame_while_outbound_is_not_ready() {
+    let mut sender = runtime();
+    let mut receiver = runtime();
+    let packet = ipv4_packet([100, 64, 0, 9]);
+    let mut transport = FakeMeshTransport::direct_ready();
+    let mut buffer = [0_u8; 1280];
+
+    sender.tun_mut().write_packet(&packet).unwrap();
+    sender
+        .pump_tun_to_transport_once(&mut transport, &mut buffer)
+        .unwrap();
+    transport.ready = false;
+    transport.peer_session_ready = false;
+    transport.path = PathKind::Unavailable;
+
+    let result = receiver.pump_transport_to_tun_once(&mut transport).unwrap();
+
+    assert_eq!(result.accepted_packets, 1);
+    assert_eq!(result.emitted_packets, 1);
 }

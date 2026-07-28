@@ -1,7 +1,7 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::io::{ErrorKind, Read, Write};
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -23,11 +23,44 @@ pub struct DaemonConfig {
     pub overlay_cidr: String,
     pub overlay_ipv4_address: String,
     pub route_mode: RouteMode,
+    #[serde(default)]
+    pub active_peer_id: Option<String>,
     pub rendezvous_servers: Vec<String>,
     pub relay_servers: Vec<String>,
+    #[serde(default)]
+    pub rendezvous_auth_token_file: Option<String>,
+    #[serde(default)]
+    pub relay_auth_token_file: Option<String>,
+    #[serde(default)]
+    pub dytallix_identity: Option<DytallixIdentityLookupConfig>,
+    #[serde(default = "default_publication_ttl_seconds")]
+    pub publication_ttl_seconds: u64,
+    #[serde(default)]
+    pub advertise_address: Option<String>,
     pub kill_switch: bool,
     pub low_latency: bool,
     pub voice_chat_safe: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DytallixIdentityLookupConfig {
+    pub endpoint: String,
+    pub contract_address: String,
+    pub network_id: String,
+    pub chain_id: String,
+    #[serde(default)]
+    pub binding_version: DytallixBindingVersion,
+    #[serde(default)]
+    pub allowed_rpc_endpoints: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DytallixBindingVersion {
+    #[default]
+    ExactPeerRecordV1,
+    StableIdentityV2,
 }
 
 impl DaemonConfig {
@@ -41,8 +74,41 @@ impl DaemonConfig {
             &self.overlay_cidr,
             &self.overlay_ipv4_address,
         )?;
+        validate_optional_nonempty("activePeerId", self.active_peer_id.as_deref())?;
         validate_server_entries("rendezvousServers", &self.rendezvous_servers)?;
         validate_server_entries("relayServers", &self.relay_servers)?;
+        validate_optional_nonempty(
+            "rendezvousAuthTokenFile",
+            self.rendezvous_auth_token_file.as_deref(),
+        )?;
+        validate_optional_nonempty("relayAuthTokenFile", self.relay_auth_token_file.as_deref())?;
+        if let Some(identity) = self.dytallix_identity.as_ref() {
+            validate_nonempty("dytallixIdentity.endpoint", &identity.endpoint)?;
+            validate_nonempty(
+                "dytallixIdentity.contractAddress",
+                &identity.contract_address,
+            )?;
+            validate_nonempty("dytallixIdentity.networkId", &identity.network_id)?;
+            validate_nonempty("dytallixIdentity.chainId", &identity.chain_id)?;
+            validate_server_entries(
+                "dytallixIdentity.allowedRpcEndpoints",
+                &identity.allowed_rpc_endpoints,
+            )?;
+        }
+        if !(2..=86_400).contains(&self.publication_ttl_seconds) {
+            return Err(ConfigValidationError::InvalidPublicationTtl {
+                value: self.publication_ttl_seconds,
+            });
+        }
+        if let Some(address) = self.advertise_address.as_deref() {
+            validate_nonempty("advertiseAddress", address)?;
+            address.parse::<SocketAddr>().map_err(|error| {
+                ConfigValidationError::InvalidAdvertiseAddress {
+                    value: address.to_string(),
+                    reason: error.to_string(),
+                }
+            })?;
+        }
         Ok(())
     }
 }
@@ -59,9 +125,18 @@ pub enum ConfigValidationError {
     InvalidOverlayIpv4Address { value: String, reason: String },
     #[error("invalid {field}[{index}]: must not be empty")]
     EmptyServerEntry { field: &'static str, index: usize },
+    #[error("invalid {field}: must not be empty")]
+    EmptyConfigEntry { field: &'static str },
+    #[error("invalid publicationTtlSeconds `{value}`: must be between 2 and 86400")]
+    InvalidPublicationTtl { value: u64 },
+    #[error("invalid advertiseAddress `{value}`: {reason}")]
+    InvalidAdvertiseAddress { value: String, reason: String },
 }
 
 const MAX_LINUX_INTERFACE_NAME_BYTES: usize = 15;
+const fn default_publication_ttl_seconds() -> u64 {
+    120
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct OverlayNetwork {
@@ -198,6 +273,23 @@ fn validate_server_entries(
     Ok(())
 }
 
+fn validate_nonempty(field: &'static str, value: &str) -> Result<(), ConfigValidationError> {
+    if value.trim().is_empty() {
+        return Err(ConfigValidationError::EmptyConfigEntry { field });
+    }
+    Ok(())
+}
+
+fn validate_optional_nonempty(
+    field: &'static str,
+    value: Option<&str>,
+) -> Result<(), ConfigValidationError> {
+    if let Some(value) = value {
+        validate_nonempty(field, value)?;
+    }
+    Ok(())
+}
+
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
@@ -205,8 +297,14 @@ impl Default for DaemonConfig {
             overlay_cidr: "100.64.0.0/10".to_string(),
             overlay_ipv4_address: "100.64.10.2".to_string(),
             route_mode: RouteMode::GameOnly,
+            active_peer_id: None,
             rendezvous_servers: Vec::new(),
             relay_servers: Vec::new(),
+            rendezvous_auth_token_file: None,
+            relay_auth_token_file: None,
+            dytallix_identity: None,
+            publication_ttl_seconds: default_publication_ttl_seconds(),
+            advertise_address: None,
             kill_switch: true,
             low_latency: true,
             voice_chat_safe: true,
@@ -360,6 +458,137 @@ impl Default for DataPlaneStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PublicationState {
+    #[default]
+    NotStarted,
+    Publishing,
+    Active,
+    Degraded,
+    Failed,
+    Expired,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DytallixTrustDecision {
+    #[default]
+    NotChecked,
+    Accepted,
+    Denied,
+    Revoked,
+    Suspended,
+    Mismatched,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DytallixTrustHealth {
+    Healthy,
+    Degraded,
+    Unavailable,
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PublicationErrorCode {
+    PublishRejected,
+    AuthenticationFailed,
+    TrustUnavailable,
+    InvalidResponse,
+    Transport,
+    Expired,
+    Internal,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicationErrorStatus {
+    pub code: PublicationErrorCode,
+    #[serde(default)]
+    pub retryable: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DytallixTrustStatus {
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default)]
+    pub decision: DytallixTrustDecision,
+    #[serde(default)]
+    pub health: DytallixTrustHealth,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LocalRegistryBindingState {
+    #[default]
+    NotConfigured,
+    Pending,
+    Active,
+    Missing,
+    Revoked,
+    Suspended,
+    Mismatched,
+    Expired,
+    Unavailable,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalRegistryBindingStatus {
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default)]
+    pub version: Option<DytallixBindingVersion>,
+    #[serde(default)]
+    pub state: LocalRegistryBindingState,
+    #[serde(default)]
+    pub identity_revision: Option<u64>,
+    #[serde(default)]
+    pub checked_at_unix: Option<u64>,
+    #[serde(default)]
+    pub last_error: Option<PublicationErrorStatus>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicationStatus {
+    #[serde(default)]
+    pub state: PublicationState,
+    #[serde(default)]
+    pub sequence: Option<u64>,
+    #[serde(default)]
+    pub expires_at_unix: Option<u64>,
+    #[serde(default)]
+    pub last_success_at_unix: Option<u64>,
+    #[serde(default)]
+    pub last_attempt_at_unix: Option<u64>,
+    #[serde(default)]
+    pub last_error: Option<PublicationErrorStatus>,
+    /// Legacy alias for selected remote-peer trust. New clients should use
+    /// `remotePeerTrust`; it remains serialized for compatibility.
+    #[serde(default)]
+    pub dytallix: DytallixTrustStatus,
+    #[serde(default)]
+    pub remote_peer_trust: DytallixTrustStatus,
+    #[serde(default)]
+    pub local_registry_binding: LocalRegistryBindingStatus,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DaemonStatus {
@@ -371,6 +600,8 @@ pub struct DaemonStatus {
     pub network: NetworkStatus,
     #[serde(default = "DataPlaneStatus::not_started")]
     pub data_plane: DataPlaneStatus,
+    #[serde(default)]
+    pub publication: PublicationStatus,
 }
 
 impl DaemonStatus {
@@ -382,6 +613,7 @@ impl DaemonStatus {
             kill_switch,
             network: NetworkStatus::not_started(),
             data_plane: DataPlaneStatus::not_started(),
+            publication: PublicationStatus::default(),
         }
     }
 }
@@ -416,6 +648,8 @@ pub struct StoredPeer {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PeerStore {
+    #[serde(default)]
+    pub selected_peer_id: Option<String>,
     pub peers: Vec<StoredPeer>,
 }
 
@@ -437,16 +671,33 @@ impl PeerStore {
     pub fn remove(&mut self, peer_id: &str) -> bool {
         let original_len = self.peers.len();
         self.peers.retain(|peer| peer.peer_id != peer_id);
-        self.peers.len() != original_len
+        let removed = self.peers.len() != original_len;
+        if removed && self.selected_peer_id.as_deref() == Some(peer_id) {
+            self.selected_peer_id = None;
+        }
+        removed
     }
 
     pub fn revoke(&mut self, peer_id: &str) -> bool {
         if let Some(peer) = self.peers.iter_mut().find(|peer| peer.peer_id == peer_id) {
             peer.revoked = true;
+            if self.selected_peer_id.as_deref() == Some(peer_id) {
+                self.selected_peer_id = None;
+            }
             true
         } else {
             false
         }
+    }
+
+    pub fn select(&mut self, peer_id: &str, now_unix: u64) -> bool {
+        let eligible = self.peers.iter().any(|peer| {
+            peer.peer_id == peer_id && !peer.revoked && peer.expires_at_unix > now_unix
+        });
+        if eligible {
+            self.selected_peer_id = Some(peer_id.to_string());
+        }
+        eligible
     }
 
     pub fn dial_candidates(&self, now_unix: u64) -> Vec<StoredPeer> {
@@ -657,6 +908,8 @@ mod tests {
         assert_eq!(config.interface_name, "qlink0");
         assert_eq!(config.overlay_cidr, "100.64.0.0/10");
         assert_eq!(config.route_mode, RouteMode::GameOnly);
+        assert_eq!(config.publication_ttl_seconds, 120);
+        assert!(config.advertise_address.is_none());
         assert!(config.kill_switch);
         assert!(config.low_latency);
         assert!(config.voice_chat_safe);
@@ -665,6 +918,96 @@ mod tests {
     #[test]
     fn default_config_passes_validation() {
         DaemonConfig::default().validate().unwrap();
+    }
+
+    #[test]
+    fn production_transport_settings_round_trip() {
+        let config: DaemonConfig = serde_json::from_value(serde_json::json!({
+            "interfaceName": "qlink0",
+            "overlayCidr": "100.64.0.0/10",
+            "overlayIpv4Address": "100.64.10.2",
+            "routeMode": "gameOnly",
+            "activePeerId": "peer-a",
+            "rendezvousServers": ["tls://rv.example:9471"],
+            "relayServers": ["tls://relay.example:9472"],
+            "rendezvousAuthTokenFile": "/etc/quantumlink/secrets/rv.token",
+            "relayAuthTokenFile": "/etc/quantumlink/secrets/relay.token",
+            "dytallixIdentity": {
+                "endpoint": "https://registry.example",
+                "contractAddress": "quantumlink-node-registry-v2",
+                "networkId": "dytallix-mainnet",
+                "chainId": "dytallix-1",
+                "bindingVersion": "stableIdentityV2",
+                "allowedRpcEndpoints": ["https://rpc.example"]
+            },
+            "publicationTtlSeconds": 300,
+            "advertiseAddress": "203.0.113.10:9471",
+            "killSwitch": true,
+            "lowLatency": true,
+            "voiceChatSafe": true
+        }))
+        .unwrap();
+
+        config.validate().unwrap();
+        assert_eq!(config.active_peer_id.as_deref(), Some("peer-a"));
+        assert_eq!(
+            config.dytallix_identity.as_ref().unwrap().network_id,
+            "dytallix-mainnet"
+        );
+        assert_eq!(
+            config.dytallix_identity.as_ref().unwrap().binding_version,
+            DytallixBindingVersion::StableIdentityV2
+        );
+        assert_eq!(config.publication_ttl_seconds, 300);
+        assert_eq!(
+            config.advertise_address.as_deref(),
+            Some("203.0.113.10:9471")
+        );
+        let value = serde_json::to_value(&config).unwrap();
+        assert_eq!(value.get("publicationTtlSeconds").unwrap(), 300);
+        assert_eq!(value.get("advertiseAddress").unwrap(), "203.0.113.10:9471");
+    }
+
+    #[test]
+    fn legacy_config_defaults_publication_settings() {
+        let mut value = serde_json::to_value(DaemonConfig::default()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("publicationTtlSeconds");
+        value.as_object_mut().unwrap().remove("advertiseAddress");
+
+        let config: DaemonConfig = serde_json::from_value(value).unwrap();
+
+        assert_eq!(config.publication_ttl_seconds, 120);
+        assert!(config.advertise_address.is_none());
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn validation_rejects_publication_ttl_outside_bounds() {
+        for publication_ttl_seconds in [0, 1, 86_401] {
+            let config = DaemonConfig {
+                publication_ttl_seconds,
+                ..DaemonConfig::default()
+            };
+
+            let error = config.validate().unwrap_err();
+            assert!(error.to_string().contains("publicationTtlSeconds"));
+        }
+    }
+
+    #[test]
+    fn validation_rejects_invalid_advertise_address() {
+        for advertise_address in ["", "203.0.113.10", "not-a-socket"] {
+            let config = DaemonConfig {
+                advertise_address: Some(advertise_address.to_string()),
+                ..DaemonConfig::default()
+            };
+
+            let error = config.validate().unwrap_err();
+            assert!(error.to_string().contains("advertiseAddress"));
+        }
     }
 
     #[test]
@@ -821,6 +1164,7 @@ mod tests {
                 error: None,
             },
             data_plane: DataPlaneStatus::not_started(),
+            publication: PublicationStatus::default(),
         };
 
         let json = serde_json::to_string(&status).unwrap();
@@ -854,6 +1198,112 @@ mod tests {
 
         assert_eq!(status.phase, ConnectionPhase::Idle);
         assert_eq!(status.network, NetworkStatus::not_started());
+        assert_eq!(status.publication, PublicationStatus::default());
+    }
+
+    #[test]
+    fn status_serializes_publication_lifecycle_without_credentials() {
+        let mut status = DaemonStatus::idle(true);
+        status.publication = PublicationStatus {
+            state: PublicationState::Active,
+            sequence: Some(42),
+            expires_at_unix: Some(4_102_444_800),
+            last_success_at_unix: Some(1_767_139_200),
+            last_attempt_at_unix: Some(1_767_139_200),
+            last_error: Some(PublicationErrorStatus {
+                code: PublicationErrorCode::AuthenticationFailed,
+                retryable: false,
+            }),
+            dytallix: DytallixTrustStatus {
+                required: true,
+                decision: DytallixTrustDecision::Accepted,
+                health: DytallixTrustHealth::Healthy,
+            },
+            remote_peer_trust: DytallixTrustStatus {
+                required: true,
+                decision: DytallixTrustDecision::Accepted,
+                health: DytallixTrustHealth::Healthy,
+            },
+            local_registry_binding: LocalRegistryBindingStatus {
+                required: true,
+                version: Some(DytallixBindingVersion::StableIdentityV2),
+                state: LocalRegistryBindingState::Active,
+                identity_revision: Some(3),
+                checked_at_unix: Some(1_767_139_200),
+                last_error: None,
+            },
+        };
+
+        let value = serde_json::to_value(&status).unwrap();
+        let publication = value.get("publication").unwrap();
+        assert_eq!(publication.get("state").unwrap(), "active");
+        assert_eq!(publication.get("sequence").unwrap(), 42);
+        assert_eq!(publication.get("expiresAtUnix").unwrap(), 4_102_444_800u64);
+        assert_eq!(
+            publication
+                .get("dytallix")
+                .and_then(|value| value.get("decision"))
+                .unwrap(),
+            "accepted"
+        );
+        assert_eq!(
+            publication
+                .get("dytallix")
+                .and_then(|value| value.get("health"))
+                .unwrap(),
+            "healthy"
+        );
+        assert_eq!(
+            publication
+                .get("lastError")
+                .and_then(|value| value.get("code"))
+                .unwrap(),
+            "authenticationFailed"
+        );
+
+        let json = serde_json::to_string(&status).unwrap();
+        for forbidden in ["wallet", "seed", "privateKey", "authToken", "credential"] {
+            assert!(!json.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn publication_status_deserializes_missing_fields_with_safe_defaults() {
+        let publication: PublicationStatus =
+            serde_json::from_str(r#"{"state":"publishing","sequence":7}"#).unwrap();
+
+        assert_eq!(publication.state, PublicationState::Publishing);
+        assert_eq!(publication.sequence, Some(7));
+        assert_eq!(
+            publication.dytallix.decision,
+            DytallixTrustDecision::NotChecked
+        );
+        assert_eq!(
+            publication.local_registry_binding.state,
+            LocalRegistryBindingState::NotConfigured
+        );
+        assert_eq!(publication.dytallix.health, DytallixTrustHealth::Unknown);
+        assert!(!publication.dytallix.required);
+        assert!(publication.expires_at_unix.is_none());
+        assert!(publication.last_error.is_none());
+    }
+
+    #[test]
+    fn publication_status_maps_future_enum_values_to_unknown() {
+        let publication: PublicationStatus = serde_json::from_str(
+            r#"{
+                "state":"futureState",
+                "dytallix":{"required":true,"decision":"futureDecision","health":"futureHealth"}
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(publication.state, PublicationState::Unknown);
+        assert_eq!(
+            publication.dytallix.decision,
+            DytallixTrustDecision::Unknown
+        );
+        assert_eq!(publication.dytallix.health, DytallixTrustHealth::Unknown);
     }
 
     #[test]

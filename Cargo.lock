@@ -1744,6 +1744,7 @@ dependencies = [
  "mdns-sd",
  "ml-dsa",
  "ml-kem",
+ "quantumlink-node-registry-v2",
  "quinn",
  "rand_core 0.6.4",
  "rcgen",
@@ -1777,6 +1778,7 @@ dependencies = [
 name = "qlink-linux"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "qlink-proto",
 ]
 
@@ -1803,11 +1805,13 @@ dependencies = [
 name = "qlinkctl"
 version = "0.1.0"
 dependencies = [
+ "qlink-core",
  "qlink-game",
  "qlink-proto",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]
@@ -1824,6 +1828,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -1840,6 +1845,24 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "quantumlink-node-registry-v2"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "bech32 0.12.0",
+ "blake3",
+ "dytallix-core",
+ "fips204",
+ "ml-dsa",
+ "pkcs8",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "signature",
  "thiserror 1.0.69",
 ]
 

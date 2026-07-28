@@ -60,10 +60,19 @@ pub struct RendezvousStore {
 impl RendezvousStore {
     pub async fn publish(&self, mesh_id: &str, record: PeerRecord) -> Result<()> {
         record.verify(mesh_id)?;
-        self.records
-            .write()
-            .await
-            .insert((mesh_id.to_string(), record.body.peer_id.clone()), record);
+        let key = (mesh_id.to_string(), record.body.peer_id.clone());
+        let mut records = self.records.write().await;
+        if let Some(current) = records.get(&key) {
+            if current.body.expires_at_unix > now_unix()
+                && record.body.sequence <= current.body.sequence
+            {
+                return Err(QlinkError::Protocol(format!(
+                    "rendezvous rejected non-increasing peer record sequence {} for {}; current sequence is {}",
+                    record.body.sequence, record.body.peer_id, current.body.sequence
+                )));
+            }
+        }
+        records.insert(key, record);
         Ok(())
     }
 
@@ -604,6 +613,15 @@ mod tests {
 
     fn signed_record() -> (String, PeerRecord) {
         let keypair = DeviceKeypair::generate().unwrap();
+        let record = signed_record_with_sequence(&keypair, 1, 60);
+        (record.body.peer_id.clone(), record)
+    }
+
+    fn signed_record_with_sequence(
+        keypair: &DeviceKeypair,
+        sequence: u64,
+        ttl_seconds: u64,
+    ) -> PeerRecord {
         let body = UnsignedPeerRecord::new(
             "devmesh",
             "mac",
@@ -615,11 +633,10 @@ mod tests {
                 priority: 120,
             }],
             vec!["100.127.0.2/32".to_string()],
-            60,
-            1,
+            ttl_seconds,
+            sequence,
         );
-        let record = PeerRecord::signed(body, &keypair).unwrap();
-        (record.body.peer_id.clone(), record)
+        PeerRecord::signed(body, keypair).unwrap()
     }
 
     async fn spawn_configured_rendezvous(
@@ -660,6 +677,58 @@ mod tests {
         assert_eq!(client.publish("devmesh", record).await.unwrap(), peer_id);
         let found = client.lookup("devmesh", &peer_id).await.unwrap().unwrap();
         assert_eq!(found.body.peer_id, peer_id);
+    }
+
+    #[tokio::test]
+    async fn rendezvous_rejects_equal_or_lower_live_sequence_and_accepts_newer() {
+        let store = RendezvousStore::default();
+        let keypair = DeviceKeypair::generate().unwrap();
+        store
+            .publish("devmesh", signed_record_with_sequence(&keypair, 5, 60))
+            .await
+            .unwrap();
+
+        for sequence in [5, 4] {
+            let error = store
+                .publish(
+                    "devmesh",
+                    signed_record_with_sequence(&keypair, sequence, 60),
+                )
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("non-increasing"));
+        }
+
+        store
+            .publish("devmesh", signed_record_with_sequence(&keypair, 6, 60))
+            .await
+            .unwrap();
+        let peer_id = keypair.public_key().peer_id();
+        let current = store.lookup("devmesh", &peer_id).await.unwrap();
+        assert_eq!(current.body.sequence, 6);
+    }
+
+    #[tokio::test]
+    async fn rendezvous_allows_sequence_restart_after_current_record_expires() {
+        let store = RendezvousStore::default();
+        let keypair = DeviceKeypair::generate().unwrap();
+        let mut expired = signed_record_with_sequence(&keypair, 10, 60);
+        expired.body.expires_at_unix = now_unix();
+        expired = PeerRecord::signed(expired.body, &keypair).unwrap();
+        store.publish("devmesh", expired).await.unwrap_err();
+
+        // Insert an expired but otherwise valid record to model an entry that
+        // aged out between publication and replacement.
+        let key = ("devmesh".to_string(), keypair.public_key().peer_id());
+        store.records.write().await.insert(key, {
+            let mut record = signed_record_with_sequence(&keypair, 10, 60);
+            record.body.expires_at_unix = now_unix();
+            PeerRecord::signed(record.body, &keypair).unwrap()
+        });
+        store
+            .publish("devmesh", signed_record_with_sequence(&keypair, 1, 60))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

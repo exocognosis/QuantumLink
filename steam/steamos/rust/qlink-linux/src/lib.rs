@@ -2,8 +2,10 @@ use std::{error::Error, fmt, process::Command as ProcessCommand};
 
 use qlink_proto::{ConfigValidationError, DaemonConfig, RouteMode};
 
+pub mod network_monitor;
 pub mod tun;
 
+pub use network_monitor::NetworkChangeMonitor;
 pub use tun::{
     protocol_family_for_packet, LoopbackTunDevice, TunDeviceConfig, TunPacketIo, TunPacketIoError,
 };

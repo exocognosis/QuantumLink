@@ -2,17 +2,23 @@
 
 QuantumLink on SteamOS is a Linux daemon deployment inside the Steam silo. The runtime shape is `qlinkd` under systemd, with `qlinkctl` as the local control and diagnostics surface.
 
-Status: Pre-production daemon scaffold. Production readiness is tracked in
+Status: Pre-production daemon implementation. Production readiness is tracked in
 `steam/steamos/docs/production-readiness.md`. SteamOS remains pre-production
-until live transport, signed release, Steam-safe routing, and Deck validation
-gates pass.
+until live public-edge/Dytallix proof, production signing, Steam-safe routing,
+and Deck validation gates pass.
 The SteamOS security test plan lives at
 `steam/steamos/docs/security-test-plan.md`.
 
-2026-06-30 closeout status: local Rust, shell, installer, and dev-package
-verification gates pass, but production publication is a No-Go until production
-signing, active rendezvous/relay evidence, public Dytallix registry evidence,
-and real Steam Deck validation are linked from the readiness ledger.
+Local Rust, shell, installer, evidence-bridge, and signed-RC verification gates
+pass. Production publication remains a No-Go until production signing, complete
+active rendezvous/relay and public Dytallix evidence, and real Steam Deck
+validation are linked from the readiness ledger.
+
+The evidence bridge has fixture coverage for an optional signed-record
+lifecycle report. It marks `signed_expiring_records` passed only when a
+redacted `qlink-core` verifier report proves ML-DSA publication lookup,
+post-expiry rejection, and higher-sequence refresh before expiry. No live
+public-edge proof is claimed by this repository state.
 
 ## Components
 
@@ -92,7 +98,60 @@ transport ready: no
 packet counters: observed=0 queued=0 dropped=0 emitted=0 accepted=0 rejected=0 transportErrors=0
 ```
 
-The resident daemon builds a live mesh transport and drives the bidirectional packet pump, so with the local-echo development transport (no rendezvous configured) the data plane reaches `ready`. On a real `MeshTransportHandle`, `data-plane state: starting` with `transport ready: no` is expected until an authenticated peer session is installed into packet-frame encryption on the live transport — the shared cross-platform gap the macOS and Windows silos also carry. It means the local TUN packet I/O runtime and transport are wired, not that protected traffic is already flowing to remote peers.
+The resident daemon builds a live mesh transport and drives the bidirectional
+packet pump. For a configured mesh it selects exactly one current, non-revoked
+peer from the trusted invite store, applies an exact inbound ACL, and installs
+the shared transport's authenticated directional packet-session leases into the
+packet core. Rekey, expiry, disconnect, and clear events are generation-aware.
+The daemon drops the complete transport if the selected peer is removed,
+revoked, expired, or replaced on disk.
+
+For a configured rendezvous service, `qlinkd` also runs a dedicated signed
+peer-record publication worker. It reserves monotonic sequence numbers in
+`/var/lib/quantumlink/publication-state.json`, writes the current public record
+to an owner-only `publication-record.json` outbox, refreshes at TTL/2, and
+retries without blocking packet or control processing. Linux netlink
+route/link/address changes trigger an immediate reconnect and republish. The
+packet path remains fail-closed before the first successful publication and
+after record expiry.
+
+Select the protected packet target explicitly when more than one peer is
+eligible:
+
+```sh
+sudo qlinkctl peer select <peer-id>
+```
+
+Public-edge authentication tokens are loaded only from absolute owner-only
+files such as `/etc/quantumlink/secrets/rendezvous.token`; token values do not
+belong in `config.json`.
+
+`publicationTtlSeconds` defaults to `120`. `advertiseAddress` can override the
+responder bind address when a stable public NAT/proxy endpoint is required.
+Wallet seeds and signing credentials never enter `qlinkd`; public Dytallix
+enrollment, update, suspension, and revocation remain offline provisioning
+actions. Public mode requires `bindingVersion: "stableIdentityV2"`; the daemon
+performs lookup-only validation and will not silently downgrade to v1.
+
+Provisioning is daemon-independent, not network-disconnected. It reads the
+pinned Dytallix settings from `/etc/quantumlink/config.json`, requires an
+explicit owner-only wallet keystore for mutations, and emits JSON receipts:
+
+```sh
+sudo qlinkctl dytallix status
+sudo qlinkctl dytallix register --keystore /secure/path/wallet.json --wallet main
+sudo qlinkctl dytallix update --keystore /secure/path/wallet.json --wallet main
+sudo qlinkctl dytallix suspend --keystore /secure/path/wallet.json --peer-id <peer-id>
+sudo qlinkctl dytallix reactivate --keystore /secure/path/wallet.json --wallet main
+sudo qlinkctl dytallix revoke --keystore /secure/path/wallet.json \
+  --peer-id <peer-id> --confirm-peer-id <peer-id>
+```
+
+Register, update, and reactivate load the existing device seed from
+`/var/lib/quantumlink`; they never generate a replacement identity. Suspend and
+revoke can operate by explicit peer ID without device-key access. A successful
+receipt proves transaction confirmation and exact registry readback, but does
+not claim finalized-chain inclusion; that remains a separate production gate.
 
 ## Runtime Modes
 
@@ -137,7 +196,7 @@ SteamOS may remount the root filesystem read-only after system updates. Re-run t
 - Linux creates a dedicated TUN interface, currently documented as `qlink0`.
 - Protected game/party routes use the overlay range `100.64.0.0/10`.
 - `qlinkd` owns route setup, nftables fail-closed policy, peer state, profile application, and the local packet-pump boundary; the packaged service plans network changes until explicitly started with `--activate-network`, then records ownership for `--deactivate-network` cleanup.
-- The packet pump uses shared `qlink-core` packet framing and replay protection, and the resident daemon drives it against a live `DaemonMeshTransport` (shared `qlink-core` mesh transport, or a local-echo development transport when no rendezvous is configured). Peer-session-key installation over the real transport and full Deck runtime validation remain separate gates.
+- The packet pump uses shared `qlink-core` packet framing and replay protection, and the resident daemon drives it against a live `DaemonMeshTransport` with authenticated directional packet-session leases. Full Deck runtime validation remains a separate gate.
 - Rendezvous services publish and look up short-lived signed peer records.
 - Peers attempt direct QUIC paths first, with optional ICE/STUN helpers as the traversal layer matures.
 - Relay services are fallback paths for hostile NAT or intentionally hidden paths.

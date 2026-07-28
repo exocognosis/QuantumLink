@@ -59,8 +59,10 @@
   - [ ] Check encapsulation/decapsulation failure handling propagates to fail-closed packet behavior.
   - [ ] Validate test vectors or known-answer fixtures where available.
 - [ ] **ML-DSA-65 and SLH-DSA identity**
-  - [ ] Verify peer records and inbound identity assertions bind peer ID, mesh ID, endpoint candidates, routes, sequence, expiration, and device key material.
-  - [ ] Confirm public mesh mode rejects missing, revoked, suspended, stale, mismatched, or expired Dytallix records.
+  - [ ] Verify peer records sign peer ID, mesh ID, issued time, endpoint candidates, routes, monotonic sequence, expiration, and device key material.
+  - [ ] Verify stable identity v2 wallet/device authorization, exact revision increments, owner-only emergency suspension, and terminal revocation.
+  - [ ] Confirm public mesh mode rejects omitted or legacy-v1 binding versions, missing, revoked, suspended, mismatched, expired, wrong-scope, and excessive-TTL records.
+  - [ ] Confirm a higher-sequence TTL refresh remains valid without changing the stable identity revision.
   - [ ] Confirm private-friends mode does not accidentally accept public-mode records as authoritative without policy.
 - [ ] **ChaCha20-Poly1305 packet framing**
   - [ ] Verify nonce uniqueness for each installed peer session.
