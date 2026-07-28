@@ -8,7 +8,7 @@ license = "MIT OR Apache-2.0"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-base64 = "0.22"
+base64 = "0.23"
 bech32 = "0.12"
 blake3 = "1"
 fips204 = { version = "0.4", default-features = false, features = ["ml-dsa-65"] }

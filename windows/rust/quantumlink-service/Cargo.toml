@@ -17,7 +17,7 @@ path = "src/lib.rs"
 [dependencies]
 qlink-core = { path = "../../../qlink-core" }
 quantumlink-proto = { path = "../quantumlink-proto" }
-base64 = "0.22"
+base64 = "0.23"
 clap = { version = "4", features = ["derive"] }
 getrandom = "0.4"
 serde = { version = "1", features = ["derive"] }

@@ -168,6 +168,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "base64"
+version = "0.23.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b25655df2c3cdd83c5e5b293b88acd880332b2ddadd7c30ac43144fdc0033da9"
+
+[[package]]
 name = "base64ct"
 version = "1.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -628,7 +634,7 @@ name = "dytallix-sdk"
 version = "0.1.0"
 source = "git+https://github.com/DytallixHQ/dytallix-sdk?rev=657d0db4794904f7c25192c9d0c1039c5b9fe5f0#657d0db4794904f7c25192c9d0c1039c5b9fe5f0"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "dytallix-core",
  "reqwest",
  "serde",
@@ -1020,7 +1026,7 @@ version = "0.1.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "96547c2556ec9d12fb1578c4eaf448b04993e7fb79cbaad930a656880a6bdfa0"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "futures-channel",
  "futures-util",
@@ -1629,7 +1635,7 @@ version = "3.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d30c53c26bc5b31a98cd02d20f25a7c8567146caf63ed593a9d87b2775291be"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "serde_core",
 ]
 
@@ -1729,7 +1735,7 @@ dependencies = [
 name = "qlink-core"
 version = "0.1.0"
 dependencies = [
- "base64",
+ "base64 0.23.0",
  "bytes",
  "clap",
  "crc32fast",
@@ -1795,7 +1801,7 @@ dependencies = [
 name = "qlink-proto"
 version = "0.1.0"
 dependencies = [
- "base64",
+ "base64 0.23.0",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -1818,7 +1824,7 @@ dependencies = [
 name = "qlinkd"
 version = "0.1.0"
 dependencies = [
- "base64",
+ "base64 0.23.0",
  "getrandom 0.4.3",
  "libc",
  "qlink-core",
@@ -1835,7 +1841,7 @@ dependencies = [
 name = "quantumlink-node-registry"
 version = "0.1.0"
 dependencies = [
- "base64",
+ "base64 0.23.0",
  "bech32 0.12.0",
  "blake3",
  "dytallix-core",
@@ -1852,7 +1858,7 @@ dependencies = [
 name = "quantumlink-node-registry-v2"
 version = "0.1.0"
 dependencies = [
- "base64",
+ "base64 0.23.0",
  "bech32 0.12.0",
  "blake3",
  "dytallix-core",
@@ -1881,7 +1887,7 @@ dependencies = [
 name = "quantumlink-service"
 version = "0.1.0"
 dependencies = [
- "base64",
+ "base64 0.23.0",
  "clap",
  "getrandom 0.4.3",
  "qlink-core",
@@ -2080,7 +2086,7 @@ version = "0.12.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "encoding_rs",
  "futures-core",
