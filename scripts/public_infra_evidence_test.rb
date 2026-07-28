@@ -10,9 +10,13 @@ require "tmpdir"
 class PublicInfraEvidenceTest < Minitest::Test
   REPO_ROOT = File.expand_path("..", __dir__)
   VERIFIER = File.join(REPO_ROOT, "scripts/verify-public-infra-evidence.rb")
+  MANIFEST_VERIFIER = File.join(REPO_ROOT, "scripts/verify-public-edge-live-manifest.rb")
   ORCHESTRATOR = File.join(REPO_ROOT, "scripts/public-edge-live-evidence.sh")
+  REVOCATION_DRILL = File.join(REPO_ROOT, "scripts/public-edge-service-token-revocation.sh")
+  ROLLBACK_DRILL = File.join(REPO_ROOT, "scripts/public-edge-incident-rollback.sh")
   ALERTS = File.join(REPO_ROOT, "infra/public-edge/prometheus/quantumlink-public-edge-alerts.yml")
   RETENTION = File.join(REPO_ROOT, "infra/public-edge/journald/quantumlink-retention.conf.example")
+  ENV_EXAMPLE = File.join(REPO_ROOT, "infra/public-edge/public-edge.env.example")
   COMMIT_SHA = "a" * 40
 
   def setup
@@ -146,6 +150,39 @@ class PublicInfraEvidenceTest < Minitest::Test
     assert_includes report.fetch("failures"), "forbidden secret marker found in public infra evidence"
   end
 
+  def test_live_manifest_verifier_accepts_complete_public_manifest
+    path = write_evidence("manifest.json", base_manifest)
+    stdout, stderr, status = run_manifest_verifier("--expected-sha", COMMIT_SHA, path)
+    report = JSON.parse(stdout)
+
+    assert status.success?, stderr
+    assert_equal true, report.fetch("valid")
+    assert_equal true, report.fetch("liveEvidenceReady")
+    assert_empty report.fetch("failures")
+    assert_empty report.fetch("blockers")
+  end
+
+  def test_live_manifest_verifier_blocks_missing_operator_proofs
+    manifest = JSON.parse(JSON.generate(base_manifest))
+    manifest["status"] = "blocked"
+    manifest["proofs"]["serviceTokenRevocation"]["rendezvousRevokedTokenRejected"] = false
+    manifest["proofs"]["serviceTokenRevocation"]["relayAuthRevocationsTotal"] = 0
+    manifest["proofs"]["incidentRollback"]["verified"] = false
+    manifest["proofs"]["incidentRollback"]["postRollbackPublicInfraReady"] = false
+    path = write_evidence("blocked-manifest.json", manifest)
+    stdout, _stderr, status = run_manifest_verifier("--expected-sha", COMMIT_SHA, path)
+    report = JSON.parse(stdout)
+
+    refute status.success?
+    assert_equal true, report.fetch("valid")
+    assert_equal false, report.fetch("liveEvidenceReady")
+    assert_includes report.fetch("blockers"), "status must be pass"
+    assert_includes report.fetch("blockers"), "rendezvous revoked-token proof must reject old token"
+    assert_includes report.fetch("blockers"), "relay auth revocations must be visible in metrics"
+    assert_includes report.fetch("blockers"), "incident rollback proof must pass"
+    assert_includes report.fetch("blockers"), "post-rollback public infra proof must pass"
+  end
+
   def test_orchestrator_contract_runs_both_smokes_and_verifiers_without_token_args
     script = File.read(ORCHESTRATOR)
 
@@ -153,6 +190,7 @@ class PublicInfraEvidenceTest < Minitest::Test
     assert_includes script, "scripts/public-infra-smoke.sh"
     assert_includes script, "--prove-turn-relay"
     assert_includes script, "scripts/verify-public-infra-evidence.rb"
+    assert_includes script, "scripts/verify-public-edge-live-manifest.rb"
     assert_includes script, "quantumLinkPublicEdgeLiveEvidence"
     assert_includes script, "QLINK_RENDEZVOUS_AUTH_TOKEN_FILE"
     assert_includes script, "QLINK_RELAY_AUTH_TOKEN_FILE"
@@ -173,6 +211,42 @@ class PublicInfraEvidenceTest < Minitest::Test
     refute_match(/--rendezvous-auth-token(?:\s|$)/, script)
     refute_match(/--relay-auth-token(?:\s|$)/, script)
     refute_match(/--turn-password(?:\s|$)/, script)
+  end
+
+  def test_operator_drill_scripts_emit_redacted_evidence_contracts
+    revocation = File.read(REVOCATION_DRILL)
+    rollback = File.read(ROLLBACK_DRILL)
+
+    assert revocation.ascii_only?
+    assert rollback.ascii_only?
+    assert_includes revocation, "service-token-digest"
+    assert_includes revocation, "auth_revocations_total"
+    assert_includes revocation, "--append-revocation-digests"
+    assert_includes revocation, "--install-replacement-tokens"
+    assert_includes revocation, "quantumLinkPublicEdgeServiceTokenRevocation"
+    assert_includes revocation, "QLINK_SERVICE_TOKEN_REVOCATION_VERIFIED=true"
+    assert_includes revocation, "QLINK_RENDEZVOUS_REVOKED_TOKEN_REJECTED=true"
+    assert_includes revocation, "QLINK_RELAY_REPLACEMENT_TOKEN_ACCEPTED=true"
+    assert_includes rollback, "scripts/public-edge-live-evidence.sh"
+    assert_includes rollback, "scripts/verify-public-edge-live-manifest.rb"
+    assert_includes rollback, "quantumLinkPublicEdgeIncidentRollback"
+    assert_includes rollback, "QLINK_INCIDENT_ROLLBACK_VERIFIED=true"
+    assert_includes rollback, "QLINK_POST_ROLLBACK_PUBLIC_INFRA_READY=true"
+    refute_match(/echo .*TOKEN/i, revocation)
+    refute_match(/echo .*PASSWORD/i, revocation)
+    refute_match(/echo .*TOKEN/i, rollback)
+    refute_match(/echo .*PASSWORD/i, rollback)
+  end
+
+  def test_public_edge_env_example_includes_operator_drill_inputs
+    env_example = File.read(ENV_EXAMPLE)
+
+    assert env_example.ascii_only?
+    assert_includes env_example, "QLINK_RENDEZVOUS_REPLACEMENT_AUTH_TOKEN_FILE"
+    assert_includes env_example, "QLINK_RELAY_REPLACEMENT_AUTH_TOKEN_FILE"
+    assert_includes env_example, "QLINK_PUBLIC_EDGE_RELEASE_ID"
+    assert_includes env_example, "QLINK_PREVIOUS_RELEASE_ID"
+    assert_includes env_example, "QLINK_ROLLBACK_MANIFEST"
   end
 
   def test_operator_alert_and_retention_artifacts_cover_public_edge_metrics
@@ -197,10 +271,75 @@ class PublicInfraEvidenceTest < Minitest::Test
     Open3.capture3("ruby", VERIFIER, *args, chdir: REPO_ROOT)
   end
 
+  def run_manifest_verifier(*args)
+    Open3.capture3("ruby", MANIFEST_VERIFIER, *args, chdir: REPO_ROOT)
+  end
+
   def write_evidence(name, evidence)
     path = File.join(@tmpdir, name)
     File.write(path, "#{JSON.pretty_generate(evidence)}\n")
     path
+  end
+
+  def base_manifest
+    {
+      "schemaVersion" => 1,
+      "evidenceKind" => "quantumLinkPublicEdgeLiveEvidence",
+      "generatedAt" => Time.now.utc.iso8601,
+      "gitSha" => COMMIT_SHA,
+      "mode" => "public",
+      "status" => "pass",
+      "endpoints" => {
+        "rendezvous" => "tls://rv.quantumlinkvpn.com:9471",
+        "relay" => "tls://relay.quantumlinkvpn.com:9472",
+        "stun" => "stun.quantumlinkvpn.com:3478",
+        "turn" => "turn.quantumlinkvpn.com:3478"
+      },
+      "credentialSources" => {
+        "controlTlsCa" => "file",
+        "rendezvousAuth" => "file",
+        "relayAuth" => "file",
+        "rendezvousRevokedTokenDigests" => "path",
+        "relayRevokedTokenDigests" => "path",
+        "turnPassword" => "file"
+      },
+      "proofs" => {
+        "serviceTokenRevocation" => {
+          "appRelayVerified" => true,
+          "turnRelayVerified" => true,
+          "rendezvousRevokedTokenRejected" => true,
+          "relayRevokedTokenRejected" => true,
+          "rendezvousReplacementTokenAccepted" => true,
+          "relayReplacementTokenAccepted" => true,
+          "rendezvousAuthRevocationsTotal" => 2,
+          "relayAuthRevocationsTotal" => 2,
+          "revocationListSha256" => "#{"b" * 64}:#{"c" * 64}"
+        },
+        "incidentRollback" => {
+          "verified" => true,
+          "incidentId" => "qlink-public-edge-drill-20260727",
+          "rollbackFromReleaseId" => "public-edge-current",
+          "rollbackToReleaseId" => "public-edge-previous",
+          "rollbackManifestSha256" => "d" * 64,
+          "rollbackDurationSeconds" => 42,
+          "postRollbackPublicInfraReady" => true
+        },
+        "appRelay" => {
+          "evidence" => "/tmp/app-relay/evidence.json",
+          "verification" => "/tmp/app-relay-verification.json",
+          "selectedPath" => "relay",
+          "framesSent" => 3,
+          "publicInfraReady" => true
+        },
+        "turnRelay" => {
+          "evidence" => "/tmp/turn-relay/evidence.json",
+          "verification" => "/tmp/turn-relay-verification.json",
+          "selectedPath" => "turn-relay",
+          "framesSent" => 3,
+          "publicInfraReady" => true
+        }
+      }
+    }
   end
 
   def base_evidence
