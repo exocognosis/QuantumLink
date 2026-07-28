@@ -142,12 +142,21 @@ ruby windows/scripts/collect-rendezvous-relay-production-measurements.rb \
   --output windows/build/validation/rendezvous-relay-production-measurements.json
 ```
 
-The collector intentionally maps only the assertions proved by public-edge
-smoke: TLS enabled, authorized traffic accepted, and unauthorized traffic
-rejected. It leaves certificate rotation, signed-record policy, rate-limit
-denials, abuse-log redaction, revocation propagation, retention, key rotation,
-endpoint rotation, and incident shutdown blocked unless separate operator
-source files are supplied. Each `--operator-source` must already be a redacted
+The collector intentionally maps only assertions directly proved by the
+public-edge smoke and verifier fields:
+
+- TLS enabled.
+- Authorized traffic accepted.
+- Unauthorized rendezvous and relay authentication rejected.
+- Rendezvous and relay endpoint request/payload limits enforced.
+- Over-quota relay datagrams denied.
+
+It leaves certificate validation and rotation, valid/expired/replayed/malformed
+signed-record behavior, revoked peer-record signing keys, identity, source, and
+entitlement limits, abuse-log redaction, revocation propagation timing,
+entitlement/policy/revoked/expired relay denial, retention, key rotation,
+endpoint rotation, and incident shutdown blocked unless separate operator source
+files are supplied. Each `--operator-source` must already be a redacted
 `windowsRendezvousRelayAssertionSourceEvidence` JSON file bound to the same
 deployment id, release commit/ref, and endpoint-set digest.
 

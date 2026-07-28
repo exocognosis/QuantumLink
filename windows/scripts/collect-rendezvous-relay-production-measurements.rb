@@ -21,11 +21,33 @@ REQUIRED_ASSERTIONS = {
   "endpoint_rotation" => %w[replacement_validated old_endpoint_drained],
   "incident_shutdown" => %w[publish_disabled relay_allocations_disabled revocations_applied]
 }.freeze
-PUBLIC_EDGE_ASSERTIONS = {
-  ["tls", "tls_enabled"] => "Public-edge smoke completed authenticated TLS control-plane and TURN-relay probes.",
-  ["authentication", "authorized_accepted"] => "Public-edge smoke published and relayed authenticated traffic successfully.",
-  ["authentication", "unauthorized_rejected"] => "Public-edge verifier confirmed rendezvous and relay negative-authentication probes."
-}.freeze
+PUBLIC_EDGE_ASSERTIONS = [
+  {
+    "control" => "tls",
+    "assertion" => "tls_enabled",
+    "rationale" => "Public-edge smoke completed authenticated TLS control-plane and TURN-relay probes."
+  },
+  {
+    "control" => "authentication",
+    "assertion" => "authorized_accepted",
+    "rationale" => "Public-edge smoke published and relayed authenticated traffic successfully."
+  },
+  {
+    "control" => "authentication",
+    "assertion" => "unauthorized_rejected",
+    "rationale" => "Public-edge verifier confirmed rendezvous and relay negative-authentication probes."
+  },
+  {
+    "control" => "rate_limits",
+    "assertion" => "endpoint_limit_enforced",
+    "rationale" => "Public-edge rendezvous and relay request-bound probes enforced configured endpoint limits."
+  },
+  {
+    "control" => "relay_denial",
+    "assertion" => "rate_limited_denied",
+    "rationale" => "Public-edge relay saturation proof denied over-quota peer datagrams and exposed the denial in metrics."
+  }
+].freeze
 MAX_INPUT_BYTES = 1_048_576
 FORBIDDEN_MARKERS = /
   BEGIN\ (?:RSA\ |EC\ |OPENSSH\ )?PRIVATE\ KEY|
@@ -87,6 +109,62 @@ def endpoint_set_sha256(rendezvous_endpoints, relay_endpoints)
     "rendezvousEndpoints" => rendezvous_endpoints.sort,
     "relayEndpoints" => relay_endpoints.sort
   }))
+end
+
+def boolean_true?(value)
+  value == true
+end
+
+def positive_integer?(value)
+  value.is_a?(Integer) && value.positive?
+end
+
+def all_evidence?(app_evidence, turn_evidence, &block)
+  [app_evidence, turn_evidence].all? { |evidence| block.call(evidence) }
+end
+
+def public_edge_assertion_supported?(control, assertion, app_evidence, turn_evidence)
+  case [control, assertion]
+  when ["tls", "tls_enabled"]
+    all_evidence?(app_evidence, turn_evidence) do |evidence|
+      boolean_true?(evidence["control_tls_ca_configured"]) &&
+        boolean_true?(evidence["rendezvous_tls_enabled"]) &&
+        boolean_true?(evidence["relay_tls_enabled"])
+    end
+  when ["authentication", "authorized_accepted"]
+    positive_integer?(app_evidence["frames_sent"]) &&
+      positive_integer?(turn_evidence["frames_sent"]) &&
+      app_evidence["selected_path"] == "relay" &&
+      turn_evidence["selected_path"] == "turn-relay"
+  when ["authentication", "unauthorized_rejected"]
+    all_evidence?(app_evidence, turn_evidence) do |evidence|
+      boolean_true?(evidence["rendezvous_auth_required"]) &&
+        boolean_true?(evidence["relay_auth_required"]) &&
+        boolean_true?(evidence["rendezvous_auth_verified"]) &&
+        boolean_true?(evidence["relay_auth_verified"])
+    end
+  when ["rate_limits", "endpoint_limit_enforced"]
+    all_evidence?(app_evidence, turn_evidence) do |evidence|
+      boolean_true?(evidence["bounds_verified"]) &&
+        boolean_true?(evidence["relay_payload_limit_verified"]) &&
+        positive_integer?(evidence["max_request_line_bytes"]) &&
+        positive_integer?(evidence["max_concurrent_connections"]) &&
+        positive_integer?(evidence["idle_timeout_seconds"]) &&
+        positive_integer?(evidence["relay_max_payload_bytes"]) &&
+        positive_integer?(evidence["relay_max_peer_id_bytes"]) &&
+        positive_integer?(evidence["relay_max_registered_peers"]) &&
+        positive_integer?(evidence["rendezvous_request_too_large_total"]) &&
+        positive_integer?(evidence["relay_request_too_large_total"]) &&
+        positive_integer?(evidence["relay_payload_too_large_total"])
+    end
+  when ["relay_denial", "rate_limited_denied"]
+    all_evidence?(app_evidence, turn_evidence) do |evidence|
+      boolean_true?(evidence["relay_saturation_limit_verified"]) &&
+        positive_integer?(evidence["relay_peer_rate_limited_total"])
+    end
+  else
+    false
+  end
 end
 
 def write_json(path, value)
@@ -192,7 +270,12 @@ abort_with("public-edge authentication proof is incomplete") unless app_evidence
 
 sources = {}
 generated_at = Time.now.utc.iso8601
-PUBLIC_EDGE_ASSERTIONS.each do |(control, assertion), rationale|
+public_edge_supported_assertions = []
+PUBLIC_EDGE_ASSERTIONS.each do |mapping|
+  control = mapping.fetch("control")
+  assertion = mapping.fetch("assertion")
+  next unless public_edge_assertion_supported?(control, assertion, app_evidence, turn_evidence)
+
   path = source_directory.join(control, "#{assertion}.json")
   proof = {
     "schemaVersion" => 1,
@@ -208,7 +291,7 @@ PUBLIC_EDGE_ASSERTIONS.each do |(control, assertion), rationale|
     "endpointSetSha256" => endpoint_digest,
     "redacted" => true,
     "sourceSystem" => "quantumLinkPublicEdgeLiveEvidence",
-    "rationale" => rationale,
+    "rationale" => mapping.fetch("rationale"),
     "inputs" => {
       "manifest" => relative_to_repo(repo_root, public_manifest_path),
       "manifestSha256" => source_digest(public_manifest_path),
@@ -224,6 +307,7 @@ PUBLIC_EDGE_ASSERTIONS.each do |(control, assertion), rationale|
   }
   write_json(path, proof)
   add_source!(sources, [control, assertion], { "source" => relative_to_repo(repo_root, path), "sourceSha256" => source_digest(path) })
+  public_edge_supported_assertions << "#{control}/#{assertion}"
 end
 
 options.fetch(:operator_sources).each do |source_arg|
@@ -273,7 +357,7 @@ measurement = {
     "manifest" => relative_to_repo(repo_root, public_manifest_path),
     "manifestSha256" => source_digest(public_manifest_path),
     "generatedSourceDirectory" => relative_to_repo(repo_root, source_directory),
-    "supportedAssertions" => PUBLIC_EDGE_ASSERTIONS.keys.map { |control, assertion| "#{control}/#{assertion}" }
+    "supportedAssertions" => public_edge_supported_assertions
   },
   "controls" => controls
 }
