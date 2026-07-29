@@ -137,9 +137,12 @@ scripts/public-edge-live-evidence.sh --env-file ./edge.env --build
 ruby windows/scripts/collect-rendezvous-relay-production-measurements.rb \
   --contract windows/deployment/rendezvous-relay-production.json \
   --public-edge-manifest build/public-edge-live-evidence/<run>/manifest.json \
-  --operator-source windows/validation/operator-sources/tls/certificate_valid.json \
-  --operator-source windows/validation/operator-sources/tls/rotation_tested.json \
   --output windows/build/validation/rendezvous-relay-production-measurements.json
+
+ruby windows/scripts/plan-rendezvous-relay-operator-sources.rb \
+  --contract windows/deployment/rendezvous-relay-production.json \
+  --measurements windows/build/validation/rendezvous-relay-production-measurements.json \
+  --output windows/build/validation/rendezvous-relay-operator-source-plan.json
 ```
 
 The collector intentionally maps only assertions directly proved by the
@@ -159,6 +162,16 @@ endpoint rotation, and incident shutdown blocked unless separate operator source
 files are supplied. Each `--operator-source` must already be a redacted
 `windowsRendezvousRelayAssertionSourceEvidence` JSON file bound to the same
 deployment id, release commit/ref, and endpoint-set digest.
+
+The operator-source planner writes a blocked plan plus non-production templates
+under `windows/build/validation/`. Templates use
+`windowsRendezvousRelayOperatorSourceTemplate`, `status: blocked`, and
+`measured: false`; they are not accepted by the collector or verifier as
+passing evidence. They identify the exact `windows/validation/operator-sources`
+path and proof requirement for each remaining assertion. After the operator
+replaces the relevant templates with measured, redacted
+`windowsRendezvousRelayAssertionSourceEvidence` files, rerun the collector with
+one `--operator-source` argument per completed source file.
 
 After collecting measurements, run
 `windows/scripts/generate-rendezvous-relay-production-evidence.rb`. The
