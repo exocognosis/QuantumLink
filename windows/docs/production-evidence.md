@@ -173,6 +173,32 @@ replaces the relevant templates with measured, redacted
 `windowsRendezvousRelayAssertionSourceEvidence` files, rerun the collector with
 one `--operator-source` argument per completed source file.
 
+For the first live-operator batch, TLS certificate/rotation and signed-record
+lifecycle source files are generated from a single redacted operator drill
+report, not by editing source JSON by hand:
+
+```sh
+ruby windows/scripts/generate-rendezvous-relay-operator-sources.rb \
+  --contract windows/deployment/rendezvous-relay-production.json \
+  --drill-report windows/build/operator-drills/tls-signed-records.json \
+  --output-directory windows/validation/operator-sources
+```
+
+The drill report must use
+`evidenceKind: windowsRendezvousRelayOperatorDrillReport`, `status: pass`,
+`redacted: true`, a fresh `generatedAt`, and the same deployment id, release
+commit/ref, and endpoint-set digest as the deployment contract. The generator
+currently promotes these seven assertions only when the report proves each
+required field: `tls/certificate_valid`, `tls/rotation_tested`,
+`signed_expiring_records/valid_record_accepted`,
+`signed_expiring_records/expired_rejected`,
+`signed_expiring_records/replay_rejected`,
+`signed_expiring_records/malformed_signature_rejected`, and
+`signed_expiring_records/revoked_key_rejected`. It rejects unredacted reports,
+raw capture/private-key markers, stale reports, endpoint mismatches, incomplete
+certificate validation, incomplete rotation proof, and incomplete signed-record
+negative tests.
+
 After collecting measurements, run
 `windows/scripts/generate-rendezvous-relay-production-evidence.rb`. The
 generator writes the manifest, distinct control proofs, digest manifest, and

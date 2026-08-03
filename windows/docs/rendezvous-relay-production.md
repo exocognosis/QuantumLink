@@ -75,6 +75,11 @@ remaining assertion source files under `windows/validation/operator-sources/`
 and writes blocked templates for each one. Those templates are operator
 checklists only; production readiness still requires replacing them with
 fresh, measured, redacted `windowsRendezvousRelayAssertionSourceEvidence` files.
+For TLS certificate validation/rotation and signed-record lifecycle drills,
+write a fresh redacted
+`windowsRendezvousRelayOperatorDrillReport` and convert it with
+`windows/scripts/generate-rendezvous-relay-operator-sources.rb`; the script
+emits only source files whose drill proof is complete and release-bound.
 
 ## Operator Runbook
 
