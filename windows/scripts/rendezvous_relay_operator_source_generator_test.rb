@@ -21,7 +21,14 @@ class RendezvousRelayOperatorSourceGeneratorTest < Minitest::Test
     ["signed_expiring_records", "expired_rejected"],
     ["signed_expiring_records", "replay_rejected"],
     ["signed_expiring_records", "malformed_signature_rejected"],
-    ["signed_expiring_records", "revoked_key_rejected"]
+    ["signed_expiring_records", "revoked_key_rejected"],
+    ["rate_limits", "identity_limit_enforced"],
+    ["rate_limits", "source_limit_enforced"],
+    ["rate_limits", "entitlement_limit_enforced"],
+    ["relay_denial", "entitlement_denied"],
+    ["relay_denial", "policy_denied"],
+    ["relay_denial", "revoked_denied"],
+    ["relay_denial", "expired_denied"]
   ].freeze
 
   def setup
@@ -48,7 +55,7 @@ class RendezvousRelayOperatorSourceGeneratorTest < Minitest::Test
 
     assert status.success?, stderr
     assert_equal "pass", result.fetch("status")
-    assert_equal 7, result.fetch("generatedSourceCount")
+    assert_equal 14, result.fetch("generatedSourceCount")
     assert_equal GENERATED_ASSERTIONS, result.fetch("sources").map { |entry| [entry.fetch("control"), entry.fetch("assertion")] }
 
     result.fetch("sources").each do |entry|
@@ -69,8 +76,8 @@ class RendezvousRelayOperatorSourceGeneratorTest < Minitest::Test
     assert collector_status.success?, collector_stderr
     collector_result = JSON.parse(collector_stdout)
     assert_equal "blocked", collector_result.fetch("status")
-    assert_equal 12, collector_result.fetch("passingAssertionCount")
-    assert_equal 23, collector_result.fetch("blockedAssertionCount")
+    assert_equal 19, collector_result.fetch("passingAssertionCount")
+    assert_equal 16, collector_result.fetch("blockedAssertionCount")
     measurement = JSON.parse(File.read(File.join(@tmpdir, "windows/build/validation/rendezvous-relay-production-measurements.json")))
     assert_equal "blocked", measurement.fetch("status")
     GENERATED_ASSERTIONS.each do |control, assertion|
@@ -113,6 +120,30 @@ class RendezvousRelayOperatorSourceGeneratorTest < Minitest::Test
 
     refute status.success?, stdout
     assert_includes stderr, "signed_expiring_records/expired_rejected relayDenied must be true"
+  end
+
+  def test_generator_rejects_incomplete_source_limit_proof
+    report_path = File.join(@tmpdir, @drill_report)
+    report = JSON.parse(File.read(report_path))
+    report.fetch("rateLimits").fetch("sourceLimitEnforced")["overLimitDenied"] = false
+    File.write(report_path, "#{JSON.pretty_generate(report)}\n")
+
+    stdout, stderr, status = invoke_generator("--assertion", "rate_limits/source_limit_enforced")
+
+    refute status.success?, stdout
+    assert_includes stderr, "rate_limits/source_limit_enforced overLimitDenied must be true"
+  end
+
+  def test_generator_rejects_incomplete_relay_revoked_denial_proof
+    report_path = File.join(@tmpdir, @drill_report)
+    report = JSON.parse(File.read(report_path))
+    report.fetch("relayDenial").fetch("revokedDenied")["relaySessionNotCreated"] = false
+    File.write(report_path, "#{JSON.pretty_generate(report)}\n")
+
+    stdout, stderr, status = invoke_generator("--assertion", "relay_denial/revoked_denied")
+
+    refute status.success?, stdout
+    assert_includes stderr, "relay_denial/revoked_denied relaySessionNotCreated must be true"
   end
 
   private
@@ -235,7 +266,43 @@ class RendezvousRelayOperatorSourceGeneratorTest < Minitest::Test
           "lookupRejected" => true,
           "relayDenied" => true
         }
+      },
+      "rateLimits" => {
+        "identityLimitEnforced" => rate_limit_proof(limit: 120, attempted: 121),
+        "sourceLimitEnforced" => rate_limit_proof(limit: 240, attempted: 241),
+        "entitlementLimitEnforced" => rate_limit_proof(limit: 60, attempted: 61)
+      },
+      "relayDenial" => {
+        "entitlementDenied" => relay_denial_proof("entitlementMissing", "entitlement_required"),
+        "policyDenied" => relay_denial_proof("policyMatched", "policy_denied"),
+        "revokedDenied" => relay_denial_proof("revocationApplied", "revoked_identity"),
+        "expiredDenied" => relay_denial_proof("recordExpiredBeforeAllocation", "expired_peer_record")
       }
+    }
+  end
+
+  def rate_limit_proof(limit:, attempted:)
+    {
+      "status" => "pass",
+      "limitConfigured" => true,
+      "limit" => limit,
+      "attemptedCount" => attempted,
+      "underLimitAccepted" => true,
+      "overLimitDenied" => true,
+      "retryAfterReturned" => true,
+      "metricsIncremented" => true
+    }
+  end
+
+  def relay_denial_proof(trigger_field, reason_code)
+    {
+      "status" => "pass",
+      trigger_field => true,
+      "allocationDenied" => true,
+      "relaySessionNotCreated" => true,
+      "clientReceivedDenial" => true,
+      "metricsIncremented" => true,
+      "reasonCode" => reason_code
     }
   end
 
