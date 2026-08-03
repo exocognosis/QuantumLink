@@ -159,6 +159,13 @@ blocked measurement output into a release-bound operator checklist and blocked
 templates for the remaining source files; those templates must be replaced by
 measured, redacted assertion source evidence before the production verifier can
 pass.
+`windows/scripts/generate-rendezvous-relay-operator-sources.rb` is the first
+promotion bridge for those source files: it turns a fresh, redacted
+`windowsRendezvousRelayOperatorDrillReport` into measured source evidence for
+TLS certificate validation, TLS rotation, and valid/expired/replayed/malformed/
+revoked signed-record lifecycle assertions. It does not mark the remaining
+identity, limits, abuse-log, revocation, retention, service-key rotation,
+endpoint-drain, or incident-shutdown assertions as passing.
 
 ## Production Host Matrix
 
