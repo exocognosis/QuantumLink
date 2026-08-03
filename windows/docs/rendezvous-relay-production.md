@@ -68,6 +68,14 @@ The verifier accepts a blocked manifest as structurally valid when
 - Operator drill evidence for key rotation, endpoint rotation, endpoint drain,
   and incident shutdown.
 
+After public-edge measurements are collected, run
+`windows/scripts/plan-rendezvous-relay-operator-sources.rb` against the
+release-bound deployment contract and measurement bundle. The plan lists the
+remaining assertion source files under `windows/validation/operator-sources/`
+and writes blocked templates for each one. Those templates are operator
+checklists only; production readiness still requires replacing them with
+fresh, measured, redacted `windowsRendezvousRelayAssertionSourceEvidence` files.
+
 ## Operator Runbook
 
 Key rotation:

@@ -3757,8 +3757,8 @@ mod tests {
 
         let connector = MeshConnector::new(
             MeshConnectorConfig::new(MESH_ID, local_key.public_key().peer_id())
-                .with_direct_probe_timeout(Duration::from_millis(500))
-                .with_overall_deadline(Duration::from_secs(2))
+                .with_direct_probe_timeout(Duration::from_secs(1))
+                .with_overall_deadline(Duration::from_secs(4))
                 .with_local_device_keypair(local_key.clone()),
             rendezvous_client,
             client_endpoint,
@@ -4345,7 +4345,7 @@ mod tests {
         let local_key = DeviceKeypair::generate().unwrap();
         let remote_key = DeviceKeypair::generate().unwrap();
         let remote_peer_id = remote_key.public_key().peer_id();
-        let expired_record = signed_record_with_ttl(
+        let expiring_record = signed_record_with_ttl(
             &remote_key,
             vec![CandidateEndpoint {
                 candidate_type: CandidateType::Host,
@@ -4353,13 +4353,14 @@ mod tests {
                 port: 1,
                 priority: 120,
             }],
-            0,
+            1,
             1,
             b"test-cert".to_vec(),
         );
 
         let peer_store: Arc<dyn PeerStore> = Arc::new(InMemoryPeerStore::new());
-        peer_store.store(MESH_ID, &expired_record);
+        peer_store.store(MESH_ID, &expiring_record);
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
 
         let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
         let (_unused_server, throwaway_cert) = QuicEndpoint::server(bind).unwrap();
@@ -4374,7 +4375,10 @@ mod tests {
         .with_peer_store(peer_store);
 
         let error = connector.connect(&remote_peer_id).await.unwrap_err();
-        assert!(matches!(error, QlinkError::RecordExpired));
+        assert!(
+            matches!(error, QlinkError::RecordExpired),
+            "expected expired cached record to fail before probing, got {error:?}"
+        );
     }
 
     // === mDNS observation integration tests ===
@@ -4847,13 +4851,19 @@ mod tests {
         fn lookup<'a>(
             &'a self,
             _peer_id: &'a str,
-        ) -> Pin<Box<dyn Future<Output = Result<Option<RegistryNodeRecord>>> + Send + 'a>> {
+        ) -> Pin<Box<dyn Future<Output = Result<Option<RegistryIdentityLookupRecord>>> + Send + 'a>>
+        {
             Box::pin(async move {
                 *self.lookups.lock().unwrap() += 1;
                 if let Some(message) = self.error.lock().unwrap().clone() {
                     return Err(QlinkError::Protocol(message));
                 }
-                Ok(self.record.lock().unwrap().clone())
+                Ok(self
+                    .record
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .map(RegistryIdentityLookupRecord::ExactPeerRecordV1))
             })
         }
     }

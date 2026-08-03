@@ -154,6 +154,11 @@ valid/expired/replayed/malformed signed-record behavior, identity and
 entitlement limits, source-address limits, abuse-log redaction, revocation
 propagation timing, entitlement/policy/revoked/expired relay denial, retention,
 key rotation, endpoint rotation, and incident shutdown.
+`windows/scripts/plan-rendezvous-relay-operator-sources.rb` converts the
+blocked measurement output into a release-bound operator checklist and blocked
+templates for the remaining source files; those templates must be replaced by
+measured, redacted assertion source evidence before the production verifier can
+pass.
 
 ## Production Host Matrix
 
