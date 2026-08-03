@@ -173,14 +173,14 @@ replaces the relevant templates with measured, redacted
 `windowsRendezvousRelayAssertionSourceEvidence` files, rerun the collector with
 one `--operator-source` argument per completed source file.
 
-For the first live-operator batch, TLS certificate/rotation and signed-record
-lifecycle source files are generated from a single redacted operator drill
-report, not by editing source JSON by hand:
+TLS certificate/rotation, signed-record lifecycle, rate-limit, and relay-denial
+source files are generated from a single redacted operator drill report, not by
+editing source JSON by hand:
 
 ```sh
 ruby windows/scripts/generate-rendezvous-relay-operator-sources.rb \
   --contract windows/deployment/rendezvous-relay-production.json \
-  --drill-report windows/build/operator-drills/tls-signed-records.json \
+  --drill-report windows/build/operator-drills/tls-signed-records-limits-denial.json \
   --output-directory windows/validation/operator-sources
 ```
 
@@ -188,16 +188,22 @@ The drill report must use
 `evidenceKind: windowsRendezvousRelayOperatorDrillReport`, `status: pass`,
 `redacted: true`, a fresh `generatedAt`, and the same deployment id, release
 commit/ref, and endpoint-set digest as the deployment contract. The generator
-currently promotes these seven assertions only when the report proves each
+currently promotes these fourteen assertions only when the report proves each
 required field: `tls/certificate_valid`, `tls/rotation_tested`,
 `signed_expiring_records/valid_record_accepted`,
 `signed_expiring_records/expired_rejected`,
 `signed_expiring_records/replay_rejected`,
 `signed_expiring_records/malformed_signature_rejected`, and
-`signed_expiring_records/revoked_key_rejected`. It rejects unredacted reports,
-raw capture/private-key markers, stale reports, endpoint mismatches, incomplete
-certificate validation, incomplete rotation proof, and incomplete signed-record
-negative tests.
+`signed_expiring_records/revoked_key_rejected`,
+`rate_limits/identity_limit_enforced`,
+`rate_limits/source_limit_enforced`,
+`rate_limits/entitlement_limit_enforced`,
+`relay_denial/entitlement_denied`, `relay_denial/policy_denied`,
+`relay_denial/revoked_denied`, and `relay_denial/expired_denied`. It rejects
+unredacted reports, raw capture/private-key markers, stale reports, endpoint
+mismatches, incomplete certificate validation, incomplete rotation proof,
+incomplete signed-record negative tests, incomplete rate-limit proofs, and
+incomplete relay-denial proofs.
 
 After collecting measurements, run
 `windows/scripts/generate-rendezvous-relay-production-evidence.rb`. The

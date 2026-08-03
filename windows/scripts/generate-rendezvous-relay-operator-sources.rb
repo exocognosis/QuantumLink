@@ -16,6 +16,17 @@ SUPPORTED_ASSERTIONS = {
     replay_rejected
     malformed_signature_rejected
     revoked_key_rejected
+  ],
+  "rate_limits" => %w[
+    identity_limit_enforced
+    source_limit_enforced
+    entitlement_limit_enforced
+  ],
+  "relay_denial" => %w[
+    entitlement_denied
+    policy_denied
+    revoked_denied
+    expired_denied
   ]
 }.freeze
 
@@ -26,7 +37,14 @@ SOURCE_RATIONALES = {
   ["signed_expiring_records", "expired_rejected"] => "Operator signed-record drill proved expired records are rejected before publish, lookup, or relay use.",
   ["signed_expiring_records", "replay_rejected"] => "Operator signed-record drill proved stale sequence replay is rejected without replacing the current record.",
   ["signed_expiring_records", "malformed_signature_rejected"] => "Operator signed-record drill proved tampered signatures are rejected without cache side effects.",
-  ["signed_expiring_records", "revoked_key_rejected"] => "Operator signed-record drill proved records signed by a revoked key are rejected by publish, lookup, and relay decisions."
+  ["signed_expiring_records", "revoked_key_rejected"] => "Operator signed-record drill proved records signed by a revoked key are rejected by publish, lookup, and relay decisions.",
+  ["rate_limits", "identity_limit_enforced"] => "Operator rate-limit drill proved the production identity bucket denies over-quota requests while preserving under-limit traffic.",
+  ["rate_limits", "source_limit_enforced"] => "Operator rate-limit drill proved the production source-prefix bucket denies over-quota requests while preserving under-limit traffic.",
+  ["rate_limits", "entitlement_limit_enforced"] => "Operator rate-limit drill proved the production entitlement-class bucket denies over-quota requests while preserving under-limit traffic.",
+  ["relay_denial", "entitlement_denied"] => "Operator relay-denial drill proved relay allocation without entitlement is denied without creating a relay session.",
+  ["relay_denial", "policy_denied"] => "Operator relay-denial drill proved a denied policy context blocks relay allocation without creating a relay session.",
+  ["relay_denial", "revoked_denied"] => "Operator relay-denial drill proved a revoked identity or key blocks relay allocation without creating a relay session.",
+  ["relay_denial", "expired_denied"] => "Operator relay-denial drill proved an expired peer record blocks relay allocation without creating a relay session."
 }.freeze
 
 MAX_INPUT_BYTES = 1_048_576
@@ -110,6 +128,10 @@ end
 
 def status_pass?(value)
   value.is_a?(Hash) && value["status"] == "pass"
+end
+
+def positive_integer?(value)
+  value.is_a?(Integer) && value.positive?
 end
 
 def proof_at(report, *path)
@@ -258,12 +280,85 @@ def validate_signed_record_proof!(report, assertion)
   end
 end
 
+def validate_rate_limit_proof!(report, assertion)
+  section = proof_at(report, "rateLimits")
+  abort_with("rate_limits section is missing") unless section.is_a?(Hash)
+
+  field_name = {
+    "identity_limit_enforced" => "identityLimitEnforced",
+    "source_limit_enforced" => "sourceLimitEnforced",
+    "entitlement_limit_enforced" => "entitlementLimitEnforced"
+  }.fetch(assertion)
+  label = "rate_limits/#{assertion}"
+  proof = section[field_name]
+  abort_with("#{label} proof is missing") unless status_pass?(proof)
+
+  %w[limitConfigured underLimitAccepted overLimitDenied retryAfterReturned metricsIncremented].each do |field|
+    abort_with("#{label} #{field} must be true") unless boolean_true?(proof[field])
+  end
+  abort_with("#{label} limit must be a positive integer") unless positive_integer?(proof["limit"])
+  abort_with("#{label} attemptedCount must exceed limit") unless positive_integer?(proof["attemptedCount"]) && proof["attemptedCount"] > proof["limit"]
+
+  {
+    "status" => "pass",
+    "limitConfigured" => true,
+    "limit" => proof["limit"],
+    "attemptedCount" => proof["attemptedCount"],
+    "underLimitAccepted" => true,
+    "overLimitDenied" => true,
+    "retryAfterReturned" => true,
+    "metricsIncremented" => true
+  }
+end
+
+def validate_relay_denial_proof!(report, assertion)
+  section = proof_at(report, "relayDenial")
+  abort_with("relay_denial section is missing") unless section.is_a?(Hash)
+
+  field_name = {
+    "entitlement_denied" => "entitlementDenied",
+    "policy_denied" => "policyDenied",
+    "revoked_denied" => "revokedDenied",
+    "expired_denied" => "expiredDenied"
+  }.fetch(assertion)
+  label = "relay_denial/#{assertion}"
+  proof = section[field_name]
+  abort_with("#{label} proof is missing") unless status_pass?(proof)
+
+  %w[allocationDenied relaySessionNotCreated clientReceivedDenial metricsIncremented].each do |field|
+    abort_with("#{label} #{field} must be true") unless boolean_true?(proof[field])
+  end
+  trigger_field = {
+    "entitlement_denied" => "entitlementMissing",
+    "policy_denied" => "policyMatched",
+    "revoked_denied" => "revocationApplied",
+    "expired_denied" => "recordExpiredBeforeAllocation"
+  }.fetch(assertion)
+  abort_with("#{label} #{trigger_field} must be true") unless boolean_true?(proof[trigger_field])
+  reason_code = proof["reasonCode"]
+  abort_with("#{label} reasonCode is required") unless nonempty_string?(reason_code)
+
+  {
+    "status" => "pass",
+    trigger_field => true,
+    "allocationDenied" => true,
+    "relaySessionNotCreated" => true,
+    "clientReceivedDenial" => true,
+    "metricsIncremented" => true,
+    "reasonCode" => reason_code
+  }
+end
+
 def validate_assertion_proof!(report, contract, control, assertion)
   case [control, assertion]
   when ["tls", "certificate_valid"]
     validate_certificate_proof!(report, contract)
   when ["tls", "rotation_tested"]
     validate_rotation_proof!(report)
+  when ["rate_limits", assertion]
+    validate_rate_limit_proof!(report, assertion)
+  when ["relay_denial", assertion]
+    validate_relay_denial_proof!(report, assertion)
   else
     validate_signed_record_proof!(report, assertion)
   end

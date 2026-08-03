@@ -162,10 +162,12 @@ pass.
 `windows/scripts/generate-rendezvous-relay-operator-sources.rb` is the first
 promotion bridge for those source files: it turns a fresh, redacted
 `windowsRendezvousRelayOperatorDrillReport` into measured source evidence for
-TLS certificate validation, TLS rotation, and valid/expired/replayed/malformed/
-revoked signed-record lifecycle assertions. It does not mark the remaining
-identity, limits, abuse-log, revocation, retention, service-key rotation,
-endpoint-drain, or incident-shutdown assertions as passing.
+TLS certificate validation, TLS rotation, valid/expired/replayed/malformed/
+revoked signed-record lifecycle assertions, identity/source/entitlement limit
+assertions, and entitlement/policy/revoked/expired relay-denial assertions. It
+does not mark the remaining abuse-log redaction, revocation propagation,
+retention, service-key rotation, endpoint-drain, or incident-shutdown assertions
+as passing.
 
 ## Production Host Matrix
 
