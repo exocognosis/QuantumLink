@@ -25,10 +25,16 @@ class RendezvousRelayOperatorSourceGeneratorTest < Minitest::Test
     ["rate_limits", "identity_limit_enforced"],
     ["rate_limits", "source_limit_enforced"],
     ["rate_limits", "entitlement_limit_enforced"],
+    ["abuse_logs", "decisions_recorded"],
+    ["abuse_logs", "payloads_excluded"],
+    ["abuse_logs", "secrets_excluded"],
     ["relay_denial", "entitlement_denied"],
     ["relay_denial", "policy_denied"],
     ["relay_denial", "revoked_denied"],
-    ["relay_denial", "expired_denied"]
+    ["relay_denial", "expired_denied"],
+    ["retention", "metadata_only"],
+    ["retention", "packet_payloads_excluded"],
+    ["retention", "game_payloads_excluded"]
   ].freeze
 
   def setup
@@ -41,7 +47,7 @@ class RendezvousRelayOperatorSourceGeneratorTest < Minitest::Test
       "relayEndpoints" => @relay_endpoints
     }))
     @contract = write_contract
-    @drill_report = write_json("windows/build/operator-drills/tls-signed-records.json", drill_report)
+    @drill_report = write_json("windows/build/operator-drills/operator-controls.json", drill_report)
     @public_manifest = write_public_edge_manifest
   end
 
@@ -55,7 +61,7 @@ class RendezvousRelayOperatorSourceGeneratorTest < Minitest::Test
 
     assert status.success?, stderr
     assert_equal "pass", result.fetch("status")
-    assert_equal 14, result.fetch("generatedSourceCount")
+    assert_equal 20, result.fetch("generatedSourceCount")
     assert_equal GENERATED_ASSERTIONS, result.fetch("sources").map { |entry| [entry.fetch("control"), entry.fetch("assertion")] }
 
     result.fetch("sources").each do |entry|
@@ -76,8 +82,8 @@ class RendezvousRelayOperatorSourceGeneratorTest < Minitest::Test
     assert collector_status.success?, collector_stderr
     collector_result = JSON.parse(collector_stdout)
     assert_equal "blocked", collector_result.fetch("status")
-    assert_equal 19, collector_result.fetch("passingAssertionCount")
-    assert_equal 16, collector_result.fetch("blockedAssertionCount")
+    assert_equal 25, collector_result.fetch("passingAssertionCount")
+    assert_equal 10, collector_result.fetch("blockedAssertionCount")
     measurement = JSON.parse(File.read(File.join(@tmpdir, "windows/build/validation/rendezvous-relay-production-measurements.json")))
     assert_equal "blocked", measurement.fetch("status")
     GENERATED_ASSERTIONS.each do |control, assertion|
@@ -144,6 +150,30 @@ class RendezvousRelayOperatorSourceGeneratorTest < Minitest::Test
 
     refute status.success?, stdout
     assert_includes stderr, "relay_denial/revoked_denied relaySessionNotCreated must be true"
+  end
+
+  def test_generator_rejects_raw_abuse_log_preview_fields
+    report_path = File.join(@tmpdir, @drill_report)
+    report = JSON.parse(File.read(report_path))
+    report.fetch("abuseLogs").fetch("payloadsExcluded")["rawPacketPreview"] = "redacted bytes"
+    File.write(report_path, "#{JSON.pretty_generate(report)}\n")
+
+    stdout, stderr, status = invoke_generator("--assertion", "abuse_logs/payloads_excluded")
+
+    refute status.success?, stdout
+    assert_includes stderr, "abuse_logs/payloads_excluded contains unsupported proof fields: rawPacketPreview"
+  end
+
+  def test_generator_rejects_incomplete_retention_game_payload_proof
+    report_path = File.join(@tmpdir, @drill_report)
+    report = JSON.parse(File.read(report_path))
+    report.fetch("retention").fetch("gamePayloadsExcluded")["retentionScanPassed"] = false
+    File.write(report_path, "#{JSON.pretty_generate(report)}\n")
+
+    stdout, stderr, status = invoke_generator("--assertion", "retention/game_payloads_excluded")
+
+    refute status.success?, stdout
+    assert_includes stderr, "retention/game_payloads_excluded retentionScanPassed must be true"
   end
 
   private
@@ -272,11 +302,63 @@ class RendezvousRelayOperatorSourceGeneratorTest < Minitest::Test
         "sourceLimitEnforced" => rate_limit_proof(limit: 240, attempted: 241),
         "entitlementLimitEnforced" => rate_limit_proof(limit: 60, attempted: 61)
       },
+      "abuseLogs" => {
+        "decisionsRecorded" => {
+          "status" => "pass",
+          "decisionsSampled" => 12,
+          "reasonCodes" => %w[auth_required policy_denied relay_quota_exceeded],
+          "reasonCodeRecorded" => true,
+          "endpointRecorded" => true,
+          "decisionTimestampRecorded" => true,
+          "requestIdRecorded" => true,
+          "operatorReviewable" => true
+        },
+        "payloadsExcluded" => {
+          "status" => "pass",
+          "packetPayloadsAbsent" => true,
+          "gamePayloadsAbsent" => true,
+          "rawBodiesAbsent" => true,
+          "payloadHashesOnly" => true,
+          "redactionScanPassed" => true
+        },
+        "secretsExcluded" => {
+          "status" => "pass",
+          "privateKeysAbsent" => true,
+          "walletStoresAbsent" => true,
+          "entitlementTokensAbsent" => true,
+          "serviceSecretsAbsent" => true,
+          "redactionScanPassed" => true
+        }
+      },
       "relayDenial" => {
         "entitlementDenied" => relay_denial_proof("entitlementMissing", "entitlement_required"),
         "policyDenied" => relay_denial_proof("policyMatched", "policy_denied"),
         "revokedDenied" => relay_denial_proof("revocationApplied", "revoked_identity"),
         "expiredDenied" => relay_denial_proof("recordExpiredBeforeAllocation", "expired_peer_record")
+      },
+      "retention" => {
+        "metadataOnly" => {
+          "status" => "pass",
+          "metadataOnlyConfigured" => true,
+          "boundedRetentionConfigured" => true,
+          "retentionDays" => 14,
+          "exportDisabled" => true,
+          "rawPayloadStorageDisabled" => true
+        },
+        "packetPayloadsExcluded" => {
+          "status" => "pass",
+          "packetPayloadsExcluded" => true,
+          "packetCaptureDisabled" => true,
+          "pcapArtifactsAbsent" => true,
+          "retentionScanPassed" => true
+        },
+        "gamePayloadsExcluded" => {
+          "status" => "pass",
+          "gamePayloadsExcluded" => true,
+          "applicationPayloadsAbsent" => true,
+          "retainedBodyBytesZero" => true,
+          "retentionScanPassed" => true
+        }
       }
     }
   end

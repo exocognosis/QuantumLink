@@ -173,14 +173,14 @@ replaces the relevant templates with measured, redacted
 `windowsRendezvousRelayAssertionSourceEvidence` files, rerun the collector with
 one `--operator-source` argument per completed source file.
 
-TLS certificate/rotation, signed-record lifecycle, rate-limit, and relay-denial
-source files are generated from a single redacted operator drill report, not by
-editing source JSON by hand:
+TLS certificate/rotation, signed-record lifecycle, rate-limit, abuse-log
+redaction, relay-denial, and retention source files are generated from a single
+redacted operator drill report, not by editing source JSON by hand:
 
 ```sh
 ruby windows/scripts/generate-rendezvous-relay-operator-sources.rb \
   --contract windows/deployment/rendezvous-relay-production.json \
-  --drill-report windows/build/operator-drills/tls-signed-records-limits-denial.json \
+  --drill-report windows/build/operator-drills/operator-controls.json \
   --output-directory windows/validation/operator-sources
 ```
 
@@ -188,7 +188,7 @@ The drill report must use
 `evidenceKind: windowsRendezvousRelayOperatorDrillReport`, `status: pass`,
 `redacted: true`, a fresh `generatedAt`, and the same deployment id, release
 commit/ref, and endpoint-set digest as the deployment contract. The generator
-currently promotes these fourteen assertions only when the report proves each
+currently promotes these twenty assertions only when the report proves each
 required field: `tls/certificate_valid`, `tls/rotation_tested`,
 `signed_expiring_records/valid_record_accepted`,
 `signed_expiring_records/expired_rejected`,
@@ -198,12 +198,17 @@ required field: `tls/certificate_valid`, `tls/rotation_tested`,
 `rate_limits/identity_limit_enforced`,
 `rate_limits/source_limit_enforced`,
 `rate_limits/entitlement_limit_enforced`,
+`abuse_logs/decisions_recorded`, `abuse_logs/payloads_excluded`,
+`abuse_logs/secrets_excluded`,
 `relay_denial/entitlement_denied`, `relay_denial/policy_denied`,
-`relay_denial/revoked_denied`, and `relay_denial/expired_denied`. It rejects
-unredacted reports, raw capture/private-key markers, stale reports, endpoint
-mismatches, incomplete certificate validation, incomplete rotation proof,
-incomplete signed-record negative tests, incomplete rate-limit proofs, and
-incomplete relay-denial proofs.
+`relay_denial/revoked_denied`, `relay_denial/expired_denied`,
+`retention/metadata_only`, `retention/packet_payloads_excluded`, and
+`retention/game_payloads_excluded`. It rejects unredacted reports, raw
+capture/private-key markers, stale reports, endpoint mismatches, incomplete
+certificate validation, incomplete rotation proof, incomplete signed-record
+negative tests, incomplete rate-limit proofs, incomplete abuse-log redaction
+proofs, incomplete relay-denial proofs, incomplete retention proofs, and
+unsupported raw abuse-log or retention proof fields.
 
 After collecting measurements, run
 `windows/scripts/generate-rendezvous-relay-production-evidence.rb`. The

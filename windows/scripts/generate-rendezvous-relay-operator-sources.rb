@@ -22,11 +22,21 @@ SUPPORTED_ASSERTIONS = {
     source_limit_enforced
     entitlement_limit_enforced
   ],
+  "abuse_logs" => %w[
+    decisions_recorded
+    payloads_excluded
+    secrets_excluded
+  ],
   "relay_denial" => %w[
     entitlement_denied
     policy_denied
     revoked_denied
     expired_denied
+  ],
+  "retention" => %w[
+    metadata_only
+    packet_payloads_excluded
+    game_payloads_excluded
   ]
 }.freeze
 
@@ -41,15 +51,22 @@ SOURCE_RATIONALES = {
   ["rate_limits", "identity_limit_enforced"] => "Operator rate-limit drill proved the production identity bucket denies over-quota requests while preserving under-limit traffic.",
   ["rate_limits", "source_limit_enforced"] => "Operator rate-limit drill proved the production source-prefix bucket denies over-quota requests while preserving under-limit traffic.",
   ["rate_limits", "entitlement_limit_enforced"] => "Operator rate-limit drill proved the production entitlement-class bucket denies over-quota requests while preserving under-limit traffic.",
+  ["abuse_logs", "decisions_recorded"] => "Operator abuse-log drill proved redacted decision metadata records reason code, endpoint, timing, and request id for production review.",
+  ["abuse_logs", "payloads_excluded"] => "Operator abuse-log drill proved packet and game payload material is excluded from retained abuse decision logs.",
+  ["abuse_logs", "secrets_excluded"] => "Operator abuse-log drill proved private keys, wallet stores, entitlement tokens, and service secrets are excluded from retained abuse decision logs.",
   ["relay_denial", "entitlement_denied"] => "Operator relay-denial drill proved relay allocation without entitlement is denied without creating a relay session.",
   ["relay_denial", "policy_denied"] => "Operator relay-denial drill proved a denied policy context blocks relay allocation without creating a relay session.",
   ["relay_denial", "revoked_denied"] => "Operator relay-denial drill proved a revoked identity or key blocks relay allocation without creating a relay session.",
-  ["relay_denial", "expired_denied"] => "Operator relay-denial drill proved an expired peer record blocks relay allocation without creating a relay session."
+  ["relay_denial", "expired_denied"] => "Operator relay-denial drill proved an expired peer record blocks relay allocation without creating a relay session.",
+  ["retention", "metadata_only"] => "Operator retention drill proved production retention is bounded and stores operational metadata only.",
+  ["retention", "packet_payloads_excluded"] => "Operator retention drill proved retained rendezvous and relay artifacts contain no packet payload material.",
+  ["retention", "game_payloads_excluded"] => "Operator retention drill proved retained rendezvous and relay artifacts contain no game payload material."
 }.freeze
 
 MAX_INPUT_BYTES = 1_048_576
 MAX_EVIDENCE_AGE_SECONDS = 7 * 24 * 60 * 60
 MAX_FUTURE_SKEW_SECONDS = 5 * 60
+MAX_RETENTION_DAYS = 30
 FORBIDDEN_MARKERS = /
   BEGIN\ (?:RSA\ |EC\ |OPENSSH\ )?PRIVATE\ KEY|
   BEGIN\ CERTIFICATE|
@@ -132,6 +149,15 @@ end
 
 def positive_integer?(value)
   value.is_a?(Integer) && value.positive?
+end
+
+def nonempty_string_array?(value)
+  value.is_a?(Array) && !value.empty? && value.all? { |entry| nonempty_string?(entry) }
+end
+
+def reject_unexpected_keys!(proof, label, allowed_keys)
+  unexpected = proof.keys - allowed_keys
+  abort_with("#{label} contains unsupported proof fields: #{unexpected.sort.join(', ')}") unless unexpected.empty?
 end
 
 def proof_at(report, *path)
@@ -311,6 +337,77 @@ def validate_rate_limit_proof!(report, assertion)
   }
 end
 
+def validate_abuse_log_proof!(report, assertion)
+  section = proof_at(report, "abuseLogs")
+  abort_with("abuse_logs section is missing") unless section.is_a?(Hash)
+
+  case assertion
+  when "decisions_recorded"
+    label = "abuse_logs/decisions_recorded"
+    proof = section["decisionsRecorded"]
+    abort_with("#{label} proof is missing") unless status_pass?(proof)
+    reject_unexpected_keys!(proof, label, %w[
+      status decisionsSampled reasonCodes reasonCodeRecorded endpointRecorded
+      decisionTimestampRecorded requestIdRecorded operatorReviewable
+    ])
+    %w[reasonCodeRecorded endpointRecorded decisionTimestampRecorded requestIdRecorded operatorReviewable].each do |field|
+      abort_with("#{label} #{field} must be true") unless boolean_true?(proof[field])
+    end
+    abort_with("#{label} decisionsSampled must be a positive integer") unless positive_integer?(proof["decisionsSampled"])
+    abort_with("#{label} reasonCodes must be a non-empty string array") unless nonempty_string_array?(proof["reasonCodes"])
+    {
+      "status" => "pass",
+      "decisionsSampled" => proof["decisionsSampled"],
+      "reasonCodes" => proof["reasonCodes"],
+      "reasonCodeRecorded" => true,
+      "endpointRecorded" => true,
+      "decisionTimestampRecorded" => true,
+      "requestIdRecorded" => true,
+      "operatorReviewable" => true
+    }
+  when "payloads_excluded"
+    label = "abuse_logs/payloads_excluded"
+    proof = section["payloadsExcluded"]
+    abort_with("#{label} proof is missing") unless status_pass?(proof)
+    reject_unexpected_keys!(proof, label, %w[
+      status packetPayloadsAbsent gamePayloadsAbsent rawBodiesAbsent
+      payloadHashesOnly redactionScanPassed
+    ])
+    %w[packetPayloadsAbsent gamePayloadsAbsent rawBodiesAbsent payloadHashesOnly redactionScanPassed].each do |field|
+      abort_with("#{label} #{field} must be true") unless boolean_true?(proof[field])
+    end
+    {
+      "status" => "pass",
+      "packetPayloadsAbsent" => true,
+      "gamePayloadsAbsent" => true,
+      "rawBodiesAbsent" => true,
+      "payloadHashesOnly" => true,
+      "redactionScanPassed" => true
+    }
+  when "secrets_excluded"
+    label = "abuse_logs/secrets_excluded"
+    proof = section["secretsExcluded"]
+    abort_with("#{label} proof is missing") unless status_pass?(proof)
+    reject_unexpected_keys!(proof, label, %w[
+      status privateKeysAbsent walletStoresAbsent entitlementTokensAbsent
+      serviceSecretsAbsent redactionScanPassed
+    ])
+    %w[privateKeysAbsent walletStoresAbsent entitlementTokensAbsent serviceSecretsAbsent redactionScanPassed].each do |field|
+      abort_with("#{label} #{field} must be true") unless boolean_true?(proof[field])
+    end
+    {
+      "status" => "pass",
+      "privateKeysAbsent" => true,
+      "walletStoresAbsent" => true,
+      "entitlementTokensAbsent" => true,
+      "serviceSecretsAbsent" => true,
+      "redactionScanPassed" => true
+    }
+  else
+    abort_with("unsupported abuse-log assertion: #{assertion}")
+  end
+end
+
 def validate_relay_denial_proof!(report, assertion)
   section = proof_at(report, "relayDenial")
   abort_with("relay_denial section is missing") unless section.is_a?(Hash)
@@ -349,6 +446,73 @@ def validate_relay_denial_proof!(report, assertion)
   }
 end
 
+def validate_retention_proof!(report, assertion)
+  section = proof_at(report, "retention")
+  abort_with("retention section is missing") unless section.is_a?(Hash)
+
+  case assertion
+  when "metadata_only"
+    label = "retention/metadata_only"
+    proof = section["metadataOnly"]
+    abort_with("#{label} proof is missing") unless status_pass?(proof)
+    reject_unexpected_keys!(proof, label, %w[
+      status metadataOnlyConfigured boundedRetentionConfigured exportDisabled
+      rawPayloadStorageDisabled retentionDays
+    ])
+    %w[metadataOnlyConfigured boundedRetentionConfigured exportDisabled rawPayloadStorageDisabled].each do |field|
+      abort_with("#{label} #{field} must be true") unless boolean_true?(proof[field])
+    end
+    abort_with("#{label} retentionDays must be a positive integer") unless positive_integer?(proof["retentionDays"])
+    abort_with("#{label} retentionDays must not exceed #{MAX_RETENTION_DAYS}") if proof["retentionDays"] > MAX_RETENTION_DAYS
+    {
+      "status" => "pass",
+      "metadataOnlyConfigured" => true,
+      "boundedRetentionConfigured" => true,
+      "retentionDays" => proof["retentionDays"],
+      "exportDisabled" => true,
+      "rawPayloadStorageDisabled" => true
+    }
+  when "packet_payloads_excluded"
+    label = "retention/packet_payloads_excluded"
+    proof = section["packetPayloadsExcluded"]
+    abort_with("#{label} proof is missing") unless status_pass?(proof)
+    reject_unexpected_keys!(proof, label, %w[
+      status packetPayloadsExcluded packetCaptureDisabled pcapArtifactsAbsent
+      retentionScanPassed
+    ])
+    %w[packetPayloadsExcluded packetCaptureDisabled pcapArtifactsAbsent retentionScanPassed].each do |field|
+      abort_with("#{label} #{field} must be true") unless boolean_true?(proof[field])
+    end
+    {
+      "status" => "pass",
+      "packetPayloadsExcluded" => true,
+      "packetCaptureDisabled" => true,
+      "pcapArtifactsAbsent" => true,
+      "retentionScanPassed" => true
+    }
+  when "game_payloads_excluded"
+    label = "retention/game_payloads_excluded"
+    proof = section["gamePayloadsExcluded"]
+    abort_with("#{label} proof is missing") unless status_pass?(proof)
+    reject_unexpected_keys!(proof, label, %w[
+      status gamePayloadsExcluded applicationPayloadsAbsent retainedBodyBytesZero
+      retentionScanPassed
+    ])
+    %w[gamePayloadsExcluded applicationPayloadsAbsent retainedBodyBytesZero retentionScanPassed].each do |field|
+      abort_with("#{label} #{field} must be true") unless boolean_true?(proof[field])
+    end
+    {
+      "status" => "pass",
+      "gamePayloadsExcluded" => true,
+      "applicationPayloadsAbsent" => true,
+      "retainedBodyBytesZero" => true,
+      "retentionScanPassed" => true
+    }
+  else
+    abort_with("unsupported retention assertion: #{assertion}")
+  end
+end
+
 def validate_assertion_proof!(report, contract, control, assertion)
   case [control, assertion]
   when ["tls", "certificate_valid"]
@@ -357,8 +521,12 @@ def validate_assertion_proof!(report, contract, control, assertion)
     validate_rotation_proof!(report)
   when ["rate_limits", assertion]
     validate_rate_limit_proof!(report, assertion)
+  when ["abuse_logs", assertion]
+    validate_abuse_log_proof!(report, assertion)
   when ["relay_denial", assertion]
     validate_relay_denial_proof!(report, assertion)
+  when ["retention", assertion]
+    validate_retention_proof!(report, assertion)
   else
     validate_signed_record_proof!(report, assertion)
   end
