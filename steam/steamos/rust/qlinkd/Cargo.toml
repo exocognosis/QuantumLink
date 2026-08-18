@@ -10,7 +10,7 @@ qlink-core = { path = "../../../../qlink-core" }
 qlink-game = { path = "../qlink-game" }
 qlink-linux = { path = "../qlink-linux" }
 qlink-proto = { path = "../qlink-proto" }
-base64 = "0.22"
+base64 = "0.23"
 getrandom = "0.4"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }

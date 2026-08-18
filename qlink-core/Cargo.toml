@@ -19,7 +19,7 @@ name = "perfgate"
 path = "src/bin/perfgate.rs"
 
 [dependencies]
-base64 = "0.22"
+base64 = "0.23"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
 crc32fast = "1.4"
