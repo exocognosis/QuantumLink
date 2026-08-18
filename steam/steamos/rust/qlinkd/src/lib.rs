@@ -10,21 +10,27 @@ use qlink_core::dytallix_identity::{
     evaluate_dytallix_policy_status, DytallixPolicyStatus, MeshTrustPolicy,
 };
 use qlink_core::packet_core::{FfiRouteMode, PacketTunnelCore};
+use qlink_game::{validate_game_cgroup_path, GameProfile};
 use qlink_linux::{
     LinuxNetworkPlan, LinuxRuntimePlan, NetworkApplyError, NetworkChangeMonitor, NetworkExecutor,
     NetworkOperation, NetworkPlanError, NftablesExecutor, NftablesOperation, NftablesPlan,
-    TunDeviceConfig, TunPacketIo,
+    NftablesRuleHandleExecutor, SystemNftablesRuleHandleExecutor, TunDeviceConfig, TunPacketIo,
 };
 use qlink_proto::{
     load_peer_store_at, peer_store_path_from_state_dir, store_peer_store_at, ConnectionPhase,
-    DaemonConfig, DaemonStatus, DataPlaneState, DataPlaneStatus, DytallixTrustStatus, InviteCode,
-    MeshTrustMode, NetworkPlanState, NetworkStatus, PeerStatus, PeerStore, PublicationErrorCode,
-    PublicationErrorStatus, PublicationState, PublicationStatus, RouteMode, StoredPeer,
+    DaemonConfig, DaemonControlRequest, DaemonStatus, DataPlaneState, DataPlaneStatus,
+    DytallixTrustStatus, GameProcessClassificationState, GameProcessClassificationStatus,
+    GameProfilePortEnforcementState, GameProfilePortEnforcementStatus, GameProfileStatus,
+    InviteCode, MeshTrustMode, NetworkPlanState, NetworkStatus, PeerStatus, PeerStore,
+    PublicationErrorCode, PublicationErrorStatus, PublicationState, PublicationStatus, RouteMode,
+    StoredPeer,
 };
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::io::{BufRead, BufReader};
 use std::io::{ErrorKind, Read, Write};
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
@@ -89,7 +95,14 @@ pub fn local_control_socket_acl() -> LocalControlSocketAcl {
 
 pub fn local_control_command_policy(request: &str) -> ControlPolicy {
     let request = request.trim();
-    if request == "status" || request == "doctor" || request == r#"{"type":"status"}"# {
+    if matches!(
+        parse_daemon_control_request(request),
+        Ok(DaemonControlRequest::Status
+            | DaemonControlRequest::SelectGameProfile { .. }
+            | DaemonControlRequest::ClearGameProfile
+            | DaemonControlRequest::BeginGameProcess { .. }
+            | DaemonControlRequest::EndGameProcess { .. })
+    ) {
         ControlPolicy::QuantumlinkGroup
     } else if request.contains("activate-network")
         || request.contains("deactivate-network")
@@ -99,6 +112,13 @@ pub fn local_control_command_policy(request: &str) -> ControlPolicy {
         ControlPolicy::ElevatedOnly
     } else {
         ControlPolicy::Unsupported
+    }
+}
+
+fn parse_daemon_control_request(request: &str) -> Result<DaemonControlRequest, serde_json::Error> {
+    match request.trim() {
+        "status" | "doctor" => Ok(DaemonControlRequest::Status),
+        request => serde_json::from_str(request),
     }
 }
 
@@ -293,26 +313,41 @@ pub struct NetworkRuntimePlan {
     pub protected_cidr: String,
     pub commands: Vec<String>,
     pub nftables_rules: Vec<String>,
+    pub game_profile_id: Option<String>,
+    pub game_udp_ports: Vec<u16>,
 }
 
 impl NetworkRuntimePlan {
-    fn from_plan(config: &DaemonConfig, plan: &LinuxRuntimePlan) -> Self {
+    fn from_plan(
+        config: &DaemonConfig,
+        plan: &LinuxRuntimePlan,
+        game_profile: Option<&GameProfile>,
+    ) -> Self {
         Self {
             interface_name: config.interface_name.clone(),
             route_mode: config.route_mode,
             protected_cidr: plan.protected_cidr().to_string(),
             commands: plan.network.commands.clone(),
             nftables_rules: plan.nftables.rules.clone(),
+            game_profile_id: game_profile.map(|profile| profile.id.clone()),
+            game_udp_ports: plan.game_udp_ports.clone(),
         }
     }
 
-    fn from_config_without_commands(config: &DaemonConfig) -> Self {
+    fn from_config_without_commands(
+        config: &DaemonConfig,
+        game_profile: Option<&GameProfile>,
+    ) -> Self {
         Self {
             interface_name: config.interface_name.clone(),
             route_mode: config.route_mode,
             protected_cidr: protected_cidr_for_record(config).to_string(),
             commands: Vec::new(),
             nftables_rules: Vec::new(),
+            game_profile_id: game_profile.map(|profile| profile.id.clone()),
+            game_udp_ports: game_profile
+                .map(|profile| profile.udp_ports.clone())
+                .unwrap_or_default(),
         }
     }
 
@@ -349,8 +384,12 @@ pub enum NetworkRuntimeState {
 }
 
 impl NetworkRuntimeState {
-    fn planned(config: &DaemonConfig, plan: &LinuxRuntimePlan) -> Self {
-        Self::Planned(NetworkRuntimePlan::from_plan(config, plan))
+    fn planned(
+        config: &DaemonConfig,
+        plan: &LinuxRuntimePlan,
+        game_profile: Option<&GameProfile>,
+    ) -> Self {
+        Self::Planned(NetworkRuntimePlan::from_plan(config, plan, game_profile))
     }
 
     fn status(&self, ownership_record_present: bool) -> NetworkStatus {
@@ -374,6 +413,44 @@ impl NetworkRuntimeState {
                 ownership_record_present,
                 Some(error.clone()),
             ),
+        }
+    }
+
+    fn game_profile_port_enforcement(
+        &self,
+        route_mode: RouteMode,
+        selected_profile_id: Option<&str>,
+        game_process_active: bool,
+    ) -> GameProfilePortEnforcementStatus {
+        if route_mode != RouteMode::GameOnly {
+            return GameProfilePortEnforcementStatus::default();
+        }
+
+        let (state, plan) = match self {
+            Self::NotStarted => {
+                return GameProfilePortEnforcementStatus {
+                    state: GameProfilePortEnforcementState::NotApplicable,
+                    ..Default::default()
+                }
+            }
+            Self::Planned(plan) => (GameProfilePortEnforcementState::Planned, plan),
+            Self::Applied(plan) => {
+                let state = if plan.game_profile_id.is_some() && game_process_active {
+                    GameProfilePortEnforcementState::Applied
+                } else {
+                    GameProfilePortEnforcementState::FailClosed
+                };
+                (state, plan)
+            }
+            Self::ApplyFailed { plan, .. } => (GameProfilePortEnforcementState::ApplyFailed, plan),
+        };
+
+        GameProfilePortEnforcementStatus {
+            state,
+            profile_id: plan.game_profile_id.clone(),
+            udp_ports: plan.game_udp_ports.clone(),
+            restart_required: plan.game_profile_id.as_deref() != selected_profile_id
+                && matches!(self, Self::Applied(_) | Self::ApplyFailed { .. }),
         }
     }
 }
@@ -428,6 +505,7 @@ impl NetworkOwnershipRecord {
                 table: self.nft_table.clone(),
             }]),
             protected_cidr: self.protected_cidr.clone(),
+            game_udp_ports: Vec::new(),
         }
     }
 }
@@ -542,6 +620,7 @@ impl DaemonRuntimeState {
             network: self.network.status(ownership_record_present),
             data_plane: self.data_plane.clone(),
             publication: self.publication.clone(),
+            game_profile: GameProfileStatus::default(),
         }
     }
 }
@@ -553,39 +632,59 @@ pub struct DaemonEngine {
     runtime: DaemonRuntimeState,
     data_plane: Option<EngineDataPlaneRuntime>,
     steam_bypass: SteamBypassSummary,
+    game_process: GameProcessRuntime,
+}
+
+#[derive(Debug, Clone, Default)]
+struct GameProcessRuntime {
+    active: Option<ActiveGameProcess>,
+    last_error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveGameProcess {
+    session_id: String,
+    profile_id: String,
+    executable: String,
+    cgroup_unit: String,
+    udp_ports: Vec<u16>,
+    rules: Vec<(NftablesOperation, u64)>,
 }
 
 impl DaemonEngine {
     pub fn new(config: DaemonConfig, paths: DaemonPaths) -> Self {
         let runtime = DaemonRuntimeState::idle(config.kill_switch);
-        let steam_bypass = SteamBypassSummary::load(&paths.config_dir(), &config);
+        let steam_bypass = SteamBypassSummary::load(&paths.config_dir(), &paths.state_dir, &config);
         Self {
             config,
             paths,
             runtime,
             data_plane: None,
             steam_bypass,
+            game_process: GameProcessRuntime::default(),
         }
     }
 
     pub fn try_new(config: DaemonConfig, paths: DaemonPaths) -> Result<Self, DaemonInitError> {
-        let plan = LinuxRuntimePlan::from_config(&config)?;
+        let steam_bypass = SteamBypassSummary::load(&paths.config_dir(), &paths.state_dir, &config);
+        let selected_profile = steam_bypass.selected_profile.as_ref();
+        let plan = Self::network_plan_for_profile(&config, selected_profile)?;
         let runtime = DaemonRuntimeState {
             phase: ConnectionPhase::Idle,
             active_party: None,
             peers: Vec::new(),
             kill_switch: config.kill_switch,
-            network: NetworkRuntimeState::planned(&config, &plan),
+            network: NetworkRuntimeState::planned(&config, &plan, selected_profile),
             data_plane: DataPlaneStatus::not_started(),
             publication: PublicationStatus::default(),
         };
-        let steam_bypass = SteamBypassSummary::load(&paths.config_dir(), &config);
         Ok(Self {
             config,
             paths,
             runtime,
             data_plane: None,
             steam_bypass,
+            game_process: GameProcessRuntime::default(),
         })
     }
 
@@ -597,6 +696,16 @@ impl DaemonEngine {
         if let Some(data_plane) = &self.data_plane {
             status.data_plane = data_plane.status();
         }
+        status.game_profile = self.steam_bypass.profile_status();
+        status.game_profile.process_classification = self.game_process_status();
+        status.game_profile.port_enforcement = self.runtime.network.game_profile_port_enforcement(
+            self.config.route_mode,
+            self.steam_bypass
+                .selected_profile
+                .as_ref()
+                .map(|profile| profile.id.as_str()),
+            self.game_process.active.is_some() && self.game_process.last_error.is_none(),
+        );
         status
     }
 
@@ -616,6 +725,211 @@ impl DaemonEngine {
     /// directory. Surfaced in the resident banner and to `qlinkctl doctor`.
     pub fn steam_bypass(&self) -> &SteamBypassSummary {
         &self.steam_bypass
+    }
+
+    pub fn select_game_profile(&mut self, profile_id: &str) -> Result<(), String> {
+        let profile = self
+            .steam_bypass
+            .game_profiles
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .cloned()
+            .ok_or_else(|| format!("unknown game profile `{profile_id}`"))?;
+        let replacement_plan = self.replacement_planned_network(Some(&profile))?;
+        self.steam_bypass
+            .select_profile(&self.paths.state_dir, profile_id)?;
+        if let Some(plan) = replacement_plan {
+            self.runtime.network = plan;
+        }
+        Ok(())
+    }
+
+    pub fn clear_game_profile(&mut self) -> Result<(), String> {
+        let replacement_plan = self.replacement_planned_network(None)?;
+        self.steam_bypass.clear_profile(&self.paths.state_dir)?;
+        if let Some(plan) = replacement_plan {
+            self.runtime.network = plan;
+        }
+        Ok(())
+    }
+
+    fn game_process_status(&self) -> GameProcessClassificationStatus {
+        if self.config.route_mode != RouteMode::GameOnly {
+            return GameProcessClassificationStatus::default();
+        }
+        if let Some(active) = self.game_process.active.as_ref() {
+            return GameProcessClassificationStatus {
+                state: if self.game_process.last_error.is_some() {
+                    GameProcessClassificationState::ApplyFailed
+                } else {
+                    GameProcessClassificationState::Active
+                },
+                profile_id: Some(active.profile_id.clone()),
+                executable: Some(active.executable.clone()),
+                cgroup_unit: Some(active.cgroup_unit.clone()),
+                udp_ports: active.udp_ports.clone(),
+                error: self.game_process.last_error.clone(),
+            };
+        }
+
+        let selected_profile_id = self
+            .steam_bypass
+            .selected_profile
+            .as_ref()
+            .map(|profile| profile.id.clone());
+        let network_armed = matches!(
+            &self.runtime.network,
+            NetworkRuntimeState::Applied(plan)
+                if plan.game_profile_id.as_ref() == selected_profile_id.as_ref()
+        );
+        let state = if self.game_process.last_error.is_some() {
+            GameProcessClassificationState::ApplyFailed
+        } else if selected_profile_id.is_some() && network_armed {
+            GameProcessClassificationState::Armed
+        } else {
+            GameProcessClassificationState::FailClosed
+        };
+        GameProcessClassificationStatus {
+            state,
+            profile_id: selected_profile_id,
+            error: self.game_process.last_error.clone(),
+            ..Default::default()
+        }
+    }
+
+    pub fn begin_game_process_with<E: NftablesRuleHandleExecutor>(
+        &mut self,
+        profile_id: &str,
+        executable: &str,
+        session_id: &str,
+        caller_uid: u32,
+        cgroup_path: &str,
+        executor: &mut E,
+    ) -> Result<(), String> {
+        if self.config.route_mode != RouteMode::GameOnly {
+            return Err("game process classification requires gameOnly route mode".to_string());
+        }
+        if self.game_process.active.is_some() {
+            return Err("a classified game process is already active".to_string());
+        }
+        let profile = self
+            .steam_bypass
+            .selected_profile
+            .as_ref()
+            .filter(|profile| profile.id == profile_id)
+            .cloned()
+            .ok_or_else(|| "launch profile must match the selected game profile".to_string())?;
+        let applied_profile_id = match &self.runtime.network {
+            NetworkRuntimeState::Applied(plan) => plan.game_profile_id.as_deref(),
+            _ => None,
+        };
+        if applied_profile_id != Some(profile_id) {
+            return Err(
+                "game process classification requires an applied matching network plan".to_string(),
+            );
+        }
+        if !profile.matches_executable(executable) {
+            return Err(format!(
+                "executable is not allowed by game profile `{profile_id}`"
+            ));
+        }
+        let cgroup = validate_game_cgroup_path(cgroup_path, caller_uid, session_id)?;
+        let comment = format!("qlink-game-{session_id}");
+        let operations = NftablesPlan::game_process_mark_operations(
+            protected_cidr_for_record(&self.config),
+            &cgroup.relative_path,
+            cgroup.level,
+            &profile.udp_ports,
+            &comment,
+        );
+        let mut rules = Vec::with_capacity(operations.len());
+        for operation in operations {
+            match executor.add_rule_with_handle(&operation) {
+                Ok(handle) => rules.push((operation, handle)),
+                Err(error) => {
+                    for (applied, handle) in rules.iter().rev() {
+                        let _ = executor.delete_rule_handle(applied, *handle);
+                    }
+                    let message = format!("failed to apply game process classification: {error}");
+                    self.game_process.last_error = Some(message.clone());
+                    return Err(message);
+                }
+            }
+        }
+
+        self.game_process = GameProcessRuntime {
+            active: Some(ActiveGameProcess {
+                session_id: session_id.to_string(),
+                profile_id: profile.id,
+                executable: executable_basename(executable).to_string(),
+                cgroup_unit: cgroup.scope_unit,
+                udp_ports: profile.udp_ports,
+                rules,
+            }),
+            last_error: None,
+        };
+        Ok(())
+    }
+
+    pub fn end_game_process_with<E: NftablesRuleHandleExecutor>(
+        &mut self,
+        session_id: &str,
+        executor: &mut E,
+    ) -> Result<(), String> {
+        let Some(mut active) = self.game_process.active.take() else {
+            return Ok(());
+        };
+        if active.session_id != session_id {
+            self.game_process.active = Some(active);
+            return Err("game session does not match the active classification".to_string());
+        }
+
+        let mut retained = Vec::new();
+        let mut first_error = None;
+        for (operation, handle) in active.rules.drain(..).rev() {
+            if let Err(error) = executor.delete_rule_handle(&operation, handle) {
+                first_error.get_or_insert_with(|| error.to_string());
+                retained.push((operation, handle));
+            }
+        }
+        if let Some(error) = first_error {
+            retained.reverse();
+            active.rules = retained;
+            self.game_process.active = Some(active);
+            let message = format!("failed to remove game process classification: {error}");
+            self.game_process.last_error = Some(message.clone());
+            return Err(message);
+        }
+        self.game_process.last_error = None;
+        Ok(())
+    }
+
+    fn network_plan_for_profile(
+        config: &DaemonConfig,
+        profile: Option<&GameProfile>,
+    ) -> Result<LinuxRuntimePlan, NetworkPlanError> {
+        LinuxRuntimePlan::from_config_with_game_udp_ports(
+            config,
+            profile
+                .map(|profile| profile.udp_ports.as_slice())
+                .unwrap_or(&[]),
+        )
+    }
+
+    fn replacement_planned_network(
+        &self,
+        profile: Option<&GameProfile>,
+    ) -> Result<Option<NetworkRuntimeState>, String> {
+        if !matches!(self.runtime.network, NetworkRuntimeState::Planned(_)) {
+            return Ok(None);
+        }
+        let plan = Self::network_plan_for_profile(&self.config, profile)
+            .map_err(|error| format!("failed to plan game profile routing: {error}"))?;
+        Ok(Some(NetworkRuntimeState::planned(
+            &self.config,
+            &plan,
+            profile,
+        )))
     }
 
     /// `true` once packet I/O has been started (network activated + TUN open).
@@ -773,19 +1087,23 @@ impl DaemonEngine {
         NE: NetworkExecutor,
         NF: NftablesExecutor,
     {
-        let plan = match LinuxRuntimePlan::from_config(&self.config) {
+        let selected_profile = self.steam_bypass.selected_profile.as_ref();
+        let plan = match Self::network_plan_for_profile(&self.config, selected_profile) {
             Ok(plan) => plan,
             Err(error) => {
                 let error =
                     NetworkApplyError::new(format!("failed to plan SteamOS networking: {error}"));
                 self.runtime.network = NetworkRuntimeState::ApplyFailed {
-                    plan: NetworkRuntimePlan::from_config_without_commands(&self.config),
+                    plan: NetworkRuntimePlan::from_config_without_commands(
+                        &self.config,
+                        selected_profile,
+                    ),
                     error: error.message().to_string(),
                 };
                 return Err(error);
             }
         };
-        let runtime_plan = NetworkRuntimePlan::from_plan(&self.config, &plan);
+        let runtime_plan = NetworkRuntimePlan::from_plan(&self.config, &plan, selected_profile);
 
         if let Err(error) = prepare_network_ownership_storage(&self.paths) {
             let error = NetworkApplyError::new(format!(
@@ -838,6 +1156,13 @@ fn route_mode_for_packet_core(route_mode: RouteMode) -> FfiRouteMode {
             FfiRouteMode::ProtectedPrefixesOnly
         }
     }
+}
+
+fn executable_basename(executable: &str) -> &str {
+    Path::new(executable)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(executable)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1096,7 +1421,17 @@ where
 }
 
 #[cfg(unix)]
-pub fn serve_status_stream(mut stream: UnixStream, engine: &DaemonEngine) -> std::io::Result<()> {
+pub fn serve_status_stream(stream: UnixStream, engine: &mut DaemonEngine) -> std::io::Result<()> {
+    let mut executor = SystemNftablesRuleHandleExecutor;
+    serve_status_stream_with_classifier(stream, engine, &mut executor)
+}
+
+#[cfg(unix)]
+pub fn serve_status_stream_with_classifier<E: NftablesRuleHandleExecutor>(
+    mut stream: UnixStream,
+    engine: &mut DaemonEngine,
+    executor: &mut E,
+) -> std::io::Result<()> {
     stream.set_read_timeout(Some(CONTROL_REQUEST_READ_TIMEOUT))?;
     let request = match read_control_request(&stream) {
         Ok(request) => request,
@@ -1107,13 +1442,79 @@ pub fn serve_status_stream(mut stream: UnixStream, engine: &DaemonEngine) -> std
         }
     };
 
-    if local_control_command_policy(&request) == ControlPolicy::QuantumlinkGroup {
-        serde_json::to_writer(&mut stream, &engine.status())?;
-        stream.write_all(b"\n")?;
-    } else {
-        write_control_error(&mut stream, "unsupported request")?;
+    if local_control_command_policy(&request) != ControlPolicy::QuantumlinkGroup {
+        return write_control_error(&mut stream, "unsupported request");
     }
+
+    let request = match parse_daemon_control_request(&request) {
+        Ok(request) => request,
+        Err(_) => return write_control_error(&mut stream, "unsupported request"),
+    };
+    let result = match request {
+        DaemonControlRequest::Status => Ok(()),
+        DaemonControlRequest::SelectGameProfile { profile_id } => {
+            engine.select_game_profile(profile_id.trim())
+        }
+        DaemonControlRequest::ClearGameProfile => engine.clear_game_profile(),
+        DaemonControlRequest::BeginGameProcess {
+            profile_id,
+            executable,
+            session_id,
+        } => control_peer_game_cgroup(&stream)
+            .map_err(|error| error.to_string())
+            .and_then(|(uid, cgroup_path)| {
+                engine.begin_game_process_with(
+                    profile_id.trim(),
+                    executable.trim(),
+                    session_id.trim(),
+                    uid,
+                    &cgroup_path,
+                    executor,
+                )
+            }),
+        DaemonControlRequest::EndGameProcess { session_id } => {
+            engine.end_game_process_with(session_id.trim(), executor)
+        }
+    };
+    if let Err(error) = result {
+        return write_control_error(&mut stream, &error);
+    }
+
+    serde_json::to_writer(&mut stream, &engine.status())?;
+    stream.write_all(b"\n")?;
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn control_peer_game_cgroup(stream: &UnixStream) -> std::io::Result<(u32, String)> {
+    let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut credentials as *mut libc::ucred).cast(),
+            &mut length,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let content = std::fs::read_to_string(format!("/proc/{}/cgroup", credentials.pid))?;
+    let cgroup_path = content
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .ok_or_else(|| std::io::Error::other("control peer is not in a cgroup v2 hierarchy"))?;
+    Ok((credentials.uid, cgroup_path.to_string()))
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn control_peer_game_cgroup(_stream: &UnixStream) -> std::io::Result<(u32, String)> {
+    Err(std::io::Error::new(
+        ErrorKind::Unsupported,
+        "game process classification requires Linux cgroup v2",
+    ))
 }
 
 #[cfg(unix)]
@@ -1151,7 +1552,7 @@ fn write_control_error(stream: &mut UnixStream, message: &str) -> std::io::Resul
 }
 
 #[cfg(all(unix, test))]
-fn serve_status_streams<I>(streams: I, engine: &DaemonEngine) -> std::io::Result<()>
+fn serve_status_streams<I>(streams: I, engine: &mut DaemonEngine) -> std::io::Result<()>
 where
     I: IntoIterator<Item = std::io::Result<UnixStream>>,
 {
@@ -1723,6 +2124,39 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RecordingRuleHandleExecutor {
+        added: Vec<NftablesOperation>,
+        deleted: Vec<(NftablesOperation, u64)>,
+        fail_add_on_call: Option<usize>,
+        fail_delete_on_call: Option<usize>,
+    }
+
+    impl NftablesRuleHandleExecutor for RecordingRuleHandleExecutor {
+        fn add_rule_with_handle(
+            &mut self,
+            operation: &NftablesOperation,
+        ) -> Result<u64, NetworkApplyError> {
+            self.added.push(operation.clone());
+            if self.fail_add_on_call == Some(self.added.len()) {
+                return Err(NetworkApplyError::new("game rule apply failed"));
+            }
+            Ok(self.added.len() as u64)
+        }
+
+        fn delete_rule_handle(
+            &mut self,
+            operation: &NftablesOperation,
+            handle: u64,
+        ) -> Result<(), NetworkApplyError> {
+            self.deleted.push((operation.clone(), handle));
+            if self.fail_delete_on_call == Some(self.deleted.len()) {
+                return Err(NetworkApplyError::new("game rule cleanup failed"));
+            }
+            Ok(())
+        }
+    }
+
     struct ReadOnlyStateAfterNftablesApply {
         operations: Vec<NftablesOperation>,
         state_dir: PathBuf,
@@ -1825,6 +2259,229 @@ mod tests {
             .commands
             .iter()
             .any(|command| { command == "ip route add 100.64.0.0/10 dev qlink0 table 51820" }));
+        assert_eq!(
+            status.game_profile.port_enforcement.state,
+            GameProfilePortEnforcementState::FailClosed
+        );
+        assert!(status
+            .network
+            .nftables_rules
+            .iter()
+            .any(|rule| rule.contains("meta mark != 0x514c drop")));
+    }
+
+    #[test]
+    fn selected_game_profile_arms_ports_without_unscoped_mark_rules() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(&temp);
+        std::fs::create_dir_all(temp.path().join("games")).unwrap();
+        std::fs::create_dir_all(&paths.state_dir).unwrap();
+        std::fs::write(
+            temp.path().join("games/factorio.toml"),
+            r#"
+                id = "factorio"
+                display_name = "Factorio"
+                executables = ["factorio"]
+                udp_ports = [34197]
+                lan_discovery = true
+                voice_chat_safe = true
+                low_latency = true
+            "#,
+        )
+        .unwrap();
+        qlink_game::store_game_profile_selection(
+            &paths.state_dir,
+            &qlink_game::GameProfileSelection::selected("factorio"),
+        )
+        .unwrap();
+
+        let engine = DaemonEngine::try_new(DaemonConfig::default(), paths).unwrap();
+        let status = engine.status();
+
+        assert_eq!(
+            status.game_profile.port_enforcement.state,
+            GameProfilePortEnforcementState::Planned
+        );
+        assert_eq!(
+            status.game_profile.port_enforcement.profile_id.as_deref(),
+            Some("factorio")
+        );
+        assert_eq!(status.game_profile.port_enforcement.udp_ports, vec![34197]);
+        assert!(!status
+            .network
+            .nftables_rules
+            .iter()
+            .any(|rule| rule.contains("meta mark set")));
+        assert_eq!(
+            status.game_profile.process_classification.state,
+            GameProcessClassificationState::FailClosed
+        );
+    }
+
+    #[test]
+    fn classified_game_scope_activates_and_removes_exact_port_rules() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(&temp);
+        std::fs::create_dir_all(temp.path().join("games")).unwrap();
+        std::fs::create_dir_all(&paths.state_dir).unwrap();
+        std::fs::write(
+            temp.path().join("games/factorio.toml"),
+            r#"
+                id = "factorio"
+                display_name = "Factorio"
+                executables = ["factorio"]
+                udp_ports = [34197]
+                lan_discovery = true
+                voice_chat_safe = true
+                low_latency = true
+            "#,
+        )
+        .unwrap();
+        qlink_game::store_game_profile_selection(
+            &paths.state_dir,
+            &qlink_game::GameProfileSelection::selected("factorio"),
+        )
+        .unwrap();
+        let mut engine = DaemonEngine::try_new(DaemonConfig::default(), paths).unwrap();
+        engine
+            .activate_network_with(
+                &mut RecordingNetworkExecutor::default(),
+                &mut RecordingNftablesExecutor::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            engine.status().game_profile.process_classification.state,
+            GameProcessClassificationState::Armed
+        );
+
+        let mut classifier = RecordingRuleHandleExecutor::default();
+        engine
+            .begin_game_process_with(
+                "factorio",
+                "/home/deck/factorio",
+                "s123abc",
+                1000,
+                "/user.slice/user-1000.slice/user@1000.service/app.slice/quantumlink-game.slice/quantumlink-game-s123abc.scope",
+                &mut classifier,
+            )
+            .unwrap();
+
+        let active = engine.status().game_profile;
+        assert_eq!(
+            active.process_classification.state,
+            GameProcessClassificationState::Active
+        );
+        assert_eq!(
+            active.port_enforcement.state,
+            GameProfilePortEnforcementState::Applied
+        );
+        assert_eq!(classifier.added.len(), 2);
+        assert!(classifier.added.iter().all(|operation| matches!(
+            operation,
+            NftablesOperation::MarkCgroupUdpPortTraffic { port: 34197, .. }
+        )));
+
+        engine
+            .end_game_process_with("s123abc", &mut classifier)
+            .unwrap();
+        assert_eq!(classifier.deleted.len(), 2);
+        assert_eq!(
+            engine.status().game_profile.process_classification.state,
+            GameProcessClassificationState::Armed
+        );
+        assert_eq!(
+            engine.status().game_profile.port_enforcement.state,
+            GameProfilePortEnforcementState::FailClosed
+        );
+
+        let mut failing_classifier = RecordingRuleHandleExecutor {
+            fail_add_on_call: Some(2),
+            ..Default::default()
+        };
+        let error = engine
+            .begin_game_process_with(
+                "factorio",
+                "/home/deck/factorio",
+                "s456def",
+                1000,
+                "/user.slice/user-1000.slice/user@1000.service/app.slice/quantumlink-game.slice/quantumlink-game-s456def.scope",
+                &mut failing_classifier,
+            )
+            .unwrap_err();
+        assert!(error.contains("game rule apply failed"));
+        assert_eq!(failing_classifier.deleted.len(), 1);
+        assert_eq!(
+            engine.status().game_profile.process_classification.state,
+            GameProcessClassificationState::ApplyFailed
+        );
+
+        let mut cleanup_classifier = RecordingRuleHandleExecutor {
+            fail_delete_on_call: Some(1),
+            ..Default::default()
+        };
+        engine
+            .begin_game_process_with(
+                "factorio",
+                "/home/deck/factorio",
+                "s789ghi",
+                1000,
+                "/user.slice/user-1000.slice/user@1000.service/app.slice/quantumlink-game.slice/quantumlink-game-s789ghi.scope",
+                &mut cleanup_classifier,
+            )
+            .unwrap();
+        let error = engine
+            .end_game_process_with("s789ghi", &mut cleanup_classifier)
+            .unwrap_err();
+        assert!(error.contains("game rule cleanup failed"));
+        assert_eq!(
+            engine.status().game_profile.process_classification.state,
+            GameProcessClassificationState::ApplyFailed
+        );
+        assert_eq!(
+            engine.status().game_profile.port_enforcement.state,
+            GameProfilePortEnforcementState::FailClosed
+        );
+    }
+
+    #[test]
+    fn active_profile_change_requires_restart_and_preserves_applied_ports() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(&temp);
+        std::fs::create_dir_all(temp.path().join("games")).unwrap();
+        std::fs::write(
+            temp.path().join("games/factorio.toml"),
+            r#"
+                id = "factorio"
+                display_name = "Factorio"
+                executables = ["factorio"]
+                udp_ports = [34197]
+                lan_discovery = true
+                voice_chat_safe = true
+                low_latency = true
+            "#,
+        )
+        .unwrap();
+        let mut engine = DaemonEngine::try_new(DaemonConfig::default(), paths).unwrap();
+        let mut network_executor = RecordingNetworkExecutor::default();
+        let mut nftables_executor = RecordingNftablesExecutor::default();
+        engine
+            .activate_network_with(&mut network_executor, &mut nftables_executor)
+            .unwrap();
+
+        engine.select_game_profile("factorio").unwrap();
+        let status = engine.status();
+
+        assert!(status.game_profile.port_enforcement.restart_required);
+        assert!(status.game_profile.port_enforcement.profile_id.is_none());
+        assert!(status.game_profile.port_enforcement.udp_ports.is_empty());
+        assert_eq!(
+            status
+                .game_profile
+                .selected_profile
+                .as_ref()
+                .map(|profile| profile.id.as_str()),
+            Some("factorio")
+        );
     }
 
     #[test]
@@ -2392,13 +3049,13 @@ mod tests {
         use std::io::{Read, Write};
         use std::os::unix::net::UnixStream;
 
-        let engine = DaemonEngine::new(DaemonConfig::default(), DaemonPaths::default());
+        let mut engine = DaemonEngine::new(DaemonConfig::default(), DaemonPaths::default());
         let (server, mut client) = UnixStream::pair().unwrap();
         let mut request = "x".repeat(4096);
         request.push('\n');
         client.write_all(request.as_bytes()).unwrap();
 
-        let error = serve_status_stream(server, &engine).unwrap_err();
+        let error = serve_status_stream(server, &mut engine).unwrap_err();
 
         assert_eq!(error.kind(), ErrorKind::InvalidData);
         assert!(error.to_string().contains("request too large"));
@@ -2413,7 +3070,7 @@ mod tests {
         use std::io::{Read, Write};
         use std::os::unix::net::UnixStream;
 
-        let engine = DaemonEngine::new(DaemonConfig::default(), DaemonPaths::default());
+        let mut engine = DaemonEngine::new(DaemonConfig::default(), DaemonPaths::default());
         let (bad_server, mut bad_client) = UnixStream::pair().unwrap();
         let (status_server, mut status_client) = UnixStream::pair().unwrap();
         let mut bad_request = "x".repeat(4096);
@@ -2421,7 +3078,7 @@ mod tests {
         bad_client.write_all(bad_request.as_bytes()).unwrap();
         status_client.write_all(b"status\n").unwrap();
 
-        serve_status_streams(vec![Ok(bad_server), Ok(status_server)], &engine).unwrap();
+        serve_status_streams(vec![Ok(bad_server), Ok(status_server)], &mut engine).unwrap();
 
         let mut bad_response = String::new();
         bad_client.read_to_string(&mut bad_response).unwrap();
@@ -2430,6 +3087,61 @@ mod tests {
         let mut status_response = String::new();
         status_client.read_to_string(&mut status_response).unwrap();
         assert!(status_response.contains(r#""phase":"idle""#));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_socket_selects_and_persists_installed_game_profile() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(&temp);
+        let games_dir = temp.path().join(game::GAMES_DIR);
+        std::fs::create_dir_all(&games_dir).unwrap();
+        std::fs::write(
+            games_dir.join("factorio.toml"),
+            r#"
+                id = "factorio"
+                display_name = "Factorio"
+                executables = ["factorio"]
+                udp_ports = [34197]
+                lan_discovery = true
+                voice_chat_safe = true
+                low_latency = true
+            "#,
+        )
+        .unwrap();
+        let mut engine = DaemonEngine::new(DaemonConfig::default(), paths.clone());
+        let (server, mut client) = UnixStream::pair().unwrap();
+        client
+            .write_all(
+                br#"{"type":"selectGameProfile","profileId":"factorio"}
+"#,
+            )
+            .unwrap();
+
+        serve_status_stream(server, &mut engine).unwrap();
+
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        let status: DaemonStatus = serde_json::from_str(response.trim())
+            .unwrap_or_else(|error| panic!("invalid status response `{response}`: {error}"));
+        assert_eq!(
+            status
+                .game_profile
+                .selected_profile
+                .as_ref()
+                .map(|profile| profile.id.as_str()),
+            Some("factorio")
+        );
+        assert_eq!(
+            qlink_game::load_game_profile_selection(paths.state_dir)
+                .unwrap()
+                .selected_profile_id
+                .as_deref(),
+            Some("factorio")
+        );
     }
 
     #[test]

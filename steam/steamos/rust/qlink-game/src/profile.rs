@@ -1,7 +1,7 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GameProfile {
     pub id: String,
     pub display_name: String,
@@ -26,6 +26,44 @@ impl GameProfile {
         self.executables
             .iter()
             .any(|candidate| candidate == basename)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.id.is_empty()
+            || self.id.len() > 64
+            || !self
+                .id
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        {
+            return Err(
+                "profile id must contain 1-64 lowercase ASCII letters, digits, or hyphens"
+                    .to_string(),
+            );
+        }
+        if self.display_name.trim().is_empty() || self.display_name.len() > 80 {
+            return Err("profile display name must contain 1-80 characters".to_string());
+        }
+        if self.executables.is_empty() {
+            return Err("profile must declare at least one executable basename".to_string());
+        }
+        for executable in &self.executables {
+            if executable.is_empty()
+                || executable.len() > 128
+                || Path::new(executable)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    != Some(executable)
+            {
+                return Err(format!(
+                    "profile executable `{executable}` must be a basename of 1-128 characters"
+                ));
+            }
+        }
+        if self.udp_ports.is_empty() || self.udp_ports.contains(&0) {
+            return Err("profile must declare at least one non-zero UDP port".to_string());
+        }
+        Ok(())
     }
 }
 

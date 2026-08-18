@@ -227,8 +227,8 @@
 ### 8.1 Installation & Setup
 - [ ] Run staged installer tests with non-root `DESTDIR`.
 - [ ] Run live install on Steam Deck A and B.
-- [ ] Verify default install does not create live `10-activate-network.conf`.
-- [ ] Verify binaries, systemd unit, config directory, state directory, runtime directory, and sample activation drop-in permissions.
+- [ ] Verify the default install does not create live `10-planning-only.conf`.
+- [ ] Verify binaries, the active systemd unit, config directory, state directory, runtime directory, and planning-only recovery sample permissions.
 - [ ] Verify reinstall is idempotent after a SteamOS update.
 - [ ] Verify uninstall/rollback removes owned state and leaves unrelated routes/nftables rules intact.
 

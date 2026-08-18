@@ -1,4 +1,4 @@
-use std::{error::Error, fmt, process::Command as ProcessCommand};
+use std::{error::Error, fmt, path::Path, process::Command as ProcessCommand};
 
 use qlink_proto::{ConfigValidationError, DaemonConfig, RouteMode};
 
@@ -22,7 +22,9 @@ const NFT_ROUTE_OUTPUT_CHAIN: &str = "route_output";
 const NFT_FILTER_OUTPUT_CHAIN: &str = "filter_output";
 const FULL_TUNNEL_CIDR: &str = "0.0.0.0/0";
 const IP_COMMAND: &str = "/usr/bin/ip";
+const IP_COMMAND_FALLBACK: &str = "/usr/sbin/ip";
 const NFT_COMMAND: &str = "/usr/bin/nft";
+const NFT_COMMAND_FALLBACK: &str = "/usr/sbin/nft";
 const FULL_TUNNEL_EXEMPTION_ERROR: &str =
     "full tunnel requires explicit underlay exemptions before activation";
 
@@ -31,17 +33,44 @@ pub struct LinuxRuntimePlan {
     pub network: LinuxNetworkPlan,
     pub nftables: NftablesPlan,
     pub protected_cidr: String,
+    pub game_udp_ports: Vec<u16>,
 }
 
 impl LinuxRuntimePlan {
     pub fn from_config(config: &DaemonConfig) -> Result<Self, NetworkPlanError> {
+        Self::from_config_with_game_udp_ports(config, &[])
+    }
+
+    pub fn from_config_with_game_udp_ports(
+        config: &DaemonConfig,
+        game_udp_ports: &[u16],
+    ) -> Result<Self, NetworkPlanError> {
         config.validate().map_err(NetworkPlanError::InvalidConfig)?;
-        if config.route_mode == RouteMode::FullTunnel {
+        if config.route_mode == RouteMode::FullTunnel && config.underlay_exemptions.is_empty() {
             return Err(NetworkPlanError::FullTunnelRequiresExplicitUnderlayExemptions);
+        }
+        if game_udp_ports.contains(&0) {
+            return Err(NetworkPlanError::InvalidGameUdpPort);
         }
 
         let protected_cidr = protected_cidr_for_route_mode(config).to_string();
         let overlay_address = format!("{}/32", config.overlay_ipv4_address);
+        let mut game_udp_ports = game_udp_ports.to_vec();
+        game_udp_ports.sort_unstable();
+        game_udp_ports.dedup();
+        let nftables = if config.route_mode == RouteMode::GameOnly {
+            NftablesPlan::game_only_fail_closed(
+                &config.interface_name,
+                &protected_cidr,
+                &config.underlay_exemptions,
+            )
+        } else {
+            NftablesPlan::fail_closed_with_exemptions(
+                &config.interface_name,
+                &protected_cidr,
+                &config.underlay_exemptions,
+            )
+        };
 
         Ok(Self {
             network: LinuxNetworkPlan::for_interface(
@@ -49,8 +78,9 @@ impl LinuxRuntimePlan {
                 &overlay_address,
                 &protected_cidr,
             ),
-            nftables: NftablesPlan::fail_closed(&config.interface_name, &protected_cidr),
+            nftables,
             protected_cidr,
+            game_udp_ports,
         })
     }
 
@@ -166,6 +196,7 @@ impl LinuxRuntimePlan {
 pub enum NetworkPlanError {
     InvalidConfig(ConfigValidationError),
     FullTunnelRequiresExplicitUnderlayExemptions,
+    InvalidGameUdpPort,
 }
 
 impl fmt::Display for NetworkPlanError {
@@ -175,6 +206,7 @@ impl fmt::Display for NetworkPlanError {
             Self::FullTunnelRequiresExplicitUnderlayExemptions => {
                 f.write_str(FULL_TUNNEL_EXEMPTION_ERROR)
             }
+            Self::InvalidGameUdpPort => f.write_str("game UDP ports must be non-zero"),
         }
     }
 }
@@ -183,7 +215,7 @@ impl Error for NetworkPlanError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::InvalidConfig(error) => Some(error),
-            Self::FullTunnelRequiresExplicitUnderlayExemptions => None,
+            Self::FullTunnelRequiresExplicitUnderlayExemptions | Self::InvalidGameUdpPort => None,
         }
     }
 }
@@ -193,6 +225,10 @@ fn protected_cidr_for_route_mode(config: &DaemonConfig) -> &str {
         RouteMode::GameOnly | RouteMode::ProtectedPrefixesOnly => &config.overlay_cidr,
         RouteMode::FullTunnel => FULL_TUNNEL_CIDR,
     }
+}
+
+fn nft_string_literal(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('\"', "\\\""))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -227,11 +263,13 @@ pub struct StdCommandRunner;
 
 impl CommandRunner for StdCommandRunner {
     fn run(&mut self, command: &SystemCommand) -> Result<(), NetworkApplyError> {
-        let output = ProcessCommand::new(&command.program)
+        let program = resolve_trusted_command(&command.program);
+        let rendered = format!("{program:?} {:?}", command.args);
+        let output = ProcessCommand::new(program)
             .args(&command.args)
             .output()
             .map_err(|error| {
-                NetworkApplyError::new(format!("failed to spawn `{}`: {error}", command.rendered()))
+                NetworkApplyError::new(format!("failed to spawn `{rendered}`: {error}"))
             })?;
 
         if output.status.success() {
@@ -250,9 +288,29 @@ impl CommandRunner for StdCommandRunner {
 
         Err(NetworkApplyError::new(format!(
             "command `{}` exited with status {}{detail}",
-            command.rendered(),
-            output.status
+            rendered, output.status
         )))
+    }
+}
+
+fn resolve_trusted_command(program: &str) -> &str {
+    resolve_trusted_command_with(program, |candidate| Path::new(candidate).is_file())
+}
+
+fn resolve_trusted_command_with<F>(program: &str, is_file: F) -> &str
+where
+    F: Fn(&str) -> bool,
+{
+    let fallback = match program {
+        IP_COMMAND => IP_COMMAND_FALLBACK,
+        NFT_COMMAND => NFT_COMMAND_FALLBACK,
+        _ => return program,
+    };
+
+    if is_file(program) || !is_file(fallback) {
+        program
+    } else {
+        fallback
     }
 }
 
@@ -723,7 +781,41 @@ pub enum NftablesOperation {
         priority: i32,
         policy: String,
     },
+    BypassDestination {
+        family: String,
+        table: String,
+        chain: String,
+        cidr: String,
+    },
     MarkTraffic {
+        family: String,
+        table: String,
+        chain: String,
+        cidr: String,
+        mark: u32,
+    },
+    MarkUdpPortTraffic {
+        family: String,
+        table: String,
+        chain: String,
+        cidr: String,
+        port: u16,
+        direction: UdpPortDirection,
+        mark: u32,
+    },
+    MarkCgroupUdpPortTraffic {
+        family: String,
+        table: String,
+        chain: String,
+        cidr: String,
+        cgroup_path: String,
+        cgroup_level: u32,
+        port: u16,
+        direction: UdpPortDirection,
+        mark: u32,
+        comment: String,
+    },
+    DropUnmarkedTraffic {
         family: String,
         table: String,
         chain: String,
@@ -743,6 +835,21 @@ pub enum NftablesOperation {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UdpPortDirection {
+    Source,
+    Destination,
+}
+
+impl UdpPortDirection {
+    fn nft_field(self) -> &'static str {
+        match self {
+            Self::Source => "sport",
+            Self::Destination => "dport",
+        }
+    }
+}
+
 impl NftablesOperation {
     pub fn to_rule(&self) -> String {
         match self {
@@ -758,6 +865,12 @@ impl NftablesOperation {
             } => format!(
                 "add chain {family} {table} {chain} {{ type {chain_type} hook {hook} priority {priority}; policy {policy}; }}"
             ),
+            Self::BypassDestination {
+                family,
+                table,
+                chain,
+                cidr,
+            } => format!("add rule {family} {table} {chain} ip daddr {cidr} return"),
             Self::MarkTraffic {
                 family,
                 table,
@@ -766,6 +879,45 @@ impl NftablesOperation {
                 mark,
             } => format!(
                 "add rule {family} {table} {chain} ip daddr {cidr} meta mark set {}",
+                format_mark(*mark)
+            ),
+            Self::MarkUdpPortTraffic {
+                family,
+                table,
+                chain,
+                cidr,
+                port,
+                direction,
+                mark,
+            } => format!(
+                "add rule {family} {table} {chain} ip daddr {cidr} udp {} {port} meta mark set {}",
+                direction.nft_field(),
+                format_mark(*mark)
+            ),
+            Self::MarkCgroupUdpPortTraffic {
+                family,
+                table,
+                chain,
+                cidr,
+                cgroup_path,
+                cgroup_level,
+                port,
+                direction,
+                mark,
+                comment,
+            } => format!(
+                "add rule {family} {table} {chain} ip daddr {cidr} socket cgroupv2 level {cgroup_level} \"{cgroup_path}\" udp {} {port} meta mark set {} comment \"{comment}\"",
+                direction.nft_field(),
+                format_mark(*mark)
+            ),
+            Self::DropUnmarkedTraffic {
+                family,
+                table,
+                chain,
+                cidr,
+                mark,
+            } => format!(
+                "add rule {family} {table} {chain} ip daddr {cidr} meta mark != {} drop",
                 format_mark(*mark)
             ),
             Self::DropOutsideInterface {
@@ -822,6 +974,25 @@ impl NftablesOperation {
                     "}".to_string(),
                 ],
             ),
+            Self::BypassDestination {
+                family,
+                table,
+                chain,
+                cidr,
+            } => SystemCommand::new(
+                NFT_COMMAND,
+                vec![
+                    "add".to_string(),
+                    "rule".to_string(),
+                    family.clone(),
+                    table.clone(),
+                    chain.clone(),
+                    "ip".to_string(),
+                    "daddr".to_string(),
+                    cidr.clone(),
+                    "return".to_string(),
+                ],
+            ),
             Self::MarkTraffic {
                 family,
                 table,
@@ -843,6 +1014,96 @@ impl NftablesOperation {
                     "mark".to_string(),
                     "set".to_string(),
                     format_mark(*mark),
+                ],
+            ),
+            Self::MarkUdpPortTraffic {
+                family,
+                table,
+                chain,
+                cidr,
+                port,
+                direction,
+                mark,
+            } => SystemCommand::new(
+                NFT_COMMAND,
+                vec![
+                    "add".to_string(),
+                    "rule".to_string(),
+                    family.clone(),
+                    table.clone(),
+                    chain.clone(),
+                    "ip".to_string(),
+                    "daddr".to_string(),
+                    cidr.clone(),
+                    "udp".to_string(),
+                    direction.nft_field().to_string(),
+                    port.to_string(),
+                    "meta".to_string(),
+                    "mark".to_string(),
+                    "set".to_string(),
+                    format_mark(*mark),
+                ],
+            ),
+            Self::MarkCgroupUdpPortTraffic {
+                family,
+                table,
+                chain,
+                cidr,
+                cgroup_path,
+                cgroup_level,
+                port,
+                direction,
+                mark,
+                comment,
+            } => SystemCommand::new(
+                NFT_COMMAND,
+                vec![
+                    "add".to_string(),
+                    "rule".to_string(),
+                    family.clone(),
+                    table.clone(),
+                    chain.clone(),
+                    "ip".to_string(),
+                    "daddr".to_string(),
+                    cidr.clone(),
+                    "socket".to_string(),
+                    "cgroupv2".to_string(),
+                    "level".to_string(),
+                    cgroup_level.to_string(),
+                    nft_string_literal(cgroup_path),
+                    "udp".to_string(),
+                    direction.nft_field().to_string(),
+                    port.to_string(),
+                    "meta".to_string(),
+                    "mark".to_string(),
+                    "set".to_string(),
+                    format_mark(*mark),
+                    "comment".to_string(),
+                    nft_string_literal(comment),
+                ],
+            ),
+            Self::DropUnmarkedTraffic {
+                family,
+                table,
+                chain,
+                cidr,
+                mark,
+            } => SystemCommand::new(
+                NFT_COMMAND,
+                vec![
+                    "add".to_string(),
+                    "rule".to_string(),
+                    family.clone(),
+                    table.clone(),
+                    chain.clone(),
+                    "ip".to_string(),
+                    "daddr".to_string(),
+                    cidr.clone(),
+                    "meta".to_string(),
+                    "mark".to_string(),
+                    "!=".to_string(),
+                    format_mark(*mark),
+                    "drop".to_string(),
                 ],
             ),
             Self::DropOutsideInterface {
@@ -926,6 +1187,113 @@ impl<R: CommandRunner> NftablesExecutor for SystemNftablesExecutor<R> {
     }
 }
 
+pub trait NftablesRuleHandleExecutor {
+    fn add_rule_with_handle(
+        &mut self,
+        operation: &NftablesOperation,
+    ) -> Result<u64, NetworkApplyError>;
+
+    fn delete_rule_handle(
+        &mut self,
+        operation: &NftablesOperation,
+        handle: u64,
+    ) -> Result<(), NetworkApplyError>;
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SystemNftablesRuleHandleExecutor;
+
+impl NftablesRuleHandleExecutor for SystemNftablesRuleHandleExecutor {
+    fn add_rule_with_handle(
+        &mut self,
+        operation: &NftablesOperation,
+    ) -> Result<u64, NetworkApplyError> {
+        if !matches!(
+            operation,
+            NftablesOperation::MarkCgroupUdpPortTraffic { .. }
+        ) {
+            return Err(NetworkApplyError::new(
+                "rule-handle executor accepts only cgroup game rules",
+            ));
+        }
+        let command = operation.to_system_command();
+        let mut args = vec!["--echo".to_string(), "--handle".to_string()];
+        args.extend(command.args);
+        let output = ProcessCommand::new(resolve_trusted_command(&command.program))
+            .args(&args)
+            .output()
+            .map_err(|error| {
+                NetworkApplyError::new(format!(
+                    "failed to spawn nftables game rule command: {error}"
+                ))
+            })?;
+        if !output.status.success() {
+            return Err(command_output_error("add nftables game rule", &output));
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        parse_nft_rule_handle(&stdout).ok_or_else(|| {
+            NetworkApplyError::new("nftables did not return a rule handle for the game rule")
+        })
+    }
+
+    fn delete_rule_handle(
+        &mut self,
+        operation: &NftablesOperation,
+        handle: u64,
+    ) -> Result<(), NetworkApplyError> {
+        let NftablesOperation::MarkCgroupUdpPortTraffic {
+            family,
+            table,
+            chain,
+            ..
+        } = operation
+        else {
+            return Err(NetworkApplyError::new(
+                "rule-handle executor accepts only cgroup game rules",
+            ));
+        };
+        let handle = handle.to_string();
+        let output = ProcessCommand::new(resolve_trusted_command(NFT_COMMAND))
+            .args(["delete", "rule", family, table, chain, "handle", &handle])
+            .output()
+            .map_err(|error| {
+                NetworkApplyError::new(format!(
+                    "failed to spawn nftables game rule cleanup: {error}"
+                ))
+            })?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(command_output_error("delete nftables game rule", &output))
+        }
+    }
+}
+
+fn parse_nft_rule_handle(output: &str) -> Option<u64> {
+    let tokens: Vec<&str> = output.split_whitespace().collect();
+    tokens.windows(2).rev().find_map(|pair| {
+        (pair[0] == "handle")
+            .then(|| pair[1].parse().ok())
+            .flatten()
+    })
+}
+
+fn command_output_error(label: &str, output: &std::process::Output) -> NetworkApplyError {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let detail = if !stderr.trim().is_empty() {
+        stderr.trim()
+    } else if !stdout.trim().is_empty() {
+        stdout.trim()
+    } else {
+        "no command output"
+    };
+    NetworkApplyError::new(format!(
+        "{label} exited with status {}: {detail}",
+        output.status
+    ))
+}
+
 fn is_absent_nftables_revert_error(operation: &NftablesOperation, message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     let Some(stderr) = stderr_detail(&lower) else {
@@ -943,7 +1311,11 @@ fn is_absent_nftables_revert_error(operation: &NftablesOperation, message: &str)
         ),
         NftablesOperation::AddTable { .. }
         | NftablesOperation::AddChain { .. }
+        | NftablesOperation::BypassDestination { .. }
         | NftablesOperation::MarkTraffic { .. }
+        | NftablesOperation::MarkUdpPortTraffic { .. }
+        | NftablesOperation::MarkCgroupUdpPortTraffic { .. }
+        | NftablesOperation::DropUnmarkedTraffic { .. }
         | NftablesOperation::DropOutsideInterface { .. } => false,
     }
 }
@@ -963,7 +1335,15 @@ pub struct NftablesPlan {
 
 impl NftablesPlan {
     pub fn fail_closed(interface_name: &str, protected_cidr: &str) -> Self {
-        Self::from_operations(vec![
+        Self::fail_closed_with_exemptions(interface_name, protected_cidr, &[])
+    }
+
+    pub fn fail_closed_with_exemptions(
+        interface_name: &str,
+        protected_cidr: &str,
+        underlay_exemptions: &[String],
+    ) -> Self {
+        let mut operations = vec![
             NftablesOperation::AddTable {
                 family: NFT_FAMILY.to_string(),
                 table: NFT_TABLE.to_string(),
@@ -986,21 +1366,127 @@ impl NftablesPlan {
                 priority: 0,
                 policy: "accept".to_string(),
             },
-            NftablesOperation::MarkTraffic {
+        ];
+        for cidr in underlay_exemptions {
+            operations.push(NftablesOperation::BypassDestination {
                 family: NFT_FAMILY.to_string(),
                 table: NFT_TABLE.to_string(),
                 chain: NFT_ROUTE_OUTPUT_CHAIN.to_string(),
-                cidr: protected_cidr.to_string(),
-                mark: QLINK_FWMARK,
-            },
-            NftablesOperation::DropOutsideInterface {
+                cidr: cidr.clone(),
+            });
+        }
+        operations.push(NftablesOperation::MarkTraffic {
+            family: NFT_FAMILY.to_string(),
+            table: NFT_TABLE.to_string(),
+            chain: NFT_ROUTE_OUTPUT_CHAIN.to_string(),
+            cidr: protected_cidr.to_string(),
+            mark: QLINK_FWMARK,
+        });
+        for cidr in underlay_exemptions {
+            operations.push(NftablesOperation::BypassDestination {
                 family: NFT_FAMILY.to_string(),
                 table: NFT_TABLE.to_string(),
                 chain: NFT_FILTER_OUTPUT_CHAIN.to_string(),
-                cidr: protected_cidr.to_string(),
-                interface: interface_name.to_string(),
+                cidr: cidr.clone(),
+            });
+        }
+        operations.push(NftablesOperation::DropOutsideInterface {
+            family: NFT_FAMILY.to_string(),
+            table: NFT_TABLE.to_string(),
+            chain: NFT_FILTER_OUTPUT_CHAIN.to_string(),
+            cidr: protected_cidr.to_string(),
+            interface: interface_name.to_string(),
+        });
+        Self::from_operations(operations)
+    }
+
+    pub fn game_only_fail_closed(
+        interface_name: &str,
+        protected_cidr: &str,
+        underlay_exemptions: &[String],
+    ) -> Self {
+        let mut operations = vec![
+            NftablesOperation::AddTable {
+                family: NFT_FAMILY.to_string(),
+                table: NFT_TABLE.to_string(),
             },
-        ])
+            NftablesOperation::AddChain {
+                family: NFT_FAMILY.to_string(),
+                table: NFT_TABLE.to_string(),
+                chain: NFT_ROUTE_OUTPUT_CHAIN.to_string(),
+                chain_type: "route".to_string(),
+                hook: NFT_OUTPUT_HOOK.to_string(),
+                priority: 0,
+                policy: "accept".to_string(),
+            },
+            NftablesOperation::AddChain {
+                family: NFT_FAMILY.to_string(),
+                table: NFT_TABLE.to_string(),
+                chain: NFT_FILTER_OUTPUT_CHAIN.to_string(),
+                chain_type: "filter".to_string(),
+                hook: NFT_OUTPUT_HOOK.to_string(),
+                priority: 0,
+                policy: "accept".to_string(),
+            },
+        ];
+        for cidr in underlay_exemptions {
+            operations.push(NftablesOperation::BypassDestination {
+                family: NFT_FAMILY.to_string(),
+                table: NFT_TABLE.to_string(),
+                chain: NFT_ROUTE_OUTPUT_CHAIN.to_string(),
+                cidr: cidr.clone(),
+            });
+        }
+        for cidr in underlay_exemptions {
+            operations.push(NftablesOperation::BypassDestination {
+                family: NFT_FAMILY.to_string(),
+                table: NFT_TABLE.to_string(),
+                chain: NFT_FILTER_OUTPUT_CHAIN.to_string(),
+                cidr: cidr.clone(),
+            });
+        }
+        operations.push(NftablesOperation::DropUnmarkedTraffic {
+            family: NFT_FAMILY.to_string(),
+            table: NFT_TABLE.to_string(),
+            chain: NFT_FILTER_OUTPUT_CHAIN.to_string(),
+            cidr: protected_cidr.to_string(),
+            mark: QLINK_FWMARK,
+        });
+        operations.push(NftablesOperation::DropOutsideInterface {
+            family: NFT_FAMILY.to_string(),
+            table: NFT_TABLE.to_string(),
+            chain: NFT_FILTER_OUTPUT_CHAIN.to_string(),
+            cidr: protected_cidr.to_string(),
+            interface: interface_name.to_string(),
+        });
+        Self::from_operations(operations)
+    }
+
+    pub fn game_process_mark_operations(
+        protected_cidr: &str,
+        cgroup_path: &str,
+        cgroup_level: u32,
+        udp_ports: &[u16],
+        comment: &str,
+    ) -> Vec<NftablesOperation> {
+        let mut operations = Vec::with_capacity(udp_ports.len() * 2);
+        for port in udp_ports {
+            for direction in [UdpPortDirection::Destination, UdpPortDirection::Source] {
+                operations.push(NftablesOperation::MarkCgroupUdpPortTraffic {
+                    family: NFT_FAMILY.to_string(),
+                    table: NFT_TABLE.to_string(),
+                    chain: NFT_ROUTE_OUTPUT_CHAIN.to_string(),
+                    cidr: protected_cidr.to_string(),
+                    cgroup_path: cgroup_path.to_string(),
+                    cgroup_level,
+                    port: *port,
+                    direction,
+                    mark: QLINK_FWMARK,
+                    comment: comment.to_string(),
+                });
+            }
+        }
+        operations
     }
 
     pub fn from_operations(operations: Vec<NftablesOperation>) -> Self {
@@ -1031,7 +1517,11 @@ impl NftablesPlan {
                     })
                 }
                 NftablesOperation::AddChain { .. }
+                | NftablesOperation::BypassDestination { .. }
                 | NftablesOperation::MarkTraffic { .. }
+                | NftablesOperation::MarkUdpPortTraffic { .. }
+                | NftablesOperation::MarkCgroupUdpPortTraffic { .. }
+                | NftablesOperation::DropUnmarkedTraffic { .. }
                 | NftablesOperation::DropOutsideInterface { .. }
                 | NftablesOperation::DeleteTable { .. } => None,
             })
@@ -1110,6 +1600,64 @@ mod tests {
             .rules
             .iter()
             .any(|rule| rule.contains("ip daddr 100.64.0.0/10")));
+        assert!(plan.game_udp_ports.is_empty());
+        assert!(plan.nftables.rules.iter().any(|rule| {
+            rule == "add rule inet qlink filter_output ip daddr 100.64.0.0/10 meta mark != 0x514c drop"
+        }));
+        assert!(!plan
+            .nftables
+            .rules
+            .iter()
+            .any(|rule| rule.contains("meta mark set")));
+    }
+
+    #[test]
+    fn game_only_plan_arms_ports_but_waits_for_process_classification() {
+        let config = DaemonConfig::default();
+
+        let plan =
+            LinuxRuntimePlan::from_config_with_game_udp_ports(&config, &[34197, 27036, 34197])
+                .expect("selected game ports should plan");
+
+        assert_eq!(plan.game_udp_ports, vec![27036, 34197]);
+        assert!(plan.nftables.rules.iter().any(|rule| {
+            rule == "add rule inet qlink filter_output ip daddr 100.64.0.0/10 meta mark != 0x514c drop"
+        }));
+        assert!(!plan
+            .nftables
+            .rules
+            .iter()
+            .any(|rule| rule.contains("meta mark set")));
+    }
+
+    #[test]
+    fn game_process_rules_bind_cgroup_ports_and_return_parseable_handles() {
+        let operations = NftablesPlan::game_process_mark_operations(
+            "100.64.0.0/10",
+            "user.slice/user-1000.slice/user@1000.service/app.slice/quantumlink-game.slice/quantumlink-game-s123.scope",
+            6,
+            &[34197],
+            "qlink-game-s123",
+        );
+
+        assert_eq!(operations.len(), 2);
+        assert_eq!(
+            operations[0].to_rule(),
+            "add rule inet qlink route_output ip daddr 100.64.0.0/10 socket cgroupv2 level 6 \"user.slice/user-1000.slice/user@1000.service/app.slice/quantumlink-game.slice/quantumlink-game-s123.scope\" udp dport 34197 meta mark set 0x514c comment \"qlink-game-s123\""
+        );
+        assert_eq!(
+            parse_nft_rule_handle("add rule inet qlink route_output # handle 47\n"),
+            Some(47)
+        );
+    }
+
+    #[test]
+    fn game_only_plan_rejects_zero_udp_port() {
+        let error =
+            LinuxRuntimePlan::from_config_with_game_udp_ports(&DaemonConfig::default(), &[0])
+                .unwrap_err();
+
+        assert_eq!(error, NetworkPlanError::InvalidGameUdpPort);
     }
 
     #[test]
@@ -1455,6 +2003,110 @@ mod tests {
             )
         );
         assert_eq!(
+            NftablesOperation::MarkUdpPortTraffic {
+                family: "inet".to_string(),
+                table: "qlink".to_string(),
+                chain: "route_output".to_string(),
+                cidr: "100.64.0.0/10".to_string(),
+                port: 34197,
+                direction: UdpPortDirection::Destination,
+                mark: 0x514c,
+            }
+            .to_system_command(),
+            system_command(
+                NFT_COMMAND,
+                &[
+                    "add",
+                    "rule",
+                    "inet",
+                    "qlink",
+                    "route_output",
+                    "ip",
+                    "daddr",
+                    "100.64.0.0/10",
+                    "udp",
+                    "dport",
+                    "34197",
+                    "meta",
+                    "mark",
+                    "set",
+                    "0x514c",
+                ],
+            )
+        );
+        assert_eq!(
+            NftablesOperation::MarkCgroupUdpPortTraffic {
+                family: "inet".to_string(),
+                table: "qlink".to_string(),
+                chain: "route_output".to_string(),
+                cidr: "100.64.0.0/10".to_string(),
+                cgroup_path:
+                    "user.slice/user-1000.slice/quantumlink-game.slice/quantumlink-game-s123.scope"
+                        .to_string(),
+                cgroup_level: 4,
+                port: 34197,
+                direction: UdpPortDirection::Destination,
+                mark: 0x514c,
+                comment: "qlink-game-s123".to_string(),
+            }
+            .to_system_command(),
+            system_command(
+                NFT_COMMAND,
+                &[
+                    "add",
+                    "rule",
+                    "inet",
+                    "qlink",
+                    "route_output",
+                    "ip",
+                    "daddr",
+                    "100.64.0.0/10",
+                    "socket",
+                    "cgroupv2",
+                    "level",
+                    "4",
+                    "\"user.slice/user-1000.slice/quantumlink-game.slice/quantumlink-game-s123.scope\"",
+                    "udp",
+                    "dport",
+                    "34197",
+                    "meta",
+                    "mark",
+                    "set",
+                    "0x514c",
+                    "comment",
+                    "\"qlink-game-s123\"",
+                ],
+            )
+        );
+        assert_eq!(
+            NftablesOperation::DropUnmarkedTraffic {
+                family: "inet".to_string(),
+                table: "qlink".to_string(),
+                chain: "filter_output".to_string(),
+                cidr: "100.64.0.0/10".to_string(),
+                mark: 0x514c,
+            }
+            .to_system_command(),
+            system_command(
+                NFT_COMMAND,
+                &[
+                    "add",
+                    "rule",
+                    "inet",
+                    "qlink",
+                    "filter_output",
+                    "ip",
+                    "daddr",
+                    "100.64.0.0/10",
+                    "meta",
+                    "mark",
+                    "!=",
+                    "0x514c",
+                    "drop",
+                ],
+            )
+        );
+        assert_eq!(
             NetworkOperation::AddAddress {
                 interface: "qlink0".to_string(),
                 address: "100.64.10.2/32".to_string(),
@@ -1735,6 +2387,29 @@ mod tests {
     }
 
     #[test]
+    fn trusted_command_resolver_prefers_the_steamos_path() {
+        let resolved = resolve_trusted_command_with(NFT_COMMAND, |_| true);
+
+        assert_eq!(resolved, NFT_COMMAND);
+    }
+
+    #[test]
+    fn trusted_command_resolver_accepts_the_standard_sbin_path() {
+        let resolved = resolve_trusted_command_with(NFT_COMMAND, |candidate| {
+            candidate == NFT_COMMAND_FALLBACK
+        });
+
+        assert_eq!(resolved, NFT_COMMAND_FALLBACK);
+    }
+
+    #[test]
+    fn trusted_command_resolver_does_not_search_path_for_other_commands() {
+        let resolved = resolve_trusted_command_with("/opt/quantumlink/tool", |_| false);
+
+        assert_eq!(resolved, "/opt/quantumlink/tool");
+    }
+
+    #[test]
     fn rendered_system_command_preserves_argument_boundaries() {
         let command = SystemCommand::new("/bin/echo", ["two words", "semi;colon"]);
 
@@ -1742,6 +2417,11 @@ mod tests {
             command.rendered(),
             r#""/bin/echo" ["two words", "semi;colon"]"#
         );
+    }
+
+    #[test]
+    fn nft_string_literals_escape_parser_control_characters() {
+        assert_eq!(nft_string_literal("a\\b\"c"), "\"a\\\\b\\\"c\"");
     }
 
     #[test]
@@ -2333,7 +3013,7 @@ mod tests {
                 "nftables:add table inet qlink",
                 "nftables:add chain inet qlink route_output { type route hook output priority 0; policy accept; }",
                 "nftables:add chain inet qlink filter_output { type filter hook output priority 0; policy accept; }",
-                "nftables:add rule inet qlink route_output ip daddr 100.64.0.0/10 meta mark set 0x514c",
+                "nftables:add rule inet qlink filter_output ip daddr 100.64.0.0/10 meta mark != 0x514c drop",
                 "nftables:add rule inet qlink filter_output ip daddr 100.64.0.0/10 oifname != \"qlink0\" drop",
             ]
         );

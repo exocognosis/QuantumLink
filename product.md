@@ -407,6 +407,9 @@ The runtime architecture is intentionally split:
   records, routing, app-layer PQC frame protection, replay protection, native
   UDP carrier work, optional dev QUIC carrier support, rendezvous, relay,
   ICE/STUN helpers, metrics, tracing, and FFI.
+- `qlinkd`, `qlinkctl`, and `qlink-desktop`: SteamOS daemon, typed control CLI,
+  and Desktop or Game Mode application. The daemon owns network and profile
+  state. The application accesses that state only through `qlinkctl`.
 
 Control-plane services help peers find and reach each other. They are not the
 steady-state trust center for packet confidentiality. Relay fallback can see
@@ -495,6 +498,35 @@ browser traffic should bypass QuantumLink by default.
 The gamer edition should focus on trusted-peer game traffic, latency-sensitive
 mode, streamer/privacy controls, and clear disclosure about what traffic is and
 is not protected.
+
+The SteamOS network policy must also:
+
+- Pin each active game flow to one path and avoid per-packet path splitting.
+- Prefer direct paths, but use measured RTT, jitter, loss, NAT cost, and relay
+  cost when it selects or changes a path.
+- Use path-change hysteresis so small metric changes do not interrupt a game.
+- Avoid IP fragmentation and re-probe the datagram MTU after path changes.
+- Preserve protected-flow fail closure without blocking Steam-safe bypass
+  traffic.
+- Recover after suspend, resume, Wi-Fi roaming, dock changes, and NAT rebinding.
+- Avoid code injection into Steam, Proton, anti-cheat, or game processes.
+- Use the shared Dytallix identity framework and `stableIdentityV2` semantics.
+
+The detailed SteamOS contract is in
+`steam/steamos/docs/gaming-vpn-product-requirements.md`.
+
+The SteamOS application must use `qlinkctl` as its control boundary. It must
+not read the daemon socket, device seed, peer store, wallet, Dytallix keystore,
+or daemon state files directly. It provides connection, peer, profile,
+identity, diagnostic, and support-bundle controls in Desktop Mode and Game
+Mode.
+
+In SteamOS game-only mode, the selected profile must define the UDP ports that
+the owned nftables route chain can mark inside the overlay CIDR. The route rule
+must also match the exact cgroup v2 scope created for the selected executable.
+The filter chain must drop unmarked overlay traffic. A profile change must use
+owned systemd teardown and restart. Game launch must use an external systemd
+scope and must not inject code into Steam, Proton, or the game process.
 
 ## Diagnostics and support
 

@@ -319,7 +319,7 @@ embed_production_evidence() {
 
 FAKE_BIN="$TMP_ROOT/bin"
 mkdir -p "$FAKE_BIN"
-for bin in qlinkd qlinkctl; do
+for bin in qlinkd qlinkctl qlink-desktop; do
     cat > "$FAKE_BIN/$bin" <<'SH'
 #!/usr/bin/env bash
 echo "fake quantumlink binary"

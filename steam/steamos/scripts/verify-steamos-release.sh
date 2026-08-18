@@ -175,9 +175,15 @@ fi
 required_files="
 bin/qlinkd
 bin/qlinkctl
+bin/qlink-desktop
 scripts/install-steamos.sh
+packaging/desktop/quantumlink-steamos.desktop
+packaging/desktop/quantumlink-steamos-game-mode.desktop
+packaging/desktop/icons/quantumlink-steamos.png
+packaging/libexec/quantumlink-service-control
+packaging/polkit/49-quantumlink-service-control.rules
 packaging/systemd/qlinkd.service
-packaging/systemd/qlinkd.service.d/activate-network.conf.sample
+packaging/systemd/qlinkd.service.d/planning-only.conf.sample
 config/config.example.json
 config/steam-bypass.toml
 config/games/factorio.toml
@@ -192,7 +198,8 @@ if [ -d "$PAYLOAD_ROOT" ]; then
             add_failure "missing package file: $rel"
         fi
     done
-    for rel in bin/qlinkd bin/qlinkctl scripts/install-steamos.sh; do
+    for rel in bin/qlinkd bin/qlinkctl bin/qlink-desktop scripts/install-steamos.sh \
+        packaging/libexec/quantumlink-service-control; do
         if [ ! -x "$PAYLOAD_ROOT/$rel" ]; then
             add_failure "package file is not executable: $rel"
         fi

@@ -36,7 +36,7 @@ fn local_control_acl_is_declared_in_systemd_unit() {
 }
 
 #[test]
-fn local_control_acl_group_members_can_only_read_status_diagnostics() {
+fn local_control_acl_group_members_can_read_status_and_select_profiles() {
     assert_eq!(
         local_control_command_policy("status"),
         ControlPolicy::QuantumlinkGroup
@@ -47,6 +47,24 @@ fn local_control_acl_group_members_can_only_read_status_diagnostics() {
     );
     assert_eq!(
         local_control_command_policy("doctor"),
+        ControlPolicy::QuantumlinkGroup
+    );
+    assert_eq!(
+        local_control_command_policy(r#"{"type":"selectGameProfile","profileId":"factorio"}"#),
+        ControlPolicy::QuantumlinkGroup
+    );
+    assert_eq!(
+        local_control_command_policy(r#"{"type":"clearGameProfile"}"#),
+        ControlPolicy::QuantumlinkGroup
+    );
+    assert_eq!(
+        local_control_command_policy(
+            r#"{"type":"beginGameProcess","profileId":"factorio","executable":"factorio","sessionId":"s123"}"#
+        ),
+        ControlPolicy::QuantumlinkGroup
+    );
+    assert_eq!(
+        local_control_command_policy(r#"{"type":"endGameProcess","sessionId":"s123"}"#),
         ControlPolicy::QuantumlinkGroup
     );
 
@@ -61,5 +79,9 @@ fn local_control_acl_group_members_can_only_read_status_diagnostics() {
     assert_eq!(
         local_control_command_policy("revoke-peer peer_1"),
         ControlPolicy::ElevatedOnly
+    );
+    assert_eq!(
+        local_control_command_policy(r#"{"type":"selectGameProfile","profileId":"../../unsafe"}"#),
+        ControlPolicy::QuantumlinkGroup
     );
 }

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=QuantumLink Game Mode
+GenericName=Gaming Mesh VPN
+Comment=Control QuantumLink with Steam Input
+Exec=/usr/local/bin/qlink-desktop --game-mode
+Icon=quantumlink-steamos
+Terminal=false
+Categories=Game;Network;
+StartupNotify=true
+StartupWMClass=qlink-desktop

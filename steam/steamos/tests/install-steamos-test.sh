@@ -65,7 +65,11 @@ cat > "$PREFIX/bin/qlinkctl" <<'EOF'
 #!/usr/bin/env sh
 echo fake qlinkctl "$@"
 EOF
-chmod 0755 "$PREFIX/bin/qlinkd" "$PREFIX/bin/qlinkctl"
+cat > "$PREFIX/bin/qlink-desktop" <<'EOF'
+#!/usr/bin/env sh
+echo fake qlink-desktop "$@"
+EOF
+chmod 0755 "$PREFIX/bin/qlinkd" "$PREFIX/bin/qlinkctl" "$PREFIX/bin/qlink-desktop"
 
 cat > "$FAKEBIN/id" <<'EOF'
 #!/usr/bin/env sh
@@ -106,6 +110,8 @@ BINDIR="/opt/quantumlink/bin"
 SYSD_UNIT_DIR="/usr/lib/systemd/system"
 CONFIG_DIR="/etc/quantumlink"
 STATE_DIR="/var/lib/quantumlink"
+APPLICATIONS_DIR="/usr/share/applications"
+ICON_DIR="/usr/share/icons/hicolor/256x256/apps"
 
 PATH="$FAKEBIN:$PATH" \
 PREFIX="$PREFIX" \
@@ -114,17 +120,28 @@ BINDIR="$BINDIR" \
 SYSD_UNIT_DIR="$SYSD_UNIT_DIR" \
 CONFIG_DIR="$CONFIG_DIR" \
 STATE_DIR="$STATE_DIR" \
+APPLICATIONS_DIR="$APPLICATIONS_DIR" \
+ICON_DIR="$ICON_DIR" \
 bash "$INSTALLER" >"$TMP_ROOT/install.out"
 
 UNIT="$DESTDIR$SYSD_UNIT_DIR/qlinkd.service"
-SAMPLE="$DESTDIR$SYSD_UNIT_DIR/qlinkd.service.d/activate-network.conf.sample"
-LIVE_DROPIN="$DESTDIR$SYSD_UNIT_DIR/qlinkd.service.d/10-activate-network.conf"
+SAMPLE="$DESTDIR$SYSD_UNIT_DIR/qlinkd.service.d/planning-only.conf.sample"
+LIVE_DROPIN="$DESTDIR$SYSD_UNIT_DIR/qlinkd.service.d/10-planning-only.conf"
 
 assert_executable "$DESTDIR$BINDIR/qlinkd"
 assert_executable "$DESTDIR$BINDIR/qlinkctl"
+assert_executable "$DESTDIR$BINDIR/qlink-desktop"
+assert_file "$DESTDIR$APPLICATIONS_DIR/quantumlink-steamos.desktop"
+assert_file "$DESTDIR$APPLICATIONS_DIR/quantumlink-steamos-game-mode.desktop"
+assert_file "$DESTDIR$ICON_DIR/quantumlink-steamos.png"
+assert_executable "$DESTDIR/usr/local/libexec/quantumlink-service-control"
+assert_file "$DESTDIR/etc/polkit-1/rules.d/49-quantumlink-service-control.rules"
+assert_contains "$DESTDIR$APPLICATIONS_DIR/quantumlink-steamos.desktop" "Exec=$BINDIR/qlink-desktop"
+assert_contains "$DESTDIR$APPLICATIONS_DIR/quantumlink-steamos-game-mode.desktop" "Exec=$BINDIR/qlink-desktop --game-mode"
+assert_contains "$DESTDIR$APPLICATIONS_DIR/quantumlink-steamos.desktop" "Icon=quantumlink-steamos"
 assert_file "$UNIT"
 assert_file "$SAMPLE"
-[ ! -e "$LIVE_DROPIN" ] || fail "default install must not enable activated networking drop-in"
+[ ! -e "$LIVE_DROPIN" ] || fail "default install must not enable planning-only drop-in"
 assert_dir "$DESTDIR$CONFIG_DIR"
 assert_dir "$DESTDIR$CONFIG_DIR/secrets"
 assert_dir "$DESTDIR$STATE_DIR"
@@ -132,25 +149,40 @@ assert_file "$DESTDIR$CONFIG_DIR/steam-bypass.toml"
 assert_dir "$DESTDIR$CONFIG_DIR/games"
 assert_file "$DESTDIR$CONFIG_DIR/games/factorio.toml"
 assert_contains "$DESTDIR$CONFIG_DIR/steam-bypass.toml" "bypass_categories"
+assert_contains "$DESTDIR/usr/local/libexec/quantumlink-service-control" \
+    'exec /usr/bin/systemctl "$1" qlinkd.service'
+assert_contains "$DESTDIR/etc/polkit-1/rules.d/49-quantumlink-service-control.rules" \
+    'polkit.Result.AUTH_ADMIN_KEEP'
 
-assert_contains "$UNIT" "ExecStart=$BINDIR/qlinkd"
-assert_not_contains "$UNIT" "ExecStart=$BINDIR/qlinkd --activate-network"
+assert_contains "$UNIT" "ExecStart=$BINDIR/qlinkd --activate-network"
 assert_contains "$UNIT" "ExecStop=$BINDIR/qlinkd --deactivate-network"
 assert_contains "$UNIT" "ExecStopPost=$BINDIR/qlinkd --deactivate-network"
 assert_contains "$UNIT" "RuntimeDirectoryMode=0750"
 assert_contains "$UNIT" "StateDirectoryMode=0750"
 assert_contains "$UNIT" "ConfigurationDirectoryMode=0750"
 assert_contains "$SAMPLE" "ExecStart="
-assert_contains "$SAMPLE" "ExecStart=$BINDIR/qlinkd --activate-network"
+assert_contains "$SAMPLE" "ExecStart=$BINDIR/qlinkd"
 
 BROKEN_ROOT="$TMP_ROOT/broken-steamos"
 BROKEN_DESTDIR="$TMP_ROOT/broken-destdir"
-mkdir -p "$BROKEN_ROOT/scripts" "$BROKEN_ROOT/packaging/systemd/qlinkd.service.d"
+mkdir -p "$BROKEN_ROOT/scripts" "$BROKEN_ROOT/packaging/systemd/qlinkd.service.d" \
+    "$BROKEN_ROOT/packaging/desktop/icons" "$BROKEN_ROOT/packaging/libexec" \
+    "$BROKEN_ROOT/packaging/polkit"
 cp "$INSTALLER" "$BROKEN_ROOT/scripts/install-steamos.sh"
 cp "$STEAMOS_ROOT/packaging/systemd/qlinkd.service" "$BROKEN_ROOT/packaging/systemd/qlinkd.service"
-cp "$STEAMOS_ROOT/packaging/systemd/qlinkd.service.d/activate-network.conf.sample" \
-    "$BROKEN_ROOT/packaging/systemd/qlinkd.service.d/activate-network.conf.sample"
-sed -i.bak "s#ExecStart=/usr/local/bin/qlinkd#ExecStart=/usr/local/bin/qlinkd --activate-network#" \
+cp "$STEAMOS_ROOT/packaging/systemd/qlinkd.service.d/planning-only.conf.sample" \
+    "$BROKEN_ROOT/packaging/systemd/qlinkd.service.d/planning-only.conf.sample"
+cp "$STEAMOS_ROOT/packaging/desktop/quantumlink-steamos.desktop" \
+    "$BROKEN_ROOT/packaging/desktop/quantumlink-steamos.desktop"
+cp "$STEAMOS_ROOT/packaging/desktop/quantumlink-steamos-game-mode.desktop" \
+    "$BROKEN_ROOT/packaging/desktop/quantumlink-steamos-game-mode.desktop"
+cp "$STEAMOS_ROOT/packaging/desktop/icons/quantumlink-steamos.png" \
+    "$BROKEN_ROOT/packaging/desktop/icons/quantumlink-steamos.png"
+cp "$STEAMOS_ROOT/packaging/libexec/quantumlink-service-control" \
+    "$BROKEN_ROOT/packaging/libexec/quantumlink-service-control"
+cp "$STEAMOS_ROOT/packaging/polkit/49-quantumlink-service-control.rules" \
+    "$BROKEN_ROOT/packaging/polkit/49-quantumlink-service-control.rules"
+sed -i.bak "s#ExecStart=/usr/local/bin/qlinkd --activate-network#ExecStart=/usr/local/bin/qlinkd#" \
     "$BROKEN_ROOT/packaging/systemd/qlinkd.service"
 if PATH="$FAKEBIN:$PATH" \
     PREFIX="$PREFIX" \
@@ -160,7 +192,7 @@ if PATH="$FAKEBIN:$PATH" \
     CONFIG_DIR="$CONFIG_DIR" \
     STATE_DIR="$STATE_DIR" \
     bash "$BROKEN_ROOT/scripts/install-steamos.sh" >"$TMP_ROOT/broken.out" 2>"$TMP_ROOT/broken.err"; then
-    fail "expected activated base ExecStart to fail installer validation"
+    fail "expected planning-only base ExecStart to fail installer validation"
 fi
 assert_contains "$TMP_ROOT/broken.err" "validation failed"
 
