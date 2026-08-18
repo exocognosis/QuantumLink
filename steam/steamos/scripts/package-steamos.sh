@@ -92,10 +92,10 @@ VERIFY_REPORT="$SIDECAR_DIR/verify-report.json"
 PRODUCTION_EVIDENCE_MANIFEST="$SIDECAR_DIR/production-evidence-manifest.json"
 
 if [ "$SKIP_BUILD" != "1" ]; then
-    cargo build --release -p qlinkd -p qlinkctl
+    cargo build --release -p qlinkd -p qlinkctl -p qlink-desktop
 fi
 
-for bin in qlinkd qlinkctl; do
+for bin in qlinkd qlinkctl qlink-desktop; do
     if [ ! -x "$BIN_DIR/$bin" ]; then
         echo "missing executable binary: $BIN_DIR/$bin" >&2
         exit 1
@@ -107,10 +107,25 @@ install -d -m 0755 "$SIDECAR_DIR" "$PAYLOAD_ROOT"
 
 install_payload_file "$BIN_DIR/qlinkd" "$PAYLOAD_ROOT/bin/qlinkd" 0755
 install_payload_file "$BIN_DIR/qlinkctl" "$PAYLOAD_ROOT/bin/qlinkctl" 0755
+install_payload_file "$BIN_DIR/qlink-desktop" "$PAYLOAD_ROOT/bin/qlink-desktop" 0755
 install_payload_file "$STEAMOS_ROOT/scripts/install-steamos.sh" "$PAYLOAD_ROOT/scripts/install-steamos.sh" 0755
+install_payload_file "$STEAMOS_ROOT/tests/deck-runtime-qualification.sh" \
+    "$PAYLOAD_ROOT/scripts/deck-runtime-qualification.sh" 0755
+install_payload_file "$STEAMOS_ROOT/tests/verify-deck-runtime-evidence.sh" \
+    "$PAYLOAD_ROOT/scripts/verify-deck-runtime-evidence.sh" 0755
 install_payload_file "$STEAMOS_ROOT/packaging/systemd/qlinkd.service" "$PAYLOAD_ROOT/packaging/systemd/qlinkd.service" 0644
-install_payload_file "$STEAMOS_ROOT/packaging/systemd/qlinkd.service.d/activate-network.conf.sample" \
-    "$PAYLOAD_ROOT/packaging/systemd/qlinkd.service.d/activate-network.conf.sample" 0644
+install_payload_file "$STEAMOS_ROOT/packaging/systemd/qlinkd.service.d/planning-only.conf.sample" \
+    "$PAYLOAD_ROOT/packaging/systemd/qlinkd.service.d/planning-only.conf.sample" 0644
+install_payload_file "$STEAMOS_ROOT/packaging/desktop/quantumlink-steamos.desktop" \
+    "$PAYLOAD_ROOT/packaging/desktop/quantumlink-steamos.desktop" 0644
+install_payload_file "$STEAMOS_ROOT/packaging/desktop/quantumlink-steamos-game-mode.desktop" \
+    "$PAYLOAD_ROOT/packaging/desktop/quantumlink-steamos-game-mode.desktop" 0644
+install_payload_file "$STEAMOS_ROOT/packaging/desktop/icons/quantumlink-steamos.png" \
+    "$PAYLOAD_ROOT/packaging/desktop/icons/quantumlink-steamos.png" 0644
+install_payload_file "$STEAMOS_ROOT/packaging/libexec/quantumlink-service-control" \
+    "$PAYLOAD_ROOT/packaging/libexec/quantumlink-service-control" 0755
+install_payload_file "$STEAMOS_ROOT/packaging/polkit/49-quantumlink-service-control.rules" \
+    "$PAYLOAD_ROOT/packaging/polkit/49-quantumlink-service-control.rules" 0644
 
 install -d -m 0755 "$PAYLOAD_ROOT/config/games" "$PAYLOAD_ROOT/docs"
 install_payload_file "$STEAMOS_ROOT/config/steam-bypass.toml" "$PAYLOAD_ROOT/config/steam-bypass.toml" 0644
@@ -124,6 +139,7 @@ cat > "$PAYLOAD_ROOT/config/config.example.json" <<'JSON'
   "overlayCidr": "100.64.0.0/10",
   "overlayIpv4Address": "100.64.10.2",
   "routeMode": "gameOnly",
+  "underlayExemptions": [],
   "activePeerId": null,
   "rendezvousServers": [
     "tls://rendezvous.example.quantumlink.invalid:9471"
@@ -151,7 +167,7 @@ cat > "$PAYLOAD_ROOT/config/config.example.json" <<'JSON'
 }
 JSON
 
-for doc in README.md docs/deck-validation.md docs/production-evidence.md docs/production-readiness.md docs/rendezvous-relay-production.md docs/release-runbook.md; do
+for doc in README.md docs/deck-validation.md docs/gaming-vpn-product-requirements.md docs/production-evidence.md docs/production-readiness.md docs/rendezvous-relay-production.md docs/release-runbook.md; do
     if [ -f "$STEAMOS_ROOT/$doc" ]; then
         install_payload_file "$STEAMOS_ROOT/$doc" "$PAYLOAD_ROOT/$doc" 0644
     fi

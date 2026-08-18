@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=QuantumLink
+GenericName=Gaming Mesh VPN
+Comment=Control QuantumLink on SteamOS
+Exec=/usr/local/bin/qlink-desktop
+Icon=quantumlink-steamos
+Terminal=false
+Categories=Network;Utility;
+StartupNotify=true
+StartupWMClass=qlink-desktop

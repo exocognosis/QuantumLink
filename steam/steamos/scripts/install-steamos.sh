@@ -11,18 +11,30 @@ SYSD_UNIT_DIR="${SYSD_UNIT_DIR:-/etc/systemd/system}"
 CONFIG_DIR="${CONFIG_DIR:-/etc/quantumlink}"
 SECRETS_DIR="$CONFIG_DIR/secrets"
 STATE_DIR="${STATE_DIR:-/var/lib/quantumlink}"
+APPLICATIONS_DIR="${APPLICATIONS_DIR:-/usr/share/applications}"
+ICON_DIR="${ICON_DIR:-/usr/share/icons/hicolor/256x256/apps}"
+LIBEXEC_DIR="/usr/local/libexec"
+POLKIT_RULES_DIR="/etc/polkit-1/rules.d"
 UNIT_NAME="qlinkd.service"
-ACTIVATED_SAMPLE_NAME="activate-network.conf.sample"
+PLANNING_SAMPLE_NAME="planning-only.conf.sample"
 CONTROL_GROUP_NAME="quantumlink"
 UNIT_TMP=""
-ACTIVATED_SAMPLE_TMP=""
+PLANNING_SAMPLE_TMP=""
+DESKTOP_ENTRY_TMP=""
+GAME_MODE_ENTRY_TMP=""
 
 cleanup() {
     if [ -n "$UNIT_TMP" ]; then
         rm -f "$UNIT_TMP"
     fi
-    if [ -n "$ACTIVATED_SAMPLE_TMP" ]; then
-        rm -f "$ACTIVATED_SAMPLE_TMP"
+    if [ -n "$PLANNING_SAMPLE_TMP" ]; then
+        rm -f "$PLANNING_SAMPLE_TMP"
+    fi
+    if [ -n "$DESKTOP_ENTRY_TMP" ]; then
+        rm -f "$DESKTOP_ENTRY_TMP"
+    fi
+    if [ -n "$GAME_MODE_ENTRY_TMP" ]; then
+        rm -f "$GAME_MODE_ENTRY_TMP"
     fi
 }
 trap cleanup EXIT
@@ -48,6 +60,10 @@ validate_paths() {
     validate_install_path SYSD_UNIT_DIR "$SYSD_UNIT_DIR"
     validate_install_path CONFIG_DIR "$CONFIG_DIR"
     validate_install_path STATE_DIR "$STATE_DIR"
+    validate_install_path APPLICATIONS_DIR "$APPLICATIONS_DIR"
+    validate_install_path ICON_DIR "$ICON_DIR"
+    validate_install_path LIBEXEC_DIR "$LIBEXEC_DIR"
+    validate_install_path POLKIT_RULES_DIR "$POLKIT_RULES_DIR"
 
     if [ -n "$DESTDIR" ]; then
         reject_symlink_components "BINDIR target" "$DESTDIR$BINDIR"
@@ -55,6 +71,10 @@ validate_paths() {
         reject_symlink_components "CONFIG_DIR target" "$DESTDIR$CONFIG_DIR"
         reject_symlink_components "SECRETS_DIR target" "$DESTDIR$SECRETS_DIR"
         reject_symlink_components "STATE_DIR target" "$DESTDIR$STATE_DIR"
+        reject_symlink_components "APPLICATIONS_DIR target" "$DESTDIR$APPLICATIONS_DIR"
+        reject_symlink_components "ICON_DIR target" "$DESTDIR$ICON_DIR"
+        reject_symlink_components "LIBEXEC_DIR target" "$DESTDIR$LIBEXEC_DIR"
+        reject_symlink_components "POLKIT_RULES_DIR target" "$DESTDIR$POLKIT_RULES_DIR"
         guarded_mkdir DESTDIR "$DESTDIR" 0755
     fi
 }
@@ -183,6 +203,13 @@ rewrite_unit_paths() {
     sed "s#/usr/local/bin/qlinkd#$BINDIR/qlinkd#g" "$src" > "$dst"
 }
 
+rewrite_desktop_paths() {
+    src="$1"
+    dst="$2"
+
+    sed "s#/usr/local/bin/qlink-desktop#$BINDIR/qlink-desktop#g" "$src" > "$dst"
+}
+
 validate_contains() {
     file="$1"
     expected="$2"
@@ -205,7 +232,7 @@ validate_exact_line() {
 
 validate_installation() {
     installed_unit="$DESTDIR$SYSD_UNIT_DIR/$UNIT_NAME"
-    installed_sample="$DESTDIR$SYSD_UNIT_DIR/$UNIT_NAME.d/$ACTIVATED_SAMPLE_NAME"
+    installed_sample="$DESTDIR$SYSD_UNIT_DIR/$UNIT_NAME.d/$PLANNING_SAMPLE_NAME"
 
     if [ ! -x "$DESTDIR$BINDIR/qlinkd" ]; then
         echo "validation failed: installed qlinkd is missing or not executable: $DESTDIR$BINDIR/qlinkd" >&2
@@ -215,21 +242,50 @@ validate_installation() {
         echo "validation failed: installed qlinkctl is missing or not executable: $DESTDIR$BINDIR/qlinkctl" >&2
         exit 1
     fi
+    if [ ! -x "$DESTDIR$BINDIR/qlink-desktop" ]; then
+        echo "validation failed: installed qlink-desktop is missing or not executable: $DESTDIR$BINDIR/qlink-desktop" >&2
+        exit 1
+    fi
+    installed_desktop="$DESTDIR$APPLICATIONS_DIR/quantumlink-steamos.desktop"
+    installed_game_mode="$DESTDIR$APPLICATIONS_DIR/quantumlink-steamos-game-mode.desktop"
+    installed_icon="$DESTDIR$ICON_DIR/quantumlink-steamos.png"
+    installed_helper="$DESTDIR$LIBEXEC_DIR/quantumlink-service-control"
+    installed_polkit_rule="$DESTDIR$POLKIT_RULES_DIR/49-quantumlink-service-control.rules"
+    if [ ! -f "$installed_desktop" ] || [ ! -f "$installed_game_mode" ] || [ ! -f "$installed_icon" ]; then
+        echo "validation failed: SteamOS desktop launcher assets are missing" >&2
+        exit 1
+    fi
+    validate_exact_line "$installed_desktop" "Exec=$BINDIR/qlink-desktop"
+    validate_exact_line "$installed_game_mode" "Exec=$BINDIR/qlink-desktop --game-mode"
+    validate_exact_line "$installed_desktop" "Icon=quantumlink-steamos"
+    if [ ! -x "$installed_helper" ]; then
+        echo "validation failed: service helper is missing or not executable: $installed_helper" >&2
+        exit 1
+    fi
+    if [ ! -f "$installed_polkit_rule" ]; then
+        echo "validation failed: PolicyKit rule is missing: $installed_polkit_rule" >&2
+        exit 1
+    fi
+    validate_contains "$installed_helper" "exec /usr/bin/systemctl \"\$1\" qlinkd.service"
+    validate_contains "$installed_polkit_rule" \
+        'action.lookup("program") !== "/usr/local/libexec/quantumlink-service-control"'
+    validate_contains "$installed_polkit_rule" 'subject.isInGroup("quantumlink")'
+    validate_contains "$installed_polkit_rule" 'polkit.Result.AUTH_ADMIN_KEEP'
     if [ ! -f "$installed_unit" ]; then
         echo "validation failed: systemd unit is missing: $installed_unit" >&2
         exit 1
     fi
-    validate_exact_line "$installed_unit" "ExecStart=$BINDIR/qlinkd"
+    validate_exact_line "$installed_unit" "ExecStart=$BINDIR/qlinkd --activate-network"
     validate_exact_line "$installed_unit" "ExecStop=$BINDIR/qlinkd --deactivate-network"
     validate_exact_line "$installed_unit" "ExecStopPost=$BINDIR/qlinkd --deactivate-network"
     validate_exact_line "$installed_unit" "Group=$CONTROL_GROUP_NAME"
     validate_exact_line "$installed_unit" "UMask=0007"
     if [ ! -f "$installed_sample" ]; then
-        echo "validation failed: activated-mode sample is missing: $installed_sample" >&2
+        echo "validation failed: planning-only sample is missing: $installed_sample" >&2
         exit 1
     fi
     validate_exact_line "$installed_sample" "ExecStart="
-    validate_exact_line "$installed_sample" "ExecStart=$BINDIR/qlinkd --activate-network"
+    validate_exact_line "$installed_sample" "ExecStart=$BINDIR/qlinkd"
 }
 
 ensure_live_control_group() {
@@ -249,32 +305,87 @@ ensure_live_control_group() {
     groupadd --system "$CONTROL_GROUP_NAME"
 }
 
+ensure_live_desktop_user() {
+    if [ -n "$DESTDIR" ]; then
+        return
+    fi
+
+    desktop_user="${QLINK_DESKTOP_USER:-${SUDO_USER:-}}"
+    if [ -z "$desktop_user" ] || [ "$desktop_user" = "root" ]; then
+        return
+    fi
+    if ! getent passwd "$desktop_user" >/dev/null 2>&1; then
+        echo "QLINK_DESKTOP_USER does not identify a local user: $desktop_user" >&2
+        exit 1
+    fi
+    if id -nG "$desktop_user" | tr ' ' '\n' | grep -Fx "$CONTROL_GROUP_NAME" >/dev/null; then
+        return
+    fi
+    if ! command -v usermod >/dev/null 2>&1; then
+        echo "missing usermod; add '$desktop_user' to '$CONTROL_GROUP_NAME' before launch" >&2
+        exit 1
+    fi
+
+    usermod -a -G "$CONTROL_GROUP_NAME" "$desktop_user"
+}
+
 validate_paths
 
 QLINKD_SRC="$(find_binary qlinkd)"
 QLINKCTL_SRC="$(find_binary qlinkctl)"
+QLINK_DESKTOP_SRC="$(find_binary qlink-desktop)"
 UNIT_SRC="$STEAMOS_ROOT/packaging/systemd/$UNIT_NAME"
-ACTIVATED_SAMPLE_SRC="$STEAMOS_ROOT/packaging/systemd/$UNIT_NAME.d/$ACTIVATED_SAMPLE_NAME"
+PLANNING_SAMPLE_SRC="$STEAMOS_ROOT/packaging/systemd/$UNIT_NAME.d/$PLANNING_SAMPLE_NAME"
+DESKTOP_ENTRY_SRC="$STEAMOS_ROOT/packaging/desktop/quantumlink-steamos.desktop"
+GAME_MODE_ENTRY_SRC="$STEAMOS_ROOT/packaging/desktop/quantumlink-steamos-game-mode.desktop"
+DESKTOP_ICON_SRC="$STEAMOS_ROOT/packaging/desktop/icons/quantumlink-steamos.png"
+SERVICE_HELPER_SRC="$STEAMOS_ROOT/packaging/libexec/quantumlink-service-control"
+POLKIT_RULE_SRC="$STEAMOS_ROOT/packaging/polkit/49-quantumlink-service-control.rules"
 
 if [ ! -f "$UNIT_SRC" ]; then
     echo "missing systemd unit: $UNIT_SRC" >&2
     exit 1
 fi
-if [ ! -f "$ACTIVATED_SAMPLE_SRC" ]; then
-    echo "missing activated-mode sample: $ACTIVATED_SAMPLE_SRC" >&2
+if [ ! -f "$PLANNING_SAMPLE_SRC" ]; then
+    echo "missing planning-only sample: $PLANNING_SAMPLE_SRC" >&2
+    exit 1
+fi
+if [ ! -f "$DESKTOP_ENTRY_SRC" ] || [ ! -f "$GAME_MODE_ENTRY_SRC" ] || [ ! -f "$DESKTOP_ICON_SRC" ]; then
+    echo "missing SteamOS desktop launcher assets" >&2
+    exit 1
+fi
+if [ ! -f "$SERVICE_HELPER_SRC" ] || [ ! -f "$POLKIT_RULE_SRC" ]; then
+    echo "missing SteamOS service authorization assets" >&2
     exit 1
 fi
 
 echo "Installing QuantumLink SteamOS assets"
 echo "  qlinkd:   $QLINKD_SRC"
 echo "  qlinkctl: $QLINKCTL_SRC"
+echo "  desktop:  $QLINK_DESKTOP_SRC"
 echo "  bindir:   $DESTDIR$BINDIR"
 
 ensure_live_control_group
+ensure_live_desktop_user
 
 guarded_mkdir "BINDIR target" "$DESTDIR$BINDIR" 0755
 guarded_install_file "BINDIR target" "$QLINKD_SRC" "$DESTDIR$BINDIR/qlinkd" 0755
 guarded_install_file "BINDIR target" "$QLINKCTL_SRC" "$DESTDIR$BINDIR/qlinkctl" 0755
+guarded_install_file "BINDIR target" "$QLINK_DESKTOP_SRC" "$DESTDIR$BINDIR/qlink-desktop" 0755
+DESKTOP_ENTRY_TMP="$(mktemp)"
+rewrite_desktop_paths "$DESKTOP_ENTRY_SRC" "$DESKTOP_ENTRY_TMP"
+guarded_install_file "APPLICATIONS_DIR target" "$DESKTOP_ENTRY_TMP" \
+    "$DESTDIR$APPLICATIONS_DIR/quantumlink-steamos.desktop" 0644
+GAME_MODE_ENTRY_TMP="$(mktemp)"
+rewrite_desktop_paths "$GAME_MODE_ENTRY_SRC" "$GAME_MODE_ENTRY_TMP"
+guarded_install_file "APPLICATIONS_DIR target" "$GAME_MODE_ENTRY_TMP" \
+    "$DESTDIR$APPLICATIONS_DIR/quantumlink-steamos-game-mode.desktop" 0644
+guarded_install_file "ICON_DIR target" "$DESKTOP_ICON_SRC" \
+    "$DESTDIR$ICON_DIR/quantumlink-steamos.png" 0644
+guarded_install_file "LIBEXEC_DIR target" "$SERVICE_HELPER_SRC" \
+    "$DESTDIR$LIBEXEC_DIR/quantumlink-service-control" 0755
+guarded_install_file "POLKIT_RULES_DIR target" "$POLKIT_RULE_SRC" \
+    "$DESTDIR$POLKIT_RULES_DIR/49-quantumlink-service-control.rules" 0644
 
 guarded_mkdir "CONFIG_DIR target" "$DESTDIR$CONFIG_DIR" 0750
 guarded_mkdir "SECRETS_DIR target" "$DESTDIR$SECRETS_DIR" 0700
@@ -299,9 +410,9 @@ fi
 UNIT_TMP="$(mktemp)"
 rewrite_unit_paths "$UNIT_SRC" "$UNIT_TMP"
 guarded_install_file "SYSD_UNIT_DIR target" "$UNIT_TMP" "$DESTDIR$SYSD_UNIT_DIR/$UNIT_NAME" 0644
-ACTIVATED_SAMPLE_TMP="$(mktemp)"
-rewrite_unit_paths "$ACTIVATED_SAMPLE_SRC" "$ACTIVATED_SAMPLE_TMP"
-guarded_install_file "SYSD_UNIT_DIR target" "$ACTIVATED_SAMPLE_TMP" "$DESTDIR$SYSD_UNIT_DIR/$UNIT_NAME.d/$ACTIVATED_SAMPLE_NAME" 0644
+PLANNING_SAMPLE_TMP="$(mktemp)"
+rewrite_unit_paths "$PLANNING_SAMPLE_SRC" "$PLANNING_SAMPLE_TMP"
+guarded_install_file "SYSD_UNIT_DIR target" "$PLANNING_SAMPLE_TMP" "$DESTDIR$SYSD_UNIT_DIR/$UNIT_NAME.d/$PLANNING_SAMPLE_NAME" 0644
 
 validate_installation
 
@@ -315,32 +426,34 @@ cat <<EOF
 
 QuantumLink SteamOS install complete.
 
-Add SteamOS users who may run qlinkctl status/doctor to the quantumlink group.
+The installer adds QLINK_DESKTOP_USER or SUDO_USER to the quantumlink group.
+Log out and back in before you open the desktop application.
 
 Next commands:
   sudoedit $CONFIG_DIR/config.json
   sudo systemctl enable --now qlinkd
   systemctl status qlinkd
   sudo qlinkctl status
+  Open QuantumLink from the SteamOS application menu.
 
 Default service behavior:
-  qlinkd.service runs dry-run planning only and does not apply TUN, route, or
-  nftables changes.
+  qlinkd.service applies the owned TUN, route, and nftables plan. Invalid or
+  unsafe network configuration stops startup before protected traffic flows.
 
-Activated mode sample:
-  sample: $SYSD_UNIT_DIR/$UNIT_NAME.d/$ACTIVATED_SAMPLE_NAME
-  enable: sudo cp $SYSD_UNIT_DIR/$UNIT_NAME.d/$ACTIVATED_SAMPLE_NAME $SYSD_UNIT_DIR/$UNIT_NAME.d/10-activate-network.conf
+Planning-only recovery sample:
+  sample: $SYSD_UNIT_DIR/$UNIT_NAME.d/$PLANNING_SAMPLE_NAME
+  enable: sudo cp $SYSD_UNIT_DIR/$UNIT_NAME.d/$PLANNING_SAMPLE_NAME $SYSD_UNIT_DIR/$UNIT_NAME.d/10-planning-only.conf
           sudo systemctl daemon-reload
           sudo systemctl restart qlinkd
-  revert: sudo rm -f $SYSD_UNIT_DIR/$UNIT_NAME.d/10-activate-network.conf
+  revert: sudo rm -f $SYSD_UNIT_DIR/$UNIT_NAME.d/10-planning-only.conf
           sudo systemctl daemon-reload
           sudo systemctl restart qlinkd
 
-  The activated sample overrides ExecStart with:
-    $BINDIR/qlinkd --activate-network
+  The planning-only sample overrides ExecStart with:
+    $BINDIR/qlinkd
   The installed unit runs ExecStop and ExecStopPost with:
     $BINDIR/qlinkd --deactivate-network
-  Those teardown commands are no-ops for dry-run service starts and remove only
+  Those teardown commands are no-ops for planning-only starts and remove only
   qlink-owned network state recorded by successful activated starts. Do not
   combine --check with --activate-network or --deactivate-network.
 

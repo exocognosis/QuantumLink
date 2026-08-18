@@ -24,6 +24,35 @@ fn network_lifecycle_full_tunnel_fails_closed_without_explicit_underlay_exemptio
 }
 
 #[test]
+fn network_lifecycle_full_tunnel_bypasses_explicit_underlay_before_mark_and_drop() {
+    let config = DaemonConfig {
+        route_mode: RouteMode::FullTunnel,
+        underlay_exemptions: vec!["203.0.113.10/32".to_string(), "198.51.100.0/24".to_string()],
+        rendezvous_servers: vec!["203.0.113.10:9471".to_string()],
+        relay_servers: vec!["198.51.100.15:9472".to_string()],
+        ..DaemonConfig::default()
+    };
+
+    let plan = LinuxRuntimePlan::from_config(&config).expect("full tunnel plan");
+
+    assert_eq!(plan.protected_cidr(), "0.0.0.0/0");
+    assert_eq!(
+        plan.nftables.rules,
+        vec![
+            "add table inet qlink",
+            "add chain inet qlink route_output { type route hook output priority 0; policy accept; }",
+            "add chain inet qlink filter_output { type filter hook output priority 0; policy accept; }",
+            "add rule inet qlink route_output ip daddr 203.0.113.10/32 return",
+            "add rule inet qlink route_output ip daddr 198.51.100.0/24 return",
+            "add rule inet qlink route_output ip daddr 0.0.0.0/0 meta mark set 0x514c",
+            "add rule inet qlink filter_output ip daddr 203.0.113.10/32 return",
+            "add rule inet qlink filter_output ip daddr 198.51.100.0/24 return",
+            "add rule inet qlink filter_output ip daddr 0.0.0.0/0 oifname != \"qlink0\" drop",
+        ]
+    );
+}
+
+#[test]
 fn network_lifecycle_nftables_failure_after_route_setup_rolls_back_tun_rule_and_route() {
     let plan = LinuxRuntimePlan::from_config(&DaemonConfig::default()).expect("valid plan");
     let events = Rc::new(RefCell::new(Vec::new()));
@@ -70,6 +99,7 @@ fn network_lifecycle_route_failure_after_tun_creation_deletes_created_tun() {
         ]),
         nftables: qlink_linux::NftablesPlan::from_operations(Vec::new()),
         protected_cidr: "100.64.0.0/10".to_string(),
+        game_udp_ports: Vec::new(),
     };
     let events = Rc::new(RefCell::new(Vec::new()));
     let mut network = RecordingNetworkExecutor::new(events.clone()).fail_on_apply(2);

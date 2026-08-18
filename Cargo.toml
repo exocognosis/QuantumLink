@@ -10,6 +10,7 @@ members = [
     "steam/steamos/rust/qlink-linux",
     "steam/steamos/rust/qlinkd",
     "steam/steamos/rust/qlinkctl",
+    "steam/steamos/rust/qlink-desktop",
     "steam/mobile/rust/qlink-mobile-proto",
 ]
 resolver = "2"

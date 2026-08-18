@@ -23,16 +23,23 @@ The archive payload includes:
 
 - `bin/qlinkd`
 - `bin/qlinkctl`
+- `bin/qlink-desktop`
 - `scripts/install-steamos.sh`
+- `scripts/deck-runtime-qualification.sh`
+- `scripts/verify-deck-runtime-evidence.sh`
+- `packaging/desktop/quantumlink-steamos.desktop`
+- `packaging/desktop/quantumlink-steamos-game-mode.desktop`
+- `packaging/desktop/icons/quantumlink-steamos.png`
 - `packaging/systemd/qlinkd.service`
-- `packaging/systemd/qlinkd.service.d/activate-network.conf.sample`
+- `packaging/systemd/qlinkd.service.d/planning-only.conf.sample`
 - `config/config.example.json`
 - `config/games/*.toml`
 - SteamOS readiness and release docs when present
 
-Before activating a packaged resident daemon, review
-`config/config.example.json` and set `publicationTtlSeconds`,
-`advertiseAddress`, and pinned `dytallixIdentity` values for the deployment.
+Before starting a packaged resident daemon, review `config/config.example.json`.
+Set `underlayExemptions` for full-tunnel operation. Also set
+`publicationTtlSeconds`, `advertiseAddress`, and pinned `dytallixIdentity`
+values for the deployment.
 Public deployments must set `bindingVersion` to `stableIdentityV2` and pin the
 HTTPS RPC endpoint, network ID, chain ID, and deployed v2 contract identifier.
 Lifecycle mutations require the deployed 20-byte hexadecimal contract address;

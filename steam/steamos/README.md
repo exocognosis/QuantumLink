@@ -38,7 +38,7 @@ public-edge proof is claimed by this repository state.
 Build the Linux binaries from the repository root:
 
 ```sh
-cargo build --release -p qlinkd -p qlinkctl
+cargo build --release -p qlinkd -p qlinkctl -p qlink-desktop
 ```
 
 Install from the repository build output:
@@ -47,7 +47,8 @@ Install from the repository build output:
 sudo ./steam/steamos/scripts/install-steamos.sh
 ```
 
-Or install from a staged prefix containing `bin/qlinkd` and `bin/qlinkctl`:
+Or install from a staged prefix containing `bin/qlinkd`, `bin/qlinkctl`, and
+`bin/qlink-desktop`:
 
 ```sh
 sudo PREFIX=/opt/quantumlink ./steam/steamos/scripts/install-steamos.sh
@@ -59,13 +60,16 @@ For package tests or image assembly, stage into a destination root without root 
 PREFIX=/opt/quantumlink DESTDIR=/tmp/qlink-root ./steam/steamos/scripts/install-steamos.sh
 ```
 
-The installer copies binaries to `/usr/local/bin` by default, creates `/etc/quantumlink` and `/var/lib/quantumlink`, installs `steam/steamos/packaging/systemd/qlinkd.service`, stages an activated-mode sample drop-in, validates the staged files, reloads systemd for live installs, and prints the next commands. Live installs without `DESTDIR` still require root.
+The installer copies the daemon, CLI, and Desktop Mode application to
+`/usr/local/bin` by default. It also installs the application-menu launcher,
+icon, systemd service, planning-only recovery sample, configuration, and game
+profiles. Live installs without `DESTDIR` require root.
 
-The packaged `qlinkd.service` starts the resident daemon in dry-run planning mode. It validates configuration, builds the intended Linux network plan, and exposes that plan through status, but it does not create TUN devices, change routes, or apply nftables rules by default.
+The packaged `qlinkd.service` starts the resident daemon with `--activate-network`. It validates configuration and applies the owned Linux TUN, route, and nftables plan. Unsafe configuration stops startup before packet I/O.
 
 When started with the explicit `--activate-network` mode, `qlinkd` applies the owned TUN/route/nftables plan, opens the configured TUN device for raw Layer 3 packet I/O, initializes the shared `qlink-core` packet pump, and reports data-plane health in status. If TUN packet I/O cannot start after network activation, `qlinkd` runs record-backed network cleanup before exiting.
 
-The installed service also runs `qlinkd --deactivate-network` during stop and stop-post cleanup. Those teardown commands are idempotent: dry-run service starts have no ownership record and therefore no teardown work, while successful activated starts write `/var/lib/quantumlink/network-ownership.json` so stop removes only QuantumLink-owned TUN, route, and nftables state.
+The installed service also runs `qlinkd --deactivate-network` during stop and stop-post cleanup. Those teardown commands are idempotent. Successful activated starts write `/var/lib/quantumlink/network-ownership.json`, so stop removes only QuantumLink-owned TUN, route, and nftables state.
 
 Typical next steps:
 
@@ -77,11 +81,50 @@ sudo qlinkctl guide
 sudo qlinkctl onboarding
 ```
 
-`qlinkctl guide` is the first operator-facing guided UX for SteamOS until a
-native SteamOS UI exists. It uses SteamOS/Linux language for `qlinkd`,
-`qlinkctl status`, `qlinkctl doctor`, systemd, dry-run planning,
-`--activate-network`, `qlink0`, nftables, Steam-safe traffic bypass, game
-profile routing, support bundles, and the remaining Deck validation gates.
+`qlink-desktop` is the SteamOS Desktop Mode control application. It uses
+`qlinkctl` for status, peer, service, support-bundle, and Dytallix operations.
+The UI process does not read daemon or wallet secrets directly. Service start,
+stop, and restart use the fixed `qlinkctl service` command and the SteamOS
+PolicyKit authentication prompt.
+
+Game profile selection uses the same control boundary. `qlinkd` validates the
+installed profile catalog and owns the selected-profile state under
+`/var/lib/quantumlink`. The desktop application and CLI cannot write that state
+directly.
+
+In `gameOnly` mode, the selected profile supplies the executable basename and
+UDP ports. The base nftables plan contains no unscoped port marks. It drops
+unmarked overlay traffic until a validated game launch activates exact cgroup
+v2 and UDP port rules. No selected profile or no classified game means all
+overlay game traffic is fail-closed.
+
+```sh
+qlinkctl profile list
+qlinkctl profile status
+qlinkctl profile select factorio
+qlinkctl profile clear
+qlinkctl game launch -- /path/to/factorio
+```
+
+For a Steam shortcut, set the launch option to:
+
+```text
+/usr/local/bin/qlinkctl game launch -- %command%
+```
+
+The launcher uses `systemd-run --user --scope` with
+`quantumlink-game.slice`. `qlinkd` verifies the caller's cgroup v2 path,
+selected profile, executable basename, and session ID before it adds any game
+route mark. It removes the rules by nftables handle after the game exits. It
+does not use a shell or inject code into the game.
+
+The installer provides two launchers. `QuantumLink` starts Desktop Mode.
+`QuantumLink Game Mode` starts the same application with controller navigation
+and a full-screen request. Add the Game Mode launcher to Steam as a non-Steam
+game. QuantumLink does not modify Steam shortcut files.
+
+`qlinkctl guide` remains the terminal operator reference for active networking,
+`qlink0`, nftables, Steam-safe routing, game profiles, and validation gates.
 
 `qlinkctl onboarding` reads the live daemon status plus the local peer store and
 formats a checklist for the current Deck: daemon reachability, dry-run or
@@ -153,18 +196,26 @@ revoke can operate by explicit peer ID without device-key access. A successful
 receipt proves transaction confirmation and exact registry readback, but does
 not claim finalized-chain inclusion; that remains a separate production gate.
 
+Full-tunnel mode requires `underlayExemptions` with canonical IPv4 CIDRs for
+rendezvous, relay, registry, and external DNS endpoints that must stay outside
+the tunnel. The daemon rejects empty or unsafe exemption sets before it applies
+network state.
+
+The gaming network requirements are in
+`steam/steamos/docs/gaming-vpn-product-requirements.md`.
+
 ## Runtime Modes
 
-- `qlinkd` starts the resident daemon in dry-run planning mode and does not mutate networking.
+- `qlinkd` starts the resident daemon in planning-only mode and does not mutate networking.
 - `qlinkd --check` validates configuration/status only and exits; it is not a network activation path.
-- `qlinkd --activate-network` is the explicit operator opt-in for real TUN, route, and nftables application.
+- `qlinkd --activate-network` applies the real TUN, route, and nftables plan. The packaged service uses this mode.
 - `qlinkd --deactivate-network` removes qlink-owned network state from the persisted ownership record and exits; it is safe when no ownership record exists.
 - `qlinkd --check`, `qlinkd --activate-network`, and `qlinkd --deactivate-network` are mutually exclusive runtime modes.
 
-To run the packaged service with real network application, install the packaged sample as a controlled systemd drop-in instead of editing the installed unit directly:
+To place the packaged service in planning-only recovery mode, install the packaged sample as a controlled systemd drop-in:
 
 ```sh
-sudo cp /etc/systemd/system/qlinkd.service.d/activate-network.conf.sample /etc/systemd/system/qlinkd.service.d/10-activate-network.conf
+sudo cp /etc/systemd/system/qlinkd.service.d/planning-only.conf.sample /etc/systemd/system/qlinkd.service.d/10-planning-only.conf
 sudo systemctl daemon-reload
 sudo systemctl restart qlinkd
 ```
@@ -174,33 +225,40 @@ The sample contains this override for the default install path:
 ```ini
 [Service]
 ExecStart=
-ExecStart=/usr/local/bin/qlinkd --activate-network
+ExecStart=/usr/local/bin/qlinkd
 ```
 
-Remove the live drop-in to return to dry-run planning mode:
+Remove the live drop-in to return to active networking:
 
 ```sh
-sudo rm -f /etc/systemd/system/qlinkd.service.d/10-activate-network.conf
+sudo rm -f /etc/systemd/system/qlinkd.service.d/10-planning-only.conf
 sudo systemctl daemon-reload
 sudo systemctl restart qlinkd
 ```
 
-If the installer was run with a custom `BINDIR`, the installed service and sample are both rewritten to that installed `qlinkd` path. The installed `ExecStop` and `ExecStopPost` lines are rewritten to the same `BINDIR`, so activated service stops use the matching `qlinkd --deactivate-network` binary. Default reinstalls do not create or delete the live `10-activate-network.conf` operator drop-in.
+If the installer was run with a custom `BINDIR`, the installed service and sample are both rewritten to that installed `qlinkd` path. The installed `ExecStop` and `ExecStopPost` lines use the same `BINDIR`. Default reinstalls do not create or delete the live planning-only operator drop-in.
 
-After copying files, the installer validates that `qlinkd` and `qlinkctl` are executable, the unit exists and contains the resolved dry-run `ExecStart` plus teardown `ExecStop`, and the activated-mode sample exists with the resolved activated `ExecStart`. Validation failures exit nonzero.
+After copying files, the installer validates all three binaries, both desktop
+launchers, the icon, the active systemd unit, and the planning-only sample.
+Validation failures exit nonzero.
 
-SteamOS may remount the root filesystem read-only after system updates. Re-run the installer after an OS image refresh if `/usr/local/bin/qlinkd`, `/usr/local/bin/qlinkctl`, or the systemd unit disappears.
+SteamOS may remount the root filesystem read-only after system updates. Re-run
+the installer after an OS image refresh if the QuantumLink binaries, launcher,
+icon, or systemd unit disappear.
 
 ## Runtime Model
 
 - Linux creates a dedicated TUN interface, currently documented as `qlink0`.
 - Protected game/party routes use the overlay range `100.64.0.0/10`.
-- `qlinkd` owns route setup, nftables fail-closed policy, peer state, profile application, and the local packet-pump boundary; the packaged service plans network changes until explicitly started with `--activate-network`, then records ownership for `--deactivate-network` cleanup.
+- `qlinkd` owns route setup, nftables fail-closed policy, peer state, profile application, and the local packet-pump boundary. The packaged service activates the network plan and records ownership for `--deactivate-network` cleanup.
 - The packet pump uses shared `qlink-core` packet framing and replay protection, and the resident daemon drives it against a live `DaemonMeshTransport` with authenticated directional packet-session leases. Full Deck runtime validation remains a separate gate.
 - Rendezvous services publish and look up short-lived signed peer records.
 - Peers attempt direct QUIC paths first, with optional ICE/STUN helpers as the traversal layer matures.
 - Relay services are fallback paths for hostile NAT or intentionally hidden paths.
-- Game profiles keep the default route off the VPN by default and protect only selected party/title traffic.
+- Game profiles keep the default route off the VPN by default. The daemon
+  stores an explicit selected profile. `qlinkctl game launch` binds the
+  selected executable and UDP ports to a dedicated cgroup v2 scope. Steam Deck
+  kernel and route-leak proof remains open.
 
 ## Development Checks
 

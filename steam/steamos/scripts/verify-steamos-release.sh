@@ -175,9 +175,17 @@ fi
 required_files="
 bin/qlinkd
 bin/qlinkctl
+bin/qlink-desktop
 scripts/install-steamos.sh
+scripts/deck-runtime-qualification.sh
+scripts/verify-deck-runtime-evidence.sh
+packaging/desktop/quantumlink-steamos.desktop
+packaging/desktop/quantumlink-steamos-game-mode.desktop
+packaging/desktop/icons/quantumlink-steamos.png
+packaging/libexec/quantumlink-service-control
+packaging/polkit/49-quantumlink-service-control.rules
 packaging/systemd/qlinkd.service
-packaging/systemd/qlinkd.service.d/activate-network.conf.sample
+packaging/systemd/qlinkd.service.d/planning-only.conf.sample
 config/config.example.json
 config/steam-bypass.toml
 config/games/factorio.toml
@@ -192,7 +200,9 @@ if [ -d "$PAYLOAD_ROOT" ]; then
             add_failure "missing package file: $rel"
         fi
     done
-    for rel in bin/qlinkd bin/qlinkctl scripts/install-steamos.sh; do
+    for rel in bin/qlinkd bin/qlinkctl bin/qlink-desktop scripts/install-steamos.sh \
+        scripts/deck-runtime-qualification.sh scripts/verify-deck-runtime-evidence.sh \
+        packaging/libexec/quantumlink-service-control; do
         if [ ! -x "$PAYLOAD_ROOT/$rel" ]; then
             add_failure "package file is not executable: $rel"
         fi
@@ -202,6 +212,11 @@ if [ -d "$PAYLOAD_ROOT" ]; then
             add_failure "install script failed shell syntax check"
         fi
     fi
+    for rel in scripts/deck-runtime-qualification.sh scripts/verify-deck-runtime-evidence.sh; do
+        if [ -f "$PAYLOAD_ROOT/$rel" ] && ! bash -n "$PAYLOAD_ROOT/$rel"; then
+            add_failure "package validation script failed shell syntax check: $rel"
+        fi
+    done
 fi
 
 SUMS="$SIDECAR_DIR/SHA256SUMS.txt"

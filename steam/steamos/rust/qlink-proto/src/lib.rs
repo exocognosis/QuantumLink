@@ -24,6 +24,8 @@ pub struct DaemonConfig {
     pub overlay_ipv4_address: String,
     pub route_mode: RouteMode,
     #[serde(default)]
+    pub underlay_exemptions: Vec<String>,
+    #[serde(default)]
     pub active_peer_id: Option<String>,
     pub rendezvous_servers: Vec<String>,
     pub relay_servers: Vec<String>,
@@ -74,6 +76,7 @@ impl DaemonConfig {
             &self.overlay_cidr,
             &self.overlay_ipv4_address,
         )?;
+        validate_underlay_exemptions(&self.underlay_exemptions, overlay)?;
         validate_optional_nonempty("activePeerId", self.active_peer_id.as_deref())?;
         validate_server_entries("rendezvousServers", &self.rendezvous_servers)?;
         validate_server_entries("relayServers", &self.relay_servers)?;
@@ -131,6 +134,12 @@ pub enum ConfigValidationError {
     InvalidPublicationTtl { value: u64 },
     #[error("invalid advertiseAddress `{value}`: {reason}")]
     InvalidAdvertiseAddress { value: String, reason: String },
+    #[error("invalid underlayExemptions[{index}] `{value}`: {reason}")]
+    InvalidUnderlayExemption {
+        index: usize,
+        value: String,
+        reason: String,
+    },
 }
 
 const MAX_LINUX_INTERFACE_NAME_BYTES: usize = 15;
@@ -152,6 +161,10 @@ impl OverlayNetwork {
     fn contains(self, address: Ipv4Addr) -> bool {
         let mask = self.mask();
         u32::from(address) & mask == u32::from(self.address)
+    }
+
+    fn overlaps(self, other: Self) -> bool {
+        self.contains(other.address) || other.contains(self.address)
     }
 }
 
@@ -261,6 +274,71 @@ fn validate_overlay_address_membership(
     })
 }
 
+fn validate_underlay_exemptions(
+    exemptions: &[String],
+    overlay: OverlayNetwork,
+) -> Result<(), ConfigValidationError> {
+    let mut parsed = Vec::with_capacity(exemptions.len());
+    for (index, value) in exemptions.iter().enumerate() {
+        let network = parse_underlay_exemption(value, index)?;
+        if network.overlaps(overlay) {
+            return Err(ConfigValidationError::InvalidUnderlayExemption {
+                index,
+                value: value.clone(),
+                reason: "must not overlap overlayCidr".to_string(),
+            });
+        }
+        if parsed.contains(&network) {
+            return Err(ConfigValidationError::InvalidUnderlayExemption {
+                index,
+                value: value.clone(),
+                reason: "must not duplicate an earlier exemption".to_string(),
+            });
+        }
+        parsed.push(network);
+    }
+    Ok(())
+}
+
+fn parse_underlay_exemption(
+    value: &str,
+    index: usize,
+) -> Result<OverlayNetwork, ConfigValidationError> {
+    let invalid = |reason: String| ConfigValidationError::InvalidUnderlayExemption {
+        index,
+        value: value.to_string(),
+        reason,
+    };
+    let (address, prefix) = value
+        .split_once('/')
+        .ok_or_else(|| invalid("must be canonical IPv4 CIDR notation".to_string()))?;
+    if address.is_empty() || prefix.is_empty() || prefix.contains('/') {
+        return Err(invalid("must be canonical IPv4 CIDR notation".to_string()));
+    }
+    let network_address = address
+        .parse::<Ipv4Addr>()
+        .map_err(|error| invalid(format!("invalid IPv4 network address: {error}")))?;
+    let prefix_len = prefix
+        .parse::<u8>()
+        .map_err(|error| invalid(format!("invalid IPv4 prefix length: {error}")))?;
+    if !(1..=32).contains(&prefix_len) {
+        return Err(invalid(
+            "IPv4 prefix length must be between 1 and 32".to_string(),
+        ));
+    }
+    let network = OverlayNetwork {
+        address: network_address,
+        prefix_len,
+    };
+    let canonical_address = Ipv4Addr::from(u32::from(network_address) & network.mask());
+    if network_address != canonical_address {
+        return Err(invalid(format!(
+            "must use canonical network address {canonical_address}/{prefix_len}"
+        )));
+    }
+    Ok(network)
+}
+
 fn validate_server_entries(
     field: &'static str,
     entries: &[String],
@@ -297,6 +375,7 @@ impl Default for DaemonConfig {
             overlay_cidr: "100.64.0.0/10".to_string(),
             overlay_ipv4_address: "100.64.10.2".to_string(),
             route_mode: RouteMode::GameOnly,
+            underlay_exemptions: Vec::new(),
             active_peer_id: None,
             rendezvous_servers: Vec::new(),
             relay_servers: Vec::new(),
@@ -589,6 +668,163 @@ pub struct PublicationStatus {
     pub local_registry_binding: LocalRegistryBindingStatus,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GameProfileInfo {
+    pub id: String,
+    pub display_name: String,
+    pub executables: Vec<String>,
+    pub udp_ports: Vec<u16>,
+    pub lan_discovery: bool,
+    pub voice_chat_safe: bool,
+    pub low_latency: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GameProfileStatus {
+    #[serde(default)]
+    pub available_profiles: Vec<GameProfileInfo>,
+    #[serde(default)]
+    pub selected_profile: Option<GameProfileInfo>,
+    #[serde(default)]
+    pub selection_warning: Option<String>,
+    #[serde(default)]
+    pub port_enforcement: GameProfilePortEnforcementStatus,
+    #[serde(default)]
+    pub process_classification: GameProcessClassificationStatus,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GameProfilePortEnforcementState {
+    #[default]
+    NotApplicable,
+    Planned,
+    FailClosed,
+    Applied,
+    ApplyFailed,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GameProfilePortEnforcementStatus {
+    pub state: GameProfilePortEnforcementState,
+    #[serde(default)]
+    pub profile_id: Option<String>,
+    #[serde(default)]
+    pub udp_ports: Vec<u16>,
+    #[serde(default)]
+    pub restart_required: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GameProcessClassificationState {
+    #[default]
+    NotApplicable,
+    FailClosed,
+    Armed,
+    Active,
+    ApplyFailed,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GameProcessClassificationStatus {
+    pub state: GameProcessClassificationState,
+    #[serde(default)]
+    pub profile_id: Option<String>,
+    #[serde(default)]
+    pub executable: Option<String>,
+    #[serde(default)]
+    pub cgroup_unit: Option<String>,
+    #[serde(default)]
+    pub udp_ports: Vec<u16>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RuntimeCapabilityState {
+    #[default]
+    NotChecked,
+    Supported,
+    Unsupported,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeCapabilityStatus {
+    pub state: RuntimeCapabilityState,
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+impl RuntimeCapabilityStatus {
+    pub fn supported() -> Self {
+        Self {
+            state: RuntimeCapabilityState::Supported,
+            detail: None,
+        }
+    }
+
+    pub fn unsupported(detail: impl Into<String>) -> Self {
+        Self {
+            state: RuntimeCapabilityState::Unsupported,
+            detail: Some(detail.into()),
+        }
+    }
+
+    pub fn unavailable(detail: impl Into<String>) -> Self {
+        Self {
+            state: RuntimeCapabilityState::Unavailable,
+            detail: Some(detail.into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SteamOsRuntimeCapabilities {
+    #[serde(default)]
+    pub cgroup_v2: RuntimeCapabilityStatus,
+    #[serde(default)]
+    pub nftables_cgroup_v2: RuntimeCapabilityStatus,
+    #[serde(default)]
+    pub tun: RuntimeCapabilityStatus,
+    #[serde(default)]
+    pub systemd_user_scopes: RuntimeCapabilityStatus,
+    #[serde(default)]
+    pub policykit: RuntimeCapabilityStatus,
+    #[serde(default)]
+    pub logind_session: RuntimeCapabilityStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum DaemonControlRequest {
+    Status,
+    SelectGameProfile {
+        profile_id: String,
+    },
+    ClearGameProfile,
+    BeginGameProcess {
+        profile_id: String,
+        executable: String,
+        session_id: String,
+    },
+    EndGameProcess {
+        session_id: String,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DaemonStatus {
@@ -602,6 +838,10 @@ pub struct DaemonStatus {
     pub data_plane: DataPlaneStatus,
     #[serde(default)]
     pub publication: PublicationStatus,
+    #[serde(default)]
+    pub game_profile: GameProfileStatus,
+    #[serde(default)]
+    pub runtime_capabilities: SteamOsRuntimeCapabilities,
 }
 
 impl DaemonStatus {
@@ -614,6 +854,8 @@ impl DaemonStatus {
             network: NetworkStatus::not_started(),
             data_plane: DataPlaneStatus::not_started(),
             publication: PublicationStatus::default(),
+            game_profile: GameProfileStatus::default(),
+            runtime_capabilities: SteamOsRuntimeCapabilities::default(),
         }
     }
 }
@@ -698,6 +940,10 @@ impl PeerStore {
             self.selected_peer_id = Some(peer_id.to_string());
         }
         eligible
+    }
+
+    pub fn clear_selection(&mut self) -> bool {
+        self.selected_peer_id.take().is_some()
     }
 
     pub fn dial_candidates(&self, now_unix: u64) -> Vec<StoredPeer> {
@@ -908,6 +1154,7 @@ mod tests {
         assert_eq!(config.interface_name, "qlink0");
         assert_eq!(config.overlay_cidr, "100.64.0.0/10");
         assert_eq!(config.route_mode, RouteMode::GameOnly);
+        assert!(config.underlay_exemptions.is_empty());
         assert_eq!(config.publication_ttl_seconds, 120);
         assert!(config.advertise_address.is_none());
         assert!(config.kill_switch);
@@ -927,6 +1174,7 @@ mod tests {
             "overlayCidr": "100.64.0.0/10",
             "overlayIpv4Address": "100.64.10.2",
             "routeMode": "gameOnly",
+            "underlayExemptions": ["203.0.113.10/32", "198.51.100.0/24"],
             "activePeerId": "peer-a",
             "rendezvousServers": ["tls://rv.example:9471"],
             "relayServers": ["tls://relay.example:9472"],
@@ -959,6 +1207,7 @@ mod tests {
             DytallixBindingVersion::StableIdentityV2
         );
         assert_eq!(config.publication_ttl_seconds, 300);
+        assert_eq!(config.underlay_exemptions.len(), 2);
         assert_eq!(
             config.advertise_address.as_deref(),
             Some("203.0.113.10:9471")
@@ -1137,6 +1386,35 @@ mod tests {
     }
 
     #[test]
+    fn validation_rejects_invalid_underlay_exemptions() {
+        for underlay_exemptions in [
+            vec!["not-a-cidr".to_string()],
+            vec!["203.0.113.7/24".to_string()],
+            vec!["0.0.0.0/0".to_string()],
+            vec!["100.64.0.0/24".to_string()],
+            vec!["203.0.113.10/32".to_string(), "203.0.113.10/32".to_string()],
+        ] {
+            let config = DaemonConfig {
+                underlay_exemptions,
+                ..DaemonConfig::default()
+            };
+
+            let error = config.validate().unwrap_err();
+            assert!(error.to_string().contains("underlayExemptions"));
+        }
+    }
+
+    #[test]
+    fn validation_accepts_canonical_non_overlay_underlay_exemptions() {
+        let config = DaemonConfig {
+            underlay_exemptions: vec!["203.0.113.10/32".to_string(), "198.51.100.0/24".to_string()],
+            ..DaemonConfig::default()
+        };
+
+        config.validate().unwrap();
+    }
+
+    #[test]
     fn status_serializes_with_peer_metrics() {
         let status = DaemonStatus {
             phase: ConnectionPhase::Connected,
@@ -1165,6 +1443,22 @@ mod tests {
             },
             data_plane: DataPlaneStatus::not_started(),
             publication: PublicationStatus::default(),
+            game_profile: GameProfileStatus {
+                available_profiles: vec![GameProfileInfo {
+                    id: "factorio".to_string(),
+                    display_name: "Factorio".to_string(),
+                    executables: vec!["factorio".to_string()],
+                    udp_ports: vec![34197],
+                    lan_discovery: true,
+                    voice_chat_safe: true,
+                    low_latency: true,
+                }],
+                selected_profile: None,
+                selection_warning: None,
+                port_enforcement: GameProfilePortEnforcementStatus::default(),
+                process_classification: GameProcessClassificationStatus::default(),
+            },
+            runtime_capabilities: SteamOsRuntimeCapabilities::default(),
         };
 
         let json = serde_json::to_string(&status).unwrap();
@@ -1173,6 +1467,49 @@ mod tests {
         assert!(json.contains("\"state\":\"planned\""));
         assert!(json.contains("\"protectedCidr\":\"100.64.0.0/10\""));
         assert!(json.contains("\"dryRun\":true"));
+        assert!(json.contains("\"displayName\":\"Factorio\""));
+        assert!(json.contains("\"portEnforcement\""));
+        assert!(json.contains("\"processClassification\""));
+        assert!(json.contains("\"runtimeCapabilities\""));
+        assert!(json.contains("\"nftablesCgroupV2\""));
+        assert!(json.contains("\"systemdUserScopes\""));
+        assert!(json.contains("\"state\":\"notApplicable\""));
+    }
+
+    #[test]
+    fn daemon_control_profile_request_uses_stable_camel_case_json() {
+        let request = DaemonControlRequest::SelectGameProfile {
+            profile_id: "factorio".to_string(),
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"selectGameProfile","profileId":"factorio"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<DaemonControlRequest>(&json).unwrap(),
+            request
+        );
+    }
+
+    #[test]
+    fn daemon_control_game_process_request_uses_stable_camel_case_json() {
+        let request = DaemonControlRequest::BeginGameProcess {
+            profile_id: "factorio".to_string(),
+            executable: "/home/deck/factorio".to_string(),
+            session_id: "s123abc".to_string(),
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"beginGameProcess","profileId":"factorio","executable":"/home/deck/factorio","sessionId":"s123abc"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<DaemonControlRequest>(&json).unwrap(),
+            request
+        );
     }
 
     #[test]
@@ -1199,6 +1536,35 @@ mod tests {
         assert_eq!(status.phase, ConnectionPhase::Idle);
         assert_eq!(status.network, NetworkStatus::not_started());
         assert_eq!(status.publication, PublicationStatus::default());
+        assert_eq!(
+            status.runtime_capabilities,
+            SteamOsRuntimeCapabilities::default()
+        );
+    }
+
+    #[test]
+    fn runtime_capability_status_uses_stable_camel_case_json() {
+        let capabilities = SteamOsRuntimeCapabilities {
+            cgroup_v2: RuntimeCapabilityStatus::supported(),
+            nftables_cgroup_v2: RuntimeCapabilityStatus::unsupported(
+                "kernel expression is unavailable",
+            ),
+            tun: RuntimeCapabilityStatus::supported(),
+            systemd_user_scopes: RuntimeCapabilityStatus::supported(),
+            policykit: RuntimeCapabilityStatus::unavailable("pkexec is not installed"),
+            logind_session: RuntimeCapabilityStatus::supported(),
+        };
+
+        let json = serde_json::to_string(&capabilities).unwrap();
+
+        assert!(json.contains("\"cgroupV2\":{\"state\":\"supported\""));
+        assert!(json.contains("\"nftablesCgroupV2\":{\"state\":\"unsupported\""));
+        assert!(json.contains("\"systemdUserScopes\":{\"state\":\"supported\""));
+        assert!(json.contains("\"policykit\":{\"state\":\"unavailable\""));
+        assert_eq!(
+            serde_json::from_str::<SteamOsRuntimeCapabilities>(&json).unwrap(),
+            capabilities
+        );
     }
 
     #[test]
@@ -1512,6 +1878,10 @@ mod tests {
         let state_dir = unique_temp_dir("qlink-proto-peer-store");
         let mut store = PeerStore::default();
         store.upsert(stored_peer_fixture());
+        store.selected_peer_id = Some("peer-host-deck".to_string());
+
+        assert!(store.clear_selection());
+        assert!(!store.clear_selection());
 
         let path = store_peer_store_at(&state_dir, &store).unwrap();
         let loaded = load_peer_store_at(&path).unwrap();

@@ -1,9 +1,12 @@
+use qlink_game::{GameLaunchPlan, GameProfile};
 use qlink_proto::{
     load_peer_store_at, peer_store_path_from_state_dir, store_peer_store_at, ConnectionPhase,
-    DaemonStatus, DataPlaneState, DytallixBindingVersion, DytallixTrustDecision,
-    DytallixTrustHealth, DytallixTrustStatus, InviteCode, LocalRegistryBindingState, MeshTrustMode,
-    NetworkPlanState, PathKind, PeerStore, PublicationErrorCode, PublicationState,
-    PublicationStatus, RouteMode, StoredPeer,
+    DaemonControlRequest, DaemonStatus, DataPlaneState, DytallixBindingVersion,
+    DytallixTrustDecision, DytallixTrustHealth, DytallixTrustStatus,
+    GameProcessClassificationState, GameProfilePortEnforcementState, GameProfileStatus, InviteCode,
+    LocalRegistryBindingState, MeshTrustMode, NetworkPlanState, PathKind, PeerStore,
+    PublicationErrorCode, PublicationState, PublicationStatus, RouteMode, RuntimeCapabilityState,
+    RuntimeCapabilityStatus, SteamOsRuntimeCapabilities, StoredPeer,
 };
 
 pub mod dytallix;
@@ -25,7 +28,7 @@ pub enum ControlError {
         #[source]
         source: std::io::Error,
     },
-    #[error("failed to send status request: {0}")]
+    #[error("failed to exchange a daemon control request: {0}")]
     Write(#[from] std::io::Error),
     #[error("invalid qlinkd status response: {0}")]
     Json(#[from] serde_json::Error),
@@ -90,14 +93,15 @@ pub fn format_guide() -> String {
         "QuantumLink SteamOS Guide",
         "",
         "Onboarding",
-        "- Build and install qlinkd plus qlinkctl, edit /etc/quantumlink/config.json, then start qlinkd under systemd.",
+        "- Build and install qlinkd, qlinkctl, and qlink-desktop, then edit /etc/quantumlink/config.json.",
         "- Begin with qlinkctl status and qlinkctl doctor before changing any network state.",
         "- Keep support bundles redacted before sharing logs outside the Deck.",
         "",
         "Runtime modes",
-        "- qlinkd starts in dry-run planning mode by default; it validates config and reports the intended TUN, route, and nftables plan without mutating networking.",
+        "- The packaged qlinkd service starts with active TUN, route, and nftables application.",
+        "- qlinkd without --activate-network remains the planning-only recovery mode.",
         "- qlinkd --check validates configuration/status and exits.",
-        "- qlinkd --activate-network is the explicit operator opt-in for live TUN, route, and nftables application.",
+        "- qlinkd --activate-network applies live TUN, route, and nftables state.",
         "- qlinkd --deactivate-network removes only QuantumLink-owned network state from the persisted ownership record.",
         "- qlinkctl doctor reports packet I/O, data-plane health, and whether transport ready is yes or no.",
         "- Publication and Dytallix failures are fail-closed: protected transport must remain disabled until qlinkctl doctor reports a current signed record and healthy required trust.",
@@ -108,9 +112,17 @@ pub fn format_guide() -> String {
         "- qlinkctl invite import <encoded-invite> stores a private mesh peer invite.",
         "- qlinkctl invite decode <code> inspects an invite without storing it.",
         "- qlinkctl peer list lists stored peers.",
+        "- qlinkctl peer state returns peers and the selected peer as JSON.",
+        "- qlinkctl peer clear clears the selected peer without revoking it.",
         "- qlinkctl peer select <peer-id> selects the single protected packet target.",
         "- qlinkctl peer trust <peer-id> explains trust source, mesh mode, and Dytallix requirements.",
         "- qlinkctl peer revoke <peer-id> marks a peer revoked; qlinkctl peer remove <peer-id> deletes it.",
+        "- qlinkctl profile list shows installed game profiles.",
+        "- qlinkctl profile status shows the active selection and profile policy flags.",
+        "- qlinkctl profile select <profile-id> validates and activates one installed profile through qlinkd.",
+        "- qlinkctl profile clear removes the active profile without deleting profile files.",
+        "- qlinkctl game launch -- <command> [args...] starts the selected executable in a classified cgroup v2 scope.",
+        "- qlinkctl service start|stop|restart requests a fixed qlinkd systemd operation through pkexec.",
         "- qlinkctl dytallix status reads stable-identity-v2 state without contacting qlinkd or loading a wallet.",
         "- qlinkctl dytallix register|update|suspend|reactivate|revoke performs one-shot wallet-authorized lifecycle operations while qlinkd remains wallet-free.",
         "- Dytallix mutation commands require an explicit owner-only keystore path; wallet seeds and private keys must never be passed through command arguments.",
@@ -128,7 +140,7 @@ pub fn format_guide() -> String {
         "",
         "Production gates",
         "- SteamOS remains pre-production until Deck validation proves real two-Deck transport, production-signed release artifacts, public Dytallix registry evidence, hardened rendezvous/relay evidence, and game compatibility validation.",
-        "- Local dry-run planning, packet I/O initialization, or transport ready: no status is not proof of protected peer traffic.",
+        "- Local planning, packet I/O initialization, or transport ready: no status is not proof of protected peer traffic.",
     ]
     .join("\n")
     .replace("{{STEAM_SAFE_BYPASS}}", &steam_safe_bypass_sentence())
@@ -453,6 +465,13 @@ pub fn select_peer_in_store(
     Ok(())
 }
 
+pub fn clear_peer_selection_in_store(state_dir: &Path) -> Result<(), PeerCommandError> {
+    let mut store = load_peer_store_for_state_dir(state_dir)?;
+    store.clear_selection();
+    store_peer_store_at(state_dir, &store)?;
+    Ok(())
+}
+
 pub fn peer_from_store(state_dir: &Path, peer_id: &str) -> Result<StoredPeer, PeerCommandError> {
     load_peer_store_for_state_dir(state_dir)?
         .peers
@@ -463,6 +482,73 @@ pub fn peer_from_store(state_dir: &Path, peer_id: &str) -> Result<StoredPeer, Pe
 
 pub fn format_peer_list(store: &PeerStore) -> Result<String, serde_json::Error> {
     serde_json::to_string_pretty(&store.peers)
+}
+
+pub fn format_peer_state(store: &PeerStore) -> Result<String, serde_json::Error> {
+    serde_json::to_string_pretty(store)
+}
+
+const PKEXEC_COMMAND: &str = "/usr/bin/pkexec";
+const SERVICE_HELPER_COMMAND: &str = "/usr/local/libexec/quantumlink-service-control";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceAction {
+    Start,
+    Stop,
+    Restart,
+}
+
+impl ServiceAction {
+    pub fn parse(value: &str) -> Result<Self, ServiceCommandError> {
+        match value {
+            "start" => Ok(Self::Start),
+            "stop" => Ok(Self::Stop),
+            "restart" => Ok(Self::Restart),
+            _ => Err(ServiceCommandError::UnsupportedAction(value.to_string())),
+        }
+    }
+
+    fn systemctl_verb(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Stop => "stop",
+            Self::Restart => "restart",
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ServiceCommandError {
+    #[error("unsupported service action `{0}`")]
+    UnsupportedAction(String),
+    #[error("failed to run the SteamOS service command: {0}")]
+    Spawn(#[from] std::io::Error),
+    #[error("qlinkd service command failed: {0}")]
+    Failed(String),
+}
+
+pub fn service_command_argv(action: ServiceAction) -> [&'static str; 2] {
+    [SERVICE_HELPER_COMMAND, action.systemctl_verb()]
+}
+
+pub fn run_service_action(action: ServiceAction) -> Result<(), ServiceCommandError> {
+    let output = std::process::Command::new(PKEXEC_COMMAND)
+        .args(service_command_argv(action))
+        .output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Err(ServiceCommandError::Failed(if message.is_empty() {
+        format!(
+            "systemctl {} exited with {}",
+            action.systemctl_verb(),
+            output.status
+        )
+    } else {
+        message
+    }))
 }
 
 pub fn format_peer_trust(peer: &StoredPeer) -> String {
@@ -578,11 +664,115 @@ pub struct RedactionReport {
 
 #[cfg(unix)]
 pub fn status_from_daemon(socket: &Path) -> Result<DaemonStatus, ControlError> {
+    request_daemon(socket, &DaemonControlRequest::Status)
+}
+
+#[cfg(unix)]
+pub fn select_game_profile(
+    socket: &Path,
+    profile_id: impl Into<String>,
+) -> Result<DaemonStatus, ControlError> {
+    request_daemon(
+        socket,
+        &DaemonControlRequest::SelectGameProfile {
+            profile_id: profile_id.into(),
+        },
+    )
+}
+
+#[cfg(unix)]
+pub fn clear_game_profile(socket: &Path) -> Result<DaemonStatus, ControlError> {
+    request_daemon(socket, &DaemonControlRequest::ClearGameProfile)
+}
+
+#[cfg(unix)]
+pub fn begin_game_process(
+    socket: &Path,
+    profile_id: impl Into<String>,
+    executable: impl Into<String>,
+    session_id: impl Into<String>,
+) -> Result<DaemonStatus, ControlError> {
+    request_daemon(
+        socket,
+        &DaemonControlRequest::BeginGameProcess {
+            profile_id: profile_id.into(),
+            executable: executable.into(),
+            session_id: session_id.into(),
+        },
+    )
+}
+
+#[cfg(unix)]
+pub fn end_game_process(
+    socket: &Path,
+    session_id: impl Into<String>,
+) -> Result<DaemonStatus, ControlError> {
+    request_daemon(
+        socket,
+        &DaemonControlRequest::EndGameProcess {
+            session_id: session_id.into(),
+        },
+    )
+}
+
+pub fn build_game_launch_plan(
+    status: &GameProfileStatus,
+    session_id: &str,
+    qlinkctl_path: &Path,
+    command: &str,
+    command_args: &[String],
+) -> Result<GameLaunchPlan, String> {
+    let selected = status
+        .selected_profile
+        .as_ref()
+        .ok_or_else(|| "select a game profile before launch".to_string())?;
+    let profile = GameProfile {
+        id: selected.id.clone(),
+        display_name: selected.display_name.clone(),
+        executables: selected.executables.clone(),
+        udp_ports: selected.udp_ports.clone(),
+        lan_discovery: selected.lan_discovery,
+        voice_chat_safe: selected.voice_chat_safe,
+        low_latency: selected.low_latency,
+    };
+    profile.validate()?;
+    GameLaunchPlan::new(&profile, session_id, qlinkctl_path, command, command_args)
+}
+
+pub fn validate_game_launch_capabilities(
+    capabilities: &SteamOsRuntimeCapabilities,
+) -> Result<(), String> {
+    for (name, capability) in [
+        ("cgroup v2", &capabilities.cgroup_v2),
+        ("nftables cgroup v2", &capabilities.nftables_cgroup_v2),
+        ("TUN", &capabilities.tun),
+        ("systemd user scopes", &capabilities.systemd_user_scopes),
+    ] {
+        if capability.state != RuntimeCapabilityState::Supported {
+            return Err(format!(
+                "game launch blocked: {name} is {}{}",
+                runtime_capability_state_label(capability.state),
+                capability
+                    .detail
+                    .as_deref()
+                    .map(|detail| format!(": {detail}"))
+                    .unwrap_or_default()
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn request_daemon(
+    socket: &Path,
+    request: &DaemonControlRequest,
+) -> Result<DaemonStatus, ControlError> {
     let mut stream = UnixStream::connect(socket).map_err(|source| ControlError::Unavailable {
         path: socket.display().to_string(),
         source,
     })?;
-    stream.write_all(br#"{"type":"status"}"#)?;
+    serde_json::to_writer(&mut stream, request)?;
     stream.write_all(b"\n")?;
 
     let mut line = String::new();
@@ -595,6 +785,10 @@ pub fn format_status(status: &DaemonStatus) -> Result<String, serde_json::Error>
     serde_json::to_string_pretty(status)
 }
 
+pub fn format_game_profile_status(status: &GameProfileStatus) -> Result<String, serde_json::Error> {
+    serde_json::to_string_pretty(status)
+}
+
 pub fn format_doctor(status: &DaemonStatus) -> String {
     format_doctor_at(status, current_unix_seconds())
 }
@@ -603,6 +797,7 @@ fn format_doctor_at(status: &DaemonStatus, now_unix: u64) -> String {
     let network = &status.network;
     let data_plane = &status.data_plane;
     let publication = &status.publication;
+    let game_profile = &status.game_profile;
     let phase = phase_label(status.phase);
     let state = network_state_label(network.state);
     let data_plane_state = data_plane_state_label(data_plane.state);
@@ -647,6 +842,23 @@ fn format_doctor_at(status: &DaemonStatus, now_unix: u64) -> String {
         now_unix,
         network.state == NetworkPlanState::Applied && !network.dry_run,
     );
+    let profile_verdict = game_profile
+        .port_enforcement
+        .restart_required
+        .then(|| "WARN - service restart required to apply game profile ports".to_string());
+    let classification_verdict = (game_profile.process_classification.state
+        == GameProcessClassificationState::ApplyFailed)
+        .then(|| {
+            format!(
+                "FAIL - game process classification failed: {}",
+                game_profile
+                    .process_classification
+                    .error
+                    .as_deref()
+                    .unwrap_or("unknown error")
+            )
+        });
+    let capability_verdict = runtime_capability_verdict(&status.runtime_capabilities);
     let verdict = match status.phase {
         ConnectionPhase::Failed => "FAIL - daemon phase failed".to_string(),
         _ if data_plane_verdict
@@ -656,7 +868,14 @@ fn format_doctor_at(status: &DaemonStatus, now_unix: u64) -> String {
             data_plane_verdict.unwrap()
         }
         _ if network_verdict.starts_with("FAIL") => network_verdict,
+        _ if capability_verdict
+            .as_deref()
+            .is_some_and(|verdict| verdict.starts_with("FAIL")) =>
+        {
+            capability_verdict.clone().unwrap()
+        }
         _ if publication_verdict.starts_with("FAIL") => publication_verdict,
+        _ if classification_verdict.is_some() => classification_verdict.unwrap(),
         ConnectionPhase::Degraded => "WARN - daemon phase degraded".to_string(),
         _ if data_plane_verdict
             .as_deref()
@@ -666,6 +885,13 @@ fn format_doctor_at(status: &DaemonStatus, now_unix: u64) -> String {
         }
         _ if network_verdict.starts_with("WARN") => network_verdict,
         _ if publication_verdict.starts_with("WARN") => publication_verdict,
+        _ if capability_verdict
+            .as_deref()
+            .is_some_and(|verdict| verdict.starts_with("WARN")) =>
+        {
+            capability_verdict.unwrap()
+        }
+        _ if profile_verdict.is_some() => profile_verdict.unwrap(),
         _ => network_verdict,
     };
 
@@ -689,6 +915,22 @@ fn format_doctor_at(status: &DaemonStatus, now_unix: u64) -> String {
          last transport error: {last_transport_error}\n\
          packet counters: observed={observed_packets} queued={queued_packets} dropped={dropped_packets} emitted={emitted_packets} accepted={accepted_packets} rejected={rejected_packets} transportErrors={transport_errors}\n\
          data-plane error: {data_plane_error}\n\
+         game profile: {selected_game_profile}\n\
+         applied game profile: {applied_game_profile}\n\
+         game profile port enforcement: {game_profile_port_enforcement}\n\
+         enforced UDP ports: {enforced_udp_ports}\n\
+         game process classification: {game_process_classification}\n\
+         classified executable: {classified_executable}\n\
+         game cgroup unit: {game_cgroup_unit}\n\
+         classification error: {classification_error}\n\
+         game profile restart required: {game_profile_restart_required}\n\
+         game profile warning: {game_profile_warning}\n\
+         capability cgroup v2: {capability_cgroup_v2}\n\
+         capability nftables cgroup v2: {capability_nftables_cgroup_v2}\n\
+         capability TUN: {capability_tun}\n\
+         capability systemd user scopes: {capability_systemd_user_scopes}\n\
+         capability PolicyKit: {capability_policykit}\n\
+         capability logind session: {capability_logind_session}\n\
          publication state: {publication_state}\n\
          publication sequence: {publication_sequence}\n\
          publication expiry (unix): {publication_expiry}\n\
@@ -744,6 +986,63 @@ fn format_doctor_at(status: &DaemonStatus, now_unix: u64) -> String {
         rejected_packets = data_plane.metrics.rejected_packets,
         transport_errors = data_plane.metrics.transport_errors,
         data_plane_error = data_plane.error.as_deref().unwrap_or("none"),
+        selected_game_profile = game_profile
+            .selected_profile
+            .as_ref()
+            .map(|profile| profile.id.as_str())
+            .unwrap_or("none"),
+        applied_game_profile = game_profile
+            .port_enforcement
+            .profile_id
+            .as_deref()
+            .unwrap_or("none"),
+        game_profile_port_enforcement = game_profile_port_enforcement_label(
+            game_profile.port_enforcement.state,
+        ),
+        enforced_udp_ports = if game_profile.port_enforcement.udp_ports.is_empty() {
+            "none".to_string()
+        } else {
+            game_profile
+                .port_enforcement
+                .udp_ports
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        },
+        game_process_classification = game_process_classification_label(
+            game_profile.process_classification.state,
+        ),
+        classified_executable = game_profile
+            .process_classification
+            .executable
+            .as_deref()
+            .unwrap_or("none"),
+        game_cgroup_unit = game_profile
+            .process_classification
+            .cgroup_unit
+            .as_deref()
+            .unwrap_or("none"),
+        classification_error = game_profile
+            .process_classification
+            .error
+            .as_deref()
+            .unwrap_or("none"),
+        game_profile_restart_required = if game_profile.port_enforcement.restart_required {
+            "yes"
+        } else {
+            "no"
+        },
+        game_profile_warning = game_profile.selection_warning.as_deref().unwrap_or("none"),
+        capability_cgroup_v2 = runtime_capability_label(&status.runtime_capabilities.cgroup_v2),
+        capability_nftables_cgroup_v2 =
+            runtime_capability_label(&status.runtime_capabilities.nftables_cgroup_v2),
+        capability_tun = runtime_capability_label(&status.runtime_capabilities.tun),
+        capability_systemd_user_scopes =
+            runtime_capability_label(&status.runtime_capabilities.systemd_user_scopes),
+        capability_policykit = runtime_capability_label(&status.runtime_capabilities.policykit),
+        capability_logind_session =
+            runtime_capability_label(&status.runtime_capabilities.logind_session),
         publication_state = publication_state_label(publication.state),
         publication_sequence = optional_u64_label(publication.sequence),
         publication_expiry = optional_u64_label(publication.expires_at_unix),
@@ -762,6 +1061,69 @@ fn format_doctor_at(status: &DaemonStatus, now_unix: u64) -> String {
         dytallix_health = dytallix_health_label(remote_peer_trust(publication).health),
         publication_action = combined_publication_action(publication, now_unix),
     )
+}
+
+fn runtime_capability_verdict(capabilities: &SteamOsRuntimeCapabilities) -> Option<String> {
+    for (name, capability) in [
+        ("cgroup v2", &capabilities.cgroup_v2),
+        ("nftables cgroup v2", &capabilities.nftables_cgroup_v2),
+        ("TUN", &capabilities.tun),
+        ("systemd user scopes", &capabilities.systemd_user_scopes),
+    ] {
+        if matches!(
+            capability.state,
+            RuntimeCapabilityState::Unsupported | RuntimeCapabilityState::Unavailable
+        ) {
+            return Some(format!(
+                "FAIL - {name} capability is {}{}",
+                runtime_capability_state_label(capability.state),
+                capability
+                    .detail
+                    .as_deref()
+                    .map(|detail| format!(": {detail}"))
+                    .unwrap_or_default()
+            ));
+        }
+    }
+    for (name, capability) in [
+        ("PolicyKit", &capabilities.policykit),
+        ("logind session", &capabilities.logind_session),
+    ] {
+        if matches!(
+            capability.state,
+            RuntimeCapabilityState::Unsupported | RuntimeCapabilityState::Unavailable
+        ) {
+            return Some(format!(
+                "WARN - {name} capability is {}{}",
+                runtime_capability_state_label(capability.state),
+                capability
+                    .detail
+                    .as_deref()
+                    .map(|detail| format!(": {detail}"))
+                    .unwrap_or_default()
+            ));
+        }
+    }
+    None
+}
+
+fn runtime_capability_label(capability: &RuntimeCapabilityStatus) -> String {
+    match capability.detail.as_deref() {
+        Some(detail) => format!(
+            "{} ({detail})",
+            runtime_capability_state_label(capability.state)
+        ),
+        None => runtime_capability_state_label(capability.state).to_string(),
+    }
+}
+
+fn runtime_capability_state_label(state: RuntimeCapabilityState) -> &'static str {
+    match state {
+        RuntimeCapabilityState::NotChecked => "not checked",
+        RuntimeCapabilityState::Supported => "supported",
+        RuntimeCapabilityState::Unsupported => "unsupported",
+        RuntimeCapabilityState::Unavailable => "unavailable",
+    }
 }
 
 #[cfg(unix)]
@@ -1038,6 +1400,26 @@ fn network_state_label(state: NetworkPlanState) -> &'static str {
         NetworkPlanState::Planned => "planned",
         NetworkPlanState::ApplyFailed => "applyFailed",
         NetworkPlanState::Applied => "applied",
+    }
+}
+
+fn game_profile_port_enforcement_label(state: GameProfilePortEnforcementState) -> &'static str {
+    match state {
+        GameProfilePortEnforcementState::NotApplicable => "notApplicable",
+        GameProfilePortEnforcementState::Planned => "planned",
+        GameProfilePortEnforcementState::FailClosed => "failClosed",
+        GameProfilePortEnforcementState::Applied => "applied",
+        GameProfilePortEnforcementState::ApplyFailed => "applyFailed",
+    }
+}
+
+fn game_process_classification_label(state: GameProcessClassificationState) -> &'static str {
+    match state {
+        GameProcessClassificationState::NotApplicable => "notApplicable",
+        GameProcessClassificationState::FailClosed => "failClosed",
+        GameProcessClassificationState::Armed => "armed",
+        GameProcessClassificationState::Active => "active",
+        GameProcessClassificationState::ApplyFailed => "applyFailed",
     }
 }
 
@@ -1371,11 +1753,22 @@ mod tests {
         }
     }
 
+    fn supported_runtime_capabilities() -> SteamOsRuntimeCapabilities {
+        SteamOsRuntimeCapabilities {
+            cgroup_v2: RuntimeCapabilityStatus::supported(),
+            nftables_cgroup_v2: RuntimeCapabilityStatus::supported(),
+            tun: RuntimeCapabilityStatus::supported(),
+            systemd_user_scopes: RuntimeCapabilityStatus::supported(),
+            policykit: RuntimeCapabilityStatus::supported(),
+            logind_session: RuntimeCapabilityStatus::supported(),
+        }
+    }
+
     #[test]
     fn format_guide_explains_steamos_modes_and_gates() {
         let guide = format_guide();
         assert!(guide.contains("QuantumLink SteamOS Guide"));
-        assert!(guide.contains("dry-run planning"));
+        assert!(guide.contains("planning-only recovery"));
         assert!(guide.contains("systemd"));
         assert!(guide.contains("--activate-network"));
         assert!(guide.contains("qlink0"));
@@ -1416,6 +1809,7 @@ mod tests {
         assert!(guide.contains("qlinkctl doctor"));
         assert!(guide.contains("qlinkctl invite import"));
         assert!(guide.contains("qlinkctl peer trust"));
+        assert!(guide.contains("qlinkctl profile select"));
         assert!(guide.contains("qlinkctl support-bundle --output"));
     }
 
@@ -1632,11 +2026,37 @@ mod tests {
         select_peer_in_store(&state_dir, "peer-a", 10).unwrap();
         let selected = load_peer_store_for_state_dir(&state_dir).unwrap();
         assert_eq!(selected.selected_peer_id.as_deref(), Some("peer-a"));
+        assert!(format_peer_state(&selected)
+            .unwrap()
+            .contains("\"selectedPeerId\": \"peer-a\""));
+
+        clear_peer_selection_in_store(&state_dir).unwrap();
+        let cleared = load_peer_store_for_state_dir(&state_dir).unwrap();
+        assert_eq!(cleared.selected_peer_id, None);
+
+        select_peer_in_store(&state_dir, "peer-a", 10).unwrap();
 
         revoke_peer_in_store(&state_dir, "peer-a").unwrap();
         let revoked = load_peer_store_for_state_dir(&state_dir).unwrap();
         assert_eq!(revoked.selected_peer_id, None);
         let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn service_commands_use_fixed_absolute_argv() {
+        assert_eq!(
+            service_command_argv(ServiceAction::Start),
+            ["/usr/local/libexec/quantumlink-service-control", "start"]
+        );
+        assert_eq!(
+            service_command_argv(ServiceAction::Stop),
+            ["/usr/local/libexec/quantumlink-service-control", "stop"]
+        );
+        assert_eq!(
+            service_command_argv(ServiceAction::Restart),
+            ["/usr/local/libexec/quantumlink-service-control", "restart"]
+        );
+        assert!(ServiceAction::parse("start;reboot").is_err());
     }
 
     #[cfg(unix)]
@@ -1682,6 +2102,27 @@ mod tests {
         assert!(doctor.contains("publication state: notStarted"));
         assert!(doctor.contains("action: publication not started"));
         assert!(doctor.contains("qlinkd never owns wallet secrets"));
+    }
+
+    #[test]
+    fn format_doctor_warns_when_profile_ports_need_restart() {
+        let mut status = status_with_network(NetworkPlanState::Planned, true, false, None);
+        status.publication = healthy_publication(false);
+        status.game_profile.port_enforcement = qlink_proto::GameProfilePortEnforcementStatus {
+            state: GameProfilePortEnforcementState::Applied,
+            profile_id: Some("factorio".to_string()),
+            udp_ports: vec![34197],
+            restart_required: true,
+        };
+
+        let doctor = format_doctor(&status);
+
+        assert!(
+            doctor.contains("verdict: WARN - service restart required to apply game profile ports")
+        );
+        assert!(doctor.contains("applied game profile: factorio"));
+        assert!(doctor.contains("enforced UDP ports: 34197"));
+        assert!(doctor.contains("game profile restart required: yes"));
     }
 
     #[test]
@@ -1971,5 +2412,105 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("unsupported request"));
+    }
+
+    #[test]
+    fn game_launch_plan_uses_selected_profile_and_fixed_systemd_boundary() {
+        let status = GameProfileStatus {
+            selected_profile: Some(qlink_proto::GameProfileInfo {
+                id: "factorio".to_string(),
+                display_name: "Factorio".to_string(),
+                executables: vec!["factorio".to_string()],
+                udp_ports: vec![34197],
+                lan_discovery: true,
+                voice_chat_safe: true,
+                low_latency: true,
+            }),
+            ..Default::default()
+        };
+
+        let plan = build_game_launch_plan(
+            &status,
+            "s123abc",
+            Path::new("/usr/local/bin/qlinkctl"),
+            "/home/deck/factorio",
+            &["--start-server".to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(plan.scope_unit, "quantumlink-game-s123abc.scope");
+        assert_eq!(plan.systemd_run_args[0], "--user");
+        assert!(plan.systemd_run_args.iter().any(|arg| arg == "factorio"));
+        assert!(!plan.systemd_run_args.iter().any(|arg| arg == "sh"));
+    }
+
+    #[test]
+    fn game_launch_capability_preflight_accepts_supported_host() {
+        validate_game_launch_capabilities(&supported_runtime_capabilities()).unwrap();
+    }
+
+    #[test]
+    fn game_launch_capability_preflight_fails_closed() {
+        let mut capabilities = supported_runtime_capabilities();
+        capabilities.nftables_cgroup_v2 =
+            RuntimeCapabilityStatus::unsupported("kernel expression is unavailable");
+
+        let error = validate_game_launch_capabilities(&capabilities).unwrap_err();
+
+        assert_eq!(
+            error,
+            "game launch blocked: nftables cgroup v2 is unsupported: kernel expression is unavailable"
+        );
+    }
+
+    #[test]
+    fn doctor_fails_when_required_game_capability_is_unsupported() {
+        let mut status = status_with_network(NetworkPlanState::Applied, false, true, None);
+        status.publication = healthy_publication(true);
+        status.runtime_capabilities = supported_runtime_capabilities();
+        status.runtime_capabilities.nftables_cgroup_v2 =
+            RuntimeCapabilityStatus::unsupported("kernel expression is unavailable");
+
+        let doctor = format_doctor_at(&status, 1_767_139_200);
+
+        assert!(doctor.contains(
+            "verdict: FAIL - nftables cgroup v2 capability is unsupported: kernel expression is unavailable"
+        ));
+        assert!(doctor.contains("capability cgroup v2: supported"));
+        assert!(doctor.contains(
+            "capability nftables cgroup v2: unsupported (kernel expression is unavailable)"
+        ));
+    }
+
+    #[test]
+    fn doctor_warns_when_desktop_authorization_capability_is_unavailable() {
+        let mut status = status_with_network(NetworkPlanState::Applied, false, true, None);
+        status.publication = healthy_publication(true);
+        status.runtime_capabilities = supported_runtime_capabilities();
+        status.runtime_capabilities.policykit =
+            RuntimeCapabilityStatus::unavailable("pkexec is not installed");
+
+        let doctor = format_doctor_at(&status, 1_767_139_200);
+
+        assert!(doctor.contains(
+            "verdict: WARN - PolicyKit capability is unavailable: pkexec is not installed"
+        ));
+        assert!(doctor.contains("capability PolicyKit: unavailable (pkexec is not installed)"));
+    }
+
+    #[test]
+    fn doctor_fails_when_game_process_classification_fails() {
+        let mut status = DaemonStatus::idle(true);
+        status.game_profile.process_classification = qlink_proto::GameProcessClassificationStatus {
+            state: GameProcessClassificationState::ApplyFailed,
+            error: Some("nftables cgroup expression unavailable".to_string()),
+            ..Default::default()
+        };
+
+        let doctor = format_doctor(&status);
+
+        assert!(doctor.contains(
+            "verdict: FAIL - game process classification failed: nftables cgroup expression unavailable"
+        ));
     }
 }

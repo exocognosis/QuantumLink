@@ -2,12 +2,16 @@ use qlink_proto::InviteCode;
 use qlinkctl::dytallix::{parse_dytallix_args, run_dytallix};
 #[cfg(unix)]
 use qlinkctl::{
-    current_unix_seconds, format_doctor, format_peer_list, format_peer_trust, format_status,
-    import_invite_to_store, load_peer_store_for_state_dir, peer_from_store, remove_peer_from_store,
-    revoke_peer_in_store, select_peer_in_store, status_from_daemon, write_support_bundle,
+    begin_game_process, build_game_launch_plan, clear_game_profile, clear_peer_selection_in_store,
+    current_unix_seconds, end_game_process, format_doctor, format_game_profile_status,
+    format_peer_list, format_peer_state, format_peer_trust, format_status, import_invite_to_store,
+    load_peer_store_for_state_dir, peer_from_store, remove_peer_from_store, revoke_peer_in_store,
+    select_game_profile, select_peer_in_store, status_from_daemon, write_support_bundle,
     SupportBundleOptions, SupportBundleReleaseInfo, DEFAULT_STATE_DIR,
 };
-use qlinkctl::{format_guide, format_onboarding_checklist};
+use qlinkctl::{format_guide, format_onboarding_checklist, run_service_action, ServiceAction};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 #[cfg(unix)]
 use std::path::Path;
 
@@ -47,6 +51,40 @@ fn main() {
             };
             support_bundle_command(&output);
         }
+        Some("profile") => match args.next().as_deref() {
+            Some("list") => {
+                reject_extra_args(args, "usage: qlinkctl profile list");
+                profile_list_command();
+            }
+            Some("status") => {
+                reject_extra_args(args, "usage: qlinkctl profile status");
+                profile_status_command();
+            }
+            Some("select") => {
+                let Some(profile_id) = args.next() else {
+                    eprintln!("usage: qlinkctl profile select <profile-id>");
+                    std::process::exit(2);
+                };
+                reject_extra_args(args, "usage: qlinkctl profile select <profile-id>");
+                profile_select_command(&profile_id);
+            }
+            Some("clear") => {
+                reject_extra_args(args, "usage: qlinkctl profile clear");
+                profile_clear_command();
+            }
+            _ => {
+                eprintln!("usage: qlinkctl profile <list|status|select|clear> [profile-id]");
+                std::process::exit(2);
+            }
+        },
+        Some("game") => match args.next().as_deref() {
+            Some("launch") => game_launch_command(args.collect()),
+            Some("enter") => game_enter_command(args.collect()),
+            _ => {
+                eprintln!("usage: qlinkctl game launch -- <command> [args...]");
+                std::process::exit(2);
+            }
+        },
         Some("invite") => match args.next().as_deref() {
             Some("import") => {
                 let Some(encoded) = args.next() else {
@@ -78,6 +116,8 @@ fn main() {
         },
         Some("peer") => match args.next().as_deref() {
             Some("list") => peer_list_command(),
+            Some("state") => peer_state_command(),
+            Some("clear") => peer_clear_command(),
             Some("remove") => {
                 let Some(peer_id) = args.next() else {
                     eprintln!("usage: qlinkctl peer remove <peer-id>");
@@ -107,17 +147,287 @@ fn main() {
                 peer_trust_command(&peer_id);
             }
             _ => {
-                eprintln!("usage: qlinkctl peer <list|remove|revoke|select|trust> [peer-id]");
+                eprintln!(
+                    "usage: qlinkctl peer <list|state|clear|remove|revoke|select|trust> [peer-id]"
+                );
                 std::process::exit(2);
             }
         },
+        Some("service") => {
+            let Some(action) = args.next() else {
+                eprintln!("usage: qlinkctl service <start|stop|restart>");
+                std::process::exit(2);
+            };
+            if args.next().is_some() {
+                eprintln!("usage: qlinkctl service <start|stop|restart>");
+                std::process::exit(2);
+            }
+            match ServiceAction::parse(&action).and_then(run_service_action) {
+                Ok(()) => println!("{action}"),
+                Err(error) => {
+                    eprintln!("{error}");
+                    std::process::exit(1);
+                }
+            }
+        }
         _ => {
             eprintln!(
-                "usage: qlinkctl <guide|onboarding|status|doctor|dytallix|support-bundle --output|invite|peer>"
+                "usage: qlinkctl <guide|onboarding|status|doctor|dytallix|support-bundle --output|profile|game|invite|peer|service>"
             );
             std::process::exit(2);
         }
     }
+}
+
+#[cfg(unix)]
+fn game_launch_command(args: Vec<String>) {
+    use signal_hook::consts::{SIGINT, SIGTERM};
+    use std::sync::{atomic::AtomicUsize, Arc};
+
+    let (command, command_args) = parse_game_command(&args, 0);
+    let socket = Path::new("/run/quantumlink/qlinkd.sock");
+    let status = status_from_daemon(socket).unwrap_or_else(|error| command_error(error));
+    qlinkctl::validate_game_launch_capabilities(&status.runtime_capabilities).unwrap_or_else(
+        |error| {
+            eprintln!("{error}");
+            std::process::exit(1);
+        },
+    );
+    let qlinkctl_path = std::env::current_exe().unwrap_or_else(|error| {
+        eprintln!("failed to resolve qlinkctl path: {error}");
+        std::process::exit(1);
+    });
+    let session_id = new_game_session_id();
+    let plan = build_game_launch_plan(
+        &status.game_profile,
+        &session_id,
+        &qlinkctl_path,
+        command,
+        command_args,
+    )
+    .unwrap_or_else(|error| {
+        eprintln!("{error}");
+        std::process::exit(1);
+    });
+
+    let termination_signal = Arc::new(AtomicUsize::new(0));
+    for signal in [SIGINT, SIGTERM] {
+        signal_hook::flag::register_usize(signal, Arc::clone(&termination_signal), signal as usize)
+            .unwrap_or_else(|error| {
+                eprintln!("failed to install game launcher signal handler: {error}");
+                std::process::exit(1);
+            });
+    }
+
+    let child = std::process::Command::new("/usr/bin/systemd-run")
+        .args(&plan.systemd_run_args)
+        .spawn();
+    let run_status = child.and_then(|child| {
+        wait_for_game_scope(child, &plan.scope_unit, termination_signal.as_ref())
+    });
+    if run_status
+        .as_ref()
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::ResourceBusy)
+    {
+        eprintln!("{}", run_status.unwrap_err());
+        std::process::exit(1);
+    }
+    let cleanup = end_game_process(socket, &session_id);
+    if let Err(error) = cleanup {
+        eprintln!("failed to remove game process classification: {error}");
+        std::process::exit(1);
+    }
+    match run_status {
+        Ok(status) if status.success() => {}
+        Ok(status) => std::process::exit(status.code().unwrap_or(1)),
+        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+            eprintln!("{error}");
+            let signal = termination_signal.load(std::sync::atomic::Ordering::Relaxed);
+            std::process::exit(128 + signal as i32);
+        }
+        Err(error) => {
+            eprintln!("failed to start systemd game scope: {error}");
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn wait_for_game_scope(
+    mut child: std::process::Child,
+    scope_unit: &str,
+    termination_signal: &std::sync::atomic::AtomicUsize,
+) -> std::io::Result<std::process::ExitStatus> {
+    use std::sync::atomic::Ordering;
+
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        let signal = termination_signal.load(Ordering::Relaxed);
+        if signal != 0 {
+            let stop_status = std::process::Command::new("/usr/bin/systemctl")
+                .args(["--user", "stop", scope_unit])
+                .status()
+                .map_err(|error| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::ResourceBusy,
+                        format!(
+                            "failed to stop interrupted game scope {scope_unit}: {error}; classification remains active"
+                        ),
+                    )
+                })?;
+            if !stop_status.success() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ResourceBusy,
+                    format!(
+                    "failed to stop interrupted game scope {scope_unit}; classification remains active"
+                    ),
+                ));
+            }
+            let _ = child.wait();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                format!("game launcher received signal {signal}"),
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+#[cfg(not(unix))]
+fn game_launch_command(_args: Vec<String>) {
+    unsupported_profile_command();
+}
+
+#[cfg(unix)]
+fn game_enter_command(args: Vec<String>) {
+    if args.len() < 4 {
+        eprintln!("invalid internal game launch request");
+        std::process::exit(2);
+    }
+    let profile_id = &args[0];
+    let session_id = &args[1];
+    let (command, command_args) = parse_game_command(&args, 2);
+    let socket = Path::new("/run/quantumlink/qlinkd.sock");
+    if let Err(error) = begin_game_process(socket, profile_id, command, session_id) {
+        command_error(error);
+    }
+
+    let error = std::process::Command::new(command)
+        .args(command_args)
+        .exec();
+    eprintln!("failed to execute game command: {error}");
+    std::process::exit(1);
+}
+
+#[cfg(not(unix))]
+fn game_enter_command(_args: Vec<String>) {
+    unsupported_profile_command();
+}
+
+fn parse_game_command(args: &[String], prefix_len: usize) -> (&str, &[String]) {
+    if args.get(prefix_len).map(String::as_str) != Some("--") {
+        eprintln!("usage: qlinkctl game launch -- <command> [args...]");
+        std::process::exit(2);
+    }
+    let Some(command) = args.get(prefix_len + 1) else {
+        eprintln!("usage: qlinkctl game launch -- <command> [args...]");
+        std::process::exit(2);
+    };
+    (command, &args[prefix_len + 2..])
+}
+
+fn new_game_session_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("s{:x}{nanos:x}", std::process::id())
+}
+
+fn reject_extra_args(mut args: impl Iterator<Item = String>, usage: &str) {
+    if args.next().is_some() {
+        eprintln!("{usage}");
+        std::process::exit(2);
+    }
+}
+
+#[cfg(unix)]
+fn profile_list_command() {
+    match status_from_daemon(Path::new("/run/quantumlink/qlinkd.sock")) {
+        Ok(status) => println!(
+            "{}",
+            serde_json::to_string_pretty(&status.game_profile.available_profiles)
+                .expect("profiles serialize")
+        ),
+        Err(error) => command_error(error),
+    }
+}
+
+#[cfg(not(unix))]
+fn profile_list_command() {
+    unsupported_profile_command();
+}
+
+#[cfg(unix)]
+fn profile_status_command() {
+    match status_from_daemon(Path::new("/run/quantumlink/qlinkd.sock")) {
+        Ok(status) => println!(
+            "{}",
+            format_game_profile_status(&status.game_profile).expect("profile status serializes")
+        ),
+        Err(error) => command_error(error),
+    }
+}
+
+#[cfg(not(unix))]
+fn profile_status_command() {
+    unsupported_profile_command();
+}
+
+#[cfg(unix)]
+fn profile_select_command(profile_id: &str) {
+    match select_game_profile(Path::new("/run/quantumlink/qlinkd.sock"), profile_id) {
+        Ok(status) => println!(
+            "{}",
+            format_game_profile_status(&status.game_profile).expect("profile status serializes")
+        ),
+        Err(error) => command_error(error),
+    }
+}
+
+#[cfg(not(unix))]
+fn profile_select_command(_profile_id: &str) {
+    unsupported_profile_command();
+}
+
+#[cfg(unix)]
+fn profile_clear_command() {
+    match clear_game_profile(Path::new("/run/quantumlink/qlinkd.sock")) {
+        Ok(status) => println!(
+            "{}",
+            format_game_profile_status(&status.game_profile).expect("profile status serializes")
+        ),
+        Err(error) => command_error(error),
+    }
+}
+
+#[cfg(not(unix))]
+fn profile_clear_command() {
+    unsupported_profile_command();
+}
+
+#[cfg(unix)]
+fn command_error(error: impl std::fmt::Display) -> ! {
+    eprintln!("{error}");
+    std::process::exit(1);
+}
+
+#[cfg(not(unix))]
+fn unsupported_profile_command() -> ! {
+    eprintln!("qlinkctl profile is only supported on Unix-like SteamOS hosts");
+    std::process::exit(2);
 }
 
 fn dytallix_usage() -> &'static str {
@@ -241,6 +551,42 @@ fn peer_list_command() {
             std::process::exit(1);
         }
     }
+}
+
+#[cfg(unix)]
+fn peer_state_command() {
+    match load_peer_store_for_state_dir(Path::new(DEFAULT_STATE_DIR))
+        .and_then(|store| format_peer_state(&store).map_err(Into::into))
+    {
+        Ok(output) => println!("{output}"),
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn peer_state_command() {
+    eprintln!("qlinkctl peer state is only supported on Unix-like SteamOS hosts");
+    std::process::exit(2);
+}
+
+#[cfg(unix)]
+fn peer_clear_command() {
+    match clear_peer_selection_in_store(Path::new(DEFAULT_STATE_DIR)) {
+        Ok(()) => println!("cleared"),
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn peer_clear_command() {
+    eprintln!("qlinkctl peer clear is only supported on Unix-like SteamOS hosts");
+    std::process::exit(2);
 }
 
 #[cfg(not(unix))]

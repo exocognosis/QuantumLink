@@ -249,6 +249,307 @@ orphaned crate.
 - Decision: No-Go remains unchanged. No schema-v2 live-chain bundle is linked,
   independently verified, and recorded as passing evidence.
 
+## 2026-08-17 Production Activation And Gaming Requirements
+
+- Host class: local macOS development host and clean temporary worktree. No
+  Steam Deck hardware, live Dytallix deployment, or public relay is claimed.
+- The packaged systemd service now starts `qlinkd --activate-network` and uses
+  record-backed stop cleanup. Packaging includes a planning-only recovery
+  sample instead of an opt-in activation sample.
+- Full-tunnel configuration now requires explicit canonical IPv4 underlay
+  exemptions. The nftables plan returns exempt traffic before mark and drop
+  rules. Invalid, duplicate, default-route, and overlay-overlapping exemptions
+  fail configuration validation.
+- Added SteamOS gaming VPN requirements for direct-first path selection,
+  per-flow path affinity, jitter and loss inputs, path-change hysteresis,
+  datagram MTU discovery, Steam-safe routing, recovery, voice traffic, and a
+  controller-accessible Desktop Mode control surface.
+- Defined the Dytallix boundary. `qlink-core` owns stable identity v2 binding,
+  signed records, policy, and verification. The Steam silo owns device-key
+  storage, provisioning commands, status, and Desktop Mode controls.
+- Passed in the clean worktree: `cargo fmt --all --check`.
+- Passed: 234 tests across `qlink-proto`, `qlink-linux`, `qlink-game`,
+  `qlinkd`, and `qlinkctl`.
+- Passed: 270 `qlink-core` library, tool, and direct-send tests, including the
+  Dytallix v1 and stable identity v2 policy suites.
+- Passed: strict Clippy for all SteamOS crates with `-D warnings`.
+- Passed: staged installer and release-verifier tests. The local OpenSSL build
+  did not support the Ed25519 production-signature positive fixture.
+- A repository-wide strict Clippy run that included `qlink-core` found existing
+  warnings in shared-core FFI documentation and enum sizing. This batch does
+  not change those shared-core files.
+- Decision: No-Go remains unchanged. Real Deck network and game evidence, a
+  schema-v2 live-chain Dytallix lifecycle bundle with independent finality,
+  public rendezvous and relay evidence, and protected production signing are
+  still required.
+
+## 2026-08-17 Desktop Mode Control Application
+
+- Host class: local macOS development host and clean temporary worktree. The
+  application used a fixture `qlinkctl` backend for visual checks. No Steam
+  Deck hardware or live-chain result is claimed.
+- Added the native `qlink-desktop` application with Overview, Peers, Dytallix
+  Identity, and Diagnostics views.
+- The application runs as the desktop user. It sends all control requests to
+  `qlinkctl` and does not implement a second daemon, protocol, peer store, or
+  Dytallix client.
+- Added typed `qlinkctl` commands for peer state, peer selection cleanup, and
+  fixed service start, stop, and restart operations. Service operations use a
+  fixed `pkexec systemctl` argument vector and cannot select another unit.
+- Dytallix controls use the existing shared-core v2 commands. Wallet secrets
+  do not enter the application process. The application supplies only the
+  keystore path, wallet name, public operation data, and exact revoke
+  confirmation.
+- Added package assets for the application binary, FreeDesktop launcher, and
+  256-pixel icon. The installer and release verifier check all three assets.
+- Passed: 78 focused tests across `qlink-desktop`, `qlink-proto`, and
+  `qlinkctl`.
+- Passed: locked release builds for `qlinkd`, `qlinkctl`, and
+  `qlink-desktop`; workspace format checks; strict scoped Clippy with
+  `-D warnings`; staged installer tests; and release-verifier tests.
+- Passed: a release package made from the optimized binaries. The verifier
+  reported `valid=true`, `productionReady=false`, and
+  `notProductionReady=true` because the package used the development signing
+  mode and did not contain production evidence.
+- Visual check passed for the native fixture-backed application. The checked
+  desktop view had no visible overlap, clipping, or blank content.
+- Decision: No-Go remains unchanged. Steam Deck Desktop Mode and Game Mode
+  input tests, profile selection, live service authorization, live Dytallix
+  finality, public edge evidence, and protected production signing remain
+  open.
+
+## 2026-08-17 Game Profile And Game Mode Controls
+
+- Host class: local macOS development host and clean temporary worktree. The
+  application used a fixture `qlinkctl` backend. No Steam Deck or Steam Input
+  result is claimed.
+- `qlink-game` now validates profile IDs, display names, executable basenames,
+  and UDP ports. It stores the selected profile in a schema-versioned,
+  owner-only state file with atomic replacement.
+- `qlinkd` owns profile selection state. It accepts typed select and clear
+  requests only for validated installed profiles. Daemon status returns the
+  selected profile and the available profile catalog.
+- `qlinkctl` now provides `profile list`, `profile status`, `profile select`,
+  and `profile clear` commands.
+- `qlink-desktop` now shows explicit profile controls. The `--game-mode` option
+  requests full screen and adds keyboard or controller navigation for pages
+  and profile selection.
+- Packaging now contains separate Desktop Mode and Game Mode launchers. The
+  installer and release verifier check both launchers.
+- Passed: 188 focused tests across `qlink-desktop`, `qlink-game`,
+  `qlink-proto`, `qlinkctl`, and `qlinkd`.
+- Passed: workspace format checks and strict scoped Clippy with `-D warnings`.
+- Passed: shell syntax checks, staged installer tests, and release-verifier
+  tests. The local OpenSSL build did not support the Ed25519 production
+  signature positive fixture.
+- Passed: optimized builds for `qlinkd`, `qlinkctl`, and `qlink-desktop`.
+- Passed: a development package that contains both launchers. The verifier
+  reported `valid=true`, `productionReady=false`, and
+  `notProductionReady=true`.
+- Visual check passed for the fixture-backed full-screen Game Profiles view.
+  The view showed three profiles, selected state, controller focus, and no
+  visible overlap or clipping.
+- Decision: No-Go remains unchanged. The selected profile does not yet drive
+  live process, port, route, or nftables flow classification. Real Steam Deck
+  and Steam Input validation, live Dytallix finality, public edge evidence, and
+  protected production signing also remain open.
+
+## 2026-08-17 Selected Profile Port Enforcement
+
+- Host class: local macOS development host and clean temporary worktree. No
+  Steam Deck nftables result is claimed.
+- `qlink-linux` now accepts a validated game UDP port selector for `gameOnly`
+  plans. It sorts and removes duplicate ports and rejects port zero.
+- The route chain marks only UDP source or destination ports from the selected
+  profile when the destination is inside the protected overlay CIDR.
+- The filter chain drops unmarked overlay traffic and then enforces the
+  existing output-interface leak rule. No selected profile produces a
+  fail-closed plan with no game port marks.
+- Protected-prefix and full-tunnel modes keep their existing route behavior.
+- Daemon status reports the profile represented by the current runtime plan,
+  the enforced UDP ports, the enforcement state, and whether a restart is
+  required.
+- Active profile changes preserve the immutable applied plan and set
+  `restartRequired=true`. The desktop application uses the fixed
+  `qlinkctl service restart` path to run owned teardown before replacement.
+- Passed: 242 focused tests across `qlink-linux`, `qlink-proto`, `qlinkd`,
+  `qlinkctl`, and `qlink-desktop`.
+- Passed: format checks, strict scoped Clippy with `-D warnings`, shell syntax,
+  staged installer tests, release-verifier tests, and optimized builds.
+- Passed: a development package made from the optimized binaries. The verifier
+  reported `valid=true`, `productionReady=false`, and
+  `notProductionReady=true`.
+- Visual check passed for the full-screen profile view. The applied profile and
+  enforced UDP ports were visible with no overlap or clipping.
+- Decision: No-Go remains unchanged. Executable-aware process classification,
+  real Deck nftables and route-leak evidence, live Dytallix finality, public
+  edge evidence, and protected production signing remain open.
+
+## 2026-08-17 Launch-Bound Process Classification
+
+- Host class: local macOS development host with Linux behavior covered by
+  typed plans and injected executors. No Steam Deck kernel result is claimed.
+- `qlinkctl game launch -- <command> [args...]` validates the selected profile
+  and builds a fixed `systemd-run --user --scope` command. It does not use a
+  shell.
+- The scope runs inside `quantumlink-game.slice`. The inner control request
+  reaches `qlinkd` before the game executable starts.
+- On Linux, `qlinkd` reads `SO_PEERCRED` and `/proc/<pid>/cgroup`. It validates
+  the caller UID, exact cgroup v2 scope, session ID, selected profile, applied
+  network plan, and executable basename.
+- The game-only startup plan contains no unscoped UDP mark. It remains
+  fail-closed until the daemon adds rules that match the exact cgroup path and
+  profile UDP source or destination port.
+- The daemon records each nftables handle. The outer launcher removes all
+  recorded rules after the scoped game exits. Partial rule application rolls
+  back the rules that were already added.
+- Status, `qlinkctl doctor`, and the Desktop Mode profile view expose
+  `failClosed`, `armed`, `active`, and `applyFailed` classification states.
+- Passed: 260 focused Rust tests across `qlink-game`, `qlink-linux`,
+  `qlink-proto`, `qlinkd`, `qlinkctl`, and `qlink-desktop`.
+- Passed: strict scoped Clippy with `-D warnings`.
+- Passed: optimized `qlinkd`, `qlinkctl`, and `qlink-desktop` builds, staged
+  installer tests, shell syntax, and release-verifier tests.
+- Passed: the development package verifier reported `valid=true` and
+  `notProductionReady=true`. Production signing remains absent by design.
+- Visual check passed for the full-screen profile view. `Process active`, the
+  classified executable, applied profile, and UDP port fit without overlap.
+- Decision: No-Go remains unchanged. Real Steam Deck cgroup v2, nftables,
+  Proton, route-leak, suspend/resume, and anti-cheat proof remains open. Live
+  Dytallix finality, public edge evidence, and protected production signing
+  also remain open.
+
+## 2026-08-18 Desktop Control Wiring
+
+- Audited each visible Desktop Mode action against the `qlinkctl` command
+  boundary.
+- Added fixed service start and restart controls. Existing connect and stop
+  controls continue to use fixed peer-selection and service commands.
+- Added peer-selection clear controls. Revocation remains irreversible because
+  `qlinkctl peer trust` reports trust state and does not restore a revoked peer.
+- Added an in-application `qlinkctl doctor` report with selectable output.
+- Backend peer state now clears stale UI selection after peer removal,
+  revocation, or external selection changes.
+- Game launch remains a Steam launch-option action. The desktop application
+  does not bypass the cgroup-qualified launcher contract.
+- Passed: 7 focused `qlink-desktop` tests, scoped formatting, and strict Clippy
+  with `-D warnings`.
+- Visual validation passed for the Diagnostics view at 1180 by 792 points. The
+  four service controls and support-bundle controls have no clipping or
+  overlap.
+- Decision: No-Go remains unchanged. This batch connects local controls but
+  does not provide Steam Deck, public edge, live Dytallix, or signing evidence.
+
+## 2026-08-18 Compatible Linux Desktop Control Integration
+
+- Host class: privileged Debian systemd container in the Docker Desktop Linux
+  VM. The host used cgroup v2 and systemd 252. It was not Steam Deck hardware.
+- Added a repeatable isolated runner for the Desktop Mode control boundary.
+  The runner stages the current SteamOS crates and assets in a clean clone.
+- Passed: `qlinkctl service start`, `restart`, and `stop` through `pkexec` and
+  the packaged systemd service in planning mode.
+- Passed: daemon status, doctor, profile list/select/clear, invite import, peer
+  select/clear/revoke/remove, read-only peer trust state, restart recovery, and
+  control-socket removal after service stop.
+- The machine-readable report is
+  `/tmp/quantumlink-steamos-desktop-control-linux.json`. It sets
+  `notProductionReady=true`.
+- All SteamOS crate manifests now declare Rust 1.88. This version supports the
+  locked dependency graph and the shared-core FFI implementation.
+- Decision: No-Go remains unchanged. This run does not apply TUN, route, or
+  nftables state. Root execution does not prove an interactive PolicyKit
+  prompt. Steam Deck rendering, Steam Input, and real game launch behavior
+  remain open.
+
+## 2026-08-18 Active Linux Network And Authorization Integration
+
+- Host class: privileged Debian systemd container in the Docker Desktop Linux
+  VM. The host used LinuxKit 6.10.14, cgroup v2, and systemd 252. It was not
+  Steam Deck hardware.
+- Replaced direct privileged `systemctl` calls with the fixed root-owned
+  `/usr/local/libexec/quantumlink-service-control` helper. The helper accepts
+  only `start`, `stop`, or `restart` for `qlinkd.service`.
+- Added a production PolicyKit rule. It limits the helper to members of the
+  `quantumlink` group and requests administrator authentication. The installer
+  installs both files and adds the desktop user to the group.
+- Passed: non-member denial and group-authorized start, restart, and stop. A
+  test-only rule removed the interactive prompt because Docker has no logind
+  session. The production `AUTH_ADMIN_KEEP` prompt remains blocked.
+- Passed: active `qlink0` creation, `100.64.10.2/32` assignment, fwmark policy
+  rule, table 51820 route, fail-closed nftables table, daemon packet I/O status,
+  and record-backed teardown.
+- Added controlled `/usr/bin` and `/usr/sbin` resolution for `ip` and `nft`.
+  The daemon does not search `PATH`.
+- Removed the invalid `systemd-run --scope --wait` combination. Scope launch
+  plans use the supported synchronous scope path.
+- Added nft string-literal encoding for cgroup paths and rule comments.
+- The Docker Desktop kernel rejected the nftables `socket cgroupv2` expression.
+  The harness now probes this kernel feature. It records native and
+  Proton-shaped classification as blocked when the feature is absent.
+- The machine-readable active-network report is
+  `/tmp/quantumlink-steamos-network-game-linux.json`. It sets
+  `notProductionReady=true` and preserves each blocked check.
+- Passed: 266 tests across the six SteamOS crates, Steam-only strict Clippy,
+  staged installer tests, release-verifier tests, shell syntax, ShellCheck, and
+  PolicyKit JavaScript syntax checks.
+- The release-verifier test skipped its Ed25519 positive fixture because the
+  local OpenSSL build cannot generate that key type. Negative signing and
+  release-gate tests passed.
+- Decision: No-Go remains unchanged. Run the same harness on a compatible
+  SteamOS kernel to close native and Proton classification. A real Steam Deck
+  must also prove interactive PolicyKit, Steam Input, route leaks,
+  suspend/resume, voice traffic, anti-cheat behavior, and game compatibility.
+
+## 2026-08-18 Runtime Capability And Launch Recovery Gate
+
+- `qlinkd` now detects and reports cgroup v2, nftables cgroup matching, TUN,
+  systemd user scopes, PolicyKit, and logind session support.
+- The capability schema has backward-compatible defaults. Older status payloads
+  deserialize as `notChecked`.
+- `qlinkctl doctor` reports required game-path capability failures as `FAIL`.
+  Missing PolicyKit or logind support produces `WARN` because these capabilities
+  affect desktop authorization but do not change the packet path.
+- `qlinkctl game launch` now stops before `systemd-run` unless cgroup v2,
+  nftables cgroup matching, TUN, and systemd user scopes report `supported`.
+- The desktop Diagnostics view shows the same typed capability state and the
+  first detected issue.
+- Concurrent launch, wrong-session cleanup, active-profile mutation, partial
+  cleanup retry, and legacy protocol behavior have focused Rust tests.
+- The launcher catches `SIGINT` and `SIGTERM`. It stops the transient scope
+  before it removes nftables classification. If scope stop fails, it keeps the
+  classification active.
+- The compatible Linux harness records the capability object in evidence schema
+  version 2. On an unsupported kernel, it proves that launch fails before game
+  rules are installed. On a compatible kernel, it also tests game crash,
+  concurrent launch, launcher interruption, daemon restart, native launch, and
+  Proton-shaped descendant cleanup.
+- Decision: No-Go remains unchanged. The Docker Desktop kernel can prove the
+  unsupported fail-closed path. A compatible SteamOS kernel must execute the
+  native, Proton-shaped, and recovery paths. Steam Deck hardware evidence is
+  still required for production.
+
+## 2026-08-18 Deck Runtime Qualification Tooling
+
+- No Steam Deck or remote SteamOS target was configured for this run. No new
+  hardware result is claimed.
+- Added a device-local preflight that rejects non-SteamOS and non-Steam Deck
+  hosts before it changes network state.
+- Added an explicit mutation gate for runtime qualification. Run mode requires
+  the signed-in desktop user and `QLINK_DECK_CONFIRM_NETWORK_MUTATION=YES`.
+- The runtime qualification requires all six reported capabilities to be
+  `supported`. It tests PolicyKit service restart, native game scope
+  classification, descendant inheritance, crash cleanup, concurrent launch
+  rejection, signal cleanup, and daemon restart cleanup.
+- The evidence schema marks all executable tests as synthetic fixtures. It
+  explicitly sets real-game compatibility and two-Deck packet proof to false.
+- Added a strict verifier. Complete evidence requires a physical Deck claim,
+  `mode=run`, `status=pass`, all runtime checks passed, all capabilities
+  supported, contained required files, and no forbidden private artifacts.
+- Added both runtime scripts to the SteamOS package and release verifier.
+- Decision: No-Go remains unchanged. Run the packaged qualification on a Deck,
+  then complete real Proton, game matrix, two-Deck packet, suspend, voice,
+  anti-cheat, and route-leak evidence.
+
 ## Go / No-Go Rule
 
 Do not label SteamOS production-ready until every blocking gate is `Passed`

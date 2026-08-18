@@ -12,8 +12,11 @@
 //! is backed by the same configuration the routing decision uses.
 
 use qlink_game::profile::SteamBypassPolicy;
-use qlink_game::{recommend_host, GameProfile, HostCandidateMetrics};
-use qlink_proto::{DaemonConfig, RouteMode};
+use qlink_game::{
+    load_game_profile_selection, recommend_host, store_game_profile_selection, GameProfile,
+    GameProfileSelection, HostCandidateMetrics,
+};
+use qlink_proto::{DaemonConfig, GameProfileInfo, GameProfileStatus, RouteMode};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
@@ -43,6 +46,9 @@ pub struct SteamBypassSummary {
     pub protect_game_profile_routes: bool,
     pub bypass_categories: Vec<String>,
     pub game_profile_count: usize,
+    pub game_profiles: Vec<GameProfile>,
+    pub selected_profile: Option<GameProfile>,
+    pub selection_warning: Option<String>,
     /// Set when the policy's protected overlay disagrees with the daemon's
     /// configured overlay, or the route mode is inconsistent with the policy.
     pub alignment_warning: Option<String>,
@@ -57,7 +63,7 @@ impl SteamBypassSummary {
     /// fails: missing or malformed optional files fall back to production-safe
     /// defaults with a recorded warning, so a bad game config cannot brick the
     /// daemon.
-    pub fn load(config_dir: &Path, config: &DaemonConfig) -> Self {
+    pub fn load(config_dir: &Path, state_dir: &Path, config: &DaemonConfig) -> Self {
         let mut load_warnings = Vec::new();
 
         let (policy, source) = match load_steam_bypass_policy(config_dir) {
@@ -72,6 +78,27 @@ impl SteamBypassSummary {
         let (profiles, profile_warnings) = load_game_profiles(config_dir);
         load_warnings.extend(profile_warnings);
 
+        let (selected_profile, selection_warning) = match load_game_profile_selection(state_dir) {
+            Ok(selection) => match selection.selected_profile_id {
+                Some(profile_id) => {
+                    match profiles.iter().find(|profile| profile.id == profile_id) {
+                        Some(profile) => (Some(profile.clone()), None),
+                        None => (
+                            None,
+                            Some(format!(
+                                "selected game profile `{profile_id}` is not installed"
+                            )),
+                        ),
+                    }
+                }
+                None => (None, None),
+            },
+            Err(error) => (
+                None,
+                Some(format!("failed to load game profile selection: {error}")),
+            ),
+        };
+
         let alignment_warning = validate_bypass_alignment(config, &policy);
 
         Self {
@@ -81,6 +108,9 @@ impl SteamBypassSummary {
             protect_game_profile_routes: policy.protect_game_profile_routes(),
             bypass_categories: policy.bypass_categories().to_vec(),
             game_profile_count: profiles.len(),
+            game_profiles: profiles,
+            selected_profile,
+            selection_warning,
             alignment_warning,
             load_warnings,
         }
@@ -90,11 +120,58 @@ impl SteamBypassSummary {
     /// `steam-safe: bypass 10 categories, overlay 100.64.0.0/10, 3 game profiles`.
     pub fn banner(&self) -> String {
         format!(
-            "steam-safe: bypass {} categories, overlay {}, {} game profile(s)",
+            "steam-safe: bypass {} categories, overlay {}, {} game profile(s), selected {}",
             self.bypass_categories.len(),
             self.protect_overlay_cidr,
-            self.game_profile_count
+            self.game_profile_count,
+            self.selected_profile
+                .as_ref()
+                .map(|profile| profile.id.as_str())
+                .unwrap_or("none")
         )
+    }
+
+    pub fn profile_status(&self) -> GameProfileStatus {
+        GameProfileStatus {
+            available_profiles: self.game_profiles.iter().map(profile_info).collect(),
+            selected_profile: self.selected_profile.as_ref().map(profile_info),
+            selection_warning: self.selection_warning.clone(),
+            ..Default::default()
+        }
+    }
+
+    pub fn select_profile(&mut self, state_dir: &Path, profile_id: &str) -> Result<(), String> {
+        let profile = self
+            .game_profiles
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .cloned()
+            .ok_or_else(|| format!("unknown game profile `{profile_id}`"))?;
+        store_game_profile_selection(state_dir, &GameProfileSelection::selected(profile_id))
+            .map_err(|error| format!("failed to store game profile selection: {error}"))?;
+        self.selected_profile = Some(profile);
+        self.selection_warning = None;
+        Ok(())
+    }
+
+    pub fn clear_profile(&mut self, state_dir: &Path) -> Result<(), String> {
+        store_game_profile_selection(state_dir, &GameProfileSelection::default())
+            .map_err(|error| format!("failed to clear game profile selection: {error}"))?;
+        self.selected_profile = None;
+        self.selection_warning = None;
+        Ok(())
+    }
+}
+
+fn profile_info(profile: &GameProfile) -> GameProfileInfo {
+    GameProfileInfo {
+        id: profile.id.clone(),
+        display_name: profile.display_name.clone(),
+        executables: profile.executables.clone(),
+        udp_ports: profile.udp_ports.clone(),
+        lan_discovery: profile.lan_discovery,
+        voice_chat_safe: profile.voice_chat_safe,
+        low_latency: profile.low_latency,
     }
 }
 
@@ -139,7 +216,18 @@ pub fn load_game_profiles(config_dir: &Path) -> (Vec<GameProfile>, Vec<String>) 
     for path in toml_paths {
         match std::fs::read_to_string(&path) {
             Ok(text) => match GameProfile::from_toml_str(&text) {
-                Ok(profile) => profiles.push(profile),
+                Ok(profile) => match profile.validate() {
+                    Ok(()) if profiles.iter().any(|loaded| loaded.id == profile.id) => warnings
+                        .push(format!(
+                            "duplicate game profile id `{}` in {}",
+                            profile.id,
+                            path.display()
+                        )),
+                    Ok(()) => profiles.push(profile),
+                    Err(error) => {
+                        warnings.push(format!("invalid game profile {}: {error}", path.display()))
+                    }
+                },
                 Err(error) => warnings.push(format!("failed to parse {}: {error}", path.display())),
             },
             Err(error) => warnings.push(format!("failed to read {}: {error}", path.display())),
@@ -203,7 +291,7 @@ mod tests {
     #[test]
     fn missing_config_dir_yields_production_safe_defaults() {
         let temp = tempfile::tempdir().unwrap();
-        let summary = SteamBypassSummary::load(temp.path(), &DaemonConfig::default());
+        let summary = SteamBypassSummary::load(temp.path(), temp.path(), &DaemonConfig::default());
 
         assert_eq!(summary.source, SteamBypassSource::Default);
         assert_eq!(summary.default_action, "bypass");
@@ -242,14 +330,51 @@ mod tests {
             "#,
         );
 
-        let summary = SteamBypassSummary::load(temp.path(), &DaemonConfig::default());
+        let summary = SteamBypassSummary::load(temp.path(), temp.path(), &DaemonConfig::default());
 
         assert_eq!(summary.source, SteamBypassSource::ConfigFile);
         assert_eq!(summary.bypass_categories, ["account", "store", "wallet"]);
         assert_eq!(summary.game_profile_count, 1);
+        assert!(summary.selected_profile.is_none());
         assert!(summary.alignment_warning.is_none());
         assert!(summary.load_warnings.is_empty());
         assert!(summary.banner().contains("100.64.0.0/10"));
+    }
+
+    #[test]
+    fn loads_and_clears_a_valid_persisted_profile_selection() {
+        let temp = tempfile::tempdir().unwrap();
+        write(
+            &temp.path().join(GAMES_DIR).join("factorio.toml"),
+            r#"
+                id = "factorio"
+                display_name = "Factorio"
+                executables = ["factorio"]
+                udp_ports = [34197]
+                lan_discovery = true
+                voice_chat_safe = true
+                low_latency = true
+            "#,
+        );
+        store_game_profile_selection(temp.path(), &GameProfileSelection::selected("factorio"))
+            .unwrap();
+
+        let mut summary =
+            SteamBypassSummary::load(temp.path(), temp.path(), &DaemonConfig::default());
+
+        assert_eq!(
+            summary
+                .selected_profile
+                .as_ref()
+                .map(|profile| profile.id.as_str()),
+            Some("factorio")
+        );
+        summary.clear_profile(temp.path()).unwrap();
+        assert!(summary.selected_profile.is_none());
+        assert!(load_game_profile_selection(temp.path())
+            .unwrap()
+            .selected_profile_id
+            .is_none());
     }
 
     #[test]
@@ -260,7 +385,7 @@ mod tests {
             "this is not valid toml = [[[",
         );
 
-        let summary = SteamBypassSummary::load(temp.path(), &DaemonConfig::default());
+        let summary = SteamBypassSummary::load(temp.path(), temp.path(), &DaemonConfig::default());
 
         assert_eq!(summary.source, SteamBypassSource::Default);
         assert_eq!(summary.default_action, "bypass");
@@ -276,7 +401,7 @@ mod tests {
             ..DaemonConfig::default()
         };
 
-        let summary = SteamBypassSummary::load(temp.path(), &config);
+        let summary = SteamBypassSummary::load(temp.path(), temp.path(), &config);
 
         let warning = summary.alignment_warning.expect("mismatch should warn");
         assert!(warning.contains("10.0.0.0/8"));

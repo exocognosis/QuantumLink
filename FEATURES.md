@@ -50,6 +50,56 @@ This feature list is synchronized with the current repository implementation. It
 - Real packet tunnel execution requires Apple Network Extension entitlements, provisioning, signing, and notarization.
 - Enterprise rollout is designed around MDM, per-app VPN payloads, VPN On Demand rules, and extension preapproval.
 
+## SteamOS Operations
+
+- `qlinkd` provides the privileged resident daemon, Linux TUN packet pump,
+  owned route lifecycle, nftables fail closure, resident peer publication, and
+  network-change handling.
+- `qlinkctl` provides onboarding, status, doctor, invite and peer management,
+  redacted support bundles, and offline Dytallix lifecycle commands.
+- The Steam-safe policy bypasses account, store, wallet, checkout, inventory,
+  marketplace, launcher, embedded browser, update, and login traffic.
+- Game profiles define executable, UDP port, LAN discovery, voice safety, and
+  low-latency intent.
+- Host selection scores RTT, jitter, packet loss, relay cost, and NAT cost.
+- Stable Dytallix Identity V2 uses the shared contract and verifier semantics.
+  Public mode rejects silent v1 downgrade.
+- The production-candidate systemd service activates the owned game-only
+  network plan. Full-tunnel mode requires explicit validated underlay CIDRs.
+- Packaging, release manifests, evidence schema V2, archive binding, and
+  development signature verification are implemented.
+- `qlink-desktop` provides SteamOS Desktop Mode controls for connection state,
+  service lifecycle, peer import, selection, peer state, Dytallix lifecycle
+  operations, packet metrics, diagnostic checks, and redacted support-bundle
+  export. It uses `qlinkctl` as its only control boundary.
+- A privileged Linux systemd integration harness verifies the packaged
+  planning service, `pkexec` service controls, daemon status, diagnostics,
+  profiles, invites, and peer lifecycle. It does not replace Steam Deck proof.
+- A second privileged Linux harness applies the TUN interface, policy route,
+  fail-closed nftables table, and owned teardown. It probes nftables cgroup v2
+  support before native and Proton-shaped launch tests.
+- Service controls use a fixed root-owned helper and a PolicyKit rule. The
+  rule permits only `quantumlink` group members and requires administrator
+  authentication on a production host.
+- `qlinkd` validates and stores explicit game-profile selection. `qlinkctl`
+  exposes list, status, select, and clear commands. The desktop application
+  exposes the same controls in Desktop Mode and controller-driven Game Mode.
+- `qlinkctl game launch` validates the selected executable, creates a dedicated
+  cgroup v2 scope, and asks `qlinkd` to bind nftables marks to that exact scope
+  and the profile's UDP ports. Unwrapped and unmarked overlay traffic is
+  fail-closed. Active profile changes use controlled systemd teardown.
+- `qlinkd` reports cgroup v2, nftables cgroup matching, TUN, systemd user scope,
+  PolicyKit, and logind capabilities through typed status. `qlinkctl doctor`
+  and the desktop Diagnostics view show the same result. Game launch stops
+  before `systemd-run` when a required capability is not supported.
+- The game launcher handles `SIGINT` and `SIGTERM`. It stops the systemd scope
+  before it removes nftables classification. If scope stop fails, it keeps the
+  classification active and reports the recovery requirement.
+- Packaged Deck runtime qualification checks the exact SteamOS hardware class,
+  required runtime capabilities, PolicyKit service control, native cgroup
+  classification, descendant inheritance, and launch cleanup failure paths.
+  Its verifier rejects incomplete checks and false real-game or two-Deck claims.
+
 ## Not Production-Complete
 
 - Public rendezvous/relay TLS is implemented behind `public-edge-tls`, but
@@ -63,3 +113,13 @@ This feature list is synchronized with the current repository implementation. It
 - Managed Device Attestation and SSO integration.
 - Full post-quantum update manifest and release-signing layer.
 - Anonymity guarantees beyond metadata minimization.
+- SteamOS two-Deck packet, route-leak, suspend/resume, voice, anti-cheat, and
+  game compatibility evidence.
+- SteamOS per-flow path affinity, path-change hysteresis, and datagram path MTU
+  discovery proof.
+- SteamOS cgroup v2 and nftables compatibility proof for native and Proton game
+  launches. The launch-bound classifier is implemented locally, but the Deck
+  kernel result remains open.
+- Steam Deck Game Mode and Steam Input validation of controller navigation.
+- Live public Dytallix lifecycle and independent finality evidence.
+- Production-signed SteamOS installer and update artifacts.

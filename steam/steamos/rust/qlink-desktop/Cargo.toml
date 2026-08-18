@@ -1,0 +1,11 @@
+[package]
+name = "qlink-desktop"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+eframe = { version = "0.31.1", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"] }
+qlink-proto = { path = "../qlink-proto" }
+serde_json = "1"
