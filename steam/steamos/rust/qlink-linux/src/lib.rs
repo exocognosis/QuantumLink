@@ -3,9 +3,11 @@ use std::{error::Error, fmt, path::Path, process::Command as ProcessCommand};
 use qlink_proto::{ConfigValidationError, DaemonConfig, RouteMode};
 
 pub mod network_monitor;
+pub mod runtime_capabilities;
 pub mod tun;
 
 pub use network_monitor::NetworkChangeMonitor;
+pub use runtime_capabilities::detect_steamos_runtime_capabilities;
 pub use tun::{
     protocol_family_for_packet, LoopbackTunDevice, TunDeviceConfig, TunPacketIo, TunPacketIoError,
 };

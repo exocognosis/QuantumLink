@@ -5,7 +5,8 @@ use qlink_proto::{
     DytallixTrustDecision, DytallixTrustHealth, DytallixTrustStatus,
     GameProcessClassificationState, GameProfilePortEnforcementState, GameProfileStatus, InviteCode,
     LocalRegistryBindingState, MeshTrustMode, NetworkPlanState, PathKind, PeerStore,
-    PublicationErrorCode, PublicationState, PublicationStatus, RouteMode, StoredPeer,
+    PublicationErrorCode, PublicationState, PublicationStatus, RouteMode, RuntimeCapabilityState,
+    RuntimeCapabilityStatus, SteamOsRuntimeCapabilities, StoredPeer,
 };
 
 pub mod dytallix;
@@ -738,6 +739,30 @@ pub fn build_game_launch_plan(
     GameLaunchPlan::new(&profile, session_id, qlinkctl_path, command, command_args)
 }
 
+pub fn validate_game_launch_capabilities(
+    capabilities: &SteamOsRuntimeCapabilities,
+) -> Result<(), String> {
+    for (name, capability) in [
+        ("cgroup v2", &capabilities.cgroup_v2),
+        ("nftables cgroup v2", &capabilities.nftables_cgroup_v2),
+        ("TUN", &capabilities.tun),
+        ("systemd user scopes", &capabilities.systemd_user_scopes),
+    ] {
+        if capability.state != RuntimeCapabilityState::Supported {
+            return Err(format!(
+                "game launch blocked: {name} is {}{}",
+                runtime_capability_state_label(capability.state),
+                capability
+                    .detail
+                    .as_deref()
+                    .map(|detail| format!(": {detail}"))
+                    .unwrap_or_default()
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn request_daemon(
     socket: &Path,
@@ -833,6 +858,7 @@ fn format_doctor_at(status: &DaemonStatus, now_unix: u64) -> String {
                     .unwrap_or("unknown error")
             )
         });
+    let capability_verdict = runtime_capability_verdict(&status.runtime_capabilities);
     let verdict = match status.phase {
         ConnectionPhase::Failed => "FAIL - daemon phase failed".to_string(),
         _ if data_plane_verdict
@@ -842,6 +868,12 @@ fn format_doctor_at(status: &DaemonStatus, now_unix: u64) -> String {
             data_plane_verdict.unwrap()
         }
         _ if network_verdict.starts_with("FAIL") => network_verdict,
+        _ if capability_verdict
+            .as_deref()
+            .is_some_and(|verdict| verdict.starts_with("FAIL")) =>
+        {
+            capability_verdict.clone().unwrap()
+        }
         _ if publication_verdict.starts_with("FAIL") => publication_verdict,
         _ if classification_verdict.is_some() => classification_verdict.unwrap(),
         ConnectionPhase::Degraded => "WARN - daemon phase degraded".to_string(),
@@ -853,6 +885,12 @@ fn format_doctor_at(status: &DaemonStatus, now_unix: u64) -> String {
         }
         _ if network_verdict.starts_with("WARN") => network_verdict,
         _ if publication_verdict.starts_with("WARN") => publication_verdict,
+        _ if capability_verdict
+            .as_deref()
+            .is_some_and(|verdict| verdict.starts_with("WARN")) =>
+        {
+            capability_verdict.unwrap()
+        }
         _ if profile_verdict.is_some() => profile_verdict.unwrap(),
         _ => network_verdict,
     };
@@ -887,6 +925,12 @@ fn format_doctor_at(status: &DaemonStatus, now_unix: u64) -> String {
          classification error: {classification_error}\n\
          game profile restart required: {game_profile_restart_required}\n\
          game profile warning: {game_profile_warning}\n\
+         capability cgroup v2: {capability_cgroup_v2}\n\
+         capability nftables cgroup v2: {capability_nftables_cgroup_v2}\n\
+         capability TUN: {capability_tun}\n\
+         capability systemd user scopes: {capability_systemd_user_scopes}\n\
+         capability PolicyKit: {capability_policykit}\n\
+         capability logind session: {capability_logind_session}\n\
          publication state: {publication_state}\n\
          publication sequence: {publication_sequence}\n\
          publication expiry (unix): {publication_expiry}\n\
@@ -990,6 +1034,15 @@ fn format_doctor_at(status: &DaemonStatus, now_unix: u64) -> String {
             "no"
         },
         game_profile_warning = game_profile.selection_warning.as_deref().unwrap_or("none"),
+        capability_cgroup_v2 = runtime_capability_label(&status.runtime_capabilities.cgroup_v2),
+        capability_nftables_cgroup_v2 =
+            runtime_capability_label(&status.runtime_capabilities.nftables_cgroup_v2),
+        capability_tun = runtime_capability_label(&status.runtime_capabilities.tun),
+        capability_systemd_user_scopes =
+            runtime_capability_label(&status.runtime_capabilities.systemd_user_scopes),
+        capability_policykit = runtime_capability_label(&status.runtime_capabilities.policykit),
+        capability_logind_session =
+            runtime_capability_label(&status.runtime_capabilities.logind_session),
         publication_state = publication_state_label(publication.state),
         publication_sequence = optional_u64_label(publication.sequence),
         publication_expiry = optional_u64_label(publication.expires_at_unix),
@@ -1008,6 +1061,69 @@ fn format_doctor_at(status: &DaemonStatus, now_unix: u64) -> String {
         dytallix_health = dytallix_health_label(remote_peer_trust(publication).health),
         publication_action = combined_publication_action(publication, now_unix),
     )
+}
+
+fn runtime_capability_verdict(capabilities: &SteamOsRuntimeCapabilities) -> Option<String> {
+    for (name, capability) in [
+        ("cgroup v2", &capabilities.cgroup_v2),
+        ("nftables cgroup v2", &capabilities.nftables_cgroup_v2),
+        ("TUN", &capabilities.tun),
+        ("systemd user scopes", &capabilities.systemd_user_scopes),
+    ] {
+        if matches!(
+            capability.state,
+            RuntimeCapabilityState::Unsupported | RuntimeCapabilityState::Unavailable
+        ) {
+            return Some(format!(
+                "FAIL - {name} capability is {}{}",
+                runtime_capability_state_label(capability.state),
+                capability
+                    .detail
+                    .as_deref()
+                    .map(|detail| format!(": {detail}"))
+                    .unwrap_or_default()
+            ));
+        }
+    }
+    for (name, capability) in [
+        ("PolicyKit", &capabilities.policykit),
+        ("logind session", &capabilities.logind_session),
+    ] {
+        if matches!(
+            capability.state,
+            RuntimeCapabilityState::Unsupported | RuntimeCapabilityState::Unavailable
+        ) {
+            return Some(format!(
+                "WARN - {name} capability is {}{}",
+                runtime_capability_state_label(capability.state),
+                capability
+                    .detail
+                    .as_deref()
+                    .map(|detail| format!(": {detail}"))
+                    .unwrap_or_default()
+            ));
+        }
+    }
+    None
+}
+
+fn runtime_capability_label(capability: &RuntimeCapabilityStatus) -> String {
+    match capability.detail.as_deref() {
+        Some(detail) => format!(
+            "{} ({detail})",
+            runtime_capability_state_label(capability.state)
+        ),
+        None => runtime_capability_state_label(capability.state).to_string(),
+    }
+}
+
+fn runtime_capability_state_label(state: RuntimeCapabilityState) -> &'static str {
+    match state {
+        RuntimeCapabilityState::NotChecked => "not checked",
+        RuntimeCapabilityState::Supported => "supported",
+        RuntimeCapabilityState::Unsupported => "unsupported",
+        RuntimeCapabilityState::Unavailable => "unavailable",
+    }
 }
 
 #[cfg(unix)]
@@ -1634,6 +1750,17 @@ mod tests {
                 checked_at_unix: required.then_some(1_767_139_200),
                 last_error: None,
             },
+        }
+    }
+
+    fn supported_runtime_capabilities() -> SteamOsRuntimeCapabilities {
+        SteamOsRuntimeCapabilities {
+            cgroup_v2: RuntimeCapabilityStatus::supported(),
+            nftables_cgroup_v2: RuntimeCapabilityStatus::supported(),
+            tun: RuntimeCapabilityStatus::supported(),
+            systemd_user_scopes: RuntimeCapabilityStatus::supported(),
+            policykit: RuntimeCapabilityStatus::supported(),
+            logind_session: RuntimeCapabilityStatus::supported(),
         }
     }
 
@@ -2315,6 +2442,60 @@ mod tests {
         assert_eq!(plan.systemd_run_args[0], "--user");
         assert!(plan.systemd_run_args.iter().any(|arg| arg == "factorio"));
         assert!(!plan.systemd_run_args.iter().any(|arg| arg == "sh"));
+    }
+
+    #[test]
+    fn game_launch_capability_preflight_accepts_supported_host() {
+        validate_game_launch_capabilities(&supported_runtime_capabilities()).unwrap();
+    }
+
+    #[test]
+    fn game_launch_capability_preflight_fails_closed() {
+        let mut capabilities = supported_runtime_capabilities();
+        capabilities.nftables_cgroup_v2 =
+            RuntimeCapabilityStatus::unsupported("kernel expression is unavailable");
+
+        let error = validate_game_launch_capabilities(&capabilities).unwrap_err();
+
+        assert_eq!(
+            error,
+            "game launch blocked: nftables cgroup v2 is unsupported: kernel expression is unavailable"
+        );
+    }
+
+    #[test]
+    fn doctor_fails_when_required_game_capability_is_unsupported() {
+        let mut status = status_with_network(NetworkPlanState::Applied, false, true, None);
+        status.publication = healthy_publication(true);
+        status.runtime_capabilities = supported_runtime_capabilities();
+        status.runtime_capabilities.nftables_cgroup_v2 =
+            RuntimeCapabilityStatus::unsupported("kernel expression is unavailable");
+
+        let doctor = format_doctor_at(&status, 1_767_139_200);
+
+        assert!(doctor.contains(
+            "verdict: FAIL - nftables cgroup v2 capability is unsupported: kernel expression is unavailable"
+        ));
+        assert!(doctor.contains("capability cgroup v2: supported"));
+        assert!(doctor.contains(
+            "capability nftables cgroup v2: unsupported (kernel expression is unavailable)"
+        ));
+    }
+
+    #[test]
+    fn doctor_warns_when_desktop_authorization_capability_is_unavailable() {
+        let mut status = status_with_network(NetworkPlanState::Applied, false, true, None);
+        status.publication = healthy_publication(true);
+        status.runtime_capabilities = supported_runtime_capabilities();
+        status.runtime_capabilities.policykit =
+            RuntimeCapabilityStatus::unavailable("pkexec is not installed");
+
+        let doctor = format_doctor_at(&status, 1_767_139_200);
+
+        assert!(doctor.contains(
+            "verdict: WARN - PolicyKit capability is unavailable: pkexec is not installed"
+        ));
+        assert!(doctor.contains("capability PolicyKit: unavailable (pkexec is not installed)"));
     }
 
     #[test]

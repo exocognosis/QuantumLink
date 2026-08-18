@@ -109,6 +109,10 @@ install_payload_file "$BIN_DIR/qlinkd" "$PAYLOAD_ROOT/bin/qlinkd" 0755
 install_payload_file "$BIN_DIR/qlinkctl" "$PAYLOAD_ROOT/bin/qlinkctl" 0755
 install_payload_file "$BIN_DIR/qlink-desktop" "$PAYLOAD_ROOT/bin/qlink-desktop" 0755
 install_payload_file "$STEAMOS_ROOT/scripts/install-steamos.sh" "$PAYLOAD_ROOT/scripts/install-steamos.sh" 0755
+install_payload_file "$STEAMOS_ROOT/tests/deck-runtime-qualification.sh" \
+    "$PAYLOAD_ROOT/scripts/deck-runtime-qualification.sh" 0755
+install_payload_file "$STEAMOS_ROOT/tests/verify-deck-runtime-evidence.sh" \
+    "$PAYLOAD_ROOT/scripts/verify-deck-runtime-evidence.sh" 0755
 install_payload_file "$STEAMOS_ROOT/packaging/systemd/qlinkd.service" "$PAYLOAD_ROOT/packaging/systemd/qlinkd.service" 0644
 install_payload_file "$STEAMOS_ROOT/packaging/systemd/qlinkd.service.d/planning-only.conf.sample" \
     "$PAYLOAD_ROOT/packaging/systemd/qlinkd.service.d/planning-only.conf.sample" 0644

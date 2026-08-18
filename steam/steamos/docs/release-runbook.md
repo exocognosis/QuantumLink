@@ -25,6 +25,8 @@ The archive payload includes:
 - `bin/qlinkctl`
 - `bin/qlink-desktop`
 - `scripts/install-steamos.sh`
+- `scripts/deck-runtime-qualification.sh`
+- `scripts/verify-deck-runtime-evidence.sh`
 - `packaging/desktop/quantumlink-steamos.desktop`
 - `packaging/desktop/quantumlink-steamos-game-mode.desktop`
 - `packaging/desktop/icons/quantumlink-steamos.png`

@@ -745,6 +745,64 @@ pub struct GameProcessClassificationStatus {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RuntimeCapabilityState {
+    #[default]
+    NotChecked,
+    Supported,
+    Unsupported,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeCapabilityStatus {
+    pub state: RuntimeCapabilityState,
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+impl RuntimeCapabilityStatus {
+    pub fn supported() -> Self {
+        Self {
+            state: RuntimeCapabilityState::Supported,
+            detail: None,
+        }
+    }
+
+    pub fn unsupported(detail: impl Into<String>) -> Self {
+        Self {
+            state: RuntimeCapabilityState::Unsupported,
+            detail: Some(detail.into()),
+        }
+    }
+
+    pub fn unavailable(detail: impl Into<String>) -> Self {
+        Self {
+            state: RuntimeCapabilityState::Unavailable,
+            detail: Some(detail.into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SteamOsRuntimeCapabilities {
+    #[serde(default)]
+    pub cgroup_v2: RuntimeCapabilityStatus,
+    #[serde(default)]
+    pub nftables_cgroup_v2: RuntimeCapabilityStatus,
+    #[serde(default)]
+    pub tun: RuntimeCapabilityStatus,
+    #[serde(default)]
+    pub systemd_user_scopes: RuntimeCapabilityStatus,
+    #[serde(default)]
+    pub policykit: RuntimeCapabilityStatus,
+    #[serde(default)]
+    pub logind_session: RuntimeCapabilityStatus,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
     tag = "type",
@@ -782,6 +840,8 @@ pub struct DaemonStatus {
     pub publication: PublicationStatus,
     #[serde(default)]
     pub game_profile: GameProfileStatus,
+    #[serde(default)]
+    pub runtime_capabilities: SteamOsRuntimeCapabilities,
 }
 
 impl DaemonStatus {
@@ -795,6 +855,7 @@ impl DaemonStatus {
             data_plane: DataPlaneStatus::not_started(),
             publication: PublicationStatus::default(),
             game_profile: GameProfileStatus::default(),
+            runtime_capabilities: SteamOsRuntimeCapabilities::default(),
         }
     }
 }
@@ -1397,6 +1458,7 @@ mod tests {
                 port_enforcement: GameProfilePortEnforcementStatus::default(),
                 process_classification: GameProcessClassificationStatus::default(),
             },
+            runtime_capabilities: SteamOsRuntimeCapabilities::default(),
         };
 
         let json = serde_json::to_string(&status).unwrap();
@@ -1408,6 +1470,9 @@ mod tests {
         assert!(json.contains("\"displayName\":\"Factorio\""));
         assert!(json.contains("\"portEnforcement\""));
         assert!(json.contains("\"processClassification\""));
+        assert!(json.contains("\"runtimeCapabilities\""));
+        assert!(json.contains("\"nftablesCgroupV2\""));
+        assert!(json.contains("\"systemdUserScopes\""));
         assert!(json.contains("\"state\":\"notApplicable\""));
     }
 
@@ -1471,6 +1536,35 @@ mod tests {
         assert_eq!(status.phase, ConnectionPhase::Idle);
         assert_eq!(status.network, NetworkStatus::not_started());
         assert_eq!(status.publication, PublicationStatus::default());
+        assert_eq!(
+            status.runtime_capabilities,
+            SteamOsRuntimeCapabilities::default()
+        );
+    }
+
+    #[test]
+    fn runtime_capability_status_uses_stable_camel_case_json() {
+        let capabilities = SteamOsRuntimeCapabilities {
+            cgroup_v2: RuntimeCapabilityStatus::supported(),
+            nftables_cgroup_v2: RuntimeCapabilityStatus::unsupported(
+                "kernel expression is unavailable",
+            ),
+            tun: RuntimeCapabilityStatus::supported(),
+            systemd_user_scopes: RuntimeCapabilityStatus::supported(),
+            policykit: RuntimeCapabilityStatus::unavailable("pkexec is not installed"),
+            logind_session: RuntimeCapabilityStatus::supported(),
+        };
+
+        let json = serde_json::to_string(&capabilities).unwrap();
+
+        assert!(json.contains("\"cgroupV2\":{\"state\":\"supported\""));
+        assert!(json.contains("\"nftablesCgroupV2\":{\"state\":\"unsupported\""));
+        assert!(json.contains("\"systemdUserScopes\":{\"state\":\"supported\""));
+        assert!(json.contains("\"policykit\":{\"state\":\"unavailable\""));
+        assert_eq!(
+            serde_json::from_str::<SteamOsRuntimeCapabilities>(&json).unwrap(),
+            capabilities
+        );
     }
 
     #[test]

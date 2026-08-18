@@ -88,6 +88,17 @@ This feature list is synchronized with the current repository implementation. It
   cgroup v2 scope, and asks `qlinkd` to bind nftables marks to that exact scope
   and the profile's UDP ports. Unwrapped and unmarked overlay traffic is
   fail-closed. Active profile changes use controlled systemd teardown.
+- `qlinkd` reports cgroup v2, nftables cgroup matching, TUN, systemd user scope,
+  PolicyKit, and logind capabilities through typed status. `qlinkctl doctor`
+  and the desktop Diagnostics view show the same result. Game launch stops
+  before `systemd-run` when a required capability is not supported.
+- The game launcher handles `SIGINT` and `SIGTERM`. It stops the systemd scope
+  before it removes nftables classification. If scope stop fails, it keeps the
+  classification active and reports the recovery requirement.
+- Packaged Deck runtime qualification checks the exact SteamOS hardware class,
+  required runtime capabilities, PolicyKit service control, native cgroup
+  classification, descendant inheritance, and launch cleanup failure paths.
+  Its verifier rejects incomplete checks and false real-game or two-Deck claims.
 
 ## Not Production-Complete
 

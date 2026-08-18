@@ -500,6 +500,56 @@ orphaned crate.
   must also prove interactive PolicyKit, Steam Input, route leaks,
   suspend/resume, voice traffic, anti-cheat behavior, and game compatibility.
 
+## 2026-08-18 Runtime Capability And Launch Recovery Gate
+
+- `qlinkd` now detects and reports cgroup v2, nftables cgroup matching, TUN,
+  systemd user scopes, PolicyKit, and logind session support.
+- The capability schema has backward-compatible defaults. Older status payloads
+  deserialize as `notChecked`.
+- `qlinkctl doctor` reports required game-path capability failures as `FAIL`.
+  Missing PolicyKit or logind support produces `WARN` because these capabilities
+  affect desktop authorization but do not change the packet path.
+- `qlinkctl game launch` now stops before `systemd-run` unless cgroup v2,
+  nftables cgroup matching, TUN, and systemd user scopes report `supported`.
+- The desktop Diagnostics view shows the same typed capability state and the
+  first detected issue.
+- Concurrent launch, wrong-session cleanup, active-profile mutation, partial
+  cleanup retry, and legacy protocol behavior have focused Rust tests.
+- The launcher catches `SIGINT` and `SIGTERM`. It stops the transient scope
+  before it removes nftables classification. If scope stop fails, it keeps the
+  classification active.
+- The compatible Linux harness records the capability object in evidence schema
+  version 2. On an unsupported kernel, it proves that launch fails before game
+  rules are installed. On a compatible kernel, it also tests game crash,
+  concurrent launch, launcher interruption, daemon restart, native launch, and
+  Proton-shaped descendant cleanup.
+- Decision: No-Go remains unchanged. The Docker Desktop kernel can prove the
+  unsupported fail-closed path. A compatible SteamOS kernel must execute the
+  native, Proton-shaped, and recovery paths. Steam Deck hardware evidence is
+  still required for production.
+
+## 2026-08-18 Deck Runtime Qualification Tooling
+
+- No Steam Deck or remote SteamOS target was configured for this run. No new
+  hardware result is claimed.
+- Added a device-local preflight that rejects non-SteamOS and non-Steam Deck
+  hosts before it changes network state.
+- Added an explicit mutation gate for runtime qualification. Run mode requires
+  the signed-in desktop user and `QLINK_DECK_CONFIRM_NETWORK_MUTATION=YES`.
+- The runtime qualification requires all six reported capabilities to be
+  `supported`. It tests PolicyKit service restart, native game scope
+  classification, descendant inheritance, crash cleanup, concurrent launch
+  rejection, signal cleanup, and daemon restart cleanup.
+- The evidence schema marks all executable tests as synthetic fixtures. It
+  explicitly sets real-game compatibility and two-Deck packet proof to false.
+- Added a strict verifier. Complete evidence requires a physical Deck claim,
+  `mode=run`, `status=pass`, all runtime checks passed, all capabilities
+  supported, contained required files, and no forbidden private artifacts.
+- Added both runtime scripts to the SteamOS package and release verifier.
+- Decision: No-Go remains unchanged. Run the packaged qualification on a Deck,
+  then complete real Proton, game matrix, two-Deck packet, suspend, voice,
+  anti-cheat, and route-leak evidence.
+
 ## Go / No-Go Rule
 
 Do not label SteamOS production-ready until every blocking gate is `Passed`

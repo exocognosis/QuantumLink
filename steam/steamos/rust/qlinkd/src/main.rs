@@ -1,3 +1,4 @@
+use qlink_linux::detect_steamos_runtime_capabilities;
 #[cfg(unix)]
 use qlink_linux::{
     LinuxTunDevice, StdCommandRunner, SystemNetworkExecutor, SystemNftablesExecutor,
@@ -27,13 +28,14 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let engine = match DaemonEngine::try_new(config, paths) {
+    let mut engine = match DaemonEngine::try_new(config, paths) {
         Ok(engine) => engine,
         Err(error) => {
             eprintln!("qlinkd startup error: {error}");
             std::process::exit(1);
         }
     };
+    engine.set_runtime_capabilities(detect_steamos_runtime_capabilities());
     match mode {
         RuntimeMode::CheckConfig => {
             println!(

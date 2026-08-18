@@ -100,6 +100,7 @@ fn sensitive_status_fixture() -> DaemonStatus {
         data_plane: DataPlaneStatus::not_started(),
         publication: Default::default(),
         game_profile: Default::default(),
+        runtime_capabilities: Default::default(),
     }
 }
 

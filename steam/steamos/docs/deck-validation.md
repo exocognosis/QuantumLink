@@ -65,6 +65,33 @@ bash steam/steamos/tests/deck-validation.sh support-bundle-check
 sudo bash steam/steamos/tests/deck-validation.sh uninstall
 ```
 
+Run the device-local runtime gate from the signed-in desktop session. Do not
+run it through `sudo`:
+
+```sh
+export QLINK_DECK_RUNTIME_EVIDENCE_DIR="$HOME/quantumlink-deck-runtime-$(date -u +%Y%m%dT%H%M%SZ)"
+bash steam/steamos/tests/deck-runtime-qualification.sh preflight
+
+export QLINK_DECK_RUNTIME_EVIDENCE_DIR="$HOME/quantumlink-deck-runtime-run-$(date -u +%Y%m%dT%H%M%SZ)"
+QLINK_DECK_CONFIRM_NETWORK_MUTATION=YES \
+  bash steam/steamos/tests/deck-runtime-qualification.sh run
+
+QLINK_DECK_RUNTIME_REQUIRE_COMPLETE=1 \
+  bash steam/steamos/tests/verify-deck-runtime-evidence.sh \
+  "$QLINK_DECK_RUNTIME_EVIDENCE_DIR"
+```
+
+The `run` mode changes the selected profile to Factorio and restarts `qlinkd`
+through the packaged PolicyKit boundary. It requires all reported host
+capabilities to be `supported`. It then tests native scope classification,
+descendant cgroup inheritance, crash cleanup, concurrent launch rejection,
+launcher interruption cleanup, and daemon restart cleanup.
+
+The runtime gate uses temporary executable fixtures. It proves Steam Deck
+kernel and lifecycle behavior. It does not prove Valve Proton behavior, a real
+game, two-Deck packet flow, anti-cheat compatibility, voice behavior, or the
+game compatibility matrix.
+
 Each run writes redacted text evidence under
 `steam/steamos/validation/deck/<timestamp>/`:
 
@@ -77,6 +104,12 @@ Each run writes redacted text evidence under
 - `ip-route.txt`
 - `support-bundle-redaction.txt`
 - `validation-report.json`
+
+The device-local runtime gate writes a separate evidence directory with:
+
+- `runtime-report.json`
+- `status-before.json`
+- `status-after.json`
 
 The script must not be used to commit raw pcaps, raw support bundles, private
 endpoints, secrets, wallet material, or unredacted host-specific logs. If a
@@ -96,3 +129,6 @@ Deck validation and game compatibility remain `Blocked` until:
    embedded browser traffic are shown to bypass QuantumLink by default.
 5. No committed evidence contains raw packet captures, private endpoint
    addresses, secrets, wallet material, or raw support bundles.
+6. The complete device-local runtime report passes
+   `verify-deck-runtime-evidence.sh` with
+   `QLINK_DECK_RUNTIME_REQUIRE_COMPLETE=1`.

@@ -181,9 +181,18 @@ fn main() {
 
 #[cfg(unix)]
 fn game_launch_command(args: Vec<String>) {
+    use signal_hook::consts::{SIGINT, SIGTERM};
+    use std::sync::{atomic::AtomicUsize, Arc};
+
     let (command, command_args) = parse_game_command(&args, 0);
     let socket = Path::new("/run/quantumlink/qlinkd.sock");
     let status = status_from_daemon(socket).unwrap_or_else(|error| command_error(error));
+    qlinkctl::validate_game_launch_capabilities(&status.runtime_capabilities).unwrap_or_else(
+        |error| {
+            eprintln!("{error}");
+            std::process::exit(1);
+        },
+    );
     let qlinkctl_path = std::env::current_exe().unwrap_or_else(|error| {
         eprintln!("failed to resolve qlinkctl path: {error}");
         std::process::exit(1);
@@ -201,9 +210,28 @@ fn game_launch_command(args: Vec<String>) {
         std::process::exit(1);
     });
 
-    let run_status = std::process::Command::new("/usr/bin/systemd-run")
+    let termination_signal = Arc::new(AtomicUsize::new(0));
+    for signal in [SIGINT, SIGTERM] {
+        signal_hook::flag::register_usize(signal, Arc::clone(&termination_signal), signal as usize)
+            .unwrap_or_else(|error| {
+                eprintln!("failed to install game launcher signal handler: {error}");
+                std::process::exit(1);
+            });
+    }
+
+    let child = std::process::Command::new("/usr/bin/systemd-run")
         .args(&plan.systemd_run_args)
-        .status();
+        .spawn();
+    let run_status = child.and_then(|child| {
+        wait_for_game_scope(child, &plan.scope_unit, termination_signal.as_ref())
+    });
+    if run_status
+        .as_ref()
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::ResourceBusy)
+    {
+        eprintln!("{}", run_status.unwrap_err());
+        std::process::exit(1);
+    }
     let cleanup = end_game_process(socket, &session_id);
     if let Err(error) = cleanup {
         eprintln!("failed to remove game process classification: {error}");
@@ -212,10 +240,58 @@ fn game_launch_command(args: Vec<String>) {
     match run_status {
         Ok(status) if status.success() => {}
         Ok(status) => std::process::exit(status.code().unwrap_or(1)),
+        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+            eprintln!("{error}");
+            let signal = termination_signal.load(std::sync::atomic::Ordering::Relaxed);
+            std::process::exit(128 + signal as i32);
+        }
         Err(error) => {
             eprintln!("failed to start systemd game scope: {error}");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(unix)]
+fn wait_for_game_scope(
+    mut child: std::process::Child,
+    scope_unit: &str,
+    termination_signal: &std::sync::atomic::AtomicUsize,
+) -> std::io::Result<std::process::ExitStatus> {
+    use std::sync::atomic::Ordering;
+
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        let signal = termination_signal.load(Ordering::Relaxed);
+        if signal != 0 {
+            let stop_status = std::process::Command::new("/usr/bin/systemctl")
+                .args(["--user", "stop", scope_unit])
+                .status()
+                .map_err(|error| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::ResourceBusy,
+                        format!(
+                            "failed to stop interrupted game scope {scope_unit}: {error}; classification remains active"
+                        ),
+                    )
+                })?;
+            if !stop_status.success() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ResourceBusy,
+                    format!(
+                    "failed to stop interrupted game scope {scope_unit}; classification remains active"
+                    ),
+                ));
+            }
+            let _ = child.wait();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                format!("game launcher received signal {signal}"),
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
 

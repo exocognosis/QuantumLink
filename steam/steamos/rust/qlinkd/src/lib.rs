@@ -23,7 +23,7 @@ use qlink_proto::{
     GameProfilePortEnforcementState, GameProfilePortEnforcementStatus, GameProfileStatus,
     InviteCode, MeshTrustMode, NetworkPlanState, NetworkStatus, PeerStatus, PeerStore,
     PublicationErrorCode, PublicationErrorStatus, PublicationState, PublicationStatus, RouteMode,
-    StoredPeer,
+    SteamOsRuntimeCapabilities, StoredPeer,
 };
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
@@ -621,6 +621,7 @@ impl DaemonRuntimeState {
             data_plane: self.data_plane.clone(),
             publication: self.publication.clone(),
             game_profile: GameProfileStatus::default(),
+            runtime_capabilities: SteamOsRuntimeCapabilities::default(),
         }
     }
 }
@@ -633,6 +634,7 @@ pub struct DaemonEngine {
     data_plane: Option<EngineDataPlaneRuntime>,
     steam_bypass: SteamBypassSummary,
     game_process: GameProcessRuntime,
+    runtime_capabilities: SteamOsRuntimeCapabilities,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -662,6 +664,7 @@ impl DaemonEngine {
             data_plane: None,
             steam_bypass,
             game_process: GameProcessRuntime::default(),
+            runtime_capabilities: SteamOsRuntimeCapabilities::default(),
         }
     }
 
@@ -685,6 +688,7 @@ impl DaemonEngine {
             data_plane: None,
             steam_bypass,
             game_process: GameProcessRuntime::default(),
+            runtime_capabilities: SteamOsRuntimeCapabilities::default(),
         })
     }
 
@@ -706,6 +710,7 @@ impl DaemonEngine {
                 .map(|profile| profile.id.as_str()),
             self.game_process.active.is_some() && self.game_process.last_error.is_none(),
         );
+        status.runtime_capabilities = self.runtime_capabilities.clone();
         status
     }
 
@@ -721,6 +726,14 @@ impl DaemonEngine {
         &self.paths
     }
 
+    pub fn set_runtime_capabilities(&mut self, capabilities: SteamOsRuntimeCapabilities) {
+        self.runtime_capabilities = capabilities;
+    }
+
+    pub fn runtime_capabilities(&self) -> &SteamOsRuntimeCapabilities {
+        &self.runtime_capabilities
+    }
+
     /// The daemon's Steam-safe bypass posture, loaded from the config
     /// directory. Surfaced in the resident banner and to `qlinkctl doctor`.
     pub fn steam_bypass(&self) -> &SteamBypassSummary {
@@ -728,6 +741,11 @@ impl DaemonEngine {
     }
 
     pub fn select_game_profile(&mut self, profile_id: &str) -> Result<(), String> {
+        if self.game_process.active.is_some() {
+            return Err(
+                "cannot change the game profile while classification is active".to_string(),
+            );
+        }
         let profile = self
             .steam_bypass
             .game_profiles
@@ -745,6 +763,9 @@ impl DaemonEngine {
     }
 
     pub fn clear_game_profile(&mut self) -> Result<(), String> {
+        if self.game_process.active.is_some() {
+            return Err("cannot clear the game profile while classification is active".to_string());
+        }
         let replacement_plan = self.replacement_planned_network(None)?;
         self.steam_bypass.clear_profile(&self.paths.state_dir)?;
         if let Some(plan) = replacement_plan {
@@ -2381,6 +2402,33 @@ mod tests {
             NftablesOperation::MarkCgroupUdpPortTraffic { port: 34197, .. }
         )));
 
+        let error = engine
+            .begin_game_process_with(
+                "factorio",
+                "/home/deck/factorio",
+                "s456def",
+                1000,
+                "/user.slice/user-1000.slice/user@1000.service/app.slice/quantumlink-game.slice/quantumlink-game-s456def.scope",
+                &mut classifier,
+            )
+            .unwrap_err();
+        assert_eq!(error, "a classified game process is already active");
+        assert_eq!(classifier.added.len(), 2);
+        assert!(engine.select_game_profile("factorio").is_err());
+        assert!(engine.clear_game_profile().is_err());
+
+        let error = engine
+            .end_game_process_with("s456def", &mut classifier)
+            .unwrap_err();
+        assert_eq!(
+            error,
+            "game session does not match the active classification"
+        );
+        assert_eq!(
+            engine.status().game_profile.process_classification.state,
+            GameProcessClassificationState::Active
+        );
+
         engine
             .end_game_process_with("s123abc", &mut classifier)
             .unwrap();
@@ -2440,6 +2488,16 @@ mod tests {
         assert_eq!(
             engine.status().game_profile.port_enforcement.state,
             GameProfilePortEnforcementState::FailClosed
+        );
+
+        cleanup_classifier.fail_delete_on_call = None;
+        engine
+            .end_game_process_with("s789ghi", &mut cleanup_classifier)
+            .unwrap();
+        assert_eq!(cleanup_classifier.deleted.len(), 3);
+        assert_eq!(
+            engine.status().game_profile.process_classification.state,
+            GameProcessClassificationState::Armed
         );
     }
 

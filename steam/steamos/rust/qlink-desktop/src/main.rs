@@ -9,7 +9,8 @@ use qlink_desktop::{
 use qlink_proto::{
     ConnectionPhase, DataPlaneState, DytallixTrustDecision, DytallixTrustHealth,
     GameProcessClassificationState, GameProfileInfo, GameProfilePortEnforcementState,
-    LocalRegistryBindingState, MeshTrustMode, NetworkPlanState, PathKind, StoredPeer,
+    LocalRegistryBindingState, MeshTrustMode, NetworkPlanState, PathKind, RuntimeCapabilityState,
+    SteamOsRuntimeCapabilities, StoredPeer,
 };
 use serde_json::Value;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -984,6 +985,49 @@ impl QuantumLinkDesktop {
                 });
             });
             ui.add_space(14.0);
+            card(ui, "Host Capabilities", |ui| {
+                let capabilities = snapshot
+                    .as_ref()
+                    .and_then(|value| value.daemon.as_ref())
+                    .map(|status| &status.runtime_capabilities);
+                ui.columns(2, |columns| {
+                    value_row(
+                        &mut columns[0],
+                        "cgroup v2",
+                        capability_state(capabilities.map(|value| value.cgroup_v2.state)),
+                    );
+                    value_row(
+                        &mut columns[0],
+                        "nftables cgroup",
+                        capability_state(capabilities.map(|value| value.nftables_cgroup_v2.state)),
+                    );
+                    value_row(
+                        &mut columns[0],
+                        "TUN",
+                        capability_state(capabilities.map(|value| value.tun.state)),
+                    );
+                    value_row(
+                        &mut columns[1],
+                        "systemd scopes",
+                        capability_state(capabilities.map(|value| value.systemd_user_scopes.state)),
+                    );
+                    value_row(
+                        &mut columns[1],
+                        "PolicyKit",
+                        capability_state(capabilities.map(|value| value.policykit.state)),
+                    );
+                    value_row(
+                        &mut columns[1],
+                        "logind session",
+                        capability_state(capabilities.map(|value| value.logind_session.state)),
+                    );
+                });
+                if let Some(detail) = capabilities.and_then(first_capability_issue) {
+                    ui.separator();
+                    ui.label(RichText::new(detail).color(AMBER));
+                }
+            });
+            ui.add_space(14.0);
             card(ui, "Service Controls", |ui| {
                 ui.horizontal_wrapped(|ui| {
                     if ui
@@ -1424,6 +1468,35 @@ fn yes_no(value: bool) -> &'static str {
     } else {
         "No"
     }
+}
+
+fn capability_state(state: Option<RuntimeCapabilityState>) -> &'static str {
+    match state {
+        Some(RuntimeCapabilityState::NotChecked) => "Not checked",
+        Some(RuntimeCapabilityState::Supported) => "Supported",
+        Some(RuntimeCapabilityState::Unsupported) => "Unsupported",
+        Some(RuntimeCapabilityState::Unavailable) => "Unavailable",
+        None => "--",
+    }
+}
+
+fn first_capability_issue(capabilities: &SteamOsRuntimeCapabilities) -> Option<&str> {
+    [
+        &capabilities.cgroup_v2,
+        &capabilities.nftables_cgroup_v2,
+        &capabilities.tun,
+        &capabilities.systemd_user_scopes,
+        &capabilities.policykit,
+        &capabilities.logind_session,
+    ]
+    .into_iter()
+    .find(|capability| {
+        matches!(
+            capability.state,
+            RuntimeCapabilityState::Unsupported | RuntimeCapabilityState::Unavailable
+        )
+    })
+    .and_then(|capability| capability.detail.as_deref())
 }
 
 fn port_enforcement_label(state: GameProfilePortEnforcementState) -> &'static str {

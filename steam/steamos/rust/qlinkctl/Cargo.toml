@@ -11,5 +11,6 @@ qlink-proto = { path = "../qlink-proto" }
 qlink-core = { path = "../../../../qlink-core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+signal-hook = "0.3"
 thiserror = "1"
 tokio = { version = "1", features = ["rt", "time"] }

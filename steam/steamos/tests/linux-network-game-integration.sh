@@ -50,24 +50,6 @@ if expected_executable:
 PY
 }
 
-nft_cgroup_v2_supported() {
-    probe_table=qlink_cgroup_probe
-    probe_cgroup=qlink-nft-probe
-    mkdir "/sys/fs/cgroup/$probe_cgroup"
-    supported=1
-    if "$NFT_COMMAND" add table inet "$probe_table" \
-        && "$NFT_COMMAND" add chain inet "$probe_table" output \
-            '{' type route hook output priority 0 ';' policy accept ';' '}' \
-        && "$NFT_COMMAND" add rule inet "$probe_table" output \
-            socket cgroupv2 level 1 "\"$probe_cgroup\"" counter \
-            2>/tmp/qlink-nft-cgroup-probe.err; then
-        supported=0
-    fi
-    "$NFT_COMMAND" delete table inet "$probe_table" >/dev/null 2>&1 || true
-    rmdir "/sys/fs/cgroup/$probe_cgroup"
-    return "$supported"
-}
-
 [ "${QLINK_INTEGRATION_ISOLATED:-}" = "1" ] || \
     fail "set QLINK_INTEGRATION_ISOLATED=1 on a disposable Linux host"
 [ "$(uname -s)" = "Linux" ] || fail "Linux is required"
@@ -141,7 +123,9 @@ EOF
 install -m 0755 /dev/stdin /usr/local/bin/factorio <<'EOF'
 #!/bin/sh
 cat "/proc/$$/cgroup" > /tmp/qlink-native-cgroup.txt
-sleep 6
+exit_code="${QLINK_GAME_EXIT_CODE:-0}"
+[ "$exit_code" -eq 0 ] || exit "$exit_code"
+sleep "${QLINK_GAME_SLEEP:-6}"
 EOF
 install -m 0755 /dev/stdin /usr/local/bin/game.exe <<'EOF'
 #!/bin/sh
@@ -204,10 +188,28 @@ grep -Fq "meta mark != 0x0000514c drop" /tmp/qlink-active-nftables.txt || \
     fail "fail-closed nftables rule is missing"
 assert_status /tmp/qlink-active-status.json armed factorio ""
 
+NFT_CGROUP_STATE="$(python3 - /tmp/qlink-active-status.json <<'PY'
+import json
+import sys
+
+capabilities = json.load(open(sys.argv[1], encoding="utf-8"))["runtimeCapabilities"]
+for name in ["cgroupV2", "tun", "systemdUserScopes", "policykit"]:
+    assert capabilities[name]["state"] == "supported", (name, capabilities[name])
+assert capabilities["logindSession"]["state"] in {"supported", "unavailable"}
+assert capabilities["nftablesCgroupV2"]["state"] in {"supported", "unsupported"}
+print(capabilities["nftablesCgroupV2"]["state"])
+PY
+)"
+
 NFT_CGROUP_STATUS=passed
 NATIVE_GAME_STATUS=passed
 PROTON_GAME_STATUS=passed
-if nft_cgroup_v2_supported; then
+GAME_CRASH_STATUS=passed
+CONCURRENT_LAUNCH_STATUS=passed
+LAUNCHER_INTERRUPTION_STATUS=passed
+DAEMON_RESTART_STATUS=passed
+UNSUPPORTED_LAUNCH_STATUS=notApplicable
+if [ "$NFT_CGROUP_STATE" = supported ]; then
     loginctl enable-linger deck
     systemctl start "user@$DECK_UID.service"
     wait_for_path "/run/user/$DECK_UID/bus" 20 || {
@@ -232,6 +234,15 @@ if nft_cgroup_v2_supported; then
         fail "native game cgroup is not a QuantumLink scope"
     grep -Fq "socket cgroupv2" /tmp/qlink-native-active-nftables.txt || \
         fail "native cgroup nftables rules are missing"
+    if runuser -u deck -- env \
+        XDG_RUNTIME_DIR="/run/user/$DECK_UID" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$DECK_UID/bus" \
+        /usr/local/bin/qlinkctl game launch -- /usr/local/bin/factorio \
+        >/tmp/qlink-concurrent-launch.out 2>/tmp/qlink-concurrent-launch.err; then
+        fail "concurrent game launch was accepted"
+    fi
+    /usr/local/bin/qlinkctl status > /tmp/qlink-concurrent-active-status.json
+    assert_status /tmp/qlink-concurrent-active-status.json active factorio factorio
     wait "$native_launch_pid" || {
         cat /tmp/qlink-native-launch.err >&2 || true
         fail "native game launch failed"
@@ -242,6 +253,72 @@ if nft_cgroup_v2_supported; then
     if grep -Fq "qlink-game-" /tmp/qlink-native-clean-nftables.txt; then
         fail "native game nftables rules remained after exit"
     fi
+
+    if runuser -u deck -- env \
+        XDG_RUNTIME_DIR="/run/user/$DECK_UID" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$DECK_UID/bus" \
+        QLINK_GAME_EXIT_CODE=7 \
+        /usr/local/bin/qlinkctl game launch -- /usr/local/bin/factorio \
+        >/tmp/qlink-crash-launch.out 2>/tmp/qlink-crash-launch.err; then
+        fail "crashing game returned success"
+    else
+        crash_status=$?
+        [ "$crash_status" -eq 7 ] || fail "crashing game returned $crash_status instead of 7"
+    fi
+    /usr/local/bin/qlinkctl status > /tmp/qlink-crash-clean-status.json
+    "$NFT_COMMAND" -a list table inet qlink > /tmp/qlink-crash-clean-nftables.txt
+    assert_status /tmp/qlink-crash-clean-status.json armed factorio ""
+    if grep -Fq "qlink-game-" /tmp/qlink-crash-clean-nftables.txt; then
+        fail "crashed game nftables rules remained after exit"
+    fi
+
+    rm -f /tmp/qlink-native-cgroup.txt
+    runuser -u deck -- env \
+        XDG_RUNTIME_DIR="/run/user/$DECK_UID" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$DECK_UID/bus" \
+        QLINK_GAME_SLEEP=60 \
+        /usr/local/bin/qlinkctl game launch -- /usr/local/bin/factorio \
+        >/tmp/qlink-interrupt-launch.out 2>/tmp/qlink-interrupt-launch.err &
+    interrupt_launch_pid=$!
+    wait_for_path /tmp/qlink-native-cgroup.txt 20 || \
+        fail "interrupt test game did not enter the classified scope"
+    kill -TERM "$interrupt_launch_pid"
+    if wait "$interrupt_launch_pid"; then
+        fail "interrupted launcher returned success"
+    else
+        interrupt_status=$?
+        [ "$interrupt_status" -eq 143 ] || \
+            fail "interrupted launcher returned $interrupt_status instead of 143"
+    fi
+    /usr/local/bin/qlinkctl status > /tmp/qlink-interrupt-clean-status.json
+    "$NFT_COMMAND" -a list table inet qlink > /tmp/qlink-interrupt-clean-nftables.txt
+    assert_status /tmp/qlink-interrupt-clean-status.json armed factorio ""
+    if grep -Fq "qlink-game-" /tmp/qlink-interrupt-clean-nftables.txt; then
+        fail "interrupted launcher left nftables rules"
+    fi
+
+    rm -f /tmp/qlink-native-cgroup.txt
+    runuser -u deck -- env \
+        XDG_RUNTIME_DIR="/run/user/$DECK_UID" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$DECK_UID/bus" \
+        /usr/local/bin/qlinkctl game launch -- /usr/local/bin/factorio \
+        >/tmp/qlink-restart-launch.out 2>/tmp/qlink-restart-launch.err &
+    restart_launch_pid=$!
+    wait_for_path /tmp/qlink-native-cgroup.txt 20 || \
+        fail "restart test game did not enter the classified scope"
+    run_authorized_service_action restart
+    wait_for_path /run/quantumlink/qlinkd.sock 20 || \
+        fail "daemon restart did not restore the control socket"
+    /usr/local/bin/qlinkctl status > /tmp/qlink-restart-clean-status.json
+    "$NFT_COMMAND" -a list table inet qlink > /tmp/qlink-restart-clean-nftables.txt
+    assert_status /tmp/qlink-restart-clean-status.json armed factorio ""
+    if grep -Fq "qlink-game-" /tmp/qlink-restart-clean-nftables.txt; then
+        fail "daemon restart left stale game nftables rules"
+    fi
+    wait "$restart_launch_pid" || {
+        cat /tmp/qlink-restart-launch.err >&2 || true
+        fail "game launcher failed after daemon restart"
+    }
 
     /usr/local/bin/qlinkctl profile select proton-integration \
         > /tmp/qlink-proton-selected.json
@@ -291,6 +368,24 @@ else
     NFT_CGROUP_STATUS=blocked
     NATIVE_GAME_STATUS=blocked
     PROTON_GAME_STATUS=blocked
+    GAME_CRASH_STATUS=blocked
+    CONCURRENT_LAUNCH_STATUS=blocked
+    LAUNCHER_INTERRUPTION_STATUS=blocked
+    DAEMON_RESTART_STATUS=blocked
+    UNSUPPORTED_LAUNCH_STATUS=passed
+    if runuser -u deck -- /usr/local/bin/qlinkctl game launch -- /usr/local/bin/factorio \
+        >/tmp/qlink-unsupported-launch.out 2>/tmp/qlink-unsupported-launch.err; then
+        fail "game launch continued without nftables cgroup v2 support"
+    fi
+    grep -Fq "game launch blocked: nftables cgroup v2 is unsupported" \
+        /tmp/qlink-unsupported-launch.err || \
+        fail "unsupported game launch did not report the capability blocker"
+    /usr/local/bin/qlinkctl status > /tmp/qlink-unsupported-launch-status.json
+    assert_status /tmp/qlink-unsupported-launch-status.json armed factorio ""
+    "$NFT_COMMAND" -a list table inet qlink > /tmp/qlink-unsupported-launch-nftables.txt
+    if grep -Fq "qlink-game-" /tmp/qlink-unsupported-launch-nftables.txt; then
+        fail "unsupported game launch installed game classification rules"
+    fi
 fi
 
 run_authorized_service_action stop
@@ -308,6 +403,11 @@ REPORT="$REPORT" \
 NFT_CGROUP_STATUS="$NFT_CGROUP_STATUS" \
 NATIVE_GAME_STATUS="$NATIVE_GAME_STATUS" \
 PROTON_GAME_STATUS="$PROTON_GAME_STATUS" \
+GAME_CRASH_STATUS="$GAME_CRASH_STATUS" \
+CONCURRENT_LAUNCH_STATUS="$CONCURRENT_LAUNCH_STATUS" \
+LAUNCHER_INTERRUPTION_STATUS="$LAUNCHER_INTERRUPTION_STATUS" \
+DAEMON_RESTART_STATUS="$DAEMON_RESTART_STATUS" \
+UNSUPPORTED_LAUNCH_STATUS="$UNSUPPORTED_LAUNCH_STATUS" \
 python3 - <<'PY'
 import json
 import os
@@ -316,13 +416,16 @@ import platform
 import subprocess
 
 report = {
-    "schemaVersion": 1,
+    "schemaVersion": 2,
     "hostClass": "privileged-linux-container",
     "kernel": platform.release(),
     "systemd": subprocess.check_output(
         ["systemctl", "--version"], text=True
     ).splitlines()[0],
     "cgroupVersion": "v2",
+    "runtimeCapabilities": json.load(
+        open("/tmp/qlink-active-status.json", encoding="utf-8")
+    )["runtimeCapabilities"],
     "checks": {
         "scopedServiceHelper": "passed",
         "policyKitGroupAuthorization": "passed",
@@ -332,8 +435,13 @@ report = {
         "activePolicyRoute": "passed",
         "activeNftablesFailClosed": "passed",
         "nftCgroupV2KernelSupport": os.environ["NFT_CGROUP_STATUS"],
+        "unsupportedGameLaunchFailsClosed": os.environ["UNSUPPORTED_LAUNCH_STATUS"],
         "nativeGameCgroupClassification": os.environ["NATIVE_GAME_STATUS"],
         "nativeGameRuleCleanup": os.environ["NATIVE_GAME_STATUS"],
+        "gameCrashRuleCleanup": os.environ["GAME_CRASH_STATUS"],
+        "concurrentGameLaunchDenied": os.environ["CONCURRENT_LAUNCH_STATUS"],
+        "launcherInterruptionRuleCleanup": os.environ["LAUNCHER_INTERRUPTION_STATUS"],
+        "daemonRestartRuleCleanup": os.environ["DAEMON_RESTART_STATUS"],
         "protonDescendantCgroupClassification": os.environ["PROTON_GAME_STATUS"],
         "protonGameRuleCleanup": os.environ["PROTON_GAME_STATUS"],
         "ownedNetworkTeardown": "passed",
