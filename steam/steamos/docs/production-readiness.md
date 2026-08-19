@@ -550,6 +550,36 @@ orphaned crate.
   then complete real Proton, game matrix, two-Deck packet, suspend, voice,
   anti-cheat, and route-leak evidence.
 
+## 2026-08-19 Flow-Stable Data Plane
+
+- Added a shared-core flow policy keyed by the IPv4 UDP/TCP 5-tuple. Each
+  active flow binds to one path kind and authenticated packet-session
+  generation.
+- Added a deterministic path score from RTT, jitter, packet loss, relay cost,
+  and NAT cost. A candidate must exceed the minimum improvement for three
+  consecutive observations before a non-failure switch is permitted.
+- A hard transport failure can switch immediately. Existing bindings move
+  once to the new authenticated generation. A stale generation fails closed.
+- Added idle-flow expiry, fragmented IPv4 rejection, confirmed path-MTU
+  enforcement, and a bounded MTU probe state machine.
+- A path or network change resets the MTU to the 1280-byte safe floor. The
+  carrier must acknowledge a larger probe before the confirmed MTU can grow.
+- Added backward-compatible daemon status for active flow count, path
+  generation, path-change reason, confirmed MTU, pending probe, RTT, jitter,
+  and packet loss. `qlinkctl doctor` and the desktop application expose this
+  state without reading daemon files directly.
+- The privileged Linux container runner now stages the local `qlink-core`
+  source with the Steam crates. Shared-core changes cannot be masked by the
+  remote clone during integration.
+- Focused shared-core, protocol, daemon, CLI, and desktop tests pass locally.
+  These tests cover score noise, sustained improvement, hard failure,
+  same-kind session rekey, network reset, fragmentation, oversize packets,
+  and legacy status defaults.
+- Decision: No-Go remains unchanged. Live alternate-path sampling and
+  controlled carrier migration are not connected to deployed direct and relay
+  paths. Carrier-level MTU probe acknowledgements, impaired-network Linux
+  evidence, and Steam Deck evidence also remain open.
+
 ## Go / No-Go Rule
 
 Do not label SteamOS production-ready until every blocking gate is `Passed`

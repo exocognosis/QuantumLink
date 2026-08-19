@@ -492,6 +492,52 @@ pub struct PacketPumpMetrics {
     pub transport_errors: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DataPlanePathChangeReason {
+    Initial,
+    PathFailure,
+    SustainedImprovement,
+    NetworkChange,
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PathMtuProbeState {
+    BaseOnly,
+    Searching,
+    Confirmed,
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FlowStabilityStatus {
+    #[serde(default)]
+    pub active_flow_count: u64,
+    #[serde(default)]
+    pub path_generation: Option<u64>,
+    #[serde(default)]
+    pub last_path_change_reason: Option<DataPlanePathChangeReason>,
+    #[serde(default)]
+    pub path_mtu: Option<u16>,
+    #[serde(default)]
+    pub next_mtu_probe: Option<u16>,
+    #[serde(default)]
+    pub mtu_probe_state: PathMtuProbeState,
+    #[serde(default)]
+    pub median_rtt_ms: Option<u32>,
+    #[serde(default)]
+    pub jitter_ms: Option<u32>,
+    #[serde(default)]
+    pub packet_loss_basis_points: Option<u32>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DataPlaneStatus {
@@ -512,6 +558,8 @@ pub struct DataPlaneStatus {
     #[serde(default)]
     pub metrics: PacketPumpMetrics,
     #[serde(default)]
+    pub flow_stability: FlowStabilityStatus,
+    #[serde(default)]
     pub error: Option<String>,
 }
 
@@ -526,6 +574,7 @@ impl DataPlaneStatus {
             peer_session_ready: false,
             last_transport_error: None,
             metrics: PacketPumpMetrics::default(),
+            flow_stability: FlowStabilityStatus::default(),
             error: None,
         }
     }
@@ -1734,6 +1783,7 @@ mod tests {
                 rejected_packets: 2,
                 transport_errors: 1,
             },
+            flow_stability: FlowStabilityStatus::default(),
             error: None,
         };
 
@@ -1767,6 +1817,7 @@ mod tests {
             peer_session_ready: true,
             last_transport_error: None,
             metrics: PacketPumpMetrics::default(),
+            flow_stability: FlowStabilityStatus::default(),
             error: None,
         };
 

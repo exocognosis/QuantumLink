@@ -7,10 +7,10 @@ use qlink_desktop::{
     QlinkCtlRunner,
 };
 use qlink_proto::{
-    ConnectionPhase, DataPlaneState, DytallixTrustDecision, DytallixTrustHealth,
-    GameProcessClassificationState, GameProfileInfo, GameProfilePortEnforcementState,
-    LocalRegistryBindingState, MeshTrustMode, NetworkPlanState, PathKind, RuntimeCapabilityState,
-    SteamOsRuntimeCapabilities, StoredPeer,
+    ConnectionPhase, DataPlanePathChangeReason, DataPlaneState, DytallixTrustDecision,
+    DytallixTrustHealth, GameProcessClassificationState, GameProfileInfo,
+    GameProfilePortEnforcementState, LocalRegistryBindingState, MeshTrustMode, NetworkPlanState,
+    PathKind, PathMtuProbeState, RuntimeCapabilityState, SteamOsRuntimeCapabilities, StoredPeer,
 };
 use serde_json::Value;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -384,10 +384,8 @@ impl QuantumLinkDesktop {
                 });
 
                 card(&mut columns[1], "Live Path", |ui| {
-                    let peer = snapshot
-                        .as_ref()
-                        .and_then(|value| value.daemon.as_ref())
-                        .and_then(|daemon| daemon.peers.first());
+                    let daemon = snapshot.as_ref().and_then(|value| value.daemon.as_ref());
+                    let peer = daemon.and_then(|status| status.peers.first());
                     metric_row(
                         ui,
                         "RTT",
@@ -413,6 +411,39 @@ impl QuantumLinkDesktop {
                         ui,
                         "Relay privacy",
                         peer.map(|peer| yes_no(peer.relay_privacy))
+                            .unwrap_or("--")
+                            .to_string(),
+                    );
+                    let stability = daemon.map(|status| &status.data_plane.flow_stability);
+                    metric_row(
+                        ui,
+                        "Active flows",
+                        stability
+                            .map(|status| status.active_flow_count.to_string())
+                            .unwrap_or_else(|| "--".to_string()),
+                    );
+                    metric_row(
+                        ui,
+                        "Path MTU",
+                        stability
+                            .and_then(|status| status.path_mtu)
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "--".to_string()),
+                    );
+                    metric_row(
+                        ui,
+                        "Last change",
+                        stability
+                            .and_then(|status| status.last_path_change_reason)
+                            .map(path_change_reason_label)
+                            .unwrap_or("--")
+                            .to_string(),
+                    );
+                    metric_row(
+                        ui,
+                        "MTU probe",
+                        stability
+                            .map(|status| path_mtu_probe_state_label(status.mtu_probe_state))
                             .unwrap_or("--")
                             .to_string(),
                     );
@@ -1388,6 +1419,25 @@ fn path_label(path: Option<PathKind>) -> &'static str {
         Some(PathKind::Relay) => "Relay path",
         Some(PathKind::Probing) => "Probing",
         Some(PathKind::Unavailable) | None => "Unavailable",
+    }
+}
+
+fn path_change_reason_label(reason: DataPlanePathChangeReason) -> &'static str {
+    match reason {
+        DataPlanePathChangeReason::Initial => "Initial path",
+        DataPlanePathChangeReason::PathFailure => "Path failure",
+        DataPlanePathChangeReason::SustainedImprovement => "Sustained improvement",
+        DataPlanePathChangeReason::NetworkChange => "Network change",
+        DataPlanePathChangeReason::Unknown => "Unknown",
+    }
+}
+
+fn path_mtu_probe_state_label(state: PathMtuProbeState) -> &'static str {
+    match state {
+        PathMtuProbeState::BaseOnly => "Safe base",
+        PathMtuProbeState::Searching => "Searching",
+        PathMtuProbeState::Confirmed => "Confirmed",
+        PathMtuProbeState::Unknown => "Unknown",
     }
 }
 

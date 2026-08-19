@@ -37,12 +37,19 @@ import sys
 status = json.load(open(sys.argv[1], encoding="utf-8"))
 expected_state, expected_profile, expected_executable = sys.argv[2:]
 network = status["network"]
+data_plane = status["dataPlane"]
+flow_stability = data_plane["flowStability"]
 process = status["gameProfile"]["processClassification"]
 assert network["state"] == "applied"
 assert network["dryRun"] is False
 assert network["ownershipRecordPresent"] is True
-assert status["dataPlane"]["state"] == "ready"
-assert status["dataPlane"]["packetIoAvailable"] is True
+assert data_plane["state"] == "ready"
+assert data_plane["packetIoAvailable"] is True
+assert flow_stability["pathGeneration"] >= 1
+assert flow_stability["pathMtu"] == 1280
+assert flow_stability["nextMtuProbe"] == 1312
+assert flow_stability["mtuProbeState"] == "searching"
+assert flow_stability["lastPathChangeReason"] in ("initial", "networkChange")
 assert process["state"] == expected_state
 assert process["profileId"] == expected_profile
 if expected_executable:
@@ -426,6 +433,9 @@ report = {
     "runtimeCapabilities": json.load(
         open("/tmp/qlink-active-status.json", encoding="utf-8")
     )["runtimeCapabilities"],
+    "flowStability": json.load(
+        open("/tmp/qlink-active-status.json", encoding="utf-8")
+    )["dataPlane"]["flowStability"],
     "checks": {
         "scopedServiceHelper": "passed",
         "policyKitGroupAuthorization": "passed",
@@ -434,6 +444,8 @@ report = {
         "activeTunAddress": "passed",
         "activePolicyRoute": "passed",
         "activeNftablesFailClosed": "passed",
+        "flowPathGenerationBound": "passed",
+        "safePathMtuEnforced": "passed",
         "nftCgroupV2KernelSupport": os.environ["NFT_CGROUP_STATUS"],
         "unsupportedGameLaunchFailsClosed": os.environ["UNSUPPORTED_LAUNCH_STATUS"],
         "nativeGameCgroupClassification": os.environ["NATIVE_GAME_STATUS"],

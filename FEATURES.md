@@ -99,6 +99,15 @@ This feature list is synchronized with the current repository implementation. It
   required runtime capabilities, PolicyKit service control, native cgroup
   classification, descendant inheritance, and launch cleanup failure paths.
   Its verifier rejects incomplete checks and false real-game or two-Deck claims.
+- Shared-core flow stability parses IPv4 UDP/TCP 5-tuples, binds each active
+  game flow to one authenticated path generation, applies sustained-score
+  hysteresis, permits immediate hard-failure recovery, and expires idle flow
+  state. The Steam packet pump rejects path mismatches, fragmented IPv4, and
+  packets above the confirmed path MTU.
+- Network changes clear flow bindings and reset the path MTU to the 1280-byte
+  safe floor before the transport revalidates. `qlinkctl doctor` and the
+  desktop application report path generation, active flows, change reason,
+  confirmed MTU, and probe state.
 
 ## Not Production-Complete
 
@@ -115,8 +124,9 @@ This feature list is synchronized with the current repository implementation. It
 - Anonymity guarantees beyond metadata minimization.
 - SteamOS two-Deck packet, route-leak, suspend/resume, voice, anti-cheat, and
   game compatibility evidence.
-- SteamOS per-flow path affinity, path-change hysteresis, and datagram path MTU
-  discovery proof.
+- SteamOS live alternate-path sampling, controlled carrier migration, and
+  carrier-level path MTU probe acknowledgement. The policy and fail-closed
+  packet-pump enforcement are implemented locally.
 - SteamOS cgroup v2 and nftables compatibility proof for native and Proton game
   launches. The launch-bound classifier is implemented locally, but the Deck
   kernel result remains open.

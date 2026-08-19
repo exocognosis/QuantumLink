@@ -36,6 +36,9 @@ trap cleanup EXIT INT TERM
 git clone --depth 1 "$SOURCE_REPOSITORY" "$STAGE_DIR"
 cp -X "$REPO_ROOT/Cargo.toml" "$STAGE_DIR/Cargo.toml"
 cp -X "$REPO_ROOT/Cargo.lock" "$STAGE_DIR/Cargo.lock"
+rm -rf "$STAGE_DIR/qlink-core/src"
+cp -X "$REPO_ROOT/qlink-core/Cargo.toml" "$STAGE_DIR/qlink-core/Cargo.toml"
+cp -R -X "$REPO_ROOT/qlink-core/src" "$STAGE_DIR/qlink-core/src"
 for crate in qlink-desktop qlink-game qlink-linux qlink-proto qlinkctl qlinkd; do
     source_crate="$REPO_ROOT/steam/steamos/rust/$crate"
     staged_crate="$STAGE_DIR/steam/steamos/rust/$crate"

@@ -14,10 +14,10 @@ Steam account or commerce traffic through QuantumLink.
 | Priority | Requirement | Product rule | Current state |
 |---|---|---|---|
 | P0 | Low path delay | Prefer a measured direct path. Use a relay only when the direct path fails or the relay has a better measured score. | Implemented locally. Hardware proof is open. |
-| P0 | Per-flow path affinity | Pin each UDP or TCP 5-tuple to one path. Do not split packets from one game flow across direct and relay paths. Switch the flow only after a path failure or a sustained threshold breach. | Policy required. Runtime proof is open. |
-| P0 | Path stability | Use hysteresis before path changes. A small score change must not move an active game flow. | Not implemented. |
+| P0 | Per-flow path affinity | Pin each UDP or TCP 5-tuple to one path. Do not split packets from one game flow across direct and relay paths. Switch the flow only after a path failure or a sustained threshold breach. | Shared-core 5-tuple binding and Steam packet-pump enforcement are implemented locally. Live multi-path and hardware proof is open. |
+| P0 | Path stability | Use hysteresis before path changes. A small score change must not move an active game flow. | The shared-core hysteresis and hard-failure state machine is implemented. Live alternate-path metric input and carrier migration proof is open. |
 | P0 | Loss and jitter control | Measure round-trip time, jitter, packet loss, and path changes. Treat loss and jitter as primary path-selection inputs. | Metrics models exist. Live sampling and selection proof are partial. |
-| P0 | Datagram MTU safety | Use Datagram Packetization Layer Path MTU Discovery. Avoid IP fragmentation. Re-probe after interface or path changes. | Fixed 1280-byte TUN MTU exists. Dynamic discovery is not implemented. |
+| P0 | Datagram MTU safety | Use Datagram Packetization Layer Path MTU Discovery. Avoid IP fragmentation. Re-probe after interface or path changes. | Fragmented IPv4 and packets above the confirmed path MTU fail closed. A shared probe state machine resets after path or network changes. The carrier probe acknowledgement path is open, so production remains at the 1280-byte safe floor. |
 | P0 | Steam-safe split tunnel | Bypass Steam account, store, wallet, checkout, inventory, marketplace, launcher, browser, update, and login traffic by default. | Policy and local tests exist. Deck route-leak proof is open. |
 | P0 | Selected profile enforcement | In game-only mode, mark only traffic from the selected executable's launch cgroup and selected UDP ports inside the protected overlay. Drop all other overlay traffic. | Launch-bound cgroup v2 and UDP rules are implemented locally. Deck kernel and route-leak proof are open. |
 | P0 | Protected-flow fail closure | Drop protected game traffic when its authenticated peer session is unavailable. Do not block bypass traffic. | Implemented locally. Deck proof is open. |
@@ -26,7 +26,7 @@ Steam account or commerce traffic through QuantumLink.
 | P0 | No process injection | Do not inject code into Steam or game processes. Use Linux routing, TUN, cgroup v2, and nftables controls outside the game process. | Implemented by the `qlinkctl game launch` scope boundary. Deck proof is open. |
 | P1 | Relay privacy | Offer a relay path that hides peer IP addresses and rate-limits unauthenticated traffic. | Relay support exists. Public operational proof is open. |
 | P1 | LAN discovery | Preserve local discovery for profiles that require it. Do not send discovery broadcasts to unrelated peers. | Profile flags exist. Runtime policy is partial. |
-| P1 | Clear path disclosure | Show direct or relay path, protected routes, bypass state, RTT, jitter, loss, and the last path change reason. | Desktop Mode shows current path and metrics. Path-change reason is open. |
+| P1 | Clear path disclosure | Show direct or relay path, protected routes, bypass state, RTT, jitter, loss, and the last path change reason. | Desktop Mode and `qlinkctl doctor` show path generation, active flows, path-change reason, confirmed MTU, and probe state. Live path samples remain partial. |
 | P1 | Controller-first controls | Provide connect, disconnect, peer selection, profile selection, and current path state without a terminal. | Desktop and Game Mode controls, including explicit profile selection, are implemented locally. Steam Deck and Steam Input proof is open. |
 
 "No packet source separation" is treated as **no per-packet path separation**.

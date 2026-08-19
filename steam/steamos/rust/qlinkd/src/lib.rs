@@ -985,6 +985,7 @@ impl DaemonEngine {
                 peer_session_ready: false,
                 last_transport_error: Some(error.to_string()),
                 metrics: Default::default(),
+                flow_stability: Default::default(),
                 error: Some(error.to_string()),
             };
             return Err(error);
@@ -999,6 +1000,7 @@ impl DaemonEngine {
             peer_session_ready: false,
             last_transport_error: None,
             metrics: Default::default(),
+            flow_stability: Default::default(),
             error: None,
         };
 
@@ -1083,6 +1085,7 @@ impl DaemonEngine {
             peer_session_ready: false,
             last_transport_error: Some(error.to_string()),
             metrics: Default::default(),
+            flow_stability: Default::default(),
             error: Some(error.to_string()),
         };
     }
@@ -1687,6 +1690,9 @@ pub fn serve_resident_loop(
             None => false,
         };
         if network_changed {
+            if let Some(data_plane) = engine.data_plane_runtime_mut() {
+                data_plane.handle_network_change();
+            }
             if let Some(transport) = transport.as_ref() {
                 transport.handle_network_change();
             }
@@ -3352,13 +3358,16 @@ mod tests {
 
     #[cfg(unix)]
     fn protected_ipv4_packet(destination: [u8; 4]) -> Vec<u8> {
-        let mut packet = vec![0_u8; 20];
+        let mut packet = vec![0_u8; 28];
         packet[0] = 0x45;
-        packet[3] = 20;
+        packet[3] = 28;
         packet[8] = 64;
         packet[9] = 17;
         packet[12..16].copy_from_slice(&[100, 64, 0, 2]);
         packet[16..20].copy_from_slice(&destination);
+        packet[20..22].copy_from_slice(&42000_u16.to_be_bytes());
+        packet[22..24].copy_from_slice(&34197_u16.to_be_bytes());
+        packet[24..26].copy_from_slice(&8_u16.to_be_bytes());
         packet
     }
 

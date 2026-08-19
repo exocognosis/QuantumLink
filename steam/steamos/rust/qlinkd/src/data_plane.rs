@@ -1,3 +1,7 @@
+use qlink_core::flow_stability::{
+    FlowPathController, PacketDecision, PathChangeReason, PathId, PathMetrics,
+    PathMtuProbeState as CorePathMtuProbeState, StablePathKind,
+};
 use qlink_core::packet_core::{
     FfiCryptoPolicy, FfiRouteMode, InstalledPeerSession, PeerSessionDirection,
 };
@@ -5,8 +9,11 @@ use qlink_core::packet_core::{
     PacketDisposition, PacketTunnelCore, PacketTunnelCoreConfig, TunnelPacket,
 };
 use qlink_linux::{protocol_family_for_packet, TunDeviceConfig, TunPacketIo, TunPacketIoError};
-use qlink_proto::{DataPlaneState, DataPlaneStatus, PacketPumpMetrics, PathKind};
-use std::{collections::VecDeque, error::Error, fmt, io::ErrorKind};
+use qlink_proto::{
+    DataPlanePathChangeReason, DataPlaneState, DataPlaneStatus, FlowStabilityStatus,
+    PacketPumpMetrics, PathKind, PathMtuProbeState,
+};
+use std::{collections::VecDeque, error::Error, fmt, io::ErrorKind, time::Instant};
 
 #[derive(Debug)]
 pub enum DataPlaneError {
@@ -128,6 +135,9 @@ pub trait TransportFrameSink {
     fn peer_session_ready(&self) -> bool {
         false
     }
+    fn path_generation(&self) -> Option<u64> {
+        None
+    }
     fn installed_peer_session(&self) -> Option<InstalledPeerSession> {
         None
     }
@@ -152,6 +162,9 @@ pub trait TransportFrameSource {
     fn peer_session_ready(&self) -> bool {
         false
     }
+    fn path_generation(&self) -> Option<u64> {
+        None
+    }
     fn take_peer_session_updates(&self) -> Vec<PeerSessionUpdate> {
         Vec::new()
     }
@@ -165,6 +178,9 @@ pub trait MeshFrameTransport {
     fn is_ready(&self) -> bool;
     fn path_kind(&self) -> PathKind;
     fn peer_session_ready(&self) -> bool;
+    fn path_generation(&self) -> Option<u64> {
+        None
+    }
     fn installed_peer_session(&self) -> Option<InstalledPeerSession>;
     fn take_peer_session_updates(&self) -> Vec<PeerSessionUpdate> {
         Vec::new()
@@ -190,6 +206,10 @@ where
 
     fn peer_session_ready(&self) -> bool {
         MeshFrameTransport::peer_session_ready(self)
+    }
+
+    fn path_generation(&self) -> Option<u64> {
+        MeshFrameTransport::path_generation(self)
     }
 
     fn installed_peer_session(&self) -> Option<InstalledPeerSession> {
@@ -226,6 +246,10 @@ where
 
     fn peer_session_ready(&self) -> bool {
         MeshFrameTransport::peer_session_ready(self)
+    }
+
+    fn path_generation(&self) -> Option<u64> {
+        MeshFrameTransport::path_generation(self)
     }
 
     fn take_peer_session_updates(&self) -> Vec<PeerSessionUpdate> {
@@ -461,6 +485,10 @@ pub struct DataPlaneRuntime<T: TunPacketIo, C: TunnelCoreAdapting> {
     transport_path: Option<PathKind>,
     peer_session_ready: bool,
     last_transport_error: Option<String>,
+    flow_stability: FlowPathController,
+    observed_path: Option<PathId>,
+    path_generation: u64,
+    started_at: Instant,
 }
 
 impl<T, C> DataPlaneRuntime<T, C>
@@ -477,6 +505,10 @@ where
             transport_path: None,
             peer_session_ready: false,
             last_transport_error: None,
+            flow_stability: FlowPathController::default(),
+            observed_path: None,
+            path_generation: 0,
+            started_at: Instant::now(),
         }
     }
 
@@ -496,6 +528,7 @@ where
             peer_session_ready: self.peer_session_ready,
             last_transport_error: self.last_transport_error.clone(),
             metrics: self.pump.counters().as_proto(),
+            flow_stability: flow_stability_status(self.flow_stability.snapshot()),
             error: self.last_error.clone(),
         }
     }
@@ -519,7 +552,47 @@ where
             }
         };
 
-        let result = self.pump.handle_packet(&buffer[..packet_len], sink);
+        let packet = &buffer[..packet_len];
+        let result = match self.current_path_id() {
+            Some(path) => match self.flow_stability.authorize_ipv4_packet(
+                packet,
+                path,
+                self.started_at.elapsed().as_millis() as u64,
+            ) {
+                Ok(PacketDecision::Allowed { .. }) => self.pump.handle_packet(packet, sink),
+                Ok(
+                    PacketDecision::DroppedNoPath
+                    | PacketDecision::DroppedPathMismatch
+                    | PacketDecision::DroppedOversize { .. },
+                ) => {
+                    let result = PacketPumpBatchResult {
+                        observed_packets: 1,
+                        dropped_packets: 1,
+                        ..Default::default()
+                    };
+                    self.pump.counters.add_batch(result);
+                    result
+                }
+                Err(_) => {
+                    let result = PacketPumpBatchResult {
+                        observed_packets: 1,
+                        rejected_packets: 1,
+                        ..Default::default()
+                    };
+                    self.pump.counters.add_batch(result);
+                    result
+                }
+            },
+            None => {
+                let result = PacketPumpBatchResult {
+                    observed_packets: 1,
+                    dropped_packets: 1,
+                    ..Default::default()
+                };
+                self.pump.counters.add_batch(result);
+                result
+            }
+        };
         if result.transport_errors > 0 {
             let error = DataPlaneError::Transport(format!(
                 "transport send failed for {} frame(s)",
@@ -566,11 +639,19 @@ where
         self.pump.counters()
     }
 
+    pub fn handle_network_change(&mut self) {
+        self.flow_stability.invalidate_for_network_change();
+        self.observed_path = None;
+        self.transport_ready = false;
+        self.transport_path = Some(PathKind::Probing);
+    }
+
     fn record_transport_status_from_sink(&mut self, sink: &dyn TransportFrameSink) {
         self.peer_session_ready = sink.peer_session_ready();
         self.transport_ready = sink.is_ready() && self.peer_session_ready;
         self.transport_path = Some(sink.path_kind());
         self.last_transport_error = sink.last_transport_error().map(str::to_string);
+        self.observe_transport_path(sink.path_generation());
     }
 
     fn record_transport_status_from_source(&mut self, source: &dyn TransportFrameSource) {
@@ -578,6 +659,42 @@ where
         self.transport_ready = source.is_ready() && self.peer_session_ready;
         self.transport_path = Some(source.path_kind());
         self.last_transport_error = source.last_transport_error().map(str::to_string);
+        self.observe_transport_path(source.path_generation());
+    }
+
+    fn observe_transport_path(&mut self, reported_generation: Option<u64>) {
+        if !self.transport_ready {
+            return;
+        }
+        let Some(kind) = stable_path_kind(self.transport_path) else {
+            return;
+        };
+        let generation = reported_generation
+            .filter(|value| *value > 0)
+            .unwrap_or_else(|| {
+                self.observed_path
+                    .filter(|path| path.kind == kind)
+                    .map(|path| path.generation)
+                    .unwrap_or_else(|| self.path_generation.saturating_add(1).max(1))
+            });
+        let path = PathId::new(kind, generation);
+        if self.observed_path == Some(path) {
+            return;
+        }
+        self.path_generation = self.path_generation.max(generation);
+        if self.observed_path.is_some() {
+            self.flow_stability
+                .switch_after_failure(path, PathMetrics::unknown());
+        } else {
+            self.flow_stability
+                .activate_initial(path, PathMetrics::unknown());
+        }
+        self.observed_path = Some(path);
+        let _ = self.flow_stability.next_mtu_probe();
+    }
+
+    fn current_path_id(&self) -> Option<PathId> {
+        self.observed_path
     }
 
     fn apply_peer_session_updates(&mut self, updates: Vec<PeerSessionUpdate>) {
@@ -596,9 +713,45 @@ where
     }
 }
 
+fn stable_path_kind(path: Option<PathKind>) -> Option<StablePathKind> {
+    match path {
+        Some(PathKind::Direct) => Some(StablePathKind::Direct),
+        Some(PathKind::Relay) => Some(StablePathKind::Relay),
+        Some(PathKind::Probing | PathKind::Unavailable) | None => None,
+    }
+}
+
+fn flow_stability_status(
+    snapshot: qlink_core::flow_stability::FlowPathSnapshot,
+) -> FlowStabilityStatus {
+    FlowStabilityStatus {
+        active_flow_count: snapshot.active_flow_count as u64,
+        path_generation: snapshot.active_path.map(|path| path.generation),
+        last_path_change_reason: snapshot.last_change_reason.map(|reason| match reason {
+            PathChangeReason::Initial => DataPlanePathChangeReason::Initial,
+            PathChangeReason::PathFailure => DataPlanePathChangeReason::PathFailure,
+            PathChangeReason::SustainedImprovement => {
+                DataPlanePathChangeReason::SustainedImprovement
+            }
+            PathChangeReason::NetworkChange => DataPlanePathChangeReason::NetworkChange,
+        }),
+        path_mtu: Some(snapshot.path_mtu.confirmed_mtu),
+        next_mtu_probe: snapshot.path_mtu.next_probe_mtu,
+        mtu_probe_state: match snapshot.path_mtu.state {
+            CorePathMtuProbeState::BaseOnly => PathMtuProbeState::BaseOnly,
+            CorePathMtuProbeState::Searching => PathMtuProbeState::Searching,
+            CorePathMtuProbeState::Confirmed => PathMtuProbeState::Confirmed,
+        },
+        median_rtt_ms: snapshot.median_rtt_ms,
+        jitter_ms: snapshot.jitter_ms,
+        packet_loss_basis_points: snapshot.packet_loss_basis_points,
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct LocalFrameQueue {
     ready: bool,
+    generation: u64,
     frames: VecDeque<Vec<u8>>,
 }
 
@@ -606,6 +759,7 @@ impl LocalFrameQueue {
     pub fn ready() -> Self {
         Self {
             ready: true,
+            generation: 1,
             frames: VecDeque::new(),
         }
     }
@@ -613,6 +767,7 @@ impl LocalFrameQueue {
     pub fn unavailable() -> Self {
         Self {
             ready: false,
+            generation: 0,
             frames: VecDeque::new(),
         }
     }
@@ -629,6 +784,18 @@ impl TransportFrameSink for LocalFrameQueue {
 
     fn peer_session_ready(&self) -> bool {
         self.ready
+    }
+
+    fn path_kind(&self) -> PathKind {
+        if self.ready {
+            PathKind::Direct
+        } else {
+            PathKind::Unavailable
+        }
+    }
+
+    fn path_generation(&self) -> Option<u64> {
+        self.ready.then_some(self.generation)
     }
 
     fn installed_peer_session(&self) -> Option<InstalledPeerSession> {
@@ -660,6 +827,18 @@ impl TransportFrameSource for LocalFrameQueue {
 
     fn peer_session_ready(&self) -> bool {
         self.ready
+    }
+
+    fn path_kind(&self) -> PathKind {
+        if self.ready {
+            PathKind::Direct
+        } else {
+            PathKind::Unavailable
+        }
+    }
+
+    fn path_generation(&self) -> Option<u64> {
+        self.ready.then_some(self.generation)
     }
 
     fn try_receive_frame(&mut self) -> Option<InboundTransportFrame> {
@@ -712,13 +891,16 @@ mod tests {
     }
 
     fn ipv4_packet(destination: [u8; 4]) -> Vec<u8> {
-        let mut packet = vec![0_u8; 20];
+        let mut packet = vec![0_u8; 28];
         packet[0] = 0x45;
-        packet[3] = 20;
+        packet[3] = 28;
         packet[8] = 64;
         packet[9] = 17;
         packet[12..16].copy_from_slice(&[100, 64, 0, 2]);
         packet[16..20].copy_from_slice(&destination);
+        packet[20..22].copy_from_slice(&42000_u16.to_be_bytes());
+        packet[22..24].copy_from_slice(&34197_u16.to_be_bytes());
+        packet[24..26].copy_from_slice(&8_u16.to_be_bytes());
         packet
     }
 
@@ -759,6 +941,14 @@ mod tests {
         assert_eq!(sink.queued_frames(), 1);
         assert!(runtime.status().packet_io_available);
         assert!(runtime.status().transport_ready);
+        assert_eq!(runtime.status().flow_stability.active_flow_count, 1);
+        assert_eq!(runtime.status().flow_stability.path_generation, Some(1));
+        assert_eq!(runtime.status().flow_stability.path_mtu, Some(1280));
+        assert_eq!(runtime.status().flow_stability.next_mtu_probe, Some(1312));
+        assert_eq!(
+            runtime.status().flow_stability.mtu_probe_state,
+            PathMtuProbeState::Searching
+        );
     }
 
     #[test]
@@ -772,6 +962,10 @@ mod tests {
 
             fn peer_session_ready(&self) -> bool {
                 true
+            }
+
+            fn path_kind(&self) -> PathKind {
+                PathKind::Direct
             }
 
             fn installed_peer_session(&self) -> Option<InstalledPeerSession> {
@@ -845,5 +1039,56 @@ mod tests {
         assert_eq!(result.dropped_packets, 1);
         assert_eq!(result.queued_packets, 0);
         assert_eq!(sink.queued_frames(), 0);
+    }
+
+    #[test]
+    fn network_change_clears_flow_bindings_and_requires_revalidation() {
+        let mut runtime = runtime();
+        let packet = ipv4_packet([100, 64, 0, 9]);
+        runtime.tun_mut().write_packet(&packet).unwrap();
+        let mut sink = LocalFrameQueue::ready();
+        let mut buffer = [0_u8; 1280];
+        runtime
+            .pump_tun_to_transport_once(&mut sink, &mut buffer)
+            .unwrap();
+        assert_eq!(runtime.status().flow_stability.active_flow_count, 1);
+
+        runtime.handle_network_change();
+
+        let status = runtime.status();
+        assert_eq!(status.flow_stability.active_flow_count, 0);
+        assert_eq!(status.flow_stability.path_generation, None);
+        assert_eq!(
+            status.flow_stability.last_path_change_reason,
+            Some(DataPlanePathChangeReason::NetworkChange)
+        );
+        assert!(!status.transport_ready);
+    }
+
+    #[test]
+    fn same_kind_session_reconnect_advances_the_bound_path_generation() {
+        let mut runtime = runtime();
+        let packet = ipv4_packet([100, 64, 0, 9]);
+        let mut sink = LocalFrameQueue::ready();
+        let mut buffer = [0_u8; 1280];
+        runtime.tun_mut().write_packet(&packet).unwrap();
+        runtime
+            .pump_tun_to_transport_once(&mut sink, &mut buffer)
+            .unwrap();
+        assert_eq!(runtime.status().flow_stability.path_generation, Some(1));
+
+        sink.generation = 2;
+        runtime.tun_mut().write_packet(&packet).unwrap();
+        runtime
+            .pump_tun_to_transport_once(&mut sink, &mut buffer)
+            .unwrap();
+
+        let status = runtime.status();
+        assert_eq!(status.flow_stability.path_generation, Some(2));
+        assert_eq!(
+            status.flow_stability.last_path_change_reason,
+            Some(DataPlanePathChangeReason::PathFailure)
+        );
+        assert_eq!(status.flow_stability.active_flow_count, 1);
     }
 }

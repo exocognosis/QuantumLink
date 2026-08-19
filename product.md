@@ -528,6 +528,13 @@ The filter chain must drop unmarked overlay traffic. A profile change must use
 owned systemd teardown and restart. Game launch must use an external systemd
 scope and must not inject code into Steam, Proton, or the game process.
 
+The current SteamOS packet pump binds each parsed IPv4 UDP/TCP 5-tuple to one
+authenticated path generation. It rejects path mismatches, IPv4 fragments, and
+packets above the confirmed path MTU. Shared-core policy requires a sustained
+score improvement before a non-failure path change and resets flow and MTU
+state after a network change. Live alternate-path sampling, carrier migration,
+and carrier-level MTU probe acknowledgements remain production gaps.
+
 ## Diagnostics and support
 
 Diagnostics should make mesh behavior explainable without leaking sensitive

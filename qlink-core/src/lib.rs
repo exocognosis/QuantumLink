@@ -8,6 +8,7 @@ pub mod dytallix_identity_v2;
 pub mod dytallix_provisioning_v2;
 pub mod error;
 pub mod ffi;
+pub mod flow_stability;
 pub mod ice;
 pub mod inbound_identity;
 pub mod local_loopback;

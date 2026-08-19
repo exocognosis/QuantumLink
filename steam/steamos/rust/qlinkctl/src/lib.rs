@@ -1,12 +1,12 @@
 use qlink_game::{GameLaunchPlan, GameProfile};
 use qlink_proto::{
     load_peer_store_at, peer_store_path_from_state_dir, store_peer_store_at, ConnectionPhase,
-    DaemonControlRequest, DaemonStatus, DataPlaneState, DytallixBindingVersion,
-    DytallixTrustDecision, DytallixTrustHealth, DytallixTrustStatus,
+    DaemonControlRequest, DaemonStatus, DataPlanePathChangeReason, DataPlaneState,
+    DytallixBindingVersion, DytallixTrustDecision, DytallixTrustHealth, DytallixTrustStatus,
     GameProcessClassificationState, GameProfilePortEnforcementState, GameProfileStatus, InviteCode,
-    LocalRegistryBindingState, MeshTrustMode, NetworkPlanState, PathKind, PeerStore,
-    PublicationErrorCode, PublicationState, PublicationStatus, RouteMode, RuntimeCapabilityState,
-    RuntimeCapabilityStatus, SteamOsRuntimeCapabilities, StoredPeer,
+    LocalRegistryBindingState, MeshTrustMode, NetworkPlanState, PathKind, PathMtuProbeState,
+    PeerStore, PublicationErrorCode, PublicationState, PublicationStatus, RouteMode,
+    RuntimeCapabilityState, RuntimeCapabilityStatus, SteamOsRuntimeCapabilities, StoredPeer,
 };
 
 pub mod dytallix;
@@ -911,6 +911,12 @@ fn format_doctor_at(status: &DaemonStatus, now_unix: u64) -> String {
          packet I/O: {packet_io}\n\
          transport ready: {transport_ready}\n\
          transport path: {transport_path}\n\
+         active game flows: {active_game_flows}\n\
+         path generation: {path_generation}\n\
+         last path change: {last_path_change}\n\
+         path MTU: {path_mtu}\n\
+         MTU probe state: {mtu_probe_state}\n\
+         next MTU probe: {next_mtu_probe}\n\
          peer session: {peer_session}\n\
          last transport error: {last_transport_error}\n\
          packet counters: observed={observed_packets} queued={queued_packets} dropped={dropped_packets} emitted={emitted_packets} accepted={accepted_packets} rejected={rejected_packets} transportErrors={transport_errors}\n\
@@ -969,6 +975,28 @@ fn format_doctor_at(status: &DaemonStatus, now_unix: u64) -> String {
             .transport_path
             .map(path_kind_label)
             .unwrap_or("unknown"),
+        active_game_flows = data_plane.flow_stability.active_flow_count,
+        path_generation = data_plane
+            .flow_stability
+            .path_generation
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        last_path_change = data_plane
+            .flow_stability
+            .last_path_change_reason
+            .map(path_change_reason_label)
+            .unwrap_or("none"),
+        path_mtu = data_plane
+            .flow_stability
+            .path_mtu
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
+        mtu_probe_state = path_mtu_probe_state_label(data_plane.flow_stability.mtu_probe_state),
+        next_mtu_probe = data_plane
+            .flow_stability
+            .next_mtu_probe
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string()),
         peer_session = if data_plane.peer_session_ready {
             "ready"
         } else {
@@ -1634,6 +1662,25 @@ fn path_kind_label(path: PathKind) -> &'static str {
     }
 }
 
+fn path_change_reason_label(reason: DataPlanePathChangeReason) -> &'static str {
+    match reason {
+        DataPlanePathChangeReason::Initial => "initial",
+        DataPlanePathChangeReason::PathFailure => "pathFailure",
+        DataPlanePathChangeReason::SustainedImprovement => "sustainedImprovement",
+        DataPlanePathChangeReason::NetworkChange => "networkChange",
+        DataPlanePathChangeReason::Unknown => "unknown",
+    }
+}
+
+fn path_mtu_probe_state_label(state: PathMtuProbeState) -> &'static str {
+    match state {
+        PathMtuProbeState::BaseOnly => "baseOnly",
+        PathMtuProbeState::Searching => "searching",
+        PathMtuProbeState::Confirmed => "confirmed",
+        PathMtuProbeState::Unknown => "unknown",
+    }
+}
+
 fn parse_status_response(line: &str) -> Result<DaemonStatus, ControlError> {
     let value = serde_json::from_str::<serde_json::Value>(line)?;
     if value.get("type").and_then(serde_json::Value::as_str) == Some("error") {
@@ -1710,6 +1757,7 @@ mod tests {
             peer_session_ready: transport_ready,
             last_transport_error: None,
             metrics: packet_pump_metrics(),
+            flow_stability: Default::default(),
             error: error.map(str::to_string),
         };
         status
